@@ -22,7 +22,7 @@ Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to pre
 
 ## Install
 
-Ubuntu is the only supported install target right now.
+Ubuntu is the supported install target.
 
 ```bash
 git clone https://github.com/Dinkum/Bitcoin-Pure.git
@@ -46,6 +46,8 @@ sudo ./install --update --repo-url git@github.com:Dinkum/Bitcoin-Pure.git --ref 
 
 What `./install` does:
 
+- works with no required flags and sensible defaults
+- is safe to rerun; existing config is preserved where possible
 - verifies the host is Ubuntu
 - installs system dependencies
 - builds `bpu-cli`
@@ -77,5 +79,3 @@ Bitcoin-Pure/
 - `GET /` serves the cached public ASCII node monitor.
 - `POST /` serves authenticated JSON-RPC.
 - `bpu-cli` exposes local chain, tx, block, and node commands.
-
-

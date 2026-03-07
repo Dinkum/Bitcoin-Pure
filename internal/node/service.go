@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
+	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -39,6 +42,8 @@ type ServiceConfig struct {
 	RPCReadTimeout     time.Duration
 	RPCWriteTimeout    time.Duration
 	RPCHeaderTimeout   time.Duration
+	RPCIdleTimeout     time.Duration
+	RPCMaxHeaderBytes  int
 	RPCMaxBodyBytes    int
 	P2PAddr            string
 	Peers              []string
@@ -118,6 +123,7 @@ type Service struct {
 	recentHdrs    recentHeaderCache
 	recentBlks    recentBlockCache
 	templateStats templateBuildTelemetry
+	nodeID        string
 	dashboard     dashboardCache
 	systemStats   dashboardSystemStats
 	startedAt     time.Time
@@ -236,12 +242,129 @@ type recentBlockCache struct {
 type dashboardCache struct {
 	mu         sync.Mutex
 	renderedAt time.Time
-	body       string
+	view       *publicDashboardView
+	pages      map[string]string
 }
 
 type dashboardBlock struct {
 	Height uint64
 	Hash   [32]byte
+}
+
+type publicDashboardView struct {
+	generatedAt time.Time
+	nodeID      string
+	createdAt   time.Time
+	info        ServiceInfo
+	health      string
+	system      dashboardSystemSummary
+	blocks      []dashboardBlockPage
+	peers       []PeerInfo
+	relay       []PeerRelayStats
+	template    BlockTemplateStats
+	pow         dashboardPowSummary
+	fees        dashboardFeeSummary
+	mining      dashboardMiningSummary
+	mempool     dashboardMempoolSummary
+	tpsChart    dashboardTPSChart
+}
+
+type dashboardBlockPage struct {
+	Height        uint64
+	Hash          [32]byte
+	PrevHash      [32]byte
+	Timestamp     time.Time
+	NBits         uint32
+	TxRoot        [32]byte
+	AuthRoot      [32]byte
+	UTXORoot      [32]byte
+	Size          int
+	TxCount       int
+	TotalFees     uint64
+	MedianFee     uint64
+	LowFee        uint64
+	HighFee       uint64
+	MinedByNode   bool
+	PreviewTxs    []dashboardTxPage
+	HiddenTxCount int
+}
+
+type dashboardTxPage struct {
+	BlockHeight uint64
+	BlockHash   [32]byte
+	Timestamp   time.Time
+	TxID        [32]byte
+	Coinbase    bool
+	Size        int
+	Fee         uint64
+	FeeRate     uint64
+	InputSum    uint64
+	OutputSum   uint64
+	AuthCount   int
+	Inputs      []dashboardTxInput
+	Outputs     []dashboardTxOutput
+}
+
+type dashboardTxInput struct {
+	PrevOut types.OutPoint
+	Amount  uint64
+}
+
+type dashboardTxOutput struct {
+	Index   int
+	Amount  uint64
+	KeyHash [32]byte
+}
+
+type dashboardPowSummary struct {
+	Algorithm          string
+	TargetSpacing      time.Duration
+	CurrentBits        uint32
+	NextBits           uint32
+	Difficulty         float64
+	AvgBlockInterval   time.Duration
+	LastBlockTimestamp time.Time
+}
+
+type dashboardFeeSummary struct {
+	Recent []dashboardBlockFeeLine
+	Clear  dashboardMempoolClearEstimate
+}
+
+type dashboardBlockFeeLine struct {
+	Height    uint64
+	MedianFee uint64
+	LowFee    uint64
+	HighFee   uint64
+}
+
+type dashboardMempoolClearEstimate struct {
+	Blocks int
+	Time   time.Duration
+}
+
+type dashboardMiningSummary struct {
+	Enabled       bool
+	Workers       int
+	RecentHeights []uint64
+	RecentHashes  [][32]byte
+}
+
+type dashboardMempoolSummary struct {
+	Count         int
+	Orphans       int
+	Top           []mempool.SnapshotEntry
+	MedianFee     uint64
+	LowFee        uint64
+	HighFee       uint64
+	EstimatedNext time.Duration
+}
+
+type dashboardTPSChart struct {
+	Label     string
+	Buckets   []float64
+	BucketEnd []time.Time
+	MaxTPS    float64
 }
 
 type dashboardSystemStats struct {
@@ -348,6 +471,12 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	if cfg.RPCMaxBodyBytes <= 0 {
 		cfg.RPCMaxBodyBytes = 1 << 20
 	}
+	if cfg.RPCMaxHeaderBytes <= 0 {
+		cfg.RPCMaxHeaderBytes = 8 << 10
+	}
+	if cfg.RPCIdleTimeout <= 0 {
+		cfg.RPCIdleTimeout = 30 * time.Second
+	}
 	logger.Info("opening node service",
 		slog.String("profile", cfg.Profile.String()),
 		slog.String("db_path", cfg.DBPath),
@@ -415,6 +544,7 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 		recentHdrs: recentHeaderCache{items: make(map[[32]byte]types.BlockHeader)},
 		recentBlks: recentBlockCache{items: make(map[[32]byte]types.Block)},
 		startedAt:  time.Now(),
+		nodeID:     deriveNodeID(cfg),
 		publicPage: shouldServePublicDashboard(),
 		stopCh:     make(chan struct{}),
 	}
@@ -460,6 +590,8 @@ func (s *Service) Start(ctx context.Context) error {
 			ReadTimeout:       s.cfg.RPCReadTimeout,
 			ReadHeaderTimeout: s.cfg.RPCHeaderTimeout,
 			WriteTimeout:      s.cfg.RPCWriteTimeout,
+			IdleTimeout:       s.cfg.RPCIdleTimeout,
+			MaxHeaderBytes:    s.cfg.RPCMaxHeaderBytes,
 		}
 		s.logger.Info("rpc server enabled", slog.String("addr", s.cfg.RPCAddr))
 		if s.publicPage {
@@ -795,12 +927,18 @@ func (s *Service) peerWriteLoop(peer *peerConn) {
 		case <-peer.closed:
 			return
 		case envelope := <-peer.sendQ:
+			if s.cfg.StallTimeout > 0 {
+				_ = peer.wire.SetWriteDeadline(time.Now().Add(s.cfg.StallTimeout))
+			}
 			if err := peer.wire.WriteMessage(envelope.msg); err != nil {
 				peer.releaseQueuedInv(envelope.invItems)
 				peer.releaseRelayBatch(envelope.msg)
 				peer.close()
 				_ = peer.wire.Close()
 				return
+			}
+			if s.cfg.StallTimeout > 0 {
+				_ = peer.wire.SetWriteDeadline(time.Time{})
 			}
 			peer.noteKnownTxs(envelope.msg)
 			peer.releaseQueuedInv(envelope.invItems)
@@ -1709,7 +1847,7 @@ func (s *Service) OrphanCount() int {
 }
 
 func (s *Service) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/" && s.publicPage {
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && s.publicPage && s.isPublicDashboardPath(r.URL.Path) {
 		s.handlePublicDashboard(w, r)
 		return
 	}
@@ -1720,8 +1858,15 @@ func (s *Service) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+func (s *Service) isPublicDashboardPath(path string) bool {
+	if path == "/" {
+		return true
+	}
+	return strings.HasPrefix(path, "/block/") || strings.HasPrefix(path, "/tx/")
+}
+
 func (s *Service) handlePublicDashboard(w http.ResponseWriter, r *http.Request) {
-	body, renderedAt, err := s.cachedDashboardHTML()
+	body, renderedAt, status, err := s.cachedDashboardHTML(r.URL.Path)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1729,26 +1874,35 @@ func (s *Service) handlePublicDashboard(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=us-ascii")
 	w.Header().Set("Cache-Control", "public, max-age=60")
 	w.Header().Set("Last-Modified", renderedAt.UTC().Format(http.TimeFormat))
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
 	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
 		return
 	}
 	_, _ = io.WriteString(w, body)
 }
 
-func (s *Service) cachedDashboardHTML() (string, time.Time, error) {
+func (s *Service) cachedDashboardHTML(path string) (string, time.Time, int, error) {
 	s.dashboard.mu.Lock()
 	defer s.dashboard.mu.Unlock()
-	if s.dashboard.body != "" && time.Since(s.dashboard.renderedAt) < time.Minute {
-		return s.dashboard.body, s.dashboard.renderedAt, nil
+	if s.dashboard.view == nil || time.Since(s.dashboard.renderedAt) >= time.Minute {
+		view, err := s.buildPublicDashboardView()
+		if err != nil {
+			return "", time.Time{}, http.StatusInternalServerError, err
+		}
+		s.dashboard.view = view
+		s.dashboard.pages = make(map[string]string)
+		s.dashboard.renderedAt = time.Now()
 	}
-	body, err := s.renderDashboardHTML()
-	if err != nil {
-		return "", time.Time{}, err
+	if body, ok := s.dashboard.pages[path]; ok {
+		return body, s.dashboard.renderedAt, http.StatusOK, nil
 	}
-	s.dashboard.body = body
-	s.dashboard.renderedAt = time.Now()
-	return s.dashboard.body, s.dashboard.renderedAt, nil
+	body, status := renderPublicDashboardPage(s.dashboard.view, path)
+	if status == http.StatusOK {
+		s.dashboard.pages[path] = body
+	}
+	return body, s.dashboard.renderedAt, status, nil
 }
 
 func (s *Service) dashboardSystemLoop() {
@@ -1775,82 +1929,362 @@ func (s *Service) recordDashboardSystemSample() error {
 	return nil
 }
 
-func (s *Service) renderDashboardHTML() (string, error) {
+func (s *Service) buildPublicDashboardView() (*publicDashboardView, error) {
+	now := time.Now()
 	info := s.Info()
 	peers := s.PeerInfo()
 	relay := s.RelayPeerStats()
 	template := s.BlockTemplateStats()
-	blocks, err := s.dashboardRecentBlocks(4)
-	if err != nil {
-		return "", err
-	}
-	system := s.systemStats.summary(time.Now(), dashboardSystemWindow)
-	mempoolEntries := s.pool.Snapshot()
+	system := s.systemStats.summary(now, dashboardSystemWindow)
 	health := s.dashboardHealth(info, peers)
-
-	var body strings.Builder
-	body.Grow(8192)
-	body.WriteString("<!doctype html>\n<html><head><meta charset=\"us-ascii\"><title>BPU Node</title></head><body><pre>\n")
-	body.WriteString(renderDashboardBanner())
-	body.WriteString("\n")
-	body.WriteString(fmt.Sprintf("Generated : %s UTC\n", time.Now().UTC().Format("2006-01-02 15:04:05")))
-	body.WriteString(fmt.Sprintf("Profile   : %s\n", info.Profile))
-	body.WriteString(fmt.Sprintf("Health    : %s\n", health))
-	body.WriteString(fmt.Sprintf("Uptime    : %s\n", formatDashboardDuration(time.Since(s.startedAt))))
-	body.WriteString(fmt.Sprintf("RPC       : %s\n", info.RPCAddr))
-	body.WriteString(fmt.Sprintf("P2P       : %s\n", info.P2PAddr))
-	body.WriteString(fmt.Sprintf("Genesis   : %s\n", filepath.Base(info.GenesisFixture)))
-	body.WriteString("\n")
-
-	body.WriteString("+-------------------- Node Stats --------------------+\n")
-	body.WriteString(fmt.Sprintf(" Tip Height    : %-12d Header Height : %-12d\n", info.TipHeight, info.HeaderHeight))
-	body.WriteString(fmt.Sprintf(" Tip Hash      : %s\n", shortHexString(info.TipHeaderHash, 16)))
-	body.WriteString(fmt.Sprintf(" UTXO Root     : %s\n", shortHexString(info.UTXORoot, 16)))
-	body.WriteString(fmt.Sprintf(" Mempool       : %-12d Orphans       : %-12d\n", s.pool.Count(), s.pool.OrphanCount()))
-	body.WriteString(fmt.Sprintf(" Peers         : %-12d Miner         : %-12t\n", len(peers), info.MinerEnabled))
-	body.WriteString(fmt.Sprintf(" Miner Workers : %-12d Template      : hits=%d rebuilds=%d frontier=%d\n",
-		info.MinerWorkers, template.CacheHits, template.Rebuilds, template.FrontierCandidates))
-	body.WriteString("+----------------------------------------------------+\n\n")
-
-	body.WriteString(renderDashboardSystemSection(system))
-	body.WriteString("\n")
-
-	body.WriteString("Block Flow\n")
-	body.WriteString(renderBlockFlow(blocks))
-	body.WriteString("\n")
-
-	body.WriteString("Peer Mesh\n")
-	if len(peers) == 0 {
-		body.WriteString("  no live peers\n\n")
-	} else {
-		for _, peer := range peers {
-			body.WriteString(fmt.Sprintf("  %s  out=%-5t height=%-6d last=%d\n",
-				peer.Addr, peer.Outbound, peer.Height, peer.LastProgress))
-		}
-		body.WriteString("\n")
+	recentBlocks, err := s.dashboardBlockPages(6, 6)
+	if err != nil {
+		return nil, err
 	}
-
-	body.WriteString("Relay Pulse\n")
-	if len(relay) == 0 {
-		body.WriteString("  no relay stats yet\n\n")
-	} else {
-		for _, stat := range relay {
-			body.WriteString(fmt.Sprintf("  %-21s q=%-3d max=%-3d txbatch=%-5d recon=%-5d req=%-5d avg=%.2fms p95=%.2fms\n",
-				stat.Addr, stat.QueueDepth, stat.MaxQueueDepth, stat.TxBatchItems, stat.TxReconItems, stat.TxReqItems, stat.RelayAvgMS, stat.RelayP95MS))
-		}
-		body.WriteString("\n")
+	blocks := recentBlocks
+	if len(blocks) > 5 {
+		blocks = blocks[:5]
 	}
+	mempoolEntries := s.pool.Snapshot()
+	pow := s.dashboardPowSummary(recentBlocks)
+	fees := s.dashboardFeeSummary(recentBlocks, mempoolEntries, pow)
+	mining := s.dashboardMiningSummary(blocks)
+	tpsChart, err := s.dashboardTPSChart(now)
+	if err != nil {
+		return nil, err
+	}
+	mempool := s.dashboardMempoolSummary(mempoolEntries, fees.Clear.Time)
+	return &publicDashboardView{
+		generatedAt: now,
+		nodeID:      s.nodeID,
+		createdAt:   s.startedAt,
+		info:        info,
+		health:      health,
+		system:      system,
+		blocks:      blocks,
+		peers:       peers,
+		relay:       relay,
+		template:    template,
+		pow:         pow,
+		fees:        fees,
+		mining:      mining,
+		mempool:     mempool,
+		tpsChart:    tpsChart,
+	}, nil
+}
 
-	body.WriteString("Mempool Sketch\n")
-	body.WriteString(renderMempoolSketch(mempoolEntries))
-	body.WriteString("\n")
+func (s *Service) dashboardBlockPages(limit int, previewLimit int) ([]dashboardBlockPage, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	s.stateMu.RLock()
+	tip := s.chainState.ChainState().TipHeight()
+	s.stateMu.RUnlock()
+	if tip == nil {
+		return nil, nil
+	}
+	blocks := make([]dashboardBlockPage, 0, limit)
+	for height := *tip + 1; height > 0 && len(blocks) < limit; {
+		height--
+		page, err := s.dashboardBlockPageAt(height, previewLimit)
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, page)
+		if height == 0 {
+			break
+		}
+	}
+	return blocks, nil
+}
 
-	body.WriteString("Legend\n")
-	body.WriteString("  GET /  : public cached node page on Ubuntu installs\n")
-	body.WriteString("  POST / : authenticated JSON-RPC\n")
-	body.WriteString("  Block relay : xthin preferred, full block fallback\n")
-	body.WriteString("</pre></body></html>\n")
-	return body.String(), nil
+func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboardBlockPage, error) {
+	hash, err := s.chainState.Store().GetBlockHashByHeight(height)
+	if err != nil {
+		return dashboardBlockPage{}, err
+	}
+	if hash == nil {
+		return dashboardBlockPage{}, fmt.Errorf("missing block hash at height %d", height)
+	}
+	block, err := s.chainState.Store().GetBlock(hash)
+	if err != nil {
+		return dashboardBlockPage{}, err
+	}
+	if block == nil {
+		return dashboardBlockPage{}, fmt.Errorf("missing block at height %d", height)
+	}
+	undo, err := s.chainState.Store().GetUndo(hash)
+	if err != nil {
+		return dashboardBlockPage{}, err
+	}
+	page := dashboardBlockPage{
+		Height:      height,
+		Hash:        *hash,
+		PrevHash:    block.Header.PrevBlockHash,
+		Timestamp:   time.Unix(int64(block.Header.Timestamp), 0).UTC(),
+		NBits:       block.Header.NBits,
+		TxRoot:      block.Header.MerkleTxIDRoot,
+		AuthRoot:    block.Header.MerkleAuthRoot,
+		UTXORoot:    block.Header.UTXORoot,
+		Size:        len(block.Encode()),
+		TxCount:     len(block.Txs),
+		MinedByNode: blockMinedByKeyHash(block, s.cfg.MinerKeyHash),
+	}
+	fees := make([]uint64, 0, len(block.Txs))
+	undoIndex := 0
+	for i, tx := range block.Txs {
+		txPage := dashboardTxPage{
+			BlockHeight: height,
+			BlockHash:   *hash,
+			Timestamp:   page.Timestamp,
+			TxID:        consensus.TxID(&tx),
+			Coinbase:    i == 0,
+			Size:        len(tx.Encode()),
+			AuthCount:   len(tx.Auth.Entries),
+		}
+		for _, output := range tx.Base.Outputs {
+			txPage.OutputSum += output.ValueAtoms
+		}
+		txPage.Outputs = make([]dashboardTxOutput, 0, len(tx.Base.Outputs))
+		for idx, output := range tx.Base.Outputs {
+			txPage.Outputs = append(txPage.Outputs, dashboardTxOutput{
+				Index:   idx,
+				Amount:  output.ValueAtoms,
+				KeyHash: output.KeyHash,
+			})
+		}
+		if !txPage.Coinbase {
+			txPage.Inputs = make([]dashboardTxInput, 0, len(tx.Base.Inputs))
+			for _, input := range tx.Base.Inputs {
+				if undoIndex >= len(undo) {
+					return dashboardBlockPage{}, fmt.Errorf("missing undo entry for block %x", *hash)
+				}
+				entry := undo[undoIndex]
+				undoIndex++
+				txPage.InputSum += entry.Entry.ValueAtoms
+				txPage.Inputs = append(txPage.Inputs, dashboardTxInput{
+					PrevOut: input.PrevOut,
+					Amount:  entry.Entry.ValueAtoms,
+				})
+			}
+			txPage.Fee = txPage.InputSum - txPage.OutputSum
+			if txPage.Size > 0 {
+				txPage.FeeRate = txPage.Fee / uint64(txPage.Size)
+			}
+			page.TotalFees += txPage.Fee
+			fees = append(fees, txPage.Fee)
+		}
+		if len(page.PreviewTxs) < previewLimit {
+			page.PreviewTxs = append(page.PreviewTxs, txPage)
+		}
+	}
+	if len(block.Txs) > len(page.PreviewTxs) {
+		page.HiddenTxCount = len(block.Txs) - len(page.PreviewTxs)
+	}
+	page.MedianFee, page.LowFee, page.HighFee = summarizeFeeSet(fees)
+	return page, nil
+}
+
+func (s *Service) dashboardPowSummary(blocks []dashboardBlockPage) dashboardPowSummary {
+	params := consensus.ParamsForProfile(s.cfg.Profile)
+	summary := dashboardPowSummary{
+		Algorithm:     "ASERT per-block",
+		TargetSpacing: time.Duration(params.TargetSpacingSecs) * time.Second,
+	}
+	s.stateMu.RLock()
+	height := s.chainState.ChainState().TipHeight()
+	header := s.chainState.ChainState().TipHeader()
+	s.stateMu.RUnlock()
+	if height == nil || header == nil {
+		return summary
+	}
+	summary.CurrentBits = header.NBits
+	nextBits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: *height, Header: *header}, params)
+	if err == nil {
+		summary.NextBits = nextBits
+	}
+	summary.Difficulty = dashboardDifficulty(header.NBits, params.PowLimitBits)
+	summary.LastBlockTimestamp = time.Unix(int64(header.Timestamp), 0).UTC()
+	if len(blocks) >= 2 {
+		var total time.Duration
+		var count int
+		for i := 0; i < len(blocks)-1; i++ {
+			delta := blocks[i].Timestamp.Sub(blocks[i+1].Timestamp)
+			if delta > 0 {
+				total += delta
+				count++
+			}
+		}
+		if count > 0 {
+			summary.AvgBlockInterval = total / time.Duration(count)
+		}
+	}
+	if summary.AvgBlockInterval <= 0 {
+		summary.AvgBlockInterval = summary.TargetSpacing
+	}
+	return summary
+}
+
+func (s *Service) dashboardFeeSummary(blocks []dashboardBlockPage, entries []mempool.SnapshotEntry, pow dashboardPowSummary) dashboardFeeSummary {
+	out := dashboardFeeSummary{
+		Recent: make([]dashboardBlockFeeLine, 0, len(blocks)),
+	}
+	var avgTxs float64
+	var txBlocks int
+	for _, block := range blocks {
+		out.Recent = append(out.Recent, dashboardBlockFeeLine{
+			Height:    block.Height,
+			MedianFee: block.MedianFee,
+			LowFee:    block.LowFee,
+			HighFee:   block.HighFee,
+		})
+		if block.TxCount > 1 {
+			avgTxs += float64(block.TxCount - 1)
+			txBlocks++
+		}
+	}
+	if txBlocks == 0 {
+		out.Clear.Blocks = 1
+		out.Clear.Time = pow.TargetSpacing
+		return out
+	}
+	avgPerBlock := avgTxs / float64(txBlocks)
+	neededBlocks := 1
+	if len(entries) > 0 {
+		neededBlocks = int(math.Ceil(float64(len(entries)) / avgPerBlock))
+		if neededBlocks < 1 {
+			neededBlocks = 1
+		}
+	}
+	out.Clear.Blocks = neededBlocks
+	out.Clear.Time = time.Duration(neededBlocks) * pow.AvgBlockInterval
+	return out
+}
+
+func (s *Service) dashboardMiningSummary(blocks []dashboardBlockPage) dashboardMiningSummary {
+	out := dashboardMiningSummary{
+		Enabled: s.cfg.MinerEnabled,
+		Workers: s.cfg.MinerWorkers,
+	}
+	if !out.Enabled {
+		return out
+	}
+	for _, block := range blocks {
+		if !block.MinedByNode {
+			continue
+		}
+		out.RecentHeights = append(out.RecentHeights, block.Height)
+		out.RecentHashes = append(out.RecentHashes, block.Hash)
+	}
+	return out
+}
+
+func (s *Service) dashboardMempoolSummary(entries []mempool.SnapshotEntry, clearEstimate time.Duration) dashboardMempoolSummary {
+	out := dashboardMempoolSummary{
+		Count:         len(entries),
+		Orphans:       s.OrphanCount(),
+		EstimatedNext: clearEstimate,
+	}
+	if len(entries) == 0 {
+		return out
+	}
+	slices.SortFunc(entries, func(a, b mempool.SnapshotEntry) int {
+		switch {
+		case a.Fee > b.Fee:
+			return -1
+		case a.Fee < b.Fee:
+			return 1
+		default:
+			return 0
+		}
+	})
+	out.HighFee = entries[0].Fee
+	out.LowFee = entries[len(entries)-1].Fee
+	fees := make([]uint64, 0, len(entries))
+	for _, entry := range entries {
+		fees = append(fees, entry.Fee)
+	}
+	out.MedianFee, _, _ = summarizeFeeSet(fees)
+	out.Top = append([]mempool.SnapshotEntry(nil), entries...)
+	if len(out.Top) > 8 {
+		out.Top = out.Top[:8]
+	}
+	return out
+}
+
+func (s *Service) dashboardTPSChart(now time.Time) (dashboardTPSChart, error) {
+	cutoff := now.Add(-time.Hour)
+	blocks, err := s.dashboardBlocksSince(cutoff, 128)
+	if err != nil {
+		return dashboardTPSChart{}, err
+	}
+	start := cutoff
+	if len(blocks) != 0 && blocks[len(blocks)-1].Timestamp.After(start) {
+		start = blocks[len(blocks)-1].Timestamp
+	}
+	span := now.Sub(start)
+	if span < time.Minute {
+		span = time.Minute
+	}
+	bucketCount := 12
+	bucketWidth := span / time.Duration(bucketCount)
+	if bucketWidth <= 0 {
+		bucketWidth = time.Minute
+	}
+	chart := dashboardTPSChart{
+		Label:     fmt.Sprintf("TPS last %s", formatDashboardWindow(span)),
+		Buckets:   make([]float64, bucketCount),
+		BucketEnd: make([]time.Time, bucketCount),
+	}
+	for i := range chart.BucketEnd {
+		chart.BucketEnd[i] = start.Add(bucketWidth * time.Duration(i+1))
+	}
+	for _, block := range blocks {
+		if block.Timestamp.Before(start) {
+			continue
+		}
+		idx := int(block.Timestamp.Sub(start) / bucketWidth)
+		if idx >= bucketCount {
+			idx = bucketCount - 1
+		}
+		if idx < 0 {
+			idx = 0
+		}
+		txs := float64(maxInt(block.TxCount-1, 0))
+		chart.Buckets[idx] += txs / bucketWidth.Seconds()
+		if chart.Buckets[idx] > chart.MaxTPS {
+			chart.MaxTPS = chart.Buckets[idx]
+		}
+	}
+	return chart, nil
+}
+
+func (s *Service) dashboardBlocksSince(cutoff time.Time, limit int) ([]dashboardBlockPage, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	s.stateMu.RLock()
+	tip := s.chainState.ChainState().TipHeight()
+	s.stateMu.RUnlock()
+	if tip == nil {
+		return nil, nil
+	}
+	out := make([]dashboardBlockPage, 0, limit)
+	for height := *tip + 1; height > 0 && len(out) < limit; {
+		height--
+		page, err := s.dashboardBlockPageAt(height, 0)
+		if err != nil {
+			return nil, err
+		}
+		if page.Timestamp.Before(cutoff) && len(out) != 0 {
+			break
+		}
+		out = append(out, page)
+		if height == 0 {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) dashboardRecentBlocks(limit int) ([]dashboardBlock, error) {
@@ -3086,93 +3520,579 @@ func (s *Service) blockByHashHex(raw string) (*types.Block, error) {
 	return block, nil
 }
 
+func renderPublicDashboardPage(view *publicDashboardView, path string) (string, int) {
+	switch {
+	case path == "/":
+		return renderPublicDashboardHome(view), http.StatusOK
+	case strings.HasPrefix(path, "/block/"):
+		hash := strings.TrimPrefix(path, "/block/")
+		for _, block := range view.blocks {
+			if hex.EncodeToString(block.Hash[:]) == hash {
+				return renderPublicBlockPage(view, block), http.StatusOK
+			}
+		}
+	case strings.HasPrefix(path, "/tx/"):
+		txid := strings.TrimPrefix(path, "/tx/")
+		for _, block := range view.blocks {
+			for i, tx := range block.PreviewTxs {
+				if i >= 5 {
+					break
+				}
+				if hex.EncodeToString(tx.TxID[:]) == txid {
+					return renderPublicTxPage(view, block, tx), http.StatusOK
+				}
+			}
+		}
+	}
+	return renderPublicNotFoundPage(view), http.StatusNotFound
+}
+
+func renderPublicDashboardHome(view *publicDashboardView) string {
+	var body strings.Builder
+	body.Grow(32768)
+	body.WriteString(renderHTMLPrologue("Bitcoin Pure Monitor"))
+	body.WriteString(renderDashboardBanner())
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("CHAIN OVERVIEW"))
+	body.WriteString(fmt.Sprintf(" Node ID      : %s\n", view.nodeID))
+	body.WriteString(fmt.Sprintf(" Created      : %s UTC\n", view.createdAt.UTC().Format("2006-01-02 15:04:05")))
+	body.WriteString(fmt.Sprintf(" Refreshed    : %s UTC\n", view.generatedAt.UTC().Format("2006-01-02 15:04:05")))
+	body.WriteString(fmt.Sprintf(" Health       : %s\n", view.health))
+	body.WriteString(fmt.Sprintf(" Tip          : height %-8d  hash %s\n", view.info.TipHeight, linkHash("/block/", view.info.TipHeaderHash, 14)))
+	body.WriteString(fmt.Sprintf(" UTXO Root    : %s\n", shortHexString(view.info.UTXORoot, 20)))
+	body.WriteString(fmt.Sprintf(" Peers        : %-4d  mempool %-6d  orphans %-4d\n", len(view.peers), view.mempool.Count, view.mempool.Orphans))
+	body.WriteString(fmt.Sprintf(" Tx Relay     : reconciliation + batched relay\n"))
+	body.WriteString(fmt.Sprintf(" Block Relay  : short-id block propagation\n"))
+	body.WriteString(fmt.Sprintf(" Template     : hits %-4d rebuilds %-4d frontier %-4d\n", view.template.CacheHits, view.template.Rebuilds, view.template.FrontierCandidates))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader("BLOCK FLOW"))
+	body.WriteString(renderBlockFlow(view.blocks))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader(view.tpsChart.Label))
+	body.WriteString(renderTPSChart(view.tpsChart))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader("FEE WINDOW"))
+	body.WriteString(renderFeeSection(view.fees))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader("POW / DAA"))
+	body.WriteString(renderPowSection(view.pow))
+	body.WriteString("\n")
+
+	if view.mining.Enabled {
+		body.WriteString(renderSectionHeader("MINING"))
+		body.WriteString(renderMiningSection(view.mining, view.pow))
+		body.WriteString("\n")
+	}
+
+	body.WriteString(renderSectionHeader("MEMPOOL"))
+	body.WriteString(renderMempoolSection(view.mempool))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader("PEER MESH"))
+	body.WriteString(renderPeerMesh(view.peers, view.relay, view.info.TipHeight))
+	body.WriteString("\n")
+
+	body.WriteString(renderDashboardSystemSection(view.system))
+	body.WriteString(renderHTMLEpilogue())
+	return body.String()
+}
+
+func renderPublicBlockPage(view *publicDashboardView, block dashboardBlockPage) string {
+	var body strings.Builder
+	body.Grow(16384)
+	body.WriteString(renderHTMLPrologue(fmt.Sprintf("Block %d", block.Height)))
+	body.WriteString(renderDashboardBannerCompact())
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader(fmt.Sprintf("BLOCK %d", block.Height)))
+	body.WriteString(fmt.Sprintf(" <a href=\"/\">[home]</a>\n"))
+	body.WriteString(renderBlockVisual(block))
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("BLOCK META"))
+	body.WriteString(fmt.Sprintf(" Hash         : %s\n", fullHashString(block.Hash)))
+	body.WriteString(fmt.Sprintf(" Prev         : %s\n", shortHexBytes(block.PrevHash, 24)))
+	body.WriteString(fmt.Sprintf(" Time         : %s UTC\n", block.Timestamp.Format("2006-01-02 15:04:05")))
+	body.WriteString(fmt.Sprintf(" Size         : %s bytes\n", formatWithCommas(block.Size)))
+	body.WriteString(fmt.Sprintf(" Tx Count     : %d\n", block.TxCount))
+	body.WriteString(fmt.Sprintf(" Fees         : median %s  low %s  high %s  total %s\n",
+		formatAtoms(block.MedianFee), formatAtoms(block.LowFee), formatAtoms(block.HighFee), formatAtoms(block.TotalFees)))
+	body.WriteString(fmt.Sprintf(" Pow Bits     : 0x%08x\n", block.NBits))
+	body.WriteString(fmt.Sprintf(" Tx Root      : %s\n", shortHexBytes(block.TxRoot, 24)))
+	body.WriteString(fmt.Sprintf(" Auth Root    : %s\n", shortHexBytes(block.AuthRoot, 24)))
+	body.WriteString(fmt.Sprintf(" UTXO Root    : %s\n", shortHexBytes(block.UTXORoot, 24)))
+	body.WriteString(fmt.Sprintf(" Mined Here   : %t\n", block.MinedByNode))
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("TX PREVIEW"))
+	body.WriteString(renderBlockTxPreview(block))
+	body.WriteString(renderHTMLEpilogue())
+	return body.String()
+}
+
+func renderPublicTxPage(_ *publicDashboardView, block dashboardBlockPage, tx dashboardTxPage) string {
+	var body strings.Builder
+	body.Grow(16384)
+	body.WriteString(renderHTMLPrologue("Transaction"))
+	body.WriteString(renderDashboardBannerCompact())
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("TRANSACTION"))
+	body.WriteString(fmt.Sprintf(" <a href=\"/\">[home]</a>  <a href=\"/block/%s\">[block %d]</a>\n",
+		hex.EncodeToString(block.Hash[:]), block.Height))
+	body.WriteString(renderTxVisual(tx))
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("TX META"))
+	body.WriteString(fmt.Sprintf(" TxID         : %s\n", fullHashString(tx.TxID)))
+	body.WriteString(fmt.Sprintf(" Block        : %d / %s\n", block.Height, shortHexBytes(block.Hash, 20)))
+	body.WriteString(fmt.Sprintf(" Time         : %s UTC\n", tx.Timestamp.Format("2006-01-02 15:04:05")))
+	body.WriteString(fmt.Sprintf(" Coinbase     : %t\n", tx.Coinbase))
+	body.WriteString(fmt.Sprintf(" Size         : %s bytes\n", formatWithCommas(tx.Size)))
+	body.WriteString(fmt.Sprintf(" Auth Entries : %d\n", tx.AuthCount))
+	body.WriteString(fmt.Sprintf(" Inputs       : %d (%s)\n", len(tx.Inputs), formatAtoms(tx.InputSum)))
+	body.WriteString(fmt.Sprintf(" Outputs      : %d (%s)\n", len(tx.Outputs), formatAtoms(tx.OutputSum)))
+	body.WriteString(fmt.Sprintf(" Fee          : %s (%s/byte)\n", formatAtoms(tx.Fee), formatAtoms(tx.FeeRate)))
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("INPUTS"))
+	body.WriteString(renderTxInputs(tx))
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("OUTPUTS"))
+	body.WriteString(renderTxOutputs(tx))
+	body.WriteString(renderHTMLEpilogue())
+	return body.String()
+}
+
+func renderPublicNotFoundPage(view *publicDashboardView) string {
+	var body strings.Builder
+	body.WriteString(renderHTMLPrologue("Not Found"))
+	body.WriteString(renderDashboardBannerCompact())
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("NOT FOUND"))
+	body.WriteString(" <a href=\"/\">[home]</a>\n")
+	body.WriteString(" This page is not in the current public cache window.\n")
+	body.WriteString(" Only the latest 5 blocks and up to 25 recent transaction pages stay live here.\n")
+	body.WriteString(fmt.Sprintf(" Current node: %s\n", view.nodeID))
+	body.WriteString(renderHTMLEpilogue())
+	return body.String()
+}
+
+func renderHTMLPrologue(title string) string {
+	return fmt.Sprintf("<!doctype html>\n<html><head><meta charset=\"us-ascii\"><title>%s</title></head><body><pre>\n", html.EscapeString(title))
+}
+
+func renderHTMLEpilogue() string {
+	return "</pre></body></html>\n"
+}
+
 func renderDashboardBanner() string {
 	return strings.Join([]string{
-		"  ____  ____  _   _",
-		" | __ )|  _ \\| | | |",
-		" |  _ \\| |_) | | | |",
-		" | |_) |  __/| |_| |",
-		" |____/|_|    \\___/",
-		" Bitcoin Pure node monitor",
+		"  ____ ___ _____ ____  ____ ___ _   _   ____  _   _ ____  _____",
+		" | __ )_ _|_   _/ ___|/ ___|_ _| \\ | | |  _ \\| | | |  _ \\| ____|",
+		" |  _ \\| |  | || |   | |    | ||  \\| | | |_) | | | | |_) |  _|",
+		" | |_) | |  | || |___| |___ | || |\\  | |  __/| |_| |  _ <| |___",
+		" |____/___| |_| \\____|\\____|___|_| \\_| |_|    \\___/|_| \\_\\_____|",
+		" .--------------------------------------------------------------------.",
+		" |                 reference implementation live monitor               |",
+		" '--------------------------------------------------------------------'",
 	}, "\n")
+}
+
+func renderDashboardBannerCompact() string {
+	return strings.Join([]string{
+		"  ____ ___ _____ ____  ____ ___ _   _   ____  _   _ ____  _____",
+		" | __ )_ _|_   _/ ___|/ ___|_ _| \\ | | |  _ \\| | | |  _ \\| ____|",
+		" |  _ \\| |  | || |   | |    | ||  \\| | | |_) | | | | |_) |  _|",
+		" | |_) | |  | || |___| |___ | || |\\  | |  __/| |_| |  _ <| |___",
+		" |____/___| |_| \\____|\\____|___|_| \\_| |_|    \\___/|_| \\_\\_____|",
+	}, "\n")
+}
+
+func renderSectionHeader(title string) string {
+	title = strings.ToUpper(title)
+	width := 68
+	if len(title)+2 > width {
+		width = len(title) + 2
+	}
+	padding := width - len(title)
+	left := padding / 2
+	right := padding - left
+	return fmt.Sprintf(".%s.\n|%s%s%s|\n'%s'\n",
+		strings.Repeat("=", width),
+		strings.Repeat(" ", left),
+		title,
+		strings.Repeat(" ", right),
+		strings.Repeat("=", width))
 }
 
 func renderDashboardSystemSection(summary dashboardSystemSummary) string {
 	var out strings.Builder
-	title := fmt.Sprintf("Node System (avg %s)", formatDashboardWindow(summary.Window))
-	out.WriteString(title)
-	out.WriteString("\n")
-	out.WriteString("+-------------------- Host Stats --------------------+\n")
-	out.WriteString(fmt.Sprintf(" CPU         : %-12s Network      : up %-9s down %-9s\n",
+	out.WriteString(renderSectionHeader(fmt.Sprintf("NODE SYSTEM (AVG %s)", formatDashboardWindow(summary.Window))))
+	out.WriteString(fmt.Sprintf(" CPU Avg      : %-18s Network        : up %-12s down %-12s\n",
 		formatDashboardCPU(summary), formatDashboardNetworkRate(summary.TxBytesPerSec, summary.HasNetwork), formatDashboardNetworkRate(summary.RxBytesPerSec, summary.HasNetwork)))
-	out.WriteString(fmt.Sprintf(" RAM         : %-12s Load Avg     : %s\n",
+	out.WriteString(fmt.Sprintf(" RAM Avg      : %-18s Load Avg       : %s\n",
 		formatDashboardMemory(summary), formatDashboardLoad(summary)))
-	out.WriteString(fmt.Sprintf(" Processes   : %-12s Server       : %s\n",
+	out.WriteString(fmt.Sprintf(" Server Load  : %-18s CPU Cores      : %s\n",
 		formatDashboardProcesses(summary), formatDashboardCores(summary)))
-	out.WriteString("+----------------------------------------------------+\n")
 	return out.String()
 }
 
-func renderBlockFlow(blocks []dashboardBlock) string {
+func renderBlockFlow(blocks []dashboardBlockPage) string {
 	if len(blocks) == 0 {
-		return "  no blocks indexed yet\n"
+		return " no blocks in active view\n"
 	}
-	top := make([]string, 0, len(blocks))
-	mid := make([]string, 0, len(blocks))
-	bot := make([]string, 0, len(blocks))
-	for i, block := range blocks {
-		label := fmt.Sprintf("h:%-6d", block.Height)
-		hash := shortHash(block.Hash)
-		if i == len(blocks)-1 {
-			label = fmt.Sprintf("tip:%-4d", block.Height)
-		}
-		top = append(top, "+--------------+")
-		mid = append(mid, fmt.Sprintf("| %-12s |", label))
-		bot = append(bot, fmt.Sprintf("| %-12s |", hash))
-	}
-	return "  " + strings.Join(top, " -> ") + "\n" +
-		"  " + strings.Join(mid, " -> ") + "\n" +
-		"  " + strings.Join(bot, " -> ") + "\n" +
-		"  " + strings.Join(top, " -> ") + "\n"
-}
-
-func renderMempoolSketch(entries []mempool.SnapshotEntry) string {
-	if len(entries) == 0 {
-		return "  [empty]\n"
-	}
-	total := len(entries)
-	slices.SortFunc(entries, func(a, b mempool.SnapshotEntry) int {
+	ordered := append([]dashboardBlockPage(nil), blocks...)
+	slices.SortFunc(ordered, func(a, b dashboardBlockPage) int {
 		switch {
-		case a.Fee > b.Fee:
+		case a.Height < b.Height:
 			return -1
-		case a.Fee < b.Fee:
+		case a.Height > b.Height:
 			return 1
 		default:
 			return 0
 		}
 	})
-	if len(entries) > 8 {
-		entries = entries[:8]
+	top := make([]string, 0, len(ordered))
+	mid := make([]string, 0, len(ordered))
+	bot := make([]string, 0, len(ordered))
+	for i, block := range ordered {
+		label := fmt.Sprintf("h:%-6d", block.Height)
+		if i == len(ordered)-1 {
+			label = fmt.Sprintf("tip:%-4d", block.Height)
+		}
+		hash := linkHash("/block/", hex.EncodeToString(block.Hash[:]), 12)
+		top = append(top, "+----------------+")
+		mid = append(mid, fmt.Sprintf("| %-14s |", label))
+		bot = append(bot, fmt.Sprintf("| %-14s |", hash))
+	}
+	arrow := "    ========>    "
+	return " " + strings.Join(top, arrow) + "\n" +
+		" " + strings.Join(mid, arrow) + "\n" +
+		" " + strings.Join(bot, arrow) + "\n" +
+		" " + strings.Join(top, arrow) + "\n"
+}
+
+func renderTPSChart(chart dashboardTPSChart) string {
+	if len(chart.Buckets) == 0 || chart.MaxTPS == 0 {
+		return " no recent block throughput yet\n"
+	}
+	const rows = 8
+	var out strings.Builder
+	for row := rows; row >= 1; row-- {
+		threshold := chart.MaxTPS * float64(row) / float64(rows)
+		out.WriteString(fmt.Sprintf(" %7.1f |", threshold))
+		for _, bucket := range chart.Buckets {
+			if bucket >= threshold {
+				out.WriteByte('#')
+			} else {
+				out.WriteByte(' ')
+			}
+		}
+		out.WriteString("\n")
+	}
+	out.WriteString("     0.0 +")
+	out.WriteString(strings.Repeat("-", len(chart.Buckets)))
+	out.WriteString("\n")
+	out.WriteString("         ")
+	for _, end := range chart.BucketEnd {
+		out.WriteString(string(end.Format("15:04")[3]))
+	}
+	out.WriteString("\n")
+	out.WriteString(fmt.Sprintf(" max %.1f tx/s\n", chart.MaxTPS))
+	return out.String()
+}
+
+func renderFeeSection(summary dashboardFeeSummary) string {
+	var out strings.Builder
+	if len(summary.Recent) == 0 {
+		out.WriteString(" no recent block fees yet\n")
+	} else {
+		for _, line := range summary.Recent {
+			out.WriteString(fmt.Sprintf(" h%-6d median %-10s low %-10s high %-10s\n",
+				line.Height, formatAtoms(line.MedianFee), formatAtoms(line.LowFee), formatAtoms(line.HighFee)))
+		}
+	}
+	out.WriteString(fmt.Sprintf(" mempool clear estimate : ~%d block(s) / %s\n", summary.Clear.Blocks, formatDashboardDuration(summary.Clear.Time)))
+	return out.String()
+}
+
+func renderPowSection(summary dashboardPowSummary) string {
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf(" Algo         : %s\n", summary.Algorithm))
+	out.WriteString(fmt.Sprintf(" Target Space : %s\n", formatDashboardDuration(summary.TargetSpacing)))
+	out.WriteString(fmt.Sprintf(" Current Bits : 0x%08x\n", summary.CurrentBits))
+	out.WriteString(fmt.Sprintf(" Next Bits    : 0x%08x\n", summary.NextBits))
+	out.WriteString(fmt.Sprintf(" Difficulty   : %.4fx\n", summary.Difficulty))
+	out.WriteString(fmt.Sprintf(" Avg Interval : %s\n", formatDashboardDuration(summary.AvgBlockInterval)))
+	if !summary.LastBlockTimestamp.IsZero() {
+		out.WriteString(fmt.Sprintf(" Last Block   : %s UTC\n", summary.LastBlockTimestamp.Format("2006-01-02 15:04:05")))
+	}
+	return out.String()
+}
+
+func renderMiningSection(summary dashboardMiningSummary, pow dashboardPowSummary) string {
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf(" Status       : enabled\n"))
+	out.WriteString(fmt.Sprintf(" Workers      : %d\n", summary.Workers))
+	out.WriteString(" Hashrate     : not sampled yet\n")
+	out.WriteString(fmt.Sprintf(" Block Cadence: target %s\n", formatDashboardDuration(pow.TargetSpacing)))
+	if len(summary.RecentHeights) == 0 {
+		out.WriteString(" Recent Wins  : none in current on-screen block window\n")
+		return out.String()
+	}
+	out.WriteString(" Recent Wins  :")
+	for i := range summary.RecentHeights {
+		out.WriteString(fmt.Sprintf(" h%d", summary.RecentHeights[i]))
+	}
+	out.WriteString("\n")
+	return out.String()
+}
+
+func renderMempoolSection(summary dashboardMempoolSummary) string {
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf(" Tx Count     : %-6d  Orphans %-6d  Median Fee %-10s\n", summary.Count, summary.Orphans, formatAtoms(summary.MedianFee)))
+	out.WriteString(fmt.Sprintf(" Fee Range    : low %-10s high %-10s  est next %s\n",
+		formatAtoms(summary.LowFee), formatAtoms(summary.HighFee), formatDashboardDuration(summary.EstimatedNext)))
+	if len(summary.Top) == 0 {
+		out.WriteString(" [empty]\n")
+		return out.String()
 	}
 	maxFee := uint64(1)
-	for _, entry := range entries {
+	for _, entry := range summary.Top {
 		if entry.Fee > maxFee {
 			maxFee = entry.Fee
 		}
 	}
-	var out strings.Builder
-	for _, entry := range entries {
-		width := int((entry.Fee * 18) / maxFee)
+	for _, entry := range summary.Top {
+		width := int((entry.Fee * 20) / maxFee)
 		if width == 0 && entry.Fee > 0 {
 			width = 1
 		}
-		bar := strings.Repeat("#", width) + strings.Repeat(".", 18-width)
-		out.WriteString(fmt.Sprintf("  %s fee=%-6d size=%-5d [%s]\n", shortHash(entry.TxID), entry.Fee, entry.Size, bar))
+		bar := strings.Repeat("#", width) + strings.Repeat(".", 20-width)
+		out.WriteString(fmt.Sprintf(" %s fee=%-10s size=%-6s [%s]\n",
+			shortHexBytes(entry.TxID, 10), formatAtoms(entry.Fee), formatWithCommas(entry.Size), bar))
 	}
-	if total > len(entries) {
-		out.WriteString("  ... top 8 by fee shown ...\n")
+	if summary.Count > len(summary.Top) {
+		out.WriteString(fmt.Sprintf(" ... %d more waiting\n", summary.Count-len(summary.Top)))
 	}
 	return out.String()
+}
+
+func renderPeerMesh(peers []PeerInfo, relay []PeerRelayStats, tipHeight uint64) string {
+	if len(peers) == 0 {
+		return " no live peers\n"
+	}
+	relayByAddr := make(map[string]PeerRelayStats, len(relay))
+	for _, stat := range relay {
+		relayByAddr[stat.Addr] = stat
+	}
+	var out strings.Builder
+	for _, peer := range peers {
+		stat := relayByAddr[peer.Addr]
+		lag := int64(tipHeight) - int64(peer.Height)
+		if lag < 0 {
+			lag = 0
+		}
+		out.WriteString(fmt.Sprintf(" %s\n", dashboardPeerLabel(peer.Addr)))
+		out.WriteString(fmt.Sprintf("    out=%-5t lag=%-3d q=%-3d p95=%-7.2fms avg=%-7.2fms batches=%-5d recon=%-5d req=%-5d last=%s\n",
+			peer.Outbound, lag, stat.QueueDepth, stat.RelayP95MS, stat.RelayAvgMS, stat.TxBatchItems, stat.TxReconItems, stat.TxReqItems, formatAgeUnix(peer.LastProgress)))
+	}
+	return out.String()
+}
+
+func renderBlockVisual(block dashboardBlockPage) string {
+	var out strings.Builder
+	out.WriteString(" +------------------------------------------------------------------+\n")
+	out.WriteString(fmt.Sprintf(" | BLOCK h:%-56d |\n", block.Height))
+	out.WriteString(" +------------------------------------------------------------------+\n")
+	out.WriteString(fmt.Sprintf(" | hash : %-58s |\n", shortHexBytes(block.Hash, 30)))
+	out.WriteString(fmt.Sprintf(" | prev : %-58s |\n", shortHexBytes(block.PrevHash, 30)))
+	out.WriteString(fmt.Sprintf(" | time : %-58s |\n", block.Timestamp.Format("2006-01-02 15:04:05")+" UTC"))
+	out.WriteString(fmt.Sprintf(" | txs  : %-58s |\n", fmt.Sprintf("%d shown=%d hidden=%d", block.TxCount, len(block.PreviewTxs), block.HiddenTxCount)))
+	out.WriteString(" +------------------------------------------------------------------+\n")
+	for i, tx := range block.PreviewTxs {
+		label := shortHexBytes(tx.TxID, 18)
+		if i < 5 {
+			label = linkHash("/tx/", hex.EncodeToString(tx.TxID[:]), 18)
+		}
+		out.WriteString(fmt.Sprintf(" |  o-- tx %-2d  %-18s fee %-10s size %-8s |\n",
+			i, label, formatAtoms(tx.Fee), formatWithCommas(tx.Size)))
+	}
+	if block.HiddenTxCount > 0 {
+		out.WriteString(fmt.Sprintf(" |  ... %d more transactions not expanded here%-20s|\n", block.HiddenTxCount, ""))
+	}
+	out.WriteString(" +------------------------------------------------------------------+\n")
+	return out.String()
+}
+
+func renderBlockTxPreview(block dashboardBlockPage) string {
+	if len(block.PreviewTxs) == 0 {
+		return " no transactions\n"
+	}
+	var out strings.Builder
+	for i, tx := range block.PreviewTxs {
+		txLabel := shortHexBytes(tx.TxID, 20)
+		if i < 5 {
+			txLabel = linkHash("/tx/", hex.EncodeToString(tx.TxID[:]), 20)
+		}
+		kind := "tx"
+		if tx.Coinbase {
+			kind = "coinbase"
+		}
+		out.WriteString(fmt.Sprintf(" %-8s %-20s in=%-2d out=%-2d fee=%-10s size=%s\n",
+			kind, txLabel, len(tx.Inputs), len(tx.Outputs), formatAtoms(tx.Fee), formatWithCommas(tx.Size)))
+	}
+	if block.HiddenTxCount > 0 {
+		out.WriteString(fmt.Sprintf(" ... %d more transactions\n", block.HiddenTxCount))
+	}
+	return out.String()
+}
+
+func renderTxVisual(tx dashboardTxPage) string {
+	var out strings.Builder
+	out.WriteString(" +--------------------------------------------------------------+\n")
+	out.WriteString(fmt.Sprintf(" | TX %-57s|\n", shortHexBytes(tx.TxID, 28)))
+	out.WriteString(" +--------------------------------------------------------------+\n")
+	out.WriteString(fmt.Sprintf(" | inputs  %-5d  sum %-12s outputs %-5d sum %-12s |\n",
+		len(tx.Inputs), formatAtoms(tx.InputSum), len(tx.Outputs), formatAtoms(tx.OutputSum)))
+	out.WriteString(fmt.Sprintf(" | fee     %-12s rate %-12s auth    %-12d |\n",
+		formatAtoms(tx.Fee), formatAtoms(tx.FeeRate), tx.AuthCount))
+	out.WriteString(" +--------------------------------------------------------------+\n")
+	return out.String()
+}
+
+func renderTxInputs(tx dashboardTxPage) string {
+	if tx.Coinbase {
+		return " coinbase transaction has no spendable inputs\n"
+	}
+	var out strings.Builder
+	for _, input := range tx.Inputs {
+		out.WriteString(fmt.Sprintf(" %s:%d  amount %-10s\n",
+			shortHexBytes(input.PrevOut.TxID, 18), input.PrevOut.Vout, formatAtoms(input.Amount)))
+	}
+	return out.String()
+}
+
+func renderTxOutputs(tx dashboardTxPage) string {
+	var out strings.Builder
+	for _, output := range tx.Outputs {
+		out.WriteString(fmt.Sprintf(" vout %-2d  amount %-10s  keyhash %s\n",
+			output.Index, formatAtoms(output.Amount), shortHexBytes(output.KeyHash, 18)))
+	}
+	return out.String()
+}
+
+func linkHash(prefix string, hash string, width int) string {
+	label := shortHexString(hash, width)
+	return fmt.Sprintf("<a href=\"%s%s\">%s</a>", prefix, hash, label)
+}
+
+func deriveNodeID(cfg ServiceConfig) string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown-host"
+	}
+	seed := hostname + "\x00" + cfg.DBPath + "\x00" + cfg.RPCAddr + "\x00" + cfg.P2PAddr + "\x00" + cfg.GenesisFixture
+	sum := bpcrypto.Sha256d([]byte(seed))
+	return strings.ToUpper(hex.EncodeToString(sum[:6]))
+}
+
+func blockMinedByKeyHash(block *types.Block, keyHash [32]byte) bool {
+	if len(block.Txs) == 0 || len(block.Txs[0].Base.Outputs) == 0 {
+		return false
+	}
+	for _, output := range block.Txs[0].Base.Outputs {
+		if output.KeyHash == keyHash {
+			return true
+		}
+	}
+	return false
+}
+
+func summarizeFeeSet(fees []uint64) (uint64, uint64, uint64) {
+	if len(fees) == 0 {
+		return 0, 0, 0
+	}
+	values := append([]uint64(nil), fees...)
+	slices.Sort(values)
+	return values[len(values)/2], values[0], values[len(values)-1]
+}
+
+func dashboardDifficulty(nBits uint32, powLimitBits uint32) float64 {
+	target, ok := compactTargetForDashboard(nBits)
+	if !ok || target.Sign() <= 0 {
+		return 0
+	}
+	powLimit, ok := compactTargetForDashboard(powLimitBits)
+	if !ok || powLimit.Sign() <= 0 {
+		return 0
+	}
+	ratio := new(big.Rat).SetFrac(powLimit, target)
+	value, _ := ratio.Float64()
+	return value
+}
+
+func compactTargetForDashboard(compact uint32) (*big.Int, bool) {
+	size := byte(compact >> 24)
+	mantissa := compact & 0x007fffff
+	if mantissa == 0 {
+		return nil, false
+	}
+	target := new(big.Int).SetUint64(uint64(mantissa))
+	if size <= 3 {
+		target.Rsh(target, uint(8*(3-int(size))))
+	} else {
+		target.Lsh(target, uint(8*(int(size)-3)))
+	}
+	return target, true
+}
+
+func shortHexBytes(hash [32]byte, width int) string {
+	return shortHexString(hex.EncodeToString(hash[:]), width)
+}
+
+func fullHashString(hash [32]byte) string {
+	return hex.EncodeToString(hash[:])
+}
+
+func formatAtoms(value uint64) string {
+	return formatUintWithCommas(value)
+}
+
+func formatWithCommas[T ~int | ~int64 | ~uint64](value T) string {
+	return formatUintWithCommas(uint64(value))
+}
+
+func formatUintWithCommas(value uint64) string {
+	raw := strconv.FormatUint(value, 10)
+	if len(raw) <= 3 {
+		return raw
+	}
+	var out strings.Builder
+	for i, ch := range raw {
+		if i != 0 && (len(raw)-i)%3 == 0 {
+			out.WriteByte(',')
+		}
+		out.WriteRune(ch)
+	}
+	return out.String()
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func formatAgeUnix(unix int64) string {
+	if unix <= 0 {
+		return "n/a"
+	}
+	return formatDashboardDuration(time.Since(time.Unix(unix, 0)))
+}
+
+func dashboardPeerLabel(addr string) string {
+	return fmt.Sprintf("peer %-28s", addr)
 }
 
 func (stats *dashboardSystemStats) record(sample dashboardSystemSample) {
@@ -3307,8 +4227,13 @@ func formatDashboardWindow(d time.Duration) string {
 		return "warming up"
 	}
 	totalSeconds := int64(d / time.Second)
-	if totalSeconds >= 600 {
-		return "10m"
+	if totalSeconds >= 3600 {
+		hours := totalSeconds / 3600
+		minutes := (totalSeconds % 3600) / 60
+		if minutes == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%02dm", hours, minutes)
 	}
 	if totalSeconds >= 60 {
 		minutes := totalSeconds / 60

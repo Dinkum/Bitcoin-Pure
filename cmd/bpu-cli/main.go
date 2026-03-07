@@ -230,6 +230,8 @@ func runServe(args []string) error {
 	rpcReadTimeout := fs.Duration("rpc-read-timeout", 0, "")
 	rpcWriteTimeout := fs.Duration("rpc-write-timeout", 0, "")
 	rpcHeaderTimeout := fs.Duration("rpc-header-timeout", 0, "")
+	rpcIdleTimeout := fs.Duration("rpc-idle-timeout", 0, "")
+	rpcMaxHeaderBytes := fs.Int("rpc-max-header-bytes", 0, "")
 	rpcMaxBodyBytes := fs.Int("rpc-max-body-bytes", 0, "")
 	p2pAddr := fs.String("p2p", "", "")
 	peerList := fs.String("peers", "", "")
@@ -281,6 +283,12 @@ func runServe(args []string) error {
 	}
 	if *rpcHeaderTimeout > 0 {
 		cfg.RPCHeaderTimeoutMS = int(rpcHeaderTimeout.Milliseconds())
+	}
+	if *rpcIdleTimeout > 0 {
+		cfg.RPCIdleTimeoutMS = int(rpcIdleTimeout.Milliseconds())
+	}
+	if *rpcMaxHeaderBytes > 0 {
+		cfg.RPCMaxHeaderBytes = *rpcMaxHeaderBytes
 	}
 	if *rpcMaxBodyBytes > 0 {
 		cfg.RPCMaxBodyBytes = *rpcMaxBodyBytes
@@ -366,6 +374,8 @@ func runServe(args []string) error {
 		RPCReadTimeout:     time.Duration(cfg.RPCReadTimeoutMS) * time.Millisecond,
 		RPCWriteTimeout:    time.Duration(cfg.RPCWriteTimeoutMS) * time.Millisecond,
 		RPCHeaderTimeout:   time.Duration(cfg.RPCHeaderTimeoutMS) * time.Millisecond,
+		RPCIdleTimeout:     time.Duration(cfg.RPCIdleTimeoutMS) * time.Millisecond,
+		RPCMaxHeaderBytes:  cfg.RPCMaxHeaderBytes,
 		RPCMaxBodyBytes:    cfg.RPCMaxBodyBytes,
 		P2PAddr:            cfg.P2PAddr,
 		Peers:              cfg.Peers,

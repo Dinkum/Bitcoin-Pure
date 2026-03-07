@@ -15,9 +15,9 @@ PROFILE=""
 declare -a PEERS=()
 
 usage() {
-	cat <<'EOF'
+    cat <<'EOF'
 scripts/update.sh prepares a staged Bitcoin Pure release for bootstrap.sh.
-This script is internal and should normally be called via ./install.
+It is normally called via ./install.
 EOF
 }
 
@@ -28,6 +28,10 @@ log() {
 fail() {
 	log "fatal: $*"
 	exit 1
+}
+
+package_installed() {
+	dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null | grep -qx 'installed'
 }
 
 detect_go_arch() {
@@ -76,9 +80,21 @@ install_go() {
 }
 
 ensure_packages() {
-	log "installing system packages"
+	local pkg
+	local -a required=(build-essential ca-certificates curl git python3 tar)
+	local -a missing=()
+	for pkg in "${required[@]}"; do
+		if ! package_installed "${pkg}"; then
+			missing+=("${pkg}")
+		fi
+	done
+	if [[ "${#missing[@]}" -eq 0 ]]; then
+		log "system packages already satisfied"
+		return
+	fi
+	log "installing system packages: ${missing[*]}"
 	apt-get update
-	DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl git python3 tar
+	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
 }
 
 render_metadata() {
@@ -151,6 +167,8 @@ cfg = {
     "rpc_read_timeout_ms": keep("rpc_read_timeout_ms", 5000),
     "rpc_write_timeout_ms": keep("rpc_write_timeout_ms", 5000),
     "rpc_header_timeout_ms": keep("rpc_header_timeout_ms", 2000),
+    "rpc_idle_timeout_ms": keep("rpc_idle_timeout_ms", 30000),
+    "rpc_max_header_bytes": keep("rpc_max_header_bytes", 8192),
     "rpc_max_body_bytes": keep("rpc_max_body_bytes", 1048576),
     "p2p_addr": keep("p2p_addr", "0.0.0.0:18444"),
     "peers": peers,
