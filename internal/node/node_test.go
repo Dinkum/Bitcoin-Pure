@@ -1,11 +1,17 @@
 package node
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -129,19 +135,38 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 	t.Helper()
 	params := consensus.RegtestParams()
 	blockTxs := append([]types.Transaction(nil), txs...)
+	if len(blockTxs) > 2 {
+		sort.Slice(blockTxs[1:], func(i, j int) bool {
+			left := consensus.TxID(&blockTxs[i+1])
+			right := consensus.TxID(&blockTxs[j+1])
+			return bytes.Compare(left[:], right[:]) < 0
+		})
+	}
+
 	tempUtxos := cloneUtxos(currentUTXOs)
+	claimedInputs := make(map[types.OutPoint]struct{})
 	var totalFees uint64
 	for i := 1; i < len(blockTxs); i++ {
-		summary, err := consensus.ValidateTx(&blockTxs[i], tempUtxos, consensus.DefaultConsensusRules())
+		tx := &blockTxs[i]
+		for _, input := range tx.Base.Inputs {
+			if _, ok := claimedInputs[input.PrevOut]; ok {
+				t.Fatalf("duplicate claimed input in tx %d: %v", i, input.PrevOut)
+			}
+			claimedInputs[input.PrevOut] = struct{}{}
+		}
+		summary, err := consensus.ValidateTx(tx, currentUTXOs, consensus.DefaultConsensusRules())
 		if err != nil {
 			t.Fatalf("validate tx %d: %v", i, err)
 		}
 		totalFees += summary.Fee
-		txid := consensus.TxID(&blockTxs[i])
-		for _, input := range blockTxs[i].Base.Inputs {
-			delete(tempUtxos, input.PrevOut)
-		}
-		for vout, output := range blockTxs[i].Base.Outputs {
+	}
+	for spent := range claimedInputs {
+		delete(tempUtxos, spent)
+	}
+	for i := 1; i < len(blockTxs); i++ {
+		tx := &blockTxs[i]
+		txid := consensus.TxID(tx)
+		for vout, output := range tx.Base.Outputs {
 			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
 				ValueAtoms: output.ValueAtoms,
 				KeyHash:    output.KeyHash,
@@ -188,11 +213,48 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 	}
 }
 
+func encodePackedTransactionsForNodeTest(txs []types.Transaction) string {
+	if len(txs) == 0 {
+		return ""
+	}
+	buf := make([]byte, 0)
+	for _, tx := range txs {
+		encoded := tx.Encode()
+		size := make([]byte, 4)
+		binary.LittleEndian.PutUint32(size, uint32(len(encoded)))
+		buf = append(buf, size...)
+		buf = append(buf, encoded...)
+	}
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
 func TestApplyBlockRequiresTip(t *testing.T) {
 	state := NewChainState(types.Regtest)
 	_, err := state.ApplyBlock(&types.Block{})
 	if !errors.Is(err, ErrNoTip) {
 		t.Fatalf("expected no tip error, got %v", err)
+	}
+}
+
+func TestApplyBlockReplacesPublishedUTXOView(t *testing.T) {
+	state := NewChainState(types.Regtest)
+	genesis := genesisBlock()
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+
+	before := state.UTXOs()
+	first := nextCoinbaseBlock(0, genesis.Header, before, 3, genesis.Header.Timestamp+600)
+	if _, err := state.ApplyBlock(&first); err != nil {
+		t.Fatal(err)
+	}
+
+	firstCoinbase := consensus.TxID(&first.Txs[0])
+	if _, ok := before[types.OutPoint{TxID: firstCoinbase, Vout: 0}]; ok {
+		t.Fatal("published pre-block UTXO view was mutated in place")
+	}
+	if _, ok := state.UTXOs()[types.OutPoint{TxID: firstCoinbase, Vout: 0}]; !ok {
+		t.Fatal("current chain view missing applied block coinbase output")
 	}
 }
 
@@ -439,7 +501,7 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	}
 }
 
-func TestPersistentChainStateAppliesAndDisconnectsBlockWithIntraBlockSpend(t *testing.T) {
+func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
 	path := t.TempDir()
 	persistent, err := OpenPersistentChainState(path, types.Regtest)
 	if err != nil {
@@ -475,45 +537,72 @@ func TestPersistentChainStateAppliesAndDisconnectsBlockWithIntraBlockSpend(t *te
 	}
 
 	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
-	parent := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
-	child := spendTxForNodeTest(t, 8, types.OutPoint{TxID: consensus.TxID(&parent), Vout: 0}, 49, 9, 1)
-	block := blockWithTxsForNodeTest(t, 0, genesis.Header, persistent.ChainState().UTXOs(), []types.Transaction{
-		{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}}}},
-		parent,
-		child,
-	}, genesis.Header.Timestamp+600)
-
-	if _, err := persistent.ApplyBlock(&block); err != nil {
-		t.Fatalf("apply block with intra-block spend: %v", err)
+	var parent types.Transaction
+	var child types.Transaction
+	foundLTORPair := false
+	for parentSeed := byte(8); parentSeed < 64 && !foundLTORPair; parentSeed++ {
+		candidateParent := spendTxForNodeTest(t, 7, genesisOut, 50, parentSeed, 1)
+		candidateParentTxID := consensus.TxID(&candidateParent)
+		for childSeed := byte(64); childSeed < 128; childSeed++ {
+			candidateChild := spendTxForNodeTest(t, parentSeed, types.OutPoint{TxID: candidateParentTxID, Vout: 0}, 49, childSeed, 1)
+			candidateChildTxID := consensus.TxID(&candidateChild)
+			if bytes.Compare(candidateParentTxID[:], candidateChildTxID[:]) < 0 {
+				parent = candidateParent
+				child = candidateChild
+				foundLTORPair = true
+				break
+			}
+		}
 	}
-	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != 1 {
-		t.Fatalf("unexpected tip after apply: %v", persistent.ChainState().TipHeight())
+	if !foundLTORPair {
+		t.Fatal("failed to construct LTOR-compliant same-block spend fixture")
 	}
-
-	blockHash := consensus.HeaderHash(&block.Header)
-	undo, err := persistent.Store().GetUndo(&blockHash)
+	coinbase := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}},
+		},
+	}
+	txs := []types.Transaction{coinbase, parent, child}
+	txids, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
+	nextUTXOs := cloneUtxos(persistent.ChainState().UTXOs())
+	delete(nextUTXOs, genesisOut)
+	parentTxID := txids[1]
+	nextUTXOs[types.OutPoint{TxID: parentTxID, Vout: 0}] = consensus.UtxoEntry{
+		ValueAtoms: parent.Base.Outputs[0].ValueAtoms,
+		KeyHash:    parent.Base.Outputs[0].KeyHash,
+	}
+	coinbaseTxID := txids[0]
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
+		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
+		KeyHash:    coinbase.Base.Outputs[0].KeyHash,
+	}
+	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: 0, Header: genesis.Header}, params)
 	if err != nil {
-		t.Fatalf("get undo: %v", err)
+		t.Fatal(err)
 	}
-	if len(undo) != 1 {
-		t.Fatalf("undo entries = %d, want 1", len(undo))
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  consensus.HeaderHash(&genesis.Header),
+			MerkleTxIDRoot: txRoot,
+			MerkleAuthRoot: authRoot,
+			UTXORoot:       consensus.ComputedUTXORoot(nextUTXOs),
+			Timestamp:      genesis.Header.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: txs,
 	}
-	if undo[0].OutPoint != genesisOut {
-		t.Fatalf("undo outpoint = %+v, want %+v", undo[0].OutPoint, genesisOut)
-	}
+	block.Header = mineHeaderForNodeTest(block.Header)
 
-	parentEntry, err := persistent.Store().GetBlockIndex(&block.Header.PrevBlockHash)
-	if err != nil {
-		t.Fatalf("get parent entry: %v", err)
+	if _, err := persistent.ApplyBlock(&block); !errors.Is(err, consensus.ErrMissingUTXO) {
+		t.Fatalf("apply block with intra-block spend error = %v, want %v", err, consensus.ErrMissingUTXO)
 	}
-	if parentEntry == nil {
-		t.Fatal("missing parent entry")
-	}
-	if err := persistent.ChainState().DisconnectBlock(&block, undo, parentEntry); err != nil {
-		t.Fatalf("disconnect block with intra-block spend: %v", err)
+	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != 0 {
+		t.Fatalf("unexpected tip after rejected block: %v", persistent.ChainState().TipHeight())
 	}
 	if _, ok := persistent.ChainState().UTXOs()[genesisOut]; !ok {
-		t.Fatal("expected genesis outpoint to be restored after disconnect")
+		t.Fatal("expected genesis outpoint to remain after rejection")
 	}
 }
 
@@ -552,7 +641,10 @@ func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	if !ok {
 		t.Fatalf("relay message type = %T, want XThinBlockMessage", msg)
 	}
-	state, missing := reconstructXThinBlock(thin, pool.Snapshot())
+	matches := pool.ShortIDMatches(func(txid [32]byte) uint64 {
+		return thinBlockShortID(thin.Nonce, txid)
+	}, xThinShortIDSet(thin))
+	state, missing := reconstructXThinBlock(thin, matches)
 	if len(missing) != 0 {
 		t.Fatalf("missing indexes = %v, want none", missing)
 	}
@@ -563,6 +655,59 @@ func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	if len(reconstructed.Txs) != len(block.Txs) {
 		t.Fatalf("tx count = %d, want %d", len(reconstructed.Txs), len(block.Txs))
 	}
+	for i := range block.Txs {
+		if consensus.TxID(&reconstructed.Txs[i]) != consensus.TxID(&block.Txs[i]) {
+			t.Fatalf("tx %d mismatch", i)
+		}
+	}
+}
+
+func TestReconstructCompactBlockFromMempoolOverlap(t *testing.T) {
+	pool := mempool.NewWithConfig(mempool.PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{11}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}
+	parent := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+	child := spendTxForNodeTest(t, 2, types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}, 49, 3, 1)
+	if _, err := pool.AcceptTx(child, utxos, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept child: %v", err)
+	}
+
+	block := types.Block{
+		Header: types.BlockHeader{Version: 1, Timestamp: 199},
+		Txs: []types.Transaction{
+			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}}},
+			parent,
+			child,
+		},
+	}
+	msg := buildCompactBlockMessage(block)
+	compact, ok := msg.(p2p.CompactBlockMessage)
+	if !ok {
+		t.Fatalf("relay message type = %T, want CompactBlockMessage", msg)
+	}
+	matches := pool.ShortIDMatches(func(txid [32]byte) uint64 {
+		return thinBlockShortID(compact.Nonce, txid)
+	}, compactShortIDSet(compact))
+	state, missing := reconstructCompactBlock(compact, matches)
+	if len(missing) != 0 {
+		t.Fatalf("missing indexes = %v, want none", missing)
+	}
+	if !state.complete() {
+		t.Fatal("expected complete compact block reconstruction")
+	}
+	reconstructed := state.block()
 	for i := range block.Txs {
 		if consensus.TxID(&reconstructed.Txs[i]) != consensus.TxID(&block.Txs[i]) {
 			t.Fatalf("tx %d mismatch", i)
@@ -660,6 +805,91 @@ func TestOnXThinBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 	}
 }
 
+func TestOnCompactBlockRequestsMissingIndexes(t *testing.T) {
+	pool := mempool.NewWithConfig(mempool.PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{12}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}
+	parent := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
+	if _, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+	child := spendTxForNodeTest(t, 2, types.OutPoint{TxID: consensus.TxID(&parent), Vout: 0}, 49, 3, 1)
+	block := types.Block{
+		Header: types.BlockHeader{Version: 1, Timestamp: 200},
+		Txs: []types.Transaction{
+			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}}},
+			parent,
+			child,
+		},
+	}
+	compact := buildCompactBlockMessage(block).(p2p.CompactBlockMessage)
+	svc := &Service{pool: pool}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	if err := svc.onCompactBlockMessage(peer, compact); err != nil {
+		t.Fatalf("onCompactBlockMessage: %v", err)
+	}
+	envelope := <-peer.sendQ
+	req, ok := envelope.msg.(p2p.GetBlockTxMessage)
+	if !ok {
+		t.Fatalf("queued message type = %T, want GetBlockTxMessage", envelope.msg)
+	}
+	if len(req.Indexes) != 1 || req.Indexes[0] != 2 {
+		t.Fatalf("requested indexes = %v, want [2]", req.Indexes)
+	}
+}
+
+func TestOnCompactBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
+	svc := &Service{pool: mempool.New()}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	block := types.Block{
+		Header: types.BlockHeader{Version: 1, Timestamp: 201},
+		Txs:    []types.Transaction{{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}},
+	}
+	for i := 0; i < 8; i++ {
+		block.Txs = append(block.Txs, types.Transaction{
+			Base: types.TxBase{
+				Version: 1,
+				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 1)}, Vout: 0}}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+			},
+		})
+	}
+	compact := buildCompactBlockMessage(block).(p2p.CompactBlockMessage)
+	if err := svc.onCompactBlockMessage(peer, compact); err != nil {
+		t.Fatalf("onCompactBlockMessage: %v", err)
+	}
+	envelope := <-peer.sendQ
+	req, ok := envelope.msg.(p2p.GetDataMessage)
+	if !ok {
+		t.Fatalf("queued message type = %T, want GetDataMessage", envelope.msg)
+	}
+	if len(req.Items) != 1 || req.Items[0].Type != p2p.InvTypeBlockFull {
+		t.Fatalf("unexpected fallback request: %+v", req.Items)
+	}
+}
+
 func TestOSReleaseLooksLikeUbuntu(t *testing.T) {
 	raw := strings.Join([]string{
 		`NAME="Ubuntu"`,
@@ -681,6 +911,7 @@ func TestOpenServiceDefaultsMinerWorkersWhenEnabled(t *testing.T) {
 		Profile:      types.Regtest,
 		DBPath:       t.TempDir(),
 		MinerEnabled: true,
+		MinerKeyHash: nodeSignerKeyHash(42),
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -690,6 +921,12 @@ func TestOpenServiceDefaultsMinerWorkersWhenEnabled(t *testing.T) {
 	wantWorkers := defaultMinerWorkers()
 	if svc.cfg.MinerWorkers != wantWorkers {
 		t.Fatalf("miner workers = %d, want %d", svc.cfg.MinerWorkers, wantWorkers)
+	}
+	if svc.cfg.MaxAncestors != 256 {
+		t.Fatalf("max ancestors = %d, want 256", svc.cfg.MaxAncestors)
+	}
+	if svc.cfg.MaxDescendants != 256 {
+		t.Fatalf("max descendants = %d, want 256", svc.cfg.MaxDescendants)
 	}
 	info := svc.Info()
 	if !info.MinerEnabled {
@@ -719,6 +956,357 @@ func TestOpenServiceDefaultsRPCHardening(t *testing.T) {
 	if svc.cfg.RPCMaxHeaderBytes != 8<<10 {
 		t.Fatalf("rpc max header bytes = %d, want 8192", svc.cfg.RPCMaxHeaderBytes)
 	}
+	if svc.cfg.MaxMessageBytes < int(consensus.MainnetParams().BlockSizeFloor) {
+		t.Fatalf("max message bytes = %d, want at least %d", svc.cfg.MaxMessageBytes, consensus.MainnetParams().BlockSizeFloor)
+	}
+}
+
+func TestOpenServiceRejectsWildcardRPCBindWithoutAuth(t *testing.T) {
+	genesis := genesisBlock()
+	_, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+		RPCAddr: ":18443",
+	}, &genesis)
+	if err == nil || !strings.Contains(err.Error(), "rpc auth token is required") {
+		t.Fatalf("expected wildcard bind auth error, got %v", err)
+	}
+}
+
+func TestOpenServiceRejectsMiningWithoutKeyHash(t *testing.T) {
+	genesis := genesisBlock()
+	_, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerEnabled: true,
+	}, &genesis)
+	if err == nil || !strings.Contains(err.Error(), "miner keyhash is required") {
+		t.Fatalf("expected miner keyhash error, got %v", err)
+	}
+}
+
+func TestApplyPeerHeadersBatchesPersistence(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	first := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := state.ApplyBlock(&first); err != nil {
+		t.Fatal(err)
+	}
+	second := nextCoinbaseBlock(1, first.Header, state.UTXOs(), 4, first.Header.Timestamp+600)
+
+	applied, err := svc.applyPeerHeaders([]types.BlockHeader{first.Header, second.Header})
+	if err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+	if applied != 2 {
+		t.Fatalf("applied = %d, want 2", applied)
+	}
+	stored, err := svc.chainState.Store().LoadHeaderState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.Height != 2 || stored.TipHeader != second.Header {
+		t.Fatal("stored header tip mismatch after batch")
+	}
+	secondHash := consensus.HeaderHash(&second.Header)
+	entry, err := svc.chainState.Store().GetBlockIndex(&secondHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil || entry.ChainWork == ([32]byte{}) {
+		t.Fatal("expected batched header chainwork to persist")
+	}
+}
+
+func TestSubmitPackedTxBatchRPC(t *testing.T) {
+	genesis := genesisBlock()
+	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
+	})
+
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	params, err := json.Marshal(map[string]string{
+		"packed": encodePackedTransactionsForNodeTest([]types.Transaction{tx}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "submitpackedtxbatch",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	if got := out["accepted"].(int); got != 1 {
+		t.Fatalf("accepted = %d, want 1", got)
+	}
+}
+
+func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
+	genesis := genesisBlock()
+	genesis.Txs[0].Base.Outputs = []types.TxOutput{
+		{ValueAtoms: 30, KeyHash: nodeSignerKeyHash(7)},
+		{ValueAtoms: 20, KeyHash: nodeSignerKeyHash(8)},
+	}
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 30, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 1}: {ValueAtoms: 20, KeyHash: nodeSignerKeyHash(8)},
+	})
+
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	keyHash7 := nodeSignerKeyHash(7)
+	params, err := json.Marshal(map[string][]string{
+		"keyhashes": []string{hex.EncodeToString(keyHash7[:])},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "getutxosbykeyhashes",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	utxos, ok := out["utxos"].([]map[string]any)
+	if ok {
+		_ = utxos
+	}
+	raw, err := json.Marshal(out["utxos"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("utxo count = %d, want 1", len(decoded))
+	}
+	if got := decoded[0]["value"].(float64); got != 30 {
+		t.Fatalf("value = %v, want 30", got)
+	}
+}
+
+func TestSubmitDecodedTxsAcceptsDependentChainBatch(t *testing.T) {
+	genesis := genesisBlock()
+	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
+	})
+
+	svc, err := OpenService(ServiceConfig{
+		Profile:        types.Regtest,
+		DBPath:         t.TempDir(),
+		MaxAncestors:   256,
+		MaxDescendants: 256,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	txs := make([]types.Transaction, 0, 64)
+	prevOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	prevValue := uint64(50)
+	currentSeed := byte(7)
+	for i := 0; i < 32; i++ {
+		nextSeed := currentSeed + 1
+		tx := spendTxForNodeTest(t, currentSeed, prevOut, prevValue, nextSeed, 1)
+		txs = append(txs, tx)
+		prevOut = types.OutPoint{TxID: consensus.TxID(&tx), Vout: 0}
+		prevValue = tx.Base.Outputs[0].ValueAtoms
+		currentSeed = nextSeed
+	}
+
+	admissions, errs, _, mempoolSize := svc.submitDecodedTxs(txs)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("batch err at %d: %v", i, err)
+		}
+	}
+	if mempoolSize != len(txs) {
+		t.Fatalf("mempool size = %d, want %d", mempoolSize, len(txs))
+	}
+	for i, admission := range admissions {
+		if admission.Orphaned {
+			t.Fatalf("admission %d unexpectedly orphaned", i)
+		}
+	}
+}
+
+func TestPlanTxRelayReconReducesDenseFanoutAndDistributesTxs(t *testing.T) {
+	peers := make([]*peerConn, 0, 16)
+	for i := 0; i < 16; i++ {
+		peers = append(peers, &peerConn{addr: fmt.Sprintf("peer-%02d:18444", i)})
+	}
+	txids := [][32]byte{{1}, {2}, {3}, {4}, {5}, {6}}
+	batches := planTxRelayRecon(peers, txids)
+	if len(batches) == 0 {
+		t.Fatal("expected relay batches")
+	}
+	seenPeers := make(map[string]struct{})
+	txFanout := make(map[[32]byte]int)
+	for _, batch := range batches {
+		seenPeers[batch.peer.addr] = struct{}{}
+		for _, txid := range batch.txids {
+			txFanout[txid]++
+		}
+	}
+	if len(seenPeers) <= 4 {
+		t.Fatalf("dense relay only used %d peers, want broader distribution", len(seenPeers))
+	}
+	wantFanout := txRelayFanout(len(peers))
+	for _, txid := range txids {
+		if got := txFanout[txid]; got != wantFanout {
+			t.Fatalf("tx %x fanout = %d, want %d", txid, got, wantFanout)
+		}
+	}
+}
+
+func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	outputs, err := svc.MineFundingOutputs([][32]byte{nodeSignerKeyHash(7), nodeSignerKeyHash(8), nodeSignerKeyHash(9)})
+	if err != nil {
+		t.Fatalf("MineFundingOutputs: %v", err)
+	}
+	if len(outputs) != 3 {
+		t.Fatalf("outputs = %d, want 3", len(outputs))
+	}
+	if svc.BlockHeight() == 0 {
+		t.Fatal("expected funding block to advance chain height")
+	}
+	utxos := svc.chainUtxoSnapshot()
+	for _, output := range outputs {
+		entry, ok := utxos[output.OutPoint]
+		if !ok {
+			t.Fatalf("missing funding outpoint %+v", output.OutPoint)
+		}
+		if entry.ValueAtoms != output.Value || entry.KeyHash != output.KeyHash {
+			t.Fatalf("funding output mismatch for %+v", output.OutPoint)
+		}
+	}
+}
+
+func TestConnectPeerReconnectsAfterDisconnect(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var (
+		mu      sync.Mutex
+		accepts int
+	)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			accepts++
+			mu.Unlock()
+			go func(conn net.Conn) {
+				defer conn.Close()
+				wire := p2p.NewConn(conn, p2p.MagicForProfile(types.Regtest), 8<<20)
+				if _, err := p2p.Handshake(wire, p2p.VersionMessage{
+					Protocol:  1,
+					Height:    0,
+					Nonce:     1,
+					UserAgent: "peer-test",
+				}, 2*time.Second); err != nil {
+					return
+				}
+			}(conn)
+		}
+	}()
+
+	if err := svc.ConnectPeer(ln.Addr().String()); err != nil {
+		t.Fatalf("ConnectPeer: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := accepts
+		mu.Unlock()
+		if got >= 2 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mu.Lock()
+	got := accepts
+	mu.Unlock()
+	t.Fatalf("accepted connections = %d, want at least 2", got)
 }
 
 func TestPeerWriteLoopSetsWriteDeadline(t *testing.T) {
@@ -758,6 +1346,205 @@ func TestPeerWriteLoopSetsWriteDeadline(t *testing.T) {
 	close(svc.stopCh)
 	<-done
 	t.Fatal("expected peer write loop to set a write deadline")
+}
+
+func TestPeerSendFailsFastWhenControlQueueIsSaturated(t *testing.T) {
+	peer := &peerConn{
+		controlQ:    make(chan outboundMessage, 1),
+		sendQ:       make(chan outboundMessage, 1),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	peer.controlQ <- outboundMessage{msg: p2p.PingMessage{Nonce: 1}}
+
+	start := time.Now()
+	err := peer.send(p2p.PongMessage{Nonce: 2})
+	if err == nil {
+		t.Fatal("expected saturated control queue error")
+	}
+	if !strings.Contains(err.Error(), "peer send queue saturated") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > controlMessageEnqueueTimeout*3 {
+		t.Fatalf("send blocked too long: %s", elapsed)
+	}
+}
+
+func TestPeerWriteLoopWakesForControlQueueTraffic(t *testing.T) {
+	conn := &deadlineSpyConn{}
+	svc := &Service{
+		cfg:    ServiceConfig{Profile: types.Regtest, StallTimeout: time.Second},
+		stopCh: make(chan struct{}),
+	}
+	peer := &peerConn{
+		wire:        p2p.NewConn(conn, p2p.MagicForProfile(types.Regtest), 1_000_000),
+		controlQ:    make(chan outboundMessage, 1),
+		sendQ:       make(chan outboundMessage, 1),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.peerWriteLoop(peer)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	peer.controlQ <- outboundMessage{msg: p2p.PingMessage{Nonce: 1}}
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if conn.sawNonZeroWriteDeadline() {
+			close(svc.stopCh)
+			<-done
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(svc.stopCh)
+	<-done
+	t.Fatal("expected peer write loop to wake up for control-queue traffic")
+}
+
+func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+
+	svc := &Service{
+		cfg:    ServiceConfig{Profile: types.Regtest, StallTimeout: time.Second},
+		stopCh: make(chan struct{}),
+	}
+	peer := &peerConn{
+		wire:           p2p.NewConn(local, p2p.MagicForProfile(types.Regtest), 1_000_000),
+		controlQ:       make(chan outboundMessage, 1),
+		relayPriorityQ: make(chan outboundMessage, 1),
+		sendQ:          make(chan outboundMessage, 1),
+		closed:         make(chan struct{}),
+		queuedInv:      make(map[p2p.InvVector]int),
+		queuedTx:       make(map[[32]byte]int),
+		knownTx:        make(map[[32]byte]struct{}),
+		pendingThin:    make(map[[32]byte]*pendingThinBlock),
+	}
+	remoteWire := p2p.NewConn(remote, p2p.MagicForProfile(types.Regtest), 1_000_000)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.peerWriteLoop(peer)
+	}()
+
+	tx := types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}
+	peer.sendQ <- outboundMessage{
+		msg:        p2p.TxBatchMessage{Txs: []types.Transaction{tx}},
+		enqueuedAt: time.Now(),
+		class:      classifyRelayMessage(p2p.TxBatchMessage{Txs: []types.Transaction{tx}}),
+	}
+	priorityItems := []p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: [32]byte{9}}}
+	peer.relayPriorityQ <- outboundMessage{
+		msg:        p2p.InvMessage{Items: priorityItems},
+		enqueuedAt: time.Now(),
+		class:      classifyRelayMessage(p2p.InvMessage{Items: priorityItems}),
+		invItems:   priorityItems,
+	}
+
+	msgCh := make(chan p2p.Message, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		msg, err := remoteWire.ReadMessage()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		msgCh <- msg
+	}()
+
+	select {
+	case err := <-errCh:
+		close(svc.stopCh)
+		<-done
+		t.Fatalf("read message: %v", err)
+	case msg := <-msgCh:
+		inv, ok := msg.(p2p.InvMessage)
+		if !ok {
+			close(svc.stopCh)
+			<-done
+			t.Fatalf("first message type = %T, want InvMessage", msg)
+		}
+		if len(inv.Items) != 1 || inv.Items[0].Type != p2p.InvTypeBlock {
+			close(svc.stopCh)
+			<-done
+			t.Fatalf("unexpected first inv payload: %#v", inv.Items)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(svc.stopCh)
+		<-done
+		t.Fatal("timed out waiting for prioritized relay message")
+	}
+
+	close(svc.stopCh)
+	<-done
+}
+
+func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+
+	inv := peer.filterQueuedInv([]p2p.InvVector{{Type: p2p.InvTypeTx, Hash: [32]byte{1}}})
+	peer.sendQ <- outboundMessage{
+		msg:      p2p.InvMessage{Items: inv},
+		invItems: inv,
+	}
+	tx := types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}
+	filteredTxs := peer.filterQueuedTxs([]types.Transaction{tx})
+	peer.sendQ <- outboundMessage{
+		msg: p2p.TxBatchMessage{Txs: filteredTxs},
+	}
+	peer.pendingTxs = []types.Transaction{tx}
+	peer.pendingRecon = [][32]byte{{2}}
+	peer.txFlushArmed = true
+	peer.reconFlushArmed = true
+	peer.knownTx[[32]byte{3}] = struct{}{}
+	peer.knownTxOrder = append(peer.knownTxOrder, [32]byte{3})
+	peer.pendingThin[[32]byte{4}] = &pendingThinBlock{}
+
+	peer.close()
+
+	if len(peer.sendQ) != 0 {
+		t.Fatalf("buffered send queue len = %d, want 0", len(peer.sendQ))
+	}
+	if len(peer.queuedInv) != 0 {
+		t.Fatalf("queued inv len = %d, want 0", len(peer.queuedInv))
+	}
+	if len(peer.queuedTx) != 0 {
+		t.Fatalf("queued tx len = %d, want 0", len(peer.queuedTx))
+	}
+	if len(peer.pendingTxs) != 0 || len(peer.pendingRecon) != 0 {
+		t.Fatalf("expected pending relay buffers cleared")
+	}
+	if peer.txFlushArmed || peer.reconFlushArmed {
+		t.Fatal("expected flush flags cleared")
+	}
+	if len(peer.knownTx) != 0 || len(peer.knownTxOrder) != 0 {
+		t.Fatal("expected known tx cache cleared")
+	}
+	if len(peer.pendingThin) != 0 {
+		t.Fatal("expected pending thin state cleared")
+	}
 }
 
 func TestOnInvMessageRequestsHeadersThroughLastUnknownBlock(t *testing.T) {
@@ -800,6 +1587,104 @@ func TestOnInvMessageRequestsHeadersThroughLastUnknownBlock(t *testing.T) {
 		}
 	case <-time.After(50 * time.Millisecond):
 		t.Fatal("timed out waiting for getheaders request")
+	}
+}
+
+func TestOnTxReconMessageRequestsOnlyMissingTxIDs(t *testing.T) {
+	pool := mempool.NewWithConfig(mempool.PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{61}, Vout: 0}
+	tx := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
+	if _, err := pool.AcceptTx(tx, consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept tx: %v", err)
+	}
+
+	svc := &Service{pool: pool}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	missing := [32]byte{0xaa}
+	if err := svc.onTxReconMessage(peer, p2p.TxReconMessage{TxIDs: [][32]byte{consensus.TxID(&tx), missing}}); err != nil {
+		t.Fatalf("onTxReconMessage: %v", err)
+	}
+
+	envelope := <-peer.sendQ
+	req, ok := envelope.msg.(p2p.TxRequestMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want TxRequestMessage", envelope.msg)
+	}
+	if len(req.TxIDs) != 1 || req.TxIDs[0] != missing {
+		t.Fatalf("requested txids = %x, want only missing tx", req.TxIDs)
+	}
+}
+
+func TestOnGetDataMessageBatchesTxLookupsAndReportsMisses(t *testing.T) {
+	pool := mempool.NewWithConfig(mempool.PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{62}, Vout: 0}
+	tx := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
+	if _, err := pool.AcceptTx(tx, consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept tx: %v", err)
+	}
+
+	svc := &Service{pool: pool}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	missing := [32]byte{0xbb}
+	msg := p2p.GetDataMessage{Items: []p2p.InvVector{
+		{Type: p2p.InvTypeTx, Hash: consensus.TxID(&tx)},
+		{Type: p2p.InvTypeTx, Hash: missing},
+	}}
+	if err := svc.onGetDataMessage(peer, msg); err != nil {
+		t.Fatalf("onGetDataMessage: %v", err)
+	}
+
+	var sawBatch bool
+	var sawNotFound bool
+	for i := 0; i < 2; i++ {
+		envelope := <-peer.sendQ
+		switch msg := envelope.msg.(type) {
+		case p2p.TxBatchMessage:
+			if len(msg.Txs) != 1 || consensus.TxID(&msg.Txs[0]) != consensus.TxID(&tx) {
+				t.Fatalf("unexpected tx batch payload")
+			}
+			sawBatch = true
+		case p2p.NotFoundMessage:
+			if len(msg.Items) != 1 || msg.Items[0].Hash != missing {
+				t.Fatalf("unexpected notfound payload: %+v", msg.Items)
+			}
+			sawNotFound = true
+		default:
+			t.Fatalf("unexpected message type %T", envelope.msg)
+		}
+	}
+	if !sawBatch || !sawNotFound {
+		t.Fatalf("expected both tx batch and notfound, sawBatch=%t sawNotFound=%t", sawBatch, sawNotFound)
 	}
 }
 

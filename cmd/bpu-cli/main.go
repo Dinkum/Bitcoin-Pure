@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,6 +24,7 @@ import (
 	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/node"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/wallet"
 )
 
 type genesisFixture struct {
@@ -64,6 +68,8 @@ func run(args []string) error {
 		return runServe(args[1:])
 	case "bench":
 		return runBench(args[1:])
+	case "wallet":
+		return runWallet(args[1:])
 	case "validate-tx":
 		return runValidateTx(args[1:])
 	case "validate-block":
@@ -250,8 +256,12 @@ func runServe(args []string) error {
 	}
 
 	cfg := config.Default()
-	if *configPath != "" {
-		loaded, err := config.Load(*configPath)
+	resolvedConfigPath := strings.TrimSpace(*configPath)
+	if resolvedConfigPath == "" && fileExists("/etc/bitcoin-pure/config.json") {
+		resolvedConfigPath = "/etc/bitcoin-pure/config.json"
+	}
+	if resolvedConfigPath != "" {
+		loaded, err := config.Load(resolvedConfigPath)
 		if err != nil {
 			return err
 		}
@@ -362,6 +372,16 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	if addr, walletPath, err := ensureMiningWalletProvisioned(resolvedConfigPath, &cfg); err != nil {
+		return err
+	} else if addr.KeyHashHex != "" {
+		logger.Info("provisioned mining wallet",
+			slog.String("wallet", "miner"),
+			slog.String("wallet_path", walletPath),
+			slog.String("receive_address", addr.Address),
+			slog.String("keyhash", addr.KeyHashHex),
+		)
+	}
 	keyHash, err := node.ParseMinerKeyHash(cfg.MinerKeyHashHex)
 	if err != nil {
 		return err
@@ -385,6 +405,9 @@ func runServe(args []string) error {
 		StallTimeout:       time.Duration(cfg.StallTimeoutMS) * time.Millisecond,
 		MaxMessageBytes:    cfg.MaxMessageBytes,
 		MinRelayFeePerByte: cfg.MinRelayFeePerByte,
+		MaxAncestors:       cfg.MaxAncestors,
+		MaxDescendants:     cfg.MaxDescendants,
+		MaxOrphans:         cfg.MaxOrphans,
 		MinerEnabled:       cfg.MinerEnabled,
 		MinerWorkers:       cfg.MinerWorkers,
 		MinerKeyHash:       keyHash,
@@ -402,6 +425,9 @@ func runServe(args []string) error {
 		slog.Int("peers", len(cfg.Peers)),
 		slog.Int("max_inbound_peers", cfg.MaxInboundPeers),
 		slog.Int("max_outbound_peers", cfg.MaxOutboundPeers),
+		slog.Int("max_ancestors", cfg.MaxAncestors),
+		slog.Int("max_descendants", cfg.MaxDescendants),
+		slog.Int("max_orphans", cfg.MaxOrphans),
 		slog.Bool("miner_enabled", cfg.MinerEnabled),
 		slog.Int("miner_workers", cfg.MinerWorkers),
 	)
@@ -489,6 +515,190 @@ func runChain(args []string) error {
 	default:
 		return errors.New("unknown chain subcommand")
 	}
+}
+
+func runWallet(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing wallet subcommand")
+	}
+	switch args[0] {
+	case "create":
+		return runWalletCreate(args[1:])
+	case "list":
+		return runWalletList(args[1:])
+	case "receive":
+		return runWalletReceive(args[1:])
+	case "send":
+		return runWalletSend(args[1:])
+	default:
+		return errors.New("unknown wallet subcommand")
+	}
+}
+
+func runWalletCreate(args []string) error {
+	fs := flag.NewFlagSet("wallet create", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli wallet create [--config PATH] [--wallet-dir DIR] <name>")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	entry, addr, err := store.CreateWallet(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wallet: %s\n", entry.Name)
+	fmt.Printf("created_at: %s\n", entry.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("receive_address: %s\n", addr.Address)
+	fmt.Printf("keyhash: %s\n", addr.KeyHashHex)
+	return nil
+}
+
+func runWalletList(args []string) error {
+	fs := flag.NewFlagSet("wallet list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	wallets := store.List()
+	if len(wallets) == 0 {
+		fmt.Println("no wallets")
+		return nil
+	}
+	for _, entry := range wallets {
+		receive := "-"
+		if latest := entry.LatestReceiveAddress(); latest != nil {
+			receive = latest.Address
+		}
+		fmt.Printf("%s  addresses=%d  pending=%d  receive=%s\n", entry.Name, len(entry.Addresses), len(entry.Pending), receive)
+	}
+	return nil
+}
+
+func runWalletReceive(args []string) error {
+	fs := flag.NewFlagSet("wallet receive", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli wallet receive [--config PATH] [--wallet-dir DIR] <wallet>")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	addr, err := store.NewReceiveAddress(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wallet: %s\n", fs.Arg(0))
+	fmt.Printf("receive_address: %s\n", addr.Address)
+	fmt.Printf("keyhash: %s\n", addr.KeyHashHex)
+	return nil
+}
+
+func runWalletSend(args []string) error {
+	fs := flag.NewFlagSet("wallet send", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	from := fs.String("from", "", "")
+	to := fs.String("to", "", "")
+	amount := fs.Uint64("amount", 0, "")
+	fee := fs.Uint64("fee", 1, "")
+	yes := fs.Bool("yes", false, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *from == "" || *to == "" || *amount == 0 {
+		return errors.New("usage: bpu-cli wallet send --from NAME --to ADDRESS --amount ATOMS [--fee ATOMS] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
+	if err := reconcileWalletPending(store, client, *from); err != nil {
+		return err
+	}
+	keyHashes, err := store.SpendableKeyHashes(*from)
+	if err != nil {
+		return err
+	}
+	utxos, err := rpcUTXOsByKeyHashes(client, keyHashes)
+	if err != nil {
+		return err
+	}
+	plan, err := store.BuildSend(*from, *to, *amount, *fee, utxos)
+	if err != nil {
+		return err
+	}
+	if err := maybeConfirmSend(plan, *yes); err != nil {
+		return err
+	}
+	var result struct {
+		TxID string `json:"txid"`
+		Fee  uint64 `json:"fee"`
+	}
+	if err := client.Call("submittx", map[string]string{"hex": plan.TransactionHex}, &result); err != nil {
+		return err
+	}
+	reportedTxID, err := decodeHex32(result.TxID)
+	if err != nil {
+		return err
+	}
+	if reportedTxID != plan.TransactionID {
+		return fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
+	}
+	spent := make([]types.OutPoint, 0, len(plan.Inputs))
+	for _, input := range plan.Inputs {
+		spent = append(spent, input.OutPoint)
+	}
+	if err := store.MarkSubmitted(*from, reportedTxID, spent); err != nil {
+		return err
+	}
+	fmt.Printf("wallet: %s\n", *from)
+	fmt.Printf("txid: %s\n", result.TxID)
+	fmt.Printf("amount: %d\n", plan.Amount)
+	fmt.Printf("fee: %d\n", plan.Fee)
+	if plan.Change > 0 && plan.ChangeAddress != nil {
+		fmt.Printf("change: %d -> %s\n", plan.Change, plan.ChangeAddress.Address)
+	}
+	return nil
 }
 
 func runChainInit(args []string) error {
@@ -621,7 +831,7 @@ func runChainValidateFixture(args []string) error {
 		if reopenedTip == nil || *reopenedTip != expectedTip {
 			return errors.New("reopened tip header mismatch")
 		}
-		reopenedRoot := consensus.ComputedUTXORoot(reopened.ChainState().UTXOs())
+		reopenedRoot := reopened.ChainState().UTXORoot()
 		if reopenedRoot != summary.UTXORoot {
 			return fmt.Errorf("reopened utxo_root mismatch: expected %x, got %x", summary.UTXORoot, reopenedRoot)
 		}
@@ -955,8 +1165,265 @@ func bytesTrimSpace(buf []byte) []byte {
 	return buf[start:end]
 }
 
+type cliRPCClient struct {
+	addr  string
+	token string
+	http  *http.Client
+}
+
+type cliRPCResponse struct {
+	Result json.RawMessage `json:"result"`
+	Error  string          `json:"error"`
+}
+
+func newRPCClient(addr, token string) *cliRPCClient {
+	return &cliRPCClient{
+		addr:  strings.TrimSpace(addr),
+		token: strings.TrimSpace(token),
+		http:  &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+func (c *cliRPCClient) Call(method string, params any, out any) error {
+	if c.addr == "" {
+		return errors.New("rpc address is required")
+	}
+	body, err := json.Marshal(map[string]any{
+		"method": method,
+		"params": params,
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := c.addr
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "http://" + endpoint
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rpc %s returned %s: %s", method, resp.Status, strings.TrimSpace(string(respBody)))
+	}
+	var rpcResp cliRPCResponse
+	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		return err
+	}
+	if rpcResp.Error != "" {
+		return errors.New(rpcResp.Error)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(rpcResp.Result, out)
+}
+
+func resolveCLIConfig(configPath string) (config.Config, string, error) {
+	cfg := config.Default()
+	resolved := strings.TrimSpace(configPath)
+	if resolved == "" && fileExists("/etc/bitcoin-pure/config.json") {
+		resolved = "/etc/bitcoin-pure/config.json"
+	}
+	if resolved == "" {
+		return cfg, "", nil
+	}
+	loaded, err := config.Load(resolved)
+	if err != nil {
+		return config.Config{}, "", err
+	}
+	return loaded, resolved, nil
+}
+
+func openWalletStore(walletDir string, cfg config.Config) (*wallet.Store, string, error) {
+	dir := strings.TrimSpace(walletDir)
+	if dir == "" {
+		dir = filepath.Join(filepath.Dir(filepath.Clean(cfg.DBPath)), "wallets")
+	}
+	path := wallet.StorePath(dir)
+	store, err := wallet.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	return store, path, nil
+}
+
+func ensureMiningWalletProvisioned(configPath string, cfg *config.Config) (wallet.Address, string, error) {
+	if cfg == nil || !cfg.MinerEnabled || strings.TrimSpace(cfg.MinerKeyHashHex) != "" {
+		return wallet.Address{}, "", nil
+	}
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return wallet.Address{}, "", errors.New("mining auto-setup requires a config file path when miner_keyhash_hex is empty")
+	}
+	store, walletPath, err := openWalletStore("", *cfg)
+	if err != nil {
+		return wallet.Address{}, "", err
+	}
+	const minerWalletName = "miner"
+	existing, err := store.Wallet(minerWalletName)
+	var addr wallet.Address
+	switch {
+	case err == nil:
+		if latest := existing.LatestReceiveAddress(); latest != nil {
+			addr = *latest
+		} else {
+			addr, err = store.NewReceiveAddress(minerWalletName)
+			if err != nil {
+				return wallet.Address{}, "", err
+			}
+		}
+	case errors.Is(err, wallet.ErrWalletNotFound):
+		_, addr, err = store.CreateWallet(minerWalletName)
+		if err != nil {
+			return wallet.Address{}, "", err
+		}
+	default:
+		return wallet.Address{}, "", err
+	}
+	cfg.MinerKeyHashHex = addr.KeyHashHex
+	if err := config.Save(configPath, *cfg); err != nil {
+		return wallet.Address{}, "", err
+	}
+	return addr, walletPath, nil
+}
+
+func resolveRPCAddr(cfg config.Config, override string) string {
+	if strings.TrimSpace(override) != "" {
+		return strings.TrimSpace(override)
+	}
+	return cfg.RPCAddr
+}
+
+func resolveRPCAuthToken(cfg config.Config, override string) string {
+	if strings.TrimSpace(override) != "" {
+		return strings.TrimSpace(override)
+	}
+	return cfg.RPCAuthToken
+}
+
+func reconcileWalletPending(store *wallet.Store, client *cliRPCClient, walletName string) error {
+	var txids []string
+	if err := client.Call("getmempool", map[string]any{}, &txids); err != nil {
+		return err
+	}
+	mempool := make(map[[32]byte]struct{}, len(txids))
+	for _, raw := range txids {
+		txid, err := decodeHex32(raw)
+		if err != nil {
+			continue
+		}
+		mempool[txid] = struct{}{}
+	}
+	_, err := store.ReconcilePending(walletName, mempool)
+	return err
+}
+
+func rpcUTXOsByKeyHashes(client *cliRPCClient, keyHashes [][32]byte) ([]wallet.SpendableUTXO, error) {
+	params := struct {
+		KeyHashes []string `json:"keyhashes"`
+	}{KeyHashes: make([]string, 0, len(keyHashes))}
+	for _, keyHash := range keyHashes {
+		params.KeyHashes = append(params.KeyHashes, hex.EncodeToString(keyHash[:]))
+	}
+	var result struct {
+		UTXOs []struct {
+			TxID    string `json:"txid"`
+			Vout    uint32 `json:"vout"`
+			Value   uint64 `json:"value"`
+			KeyHash string `json:"keyhash"`
+		} `json:"utxos"`
+	}
+	if err := client.Call("getutxosbykeyhashes", params, &result); err != nil {
+		return nil, err
+	}
+	out := make([]wallet.SpendableUTXO, 0, len(result.UTXOs))
+	for _, item := range result.UTXOs {
+		txid, err := decodeHex32(item.TxID)
+		if err != nil {
+			return nil, err
+		}
+		keyHash, err := decodeHex32(item.KeyHash)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, wallet.SpendableUTXO{
+			OutPoint: types.OutPoint{TxID: txid, Vout: item.Vout},
+			Value:    item.Value,
+			KeyHash:  keyHash,
+		})
+	}
+	return out, nil
+}
+
+func maybeConfirmSend(plan wallet.SendPlan, yes bool) error {
+	if yes {
+		return nil
+	}
+	if !stdinLooksInteractive() {
+		return errors.New("wallet send requires --yes when stdin is not interactive")
+	}
+	fmt.Printf("from: %s\n", plan.WalletName)
+	fmt.Printf("to: %s\n", plan.ToAddress)
+	fmt.Printf("txid: %x\n", plan.TransactionID)
+	fmt.Printf("inputs: %d\n", len(plan.Inputs))
+	fmt.Printf("input_total: %d\n", plan.InputTotal)
+	fmt.Printf("amount: %d\n", plan.Amount)
+	fmt.Printf("fee: %d\n", plan.Fee)
+	if plan.Change > 0 && plan.ChangeAddress != nil {
+		fmt.Printf("change: %d -> %s\n", plan.Change, plan.ChangeAddress.Address)
+	}
+	fmt.Print("broadcast transaction? [y/N]: ")
+	var response string
+	if _, err := fmt.Fscanln(os.Stdin, &response); err != nil {
+		return errors.New("transaction cancelled")
+	}
+	switch strings.ToLower(strings.TrimSpace(response)) {
+	case "y", "yes":
+		return nil
+	default:
+		return errors.New("transaction cancelled")
+	}
+}
+
+func stdinLooksInteractive() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func decodeHex32(raw string) ([32]byte, error) {
+	var out [32]byte
+	buf, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil || len(buf) != 32 {
+		return out, fmt.Errorf("invalid 32-byte hex: %q", raw)
+	}
+	copy(out[:], buf)
+	return out, nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func usageError() error {
-	return errors.New("usage: bpu-cli <serve|bench|validate-tx|validate-block|chain>")
+	return errors.New("usage: bpu-cli <serve|bench|wallet|validate-tx|validate-block|chain>")
 }
 
 func defaultGenesisFixture(profile types.ChainProfile) string {

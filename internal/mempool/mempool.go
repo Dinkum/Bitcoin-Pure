@@ -32,8 +32,8 @@ func DefaultConfig() PoolConfig {
 	return PoolConfig{
 		MinRelayFeePerByte: 1,
 		MaxTxSize:          1_000_000,
-		MaxAncestors:       25,
-		MaxDescendants:     25,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
 		MaxOrphans:         128,
 	}
 }
@@ -182,6 +182,39 @@ func (p *Pool) Contains(txid [32]byte) bool {
 	return ok
 }
 
+func (p *Pool) MissingTxIDs(txids [][32]byte) [][32]byte {
+	if len(txids) == 0 {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	missing := make([][32]byte, 0, len(txids))
+	for _, txid := range txids {
+		if _, ok := p.entries[txid]; ok {
+			continue
+		}
+		missing = append(missing, txid)
+	}
+	return missing
+}
+
+func (p *Pool) TransactionsByID(txids [][32]byte) []types.Transaction {
+	if len(txids) == 0 {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	txs := make([]types.Transaction, 0, len(txids))
+	for _, txid := range txids {
+		entry := p.entries[txid]
+		if entry == nil {
+			continue
+		}
+		txs = append(txs, entry.Tx)
+	}
+	return txs
+}
+
 func (p *Pool) OrphanCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -214,6 +247,23 @@ func (p *Pool) Snapshot() []SnapshotEntry {
 	return entries
 }
 
+func (p *Pool) ShortIDMatches(shortIDFn func([32]byte) uint64, wanted map[uint64]struct{}) map[uint64][]types.Transaction {
+	if len(wanted) == 0 {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	matches := make(map[uint64][]types.Transaction, len(wanted))
+	for _, entry := range p.entries {
+		shortID := shortIDFn(entry.TxID)
+		if _, ok := wanted[shortID]; !ok {
+			continue
+		}
+		matches[shortID] = append(matches[shortID], entry.Tx)
+	}
+	return matches
+}
+
 func (p *Pool) AdmissionSnapshot() AdmissionSnapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -238,6 +288,39 @@ func (p *Pool) AdmissionSnapshot() AdmissionSnapshot {
 		snapshot.Orphans[txid] = struct{}{}
 	}
 	return snapshot
+}
+
+func AdvanceAdmissionSnapshot(snapshot *AdmissionSnapshot, chainUtxos consensus.UtxoSet, accepted []AcceptedTx) error {
+	if snapshot == nil {
+		return nil
+	}
+	for _, entry := range accepted {
+		view, parents, missing, err := resolveInputsWithView(entry.Tx, chainUtxos, snapshot.Entries, snapshot.Spent)
+		if err != nil {
+			return err
+		}
+		if len(missing) != 0 {
+			return ErrTxAlreadyExists
+		}
+		_ = view
+		ancestorIDs := gatherAncestorsForView(snapshot.Entries, parents)
+		for ancestorID := range ancestorIDs {
+			ancestor := snapshot.Entries[ancestorID]
+			ancestor.DescendantCount++
+			snapshot.Entries[ancestorID] = ancestor
+		}
+		snapshot.Entries[entry.TxID] = admissionEntry{
+			Tx:              entry.Tx,
+			TxID:            entry.TxID,
+			Parents:         copyTxIDSet(parents),
+			DescendantCount: 1,
+		}
+		for _, input := range entry.Tx.Base.Inputs {
+			snapshot.Spent[input.PrevOut] = entry.TxID
+		}
+		delete(snapshot.Orphans, entry.TxID)
+	}
+	return nil
 }
 
 func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
@@ -384,36 +467,48 @@ func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rule
 }
 
 func (p *Pool) SelectForBlock(chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
+	tempUtxos := cloneUtxos(chainUtxos)
+	return p.SelectForBlockInPlace(tempUtxos, rules, maxTxBytes)
+}
+
+// SelectForBlockInPlace consumes a mutable chain view and advances it as eligible
+// transactions are accepted. Eligibility is still checked against the original
+// pre-block UTXO set so block assembly cannot create same-block dependency edges.
+func (p *Pool) SelectForBlockInPlace(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.selectForBlockLocked(currentUtxos, rules, maxTxBytes)
+}
+
+func (p *Pool) selectForBlockLocked(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
+	preBlockUtxos := cloneUtxos(currentUtxos)
 	selected := make([]SnapshotEntry, 0, len(p.entries))
 	included := make(map[[32]byte]struct{}, len(p.entries))
-	tempUtxos := cloneUtxos(chainUtxos)
+	claimed := make(map[types.OutPoint]struct{})
 	usedBytes := 0
 	var totalFees uint64
 
-	for {
-		ordered := p.cachedPackageCandidatesLocked()
-		if len(ordered) == 0 {
-			break
-		}
-
+	pending := append([]packageCandidate(nil), p.cachedPackageCandidatesLocked()...)
+	for len(pending) > 0 {
+		next := make([]packageCandidate, 0, len(pending))
 		progress := false
-		for _, candidate := range ordered {
+		for _, candidate := range pending {
 			filtered := filterCandidateEntries(candidate.Entries, included)
 			if len(filtered) == 0 {
 				continue
 			}
 			filteredSize, filteredFee := packageStats(filtered)
 			if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
+				next = append(next, candidate)
 				continue
 			}
 			if !p.meetsRelayFloor(filteredFee, filteredSize) {
 				continue
 			}
 
-			packageFees, ok := applyCandidatePackage(tempUtxos, filtered, rules)
+			packageFees, ok := applyCandidatePackage(preBlockUtxos, currentUtxos, claimed, filtered, rules)
 			if !ok {
+				next = append(next, candidate)
 				continue
 			}
 
@@ -424,21 +519,23 @@ func (p *Pool) SelectForBlock(chainUtxos consensus.UtxoSet, rules consensus.Cons
 				selected = append(selected, snapshotForEntry(entry))
 			}
 			progress = true
-			break
 		}
 		if !progress {
 			break
 		}
+		pending = next
 	}
 
+	sortSnapshotEntriesByTxID(selected)
 	return selected, totalFees
 }
 
-func (p *Pool) AppendForBlock(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
+func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	appendOnly := make([]SnapshotEntry, 0, len(p.entries))
 	included := make(map[[32]byte]struct{}, len(selected))
+	claimed := claimedOutPointsForSnapshots(selected)
 	usedBytes := 0
 	for _, entry := range selected {
 		included[entry.TxID] = struct{}{}
@@ -446,28 +543,27 @@ func (p *Pool) AppendForBlock(currentUtxos consensus.UtxoSet, rules consensus.Co
 	}
 	var totalFees uint64
 
-	for {
-		ordered := p.cachedPackageCandidatesLocked()
-		if len(ordered) == 0 {
-			break
-		}
-
+	pending := append([]packageCandidate(nil), p.cachedPackageCandidatesLocked()...)
+	for len(pending) > 0 {
+		next := make([]packageCandidate, 0, len(pending))
 		progress := false
-		for _, candidate := range ordered {
+		for _, candidate := range pending {
 			filtered := filterCandidateEntries(candidate.Entries, included)
 			if len(filtered) == 0 {
 				continue
 			}
 			filteredSize, filteredFee := packageStats(filtered)
 			if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
+				next = append(next, candidate)
 				continue
 			}
 			if !p.meetsRelayFloor(filteredFee, filteredSize) {
 				continue
 			}
 
-			packageFees, ok := applyCandidatePackage(currentUtxos, filtered, rules)
+			packageFees, ok := applyCandidatePackage(preBlockUtxos, currentUtxos, claimed, filtered, rules)
 			if !ok {
+				next = append(next, candidate)
 				continue
 			}
 
@@ -478,13 +574,14 @@ func (p *Pool) AppendForBlock(currentUtxos consensus.UtxoSet, rules consensus.Co
 				appendOnly = append(appendOnly, snapshotForEntry(entry))
 			}
 			progress = true
-			break
 		}
 		if !progress {
 			break
 		}
+		pending = next
 	}
 
+	sortSnapshotEntriesByTxID(appendOnly)
 	return appendOnly, totalFees
 }
 
@@ -1054,17 +1151,34 @@ type appliedTxUndo struct {
 	created []types.OutPoint
 }
 
-func applyCandidatePackage(utxos consensus.UtxoSet, entries []*Entry, rules consensus.ConsensusRules) (uint64, bool) {
+func applyCandidatePackage(preBlockUtxos consensus.UtxoSet, currentUtxos consensus.UtxoSet, claimed map[types.OutPoint]struct{}, entries []*Entry, rules consensus.ConsensusRules) (uint64, bool) {
 	undos := make([]appliedTxUndo, 0, len(entries))
+	newlyClaimed := make([]types.OutPoint, 0, len(entries))
 	var totalFees uint64
+	lookup := func(out types.OutPoint) (consensus.UtxoEntry, bool) {
+		utxo, ok := preBlockUtxos[out]
+		return utxo, ok
+	}
 	for _, entry := range entries {
-		summary, err := consensus.ValidateTx(&entry.Tx, utxos, rules)
+		for _, input := range entry.Tx.Base.Inputs {
+			if _, ok := claimed[input.PrevOut]; ok {
+				rollbackAppliedPackage(currentUtxos, undos)
+				rollbackClaimedInputs(claimed, newlyClaimed)
+				return 0, false
+			}
+		}
+		summary, err := consensus.ValidateTxWithLookup(&entry.Tx, lookup, rules)
 		if err != nil {
-			rollbackAppliedPackage(utxos, undos)
+			rollbackAppliedPackage(currentUtxos, undos)
+			rollbackClaimedInputs(claimed, newlyClaimed)
 			return 0, false
 		}
 		totalFees += summary.Fee
-		undos = append(undos, applyTxWithUndo(utxos, entry.Tx, entry.TxID))
+		for _, input := range entry.Tx.Base.Inputs {
+			claimed[input.PrevOut] = struct{}{}
+			newlyClaimed = append(newlyClaimed, input.PrevOut)
+		}
+		undos = append(undos, applyTxWithUndo(currentUtxos, entry.Tx, entry.TxID))
 	}
 	return totalFees, true
 }
@@ -1100,6 +1214,12 @@ func rollbackAppliedPackage(utxos consensus.UtxoSet, undos []appliedTxUndo) {
 		for out, entry := range undo.spent {
 			utxos[out] = entry
 		}
+	}
+}
+
+func rollbackClaimedInputs(claimed map[types.OutPoint]struct{}, inputs []types.OutPoint) {
+	for i := len(inputs) - 1; i >= 0; i-- {
+		delete(claimed, inputs[i])
 	}
 }
 
@@ -1297,12 +1417,28 @@ func applyTx(utxos consensus.UtxoSet, tx types.Transaction, txid [32]byte) {
 	}
 }
 
+func sortSnapshotEntriesByTxID(entries []SnapshotEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		return bytes.Compare(entries[i].TxID[:], entries[j].TxID[:]) < 0
+	})
+}
+
 func cloneUtxos(utxos consensus.UtxoSet) consensus.UtxoSet {
 	out := make(consensus.UtxoSet, len(utxos))
 	for outPoint, entry := range utxos {
 		out[outPoint] = entry
 	}
 	return out
+}
+
+func claimedOutPointsForSnapshots(entries []SnapshotEntry) map[types.OutPoint]struct{} {
+	claimed := make(map[types.OutPoint]struct{}, len(entries))
+	for _, entry := range entries {
+		for _, input := range entry.Tx.Base.Inputs {
+			claimed[input.PrevOut] = struct{}{}
+		}
+	}
+	return claimed
 }
 
 func copyOutPointSet(in map[types.OutPoint]struct{}) map[types.OutPoint]struct{} {

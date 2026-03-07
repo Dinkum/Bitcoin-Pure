@@ -9,6 +9,7 @@ import (
 	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 )
 
 var (
@@ -40,6 +41,7 @@ type ChainState struct {
 	tipHeader      *types.BlockHeader
 	blockSizeState consensus.BlockSizeState
 	utxos          consensus.UtxoSet
+	utxoAcc        *utreexo.Accumulator
 }
 
 type PersistentChainState struct {
@@ -78,6 +80,11 @@ func (c *ChainState) InitializeTip(height uint64, header types.BlockHeader, bloc
 	c.tipHeader = &header
 	c.blockSizeState = blockSizeState
 	c.utxos = cloneUtxos(utxos)
+	acc, err := consensus.UtxoAccumulator(c.utxos)
+	if err != nil {
+		return err
+	}
+	c.utxoAcc = acc
 	return nil
 }
 
@@ -117,8 +124,13 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 			KeyHash:    output.KeyHash,
 		}
 	}
-	seededBlockSizeState := consensus.AdvanceBlockSizeState(consensus.NewBlockSizeState(c.params), uint64(len(genesis.Encode())), c.params)
-	postGenesisUTXORoot := consensus.ComputedUTXORoot(utxos)
+	seededBlockSizeState := consensus.NewBlockSizeState(c.params)
+	seededBlockSizeState.BlockSize = uint64(len(genesis.Encode()))
+	acc, err := consensus.UtxoAccumulator(utxos)
+	if err != nil {
+		return GenesisBootstrapSummary{}, err
+	}
+	postGenesisUTXORoot := acc.Root()
 	if genesis.Header.UTXORoot != postGenesisUTXORoot {
 		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: utxo_root mismatch")
 	}
@@ -131,7 +143,7 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 		CoinbaseTxID:        coinbaseTxID,
 		PostGenesisUTXORoot: postGenesisUTXORoot,
 		UTXOCount:           len(c.utxos),
-		BlockSizeLimit:      c.blockSizeState.Limit,
+		BlockSizeLimit:      consensus.NextBlockSizeLimit(c.blockSizeState, c.params),
 	}
 	logger.Info("initialized chain from genesis",
 		slog.String("profile", c.params.Profile.String()),
@@ -148,11 +160,15 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 	if c.height == nil || c.tipHeader == nil {
 		return consensus.BlockValidationSummary{}, ErrNoTip
 	}
-	summary, err := consensus.ValidateAndApplyBlock(
+	// The published chain UTXO map is treated as immutable so admission/template
+	// readers can hold a shared view without cloning the full set first.
+	workingUtxos := cloneUtxos(c.utxos)
+	summary, nextAcc, err := consensus.ValidateAndApplyBlockWithAccumulator(
 		block,
 		consensus.PrevBlockContext{Height: *c.height, Header: *c.tipHeader},
 		c.blockSizeState,
-		c.utxos,
+		workingUtxos,
+		c.utxoAcc,
 		c.params,
 		c.rules,
 	)
@@ -164,13 +180,15 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 	tip := block.Header
 	c.tipHeader = &tip
 	c.blockSizeState = summary.NextBlockSizeState
+	c.utxos = workingUtxos
+	c.utxoAcc = nextAcc
 	hash := consensus.HeaderHash(&block.Header)
 	logger.Info("validated block",
 		slog.Uint64("height", summary.Height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
 		slog.Int("txs", len(block.Txs)),
 		slog.Int("utxo_count", len(c.utxos)),
-		slog.Uint64("next_block_size_limit", summary.NextBlockSizeState.Limit),
+		slog.Uint64("next_block_size_limit", consensus.NextBlockSizeLimit(summary.NextBlockSizeState, c.params)),
 	)
 	return summary, nil
 }
@@ -187,9 +205,9 @@ func (c *ChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySummary, err
 	return ChainReplaySummary{
 		TipHeight:      *c.height,
 		TipHeaderHash:  consensus.HeaderHash(c.tipHeader),
-		UTXORoot:       consensus.ComputedUTXORoot(c.utxos),
+		UTXORoot:       c.UTXORoot(),
 		UTXOCount:      len(c.utxos),
-		BlockSizeLimit: c.blockSizeState.Limit,
+		BlockSizeLimit: consensus.NextBlockSizeLimit(c.blockSizeState, c.params),
 	}, nil
 }
 
@@ -211,6 +229,17 @@ func (c *ChainState) BlockSizeState() consensus.BlockSizeState {
 
 func (c *ChainState) UTXOs() consensus.UtxoSet {
 	return c.utxos
+}
+
+func (c *ChainState) UTXORoot() [32]byte {
+	if c.utxoAcc == nil {
+		return consensus.ComputedUTXORoot(c.utxos)
+	}
+	return c.utxoAcc.Root()
+}
+
+func (c *ChainState) UTXOAccumulator() *utreexo.Accumulator {
+	return c.utxoAcc
 }
 
 func (c *ChainState) StoredState() (*storage.StoredChainState, error) {
@@ -257,7 +286,7 @@ func OpenPersistentChainStateWithRules(path string, profile types.ChainProfile, 
 		logger.Info("loaded persisted chain state",
 			slog.Uint64("height", stored.Height),
 			slog.Int("utxo_count", len(stored.UTXOs)),
-			slog.Uint64("block_size_limit", stored.BlockSizeState.Limit),
+			slog.Uint64("block_size_limit", consensus.NextBlockSizeLimit(stored.BlockSizeState, state.params)),
 		)
 	} else {
 		state = NewChainState(profile).WithRules(rules)

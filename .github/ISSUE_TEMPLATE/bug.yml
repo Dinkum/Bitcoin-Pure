@@ -1,36 +1,32 @@
 name: Bug report
-description: Submit a new bug report.
+description: Report a defect in Bitcoin Pure.
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        ## This issue tracker is only for technical issues related to Bitcoin Core.
+        Use this form for reproducible defects in Bitcoin Pure.
 
-        * General bitcoin questions and/or support requests should use Bitcoin StackExchange at https://bitcoin.stackexchange.com.
-        * For reporting security issues, please read instructions at https://bitcoincore.org/en/contact/.
-        * If the node is "stuck" during sync or giving "block checksum mismatch" errors, please ensure your hardware is stable by running `memtest` and observe CPU temperature with a load-test tool such as `linpack` before creating an issue.
-
-        ----
+        Do not report exploitable security issues in the public issue tracker.
   - type: checkboxes
     attributes:
       label: Is there an existing issue for this?
       description: Please search to see if an issue already exists for the bug you encountered.
       options:
-      - label: I have searched the existing issues
-        required: true
+        - label: I have searched the existing issues
+          required: true
   - type: textarea
     id: current-behaviour
     attributes:
       label: Current behaviour
-      description: Tell us what went wrong
+      description: Tell us what went wrong.
     validations:
       required: true
   - type: textarea
     id: expected-behaviour
     attributes:
       label: Expected behaviour
-      description: Tell us what you expected to happen
+      description: Tell us what you expected to happen.
     validations:
       required: true
   - type: textarea
@@ -38,9 +34,8 @@ body:
     attributes:
       label: Steps to reproduce
       description: |
-        Tell us how to reproduce your bug. Please attach related screenshots if necessary.
-        * Run-time or compile-time configuration options
-        * Actions taken
+        Tell us how to reproduce the problem.
+        Include configuration, commands, RPC payloads, peers, or fixture data where relevant.
     validations:
       required: true
   - type: textarea
@@ -48,37 +43,35 @@ body:
     attributes:
       label: Relevant log output
       description: |
-        Please copy and paste any relevant log output or attach a debug log file.
+        Paste any relevant logs, panic output, RPC errors, or screenshots.
 
-        You can find the debug.log in your [data dir.](https://github.com/bitcoin/bitcoin/blob/master/doc/files.md#data-directory-location)
-
-        Please be aware that the debug log might contain personally identifying information.
+        Remove secrets, auth tokens, and private host details before submitting.
     validations:
       required: false
   - type: dropdown
     attributes:
-      label: How did you obtain Bitcoin Core
+      label: How are you running Bitcoin Pure?
       multiple: false
       options:
         - Compiled from source
-        - Pre-built binaries
-        - Package manager
+        - Installed with ./install
+        - Running a packaged build
         - Other
     validations:
       required: true
   - type: input
-    id: core-version
+    id: version
     attributes:
-      label: What version of Bitcoin Core are you using?
-      description: Run `bitcoind --version` or in Bitcoin-QT use `Help > About Bitcoin Core`
-      placeholder: e.g. v24.0.1 or master@e1bf547
+      label: What version are you using?
+      description: Include the release version, commit, or branch if known.
+      placeholder: e.g. v0.1.6 or main@abcdef1
     validations:
       required: true
   - type: input
     id: os
     attributes:
       label: Operating system and version
-      placeholder: e.g. "MacOS Ventura 13.2" or "Ubuntu 22.04 LTS"
+      placeholder: e.g. Ubuntu 24.04 or macOS 15
     validations:
       required: true
   - type: textarea
@@ -86,8 +79,7 @@ body:
     attributes:
       label: Machine specifications
       description: |
-        What are the specifications of the host machine?
-        e.g. OS/CPU and disk type, network connectivity
+        Describe the host environment if it matters.
+        Example: CPU, RAM, disk type, VM/container, and network conditions.
     validations:
       required: false
-

@@ -56,6 +56,12 @@ type BlockUndoEntry struct {
 	Entry    consensus.UtxoEntry
 }
 
+type HeaderBatchEntry struct {
+	Height    uint64
+	Header    types.BlockHeader
+	ChainWork [32]byte
+}
+
 type ChainStore struct {
 	db *pebble.DB
 }
@@ -260,6 +266,32 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 	return nil
 }
 
+func (s *ChainStore) WriteHeaderBatch(state *StoredHeaderState, entries []HeaderBatchEntry) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := writeHeaderMeta(batch, state); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := putHeaderBatch(batch, BlockIndexEntry{
+			Height:     entry.Height,
+			ParentHash: entry.Header.PrevBlockHash,
+			Header:     entry.Header,
+			ChainWork:  entry.ChainWork,
+		}, true); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	logging.Component("storage").Info("wrote header batch",
+		slog.Uint64("height", state.Height),
+		slog.Int("count", len(entries)),
+	)
+	return nil
+}
+
 func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
@@ -303,16 +335,24 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 }
 
 func (s *ChainStore) AppendBlock(state *StoredChainState, block *types.Block, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	entry, err := s.buildLinearIndexEntry(state.Height, &block.Header, true, state.BlockSizeState)
+	if err != nil {
+		return err
+	}
+	return s.AppendValidatedBlock(state, block, &entry, nil, spent, created)
+}
+
+func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeMeta(batch, state); err != nil {
 		return err
 	}
-	entry, err := s.buildLinearIndexEntry(state.Height, &block.Header, true, state.BlockSizeState)
-	if err != nil {
+	if err := putBlockBatch(batch, block, *entry, true); err != nil {
 		return err
 	}
-	if err := putBlockBatch(batch, block, entry, true); err != nil {
+	hash := consensus.HeaderHash(&block.Header)
+	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
 		return err
 	}
 	for _, outPoint := range spent {
@@ -328,7 +368,6 @@ func (s *ChainStore) AppendBlock(state *StoredChainState, block *types.Block, sp
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
-	hash := consensus.HeaderHash(&block.Header)
 	logging.Component("storage").Info("appended block delta",
 		slog.Uint64("height", state.Height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
@@ -687,35 +726,20 @@ func (s *ChainStore) buildLinearIndexEntry(height uint64, header *types.BlockHea
 }
 
 func encodeBlockSizeState(state consensus.BlockSizeState) []byte {
-	buf := make([]byte, 24, 24+len(state.RecentBlockSizes)*8)
-	binary.LittleEndian.PutUint64(buf[:8], state.Limit)
-	binary.LittleEndian.PutUint64(buf[8:16], state.EWMA)
-	binary.LittleEndian.PutUint64(buf[16:24], uint64(len(state.RecentBlockSizes)))
-	for _, size := range state.RecentBlockSizes {
-		next := make([]byte, 8)
-		binary.LittleEndian.PutUint64(next, size)
-		buf = append(buf, next...)
-	}
+	buf := make([]byte, 24)
+	binary.LittleEndian.PutUint64(buf[:8], state.BlockSize)
+	binary.LittleEndian.PutUint64(buf[8:16], state.Epsilon)
+	binary.LittleEndian.PutUint64(buf[16:24], state.Beta)
 	return buf
 }
 
 func decodeBlockSizeState(buf []byte) (consensus.BlockSizeState, error) {
-	if len(buf) < 24 {
+	if len(buf) != 24 {
 		return consensus.BlockSizeState{}, errors.New("invalid block size state encoding")
 	}
-	count := binary.LittleEndian.Uint64(buf[16:24])
-	expected := 24 + int(count)*8
-	if len(buf) != expected {
-		return consensus.BlockSizeState{}, fmt.Errorf("invalid block size state length: %d", len(buf))
-	}
-	recent := make([]uint64, 0, count)
-	for i := 0; i < int(count); i++ {
-		start := 24 + i*8
-		recent = append(recent, binary.LittleEndian.Uint64(buf[start:start+8]))
-	}
 	return consensus.BlockSizeState{
-		Limit:            binary.LittleEndian.Uint64(buf[:8]),
-		EWMA:             binary.LittleEndian.Uint64(buf[8:16]),
-		RecentBlockSizes: recent,
+		BlockSize: binary.LittleEndian.Uint64(buf[:8]),
+		Epsilon:   binary.LittleEndian.Uint64(buf[8:16]),
+		Beta:      binary.LittleEndian.Uint64(buf[16:24]),
 	}, nil
 }
