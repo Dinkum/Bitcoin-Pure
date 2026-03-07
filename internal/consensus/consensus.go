@@ -1,11 +1,13 @@
 package consensus
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
-	"slices"
+	"runtime"
+	"sync"
 
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
@@ -21,11 +23,6 @@ type ChainParams struct {
 	HalvingInterval     uint64
 	InitialSubsidyAtoms uint64
 	BlockSizeFloor      uint64
-	BlockWindow         int
-	EWMANumer           uint64
-	EWMADenom           uint64
-	UpDriftPPM          uint64
-	DownDriftPPM        uint64
 	PowLimitBits        uint32
 	GenesisTimestamp    uint64
 	GenesisBits         uint32
@@ -39,11 +36,6 @@ func MainnetParams() ChainParams {
 		HalvingInterval:     2_500_000,
 		InitialSubsidyAtoms: 1_000_000,
 		BlockSizeFloor:      32_000_000,
-		BlockWindow:         1000,
-		EWMANumer:           1,
-		EWMADenom:           1000,
-		UpDriftPPM:          13,
-		DownDriftPPM:        13,
 		PowLimitBits:        0x1d00ffff,
 		GenesisTimestamp:    1_700_000_000,
 		GenesisBits:         0x1d00ffff,
@@ -89,17 +81,37 @@ type UtxoEntry struct {
 
 type UtxoSet map[types.OutPoint]UtxoEntry
 
+func UtxoLeaves(utxos UtxoSet) []utreexo.UtxoLeaf {
+	leaves := make([]utreexo.UtxoLeaf, 0, len(utxos))
+	for outPoint, coin := range utxos {
+		leaves = append(leaves, utreexo.UtxoLeaf{
+			OutPoint:   outPoint,
+			ValueAtoms: coin.ValueAtoms,
+			KeyHash:    coin.KeyHash,
+		})
+	}
+	return leaves
+}
+
+func UtxoAccumulator(utxos UtxoSet) (*utreexo.Accumulator, error) {
+	return utreexo.NewAccumulatorFromLeaves(UtxoLeaves(utxos))
+}
+
 type BlockSizeState struct {
-	Limit            uint64
-	EWMA             uint64
-	RecentBlockSizes []uint64
+	BlockSize uint64
+	Epsilon   uint64
+	Beta      uint64
 }
 
 func NewBlockSizeState(params ChainParams) BlockSizeState {
 	return BlockSizeState{
-		Limit: params.BlockSizeFloor,
-		EWMA:  params.BlockSizeFloor,
+		Epsilon: params.BlockSizeFloor / 2,
+		Beta:    params.BlockSizeFloor / 2,
 	}
+}
+
+func (s BlockSizeState) Limit() uint64 {
+	return s.Epsilon + s.Beta
 }
 
 type PrevBlockContext struct {
@@ -119,6 +131,8 @@ type TxValidationSummary struct {
 	Fee       uint64
 }
 
+type UtxoLookup func(types.OutPoint) (UtxoEntry, bool)
+
 type BlockValidationSummary struct {
 	Height             uint64
 	TotalFees          uint64
@@ -126,9 +140,15 @@ type BlockValidationSummary struct {
 	NextBlockSizeState BlockSizeState
 }
 
+const (
+	minParallelMerkleLeaves = 256
+	minParallelBlockHashes  = 128
+)
+
 var (
 	ErrEmptyBlock            = errors.New("empty block")
 	ErrFirstTxNotCoinbase    = errors.New("first transaction must be coinbase")
+	ErrTxOrderInvalid        = errors.New("non-coinbase transactions must be in ascending txid order")
 	ErrCoinbaseHasAuth       = errors.New("coinbase must not have auth entries")
 	ErrCoinbaseNoOutputs     = errors.New("coinbase has no outputs")
 	ErrEmptyInputs           = errors.New("non-coinbase transaction has zero inputs")
@@ -167,26 +187,120 @@ func HeaderHash(header *types.BlockHeader) [32]byte {
 }
 
 func MerkleRoot(items [][32]byte) [32]byte {
+	return merkleRoot(items, false)
+}
+
+func MerkleRootParallel(items [][32]byte) [32]byte {
+	return merkleRoot(items, true)
+}
+
+func merkleRoot(items [][32]byte, allowParallel bool) [32]byte {
 	if len(items) == 0 {
 		return [32]byte{}
 	}
 	layer := append([][32]byte(nil), items...)
 	for len(layer) > 1 {
-		next := make([][32]byte, 0, (len(layer)+1)/2)
-		for i := 0; i < len(layer); i += 2 {
-			left := layer[i]
-			right := left
-			if i+1 < len(layer) {
-				right = layer[i+1]
-			}
-			buf := make([]byte, 0, 64)
-			buf = append(buf, left[:]...)
-			buf = append(buf, right[:]...)
-			next = append(next, crypto.Sha256d(buf))
+		next := make([][32]byte, (len(layer)+1)/2)
+		if allowParallel && shouldParallelMerkleLayer(len(layer)) {
+			hashMerkleLayerParallel(next, layer)
+		} else {
+			hashMerkleLayer(next, layer)
 		}
 		layer = next
 	}
 	return layer[0]
+}
+
+func hashMerkleLayer(next, layer [][32]byte) {
+	for i := range next {
+		next[i] = hashMerklePair(layer, i*2)
+	}
+}
+
+func hashMerkleLayerParallel(next, layer [][32]byte) {
+	workers := parallelWorkers(len(next))
+	if workers <= 1 {
+		hashMerkleLayer(next, layer)
+		return
+	}
+	chunk := (len(next) + workers - 1) / workers
+	var wg sync.WaitGroup
+	for start := 0; start < len(next); start += chunk {
+		end := start + chunk
+		if end > len(next) {
+			end = len(next)
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				next[i] = hashMerklePair(layer, i*2)
+			}
+		}(start, end)
+	}
+	wg.Wait()
+}
+
+func hashMerklePair(layer [][32]byte, leftIndex int) [32]byte {
+	left := layer[leftIndex]
+	right := left
+	if leftIndex+1 < len(layer) {
+		right = layer[leftIndex+1]
+	}
+	var buf [64]byte
+	copy(buf[:32], left[:])
+	copy(buf[32:], right[:])
+	return crypto.Sha256d(buf[:])
+}
+
+func BuildBlockRoots(txs []types.Transaction) ([][32]byte, [][32]byte, [32]byte, [32]byte) {
+	txids := make([][32]byte, len(txs))
+	authids := make([][32]byte, len(txs))
+	if shouldParallelBlockHashes(len(txs)) {
+		workers := parallelWorkers(len(txs))
+		chunk := (len(txs) + workers - 1) / workers
+		var wg sync.WaitGroup
+		for start := 0; start < len(txs); start += chunk {
+			end := start + chunk
+			if end > len(txs) {
+				end = len(txs)
+			}
+			wg.Add(1)
+			go func(start, end int) {
+				defer wg.Done()
+				for i := start; i < end; i++ {
+					txids[i] = TxID(&txs[i])
+					authids[i] = AuthID(&txs[i])
+				}
+			}(start, end)
+		}
+		wg.Wait()
+	} else {
+		for i := range txs {
+			txids[i] = TxID(&txs[i])
+			authids[i] = AuthID(&txs[i])
+		}
+	}
+	return txids, authids, MerkleRootParallel(txids), MerkleRootParallel(authids)
+}
+
+func shouldParallelMerkleLayer(layerLen int) bool {
+	return layerLen >= minParallelMerkleLeaves && runtime.GOMAXPROCS(0) > 1
+}
+
+func shouldParallelBlockHashes(txCount int) bool {
+	return txCount >= minParallelBlockHashes && runtime.GOMAXPROCS(0) > 1
+}
+
+func parallelWorkers(units int) int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		return 1
+	}
+	if workers > units {
+		return units
+	}
+	return workers
 }
 
 func SubsidyAtoms(height uint64, params ChainParams) uint64 {
@@ -297,7 +411,14 @@ func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]
 	return crypto.TaggedHash(SighashTag, preimage), nil
 }
 
-func ValidateTx(tx *types.Transaction, utxos UtxoSet, _ ConsensusRules) (TxValidationSummary, error) {
+func ValidateTx(tx *types.Transaction, utxos UtxoSet, rules ConsensusRules) (TxValidationSummary, error) {
+	return ValidateTxWithLookup(tx, func(out types.OutPoint) (UtxoEntry, bool) {
+		utxo, ok := utxos[out]
+		return utxo, ok
+	}, rules)
+}
+
+func ValidateTxWithLookup(tx *types.Transaction, lookup UtxoLookup, _ ConsensusRules) (TxValidationSummary, error) {
 	if len(tx.Base.Inputs) == 0 {
 		return TxValidationSummary{}, ErrEmptyInputs
 	}
@@ -310,6 +431,7 @@ func ValidateTx(tx *types.Transaction, utxos UtxoSet, _ ConsensusRules) (TxValid
 
 	seen := make(map[types.OutPoint]struct{}, len(tx.Base.Inputs))
 	inputAmounts := make([]uint64, 0, len(tx.Base.Inputs))
+	resolvedInputs := make([]UtxoEntry, 0, len(tx.Base.Inputs))
 	var inputSum uint64
 	var outputSum uint64
 
@@ -318,7 +440,7 @@ func ValidateTx(tx *types.Transaction, utxos UtxoSet, _ ConsensusRules) (TxValid
 			return TxValidationSummary{}, ErrDuplicateInput
 		}
 		seen[input.PrevOut] = struct{}{}
-		utxo, ok := utxos[input.PrevOut]
+		utxo, ok := lookup(input.PrevOut)
 		if !ok {
 			return TxValidationSummary{}, ErrMissingUTXO
 		}
@@ -328,6 +450,7 @@ func ValidateTx(tx *types.Transaction, utxos UtxoSet, _ ConsensusRules) (TxValid
 		}
 		inputSum = next
 		inputAmounts = append(inputAmounts, utxo.ValueAtoms)
+		resolvedInputs = append(resolvedInputs, utxo)
 	}
 
 	for _, output := range tx.Base.Outputs {
@@ -341,8 +464,8 @@ func ValidateTx(tx *types.Transaction, utxos UtxoSet, _ ConsensusRules) (TxValid
 		return TxValidationSummary{}, ErrInputsLessThanOutputs
 	}
 
-	for i, input := range tx.Base.Inputs {
-		utxo := utxos[input.PrevOut]
+	for i := range tx.Base.Inputs {
+		utxo := resolvedInputs[i]
 		auth := tx.Auth.Entries[i]
 		keyHash := crypto.KeyHash(&auth.PubKey)
 		if keyHash != utxo.KeyHash {
@@ -365,66 +488,97 @@ func ValidateTx(tx *types.Transaction, utxos UtxoSet, _ ConsensusRules) (TxValid
 }
 
 func ComputedUTXORoot(utxos UtxoSet) [32]byte {
-	leaves := make([]utreexo.UtxoLeaf, 0, len(utxos))
-	for outPoint, coin := range utxos {
-		leaves = append(leaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			ValueAtoms: coin.ValueAtoms,
-			KeyHash:    coin.KeyHash,
-		})
-	}
-	return utreexo.UtxoRoot(leaves)
+	return utreexo.UtxoRoot(UtxoLeaves(utxos))
+}
+
+const (
+	ablaGammaDen   = uint64(37_938)
+	ablaThetaDen   = uint64(37_938)
+	ablaDelta      = uint64(10)
+	ablaEpsilonMax = uint64(2_837_960_626_724_546_304)
+	ablaBetaMax    = uint64(9_459_868_755_748_488_064)
+)
+
+func NextBlockSizeLimit(prev BlockSizeState, params ChainParams) uint64 {
+	return ablaNextStep(prev, params).Limit()
 }
 
 func AdvanceBlockSizeState(prev BlockSizeState, blockSize uint64, params ChainParams) BlockSizeState {
-	recent := append(append([]uint64(nil), prev.RecentBlockSizes...), blockSize)
-	if len(recent) > params.BlockWindow {
-		recent = recent[len(recent)-params.BlockWindow:]
+	next := ablaNextStep(prev, params)
+	next.BlockSize = blockSize
+	return next
+}
+
+func ablaNextStep(prev BlockSizeState, params ChainParams) BlockSizeState {
+	e := max64(prev.Epsilon, params.BlockSizeFloor/2)
+	b := max64(prev.Beta, params.BlockSizeFloor/2)
+	y := e + b
+	x := min64(prev.BlockSize, y)
+
+	nextE := e
+	nextB := b
+	decay := b / ablaThetaDen
+	threeX := new(big.Int).Mul(new(big.Int).SetUint64(x), big.NewInt(3))
+	twoE := new(big.Int).Mul(new(big.Int).SetUint64(e), big.NewInt(2))
+	if threeX.Cmp(twoE) > 0 {
+		diff := new(big.Int).Sub(threeX, twoE)
+		dENum := new(big.Int).Mul(new(big.Int).SetUint64(e), diff)
+		denInner := new(big.Int).Add(
+			new(big.Int).SetUint64(e),
+			new(big.Int).Mul(new(big.Int).SetUint64(b), big.NewInt(3)),
+		)
+		dEDen := new(big.Int).Mul(denInner, big.NewInt(int64(2*ablaGammaDen)))
+		dE := bigIntToUint64(new(big.Int).Div(dENum, dEDen))
+		nextE = bigIntToUint64(new(big.Int).Add(new(big.Int).SetUint64(e), new(big.Int).SetUint64(dE)))
+		nextB = bigIntToUint64(new(big.Int).Add(
+			new(big.Int).SetUint64(b-decay),
+			new(big.Int).Mul(new(big.Int).SetUint64(dE), new(big.Int).SetUint64(ablaDelta)),
+		))
+	} else {
+		shrinkNum := bigIntToUint64(new(big.Int).Sub(twoE, threeX))
+		shrinkDen := 2 * ablaGammaDen
+		dE := ceilDivUint64(shrinkNum, shrinkDen)
+		nextE = saturatingSub(e, dE)
+		nextB = b - decay
 	}
 
-	ewma := blockSize
-	if len(prev.RecentBlockSizes) != 0 {
-		retain := params.EWMADenom - params.EWMANumer
-		a := uint128Mul(prev.EWMA, retain)
-		b := uint128Mul(blockSize, params.EWMANumer)
-		ewma = uint64((a + b + uint128(params.EWMADenom/2)) / uint128(params.EWMADenom))
-	}
-
-	median := params.BlockSizeFloor
-	if len(recent) != 0 {
-		sorted := append([]uint64(nil), recent...)
-		slices.Sort(sorted)
-		median = sorted[len(sorted)/2]
-	}
-
-	target := max64(params.BlockSizeFloor, max64(median, ewma))
-	maxUpDelta := max64(1, prev.Limit*params.UpDriftPPM/1_000_000)
-	maxDownDelta := max64(1, prev.Limit*params.DownDriftPPM/1_000_000)
-	limit := prev.Limit
-	if target > limit {
-		limit = min64(target, limit+maxUpDelta)
-	} else if target < limit {
-		lower := max64(params.BlockSizeFloor, saturatingSub(limit, maxDownDelta))
-		limit = max64(target, lower)
-	}
-
+	nextE = clampUint64(nextE, params.BlockSizeFloor/2, ablaEpsilonMax)
+	nextB = clampUint64(nextB, params.BlockSizeFloor/2, ablaBetaMax)
 	return BlockSizeState{
-		Limit:            max64(limit, params.BlockSizeFloor),
-		EWMA:             ewma,
-		RecentBlockSizes: recent,
+		Epsilon: nextE,
+		Beta:    nextB,
 	}
 }
 
-type uint128 = uint64
-
-func uint128Mul(a, b uint64) uint128 {
-	if a == 0 || b == 0 {
+func bigIntToUint64(v *big.Int) uint64 {
+	if v == nil || v.Sign() <= 0 {
 		return 0
 	}
-	if a > ^uint64(0)/b {
+	if !v.IsUint64() {
 		return ^uint64(0)
 	}
-	return a * b
+	return v.Uint64()
+}
+
+func ceilDivUint64(num uint64, den uint64) uint64 {
+	if den == 0 {
+		return 0
+	}
+	q := num / den
+	if num%den == 0 {
+		return q
+	}
+	return q + 1
+}
+
+func clampUint64(v uint64, floor uint64, ceil uint64) uint64 {
+	if v < floor {
+		return floor
+	}
+	if v > ceil {
+		return ceil
+	}
+	return v
 }
 
 func compactToTarget(compact uint32) (*big.Int, error) {
@@ -733,59 +887,106 @@ func cloneUtxos(utxos UtxoSet) UtxoSet {
 	return out
 }
 
-func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, params ChainParams, rules ConsensusRules) (BlockValidationSummary, error) {
-	if len(block.Txs) == 0 {
-		return BlockValidationSummary{}, ErrEmptyBlock
+func blockUtxoDelta(block *types.Block) ([]types.OutPoint, []utreexo.UtxoLeaf) {
+	spent := make([]types.OutPoint, 0)
+	created := make([]utreexo.UtxoLeaf, 0)
+	for i := 1; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
+		txid := TxID(tx)
+		for _, input := range tx.Base.Inputs {
+			spent = append(spent, input.PrevOut)
+		}
+		for vout, output := range tx.Base.Outputs {
+			created = append(created, utreexo.UtxoLeaf{
+				OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
+				ValueAtoms: output.ValueAtoms,
+				KeyHash:    output.KeyHash,
+			})
+		}
 	}
-	if len(block.Encode()) > int(blockSizeState.Limit) {
-		return BlockValidationSummary{}, ErrBlockTooLarge
+	coinbase := &block.Txs[0]
+	coinbaseTxID := TxID(coinbase)
+	for vout, output := range coinbase.Base.Outputs {
+		created = append(created, utreexo.UtxoLeaf{
+			OutPoint:   types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)},
+			ValueAtoms: output.ValueAtoms,
+			KeyHash:    output.KeyHash,
+		})
+	}
+	return spent, created
+}
+
+func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, params ChainParams, rules ConsensusRules) (BlockValidationSummary, error) {
+	summary, _, err := validateAndApplyBlock(block, prev, blockSizeState, utxos, nil, params, rules)
+	return summary, err
+}
+
+func ValidateAndApplyBlockWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *utreexo.Accumulator, error) {
+	return validateAndApplyBlock(block, prev, blockSizeState, utxos, accumulator, params, rules)
+}
+
+func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *utreexo.Accumulator, error) {
+	if len(block.Txs) == 0 {
+		return BlockValidationSummary{}, nil, ErrEmptyBlock
+	}
+	if len(block.Encode()) > int(NextBlockSizeLimit(blockSizeState, params)) {
+		return BlockValidationSummary{}, nil, ErrBlockTooLarge
 	}
 
-	txids := make([][32]byte, 0, len(block.Txs))
-	authids := make([][32]byte, 0, len(block.Txs))
-	for i := range block.Txs {
-		txids = append(txids, TxID(&block.Txs[i]))
-		authids = append(authids, AuthID(&block.Txs[i]))
+	txids, _, txRoot, authRoot := BuildBlockRoots(block.Txs)
+	if txRoot != block.Header.MerkleTxIDRoot {
+		return BlockValidationSummary{}, nil, ErrMerkleTxIDMismatch
 	}
-	if MerkleRoot(txids) != block.Header.MerkleTxIDRoot {
-		return BlockValidationSummary{}, ErrMerkleTxIDMismatch
-	}
-	if MerkleRoot(authids) != block.Header.MerkleAuthRoot {
-		return BlockValidationSummary{}, ErrMerkleAuthMismatch
+	if authRoot != block.Header.MerkleAuthRoot {
+		return BlockValidationSummary{}, nil, ErrMerkleAuthMismatch
 	}
 
 	if err := ValidateHeader(&block.Header, prev, params); err != nil {
-		return BlockValidationSummary{}, err
+		return BlockValidationSummary{}, nil, err
 	}
 
 	coinbase := &block.Txs[0]
 	if len(coinbase.Base.Inputs) != 0 {
-		return BlockValidationSummary{}, ErrFirstTxNotCoinbase
+		return BlockValidationSummary{}, nil, ErrFirstTxNotCoinbase
 	}
 	if len(coinbase.Auth.Entries) != 0 {
-		return BlockValidationSummary{}, ErrCoinbaseHasAuth
+		return BlockValidationSummary{}, nil, ErrCoinbaseHasAuth
 	}
 	if len(coinbase.Base.Outputs) == 0 {
-		return BlockValidationSummary{}, ErrCoinbaseNoOutputs
+		return BlockValidationSummary{}, nil, ErrCoinbaseNoOutputs
 	}
 
 	tempUtxos := cloneUtxos(utxos)
+	claimedInputs := make(map[types.OutPoint]struct{})
 	var totalFees uint64
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
-		txSummary, err := ValidateTx(tx, tempUtxos, rules)
+		if i > 1 && bytes.Compare(txids[i-1][:], txids[i][:]) >= 0 {
+			return BlockValidationSummary{}, nil, ErrTxOrderInvalid
+		}
+		for _, input := range tx.Base.Inputs {
+			if _, ok := claimedInputs[input.PrevOut]; ok {
+				return BlockValidationSummary{}, nil, ErrDuplicateInput
+			}
+			claimedInputs[input.PrevOut] = struct{}{}
+		}
+		txSummary, err := ValidateTx(tx, utxos, rules)
 		if err != nil {
-			return BlockValidationSummary{}, err
+			return BlockValidationSummary{}, nil, err
 		}
 		nextFees := totalFees + txSummary.Fee
 		if nextFees < totalFees {
-			return BlockValidationSummary{}, ErrAmountOverflow
+			return BlockValidationSummary{}, nil, ErrAmountOverflow
 		}
 		totalFees = nextFees
 
-		for _, input := range tx.Base.Inputs {
-			delete(tempUtxos, input.PrevOut)
-		}
+	}
+
+	for spent := range claimedInputs {
+		delete(tempUtxos, spent)
+	}
+	for i := 1; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
 		txHash := TxID(tx)
 		for vout, output := range tx.Base.Outputs {
 			tempUtxos[types.OutPoint{TxID: txHash, Vout: uint32(vout)}] = UtxoEntry{
@@ -797,11 +998,11 @@ func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 
 	coinbaseValue, err := sumCoinbaseOutputs(coinbase)
 	if err != nil {
-		return BlockValidationSummary{}, err
+		return BlockValidationSummary{}, nil, err
 	}
 	subsidy := SubsidyAtoms(prev.Height+1, params)
 	if coinbaseValue > subsidy+totalFees {
-		return BlockValidationSummary{}, ErrCoinbaseOverpay
+		return BlockValidationSummary{}, nil, ErrCoinbaseOverpay
 	}
 
 	coinbaseTxID := TxID(coinbase)
@@ -812,8 +1013,23 @@ func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 		}
 	}
 
-	if rules.EnforceUTXORoot && ComputedUTXORoot(tempUtxos) != block.Header.UTXORoot {
-		return BlockValidationSummary{}, ErrUTXORootMismatch
+	var nextAccumulator *utreexo.Accumulator
+	if accumulator != nil {
+		spent, created := blockUtxoDelta(block)
+		nextAccumulator, err = accumulator.Apply(spent, created)
+		if err != nil {
+			return BlockValidationSummary{}, nil, err
+		}
+	}
+	if rules.EnforceUTXORoot {
+		root := block.Header.UTXORoot
+		if nextAccumulator != nil {
+			if nextAccumulator.Root() != root {
+				return BlockValidationSummary{}, nil, ErrUTXORootMismatch
+			}
+		} else if ComputedUTXORoot(tempUtxos) != root {
+			return BlockValidationSummary{}, nil, ErrUTXORootMismatch
+		}
 	}
 
 	for k := range utxos {
@@ -829,7 +1045,7 @@ func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 		TotalFees:          totalFees,
 		CoinbaseValue:      coinbaseValue,
 		NextBlockSizeState: nextState,
-	}, nil
+	}, nextAccumulator, nil
 }
 
 func DecodeTxHex(raw string, limits types.CodecLimits) (types.Transaction, error) {

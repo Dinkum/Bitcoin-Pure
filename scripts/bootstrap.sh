@@ -40,7 +40,7 @@ Options:
   --update         Fetch a fresh checkout from the configured Git remote and deploy it atomically
   --repo-url URL   Git remote to use for --update (otherwise uses the stored origin URL)
   --ref REF        Branch, tag, or ref to deploy during --update
-  --mining MODE    Override miner_enabled in config with on or off
+  --mining MODE    Override miner_enabled in config with on or off; enabling auto-provisions a miner wallet when needed
   --profile NAME   Override chain profile in config
   --peer HOST:PORT Add/replace configured peers
 EOF

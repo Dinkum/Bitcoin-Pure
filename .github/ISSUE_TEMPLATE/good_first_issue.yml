@@ -1,44 +1,39 @@
 name: Good First Issue
-description: (Regular devs only) Suggest a new good first issue
+description: Suggest a scoped issue suitable for a new contributor.
 labels: [good first issue]
 body:
   - type: markdown
     attributes:
       value: |
-        Please add the label "good first issue" manually before or after opening
-
-        A good first issue is an uncontroversial issue, that has a relatively unique and obvious solution
-
-        Motivate the issue and explain the solution briefly
+        Use this for well-scoped tasks with a clear success condition and low architectural risk.
   - type: textarea
     id: motivation
     attributes:
       label: Motivation
-      description: Motivate the issue
+      description: Explain why the task matters.
     validations:
       required: true
   - type: textarea
     id: solution
     attributes:
       label: Possible solution
-      description: Describe a possible solution
+      description: Describe the likely approach.
     validations:
       required: false
   - type: textarea
     id: useful-skills
     attributes:
-      label: Useful Skills
-      description: For example, “`std::thread`”, “Qt6 GUI and async GUI design” or “basic understanding of Bitcoin mining and the Bitcoin Core RPC interface”.
+      label: Useful skills
+      description: List the knowledge a contributor would need before attempting the task.
       value: |
-        * Compiling Bitcoin Core from source
-        * Running the C++ unit tests and the Python functional tests
-        * ...
+        * Running `go test ./...`
+        * Navigating `cmd/bpu-cli` and `internal/*`
+        * Basic familiarity with Bitcoin Pure consensus and node behavior
   - type: textarea
     attributes:
       label: Guidance for new contributors
-      description: Please leave this to automatically add the footer for new contributors
+      description: Add any repo-specific pointers that reduce setup and review friction.
       value: |
         Want to work on this issue?
 
-        For guidance on contributing, please read [CONTRIBUTING.md](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md) before opening your pull request.
-
+        Include your approach, the tests you plan to add or update, and the parts of the codebase you expect to touch.

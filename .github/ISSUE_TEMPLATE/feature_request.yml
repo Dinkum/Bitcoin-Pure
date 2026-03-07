@@ -1,36 +1,36 @@
 name: Feature Request
-description: Suggest an idea for this project.
-labels: [Feature]
+description: Suggest a product or protocol improvement for Bitcoin Pure.
+labels: [enhancement]
 body:
   - type: textarea
     id: feature
     attributes:
-      label: Please describe the feature you'd like to see added.
-      description: Attach screenshots or logs if applicable.
+      label: Feature request
+      description: Describe the change you want and who it helps.
     validations:
       required: true
   - type: textarea
     id: related-problem
     attributes:
-      label: Is your feature related to a problem, if so please describe it.
-      description: Attach screenshots or logs if applicable.
+      label: Related problem
+      description: Explain the operational, UX, or protocol gap behind this request.
     validations:
       required: false
   - type: textarea
     id: solution
     attributes:
-      label: Describe the solution you'd like
+      label: Proposed solution
     validations:
       required: false
   - type: textarea
     id: alternatives
     attributes:
-      label: Describe any alternatives you've considered
+      label: Alternatives considered
     validations:
       required: false
   - type: textarea
     id: additional-context
     attributes:
-      label: Please leave any additional context
+      label: Additional context
     validations:
       required: false

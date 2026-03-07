@@ -1,6 +1,7 @@
 package mempool
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -228,7 +229,7 @@ func TestAcceptTxEvictsOldestOrphan(t *testing.T) {
 	}
 }
 
-func TestSelectForBlockUsesAncestorAwarePackageOrder(t *testing.T) {
+func TestSelectForBlockExcludesSameBlockDescendantsAndReturnsLTOR(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,
 		MaxTxSize:          1_000_000,
@@ -258,11 +259,17 @@ func TestSelectForBlockUsesAncestorAwarePackageOrder(t *testing.T) {
 	}
 
 	selected, _ := pool.SelectForBlock(utxos, consensus.DefaultConsensusRules(), 1_000_000)
-	if len(selected) < 3 {
-		t.Fatalf("selected count = %d, want at least 3", len(selected))
+	if len(selected) != 2 {
+		t.Fatalf("selected count = %d, want 2", len(selected))
 	}
-	if selected[0].TxID != parentAdmission.TxID || selected[1].TxID != childAdmission.TxID || selected[2].TxID != mediumAdmission.TxID {
-		t.Fatalf("unexpected package order: got %x %x %x", selected[0].TxID, selected[1].TxID, selected[2].TxID)
+	if selected[0].TxID == childAdmission.TxID || selected[1].TxID == childAdmission.TxID {
+		t.Fatal("expected child spend to be excluded from same block selection")
+	}
+	if (selected[0].TxID != parentAdmission.TxID && selected[0].TxID != mediumAdmission.TxID) || (selected[1].TxID != parentAdmission.TxID && selected[1].TxID != mediumAdmission.TxID) {
+		t.Fatalf("unexpected selected txids: got %x %x", selected[0].TxID, selected[1].TxID)
+	}
+	if bytes.Compare(selected[0].TxID[:], selected[1].TxID[:]) >= 0 {
+		t.Fatalf("selection not in txid order: got %x before %x", selected[0].TxID, selected[1].TxID)
 	}
 }
 
@@ -404,6 +411,126 @@ func TestPrepareAdmissionAndCommitPreparedHandleSameBatchParents(t *testing.T) {
 	}
 }
 
+func TestAdvanceAdmissionSnapshotTracksSameBatchParents(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{23}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+	}
+
+	parent := spendTx(t, 1, prevOut, 50, 2, 1)
+	child := spendTx(t, 2, types.OutPoint{TxID: consensus.TxID(&parent), Vout: 0}, 49, 3, 1)
+
+	snapshot := pool.AdmissionSnapshot()
+	parentPrepared, err := pool.PrepareAdmission(parent, snapshot, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("prepare parent: %v", err)
+	}
+	parentAdmission, err := pool.CommitPrepared(parentPrepared, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("commit parent: %v", err)
+	}
+	if err := AdvanceAdmissionSnapshot(&snapshot, utxos, parentAdmission.Accepted); err != nil {
+		t.Fatalf("advance snapshot: %v", err)
+	}
+
+	childPrepared, err := pool.PrepareAdmission(child, snapshot, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("prepare child: %v", err)
+	}
+	if len(childPrepared.Missing) != 0 {
+		t.Fatalf("expected child to resolve against advanced snapshot, missing=%d", len(childPrepared.Missing))
+	}
+}
+
+func TestShortIDMatchesOnlyScansWantedIDs(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	utxos := consensus.UtxoSet{
+		{TxID: [32]byte{41}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		{TxID: [32]byte{42}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
+	}
+	first := spendTx(t, 1, types.OutPoint{TxID: [32]byte{41}, Vout: 0}, 50, 3, 1)
+	second := spendTx(t, 2, types.OutPoint{TxID: [32]byte{42}, Vout: 0}, 50, 4, 1)
+	firstAdmission, err := pool.AcceptTx(first, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept first: %v", err)
+	}
+	secondAdmission, err := pool.AcceptTx(second, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept second: %v", err)
+	}
+
+	shortIDFn := func(txid [32]byte) uint64 {
+		return uint64(txid[0])<<8 | uint64(txid[1])
+	}
+	wantFirst := shortIDFn(firstAdmission.TxID)
+	wantSecond := shortIDFn(secondAdmission.TxID)
+	matches := pool.ShortIDMatches(shortIDFn, map[uint64]struct{}{
+		wantFirst:  {},
+		0xffff:     {},
+		wantSecond: {},
+	})
+	if len(matches[wantFirst]) != 1 {
+		t.Fatalf("first short id matches = %d, want 1", len(matches[wantFirst]))
+	}
+	if len(matches[wantSecond]) != 1 {
+		t.Fatalf("second short id matches = %d, want 1", len(matches[wantSecond]))
+	}
+	if len(matches[0xffff]) != 0 {
+		t.Fatalf("unexpected unmatched short id candidates: %d", len(matches[0xffff]))
+	}
+}
+
+func TestBatchLookupHelpersPreserveRequestedOrderAndMisses(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	utxos := consensus.UtxoSet{
+		{TxID: [32]byte{51}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		{TxID: [32]byte{52}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
+	}
+	first := spendTx(t, 1, types.OutPoint{TxID: [32]byte{51}, Vout: 0}, 50, 3, 1)
+	second := spendTx(t, 2, types.OutPoint{TxID: [32]byte{52}, Vout: 0}, 50, 4, 1)
+	firstAdmission, err := pool.AcceptTx(first, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept first: %v", err)
+	}
+	secondAdmission, err := pool.AcceptTx(second, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept second: %v", err)
+	}
+
+	requested := [][32]byte{secondAdmission.TxID, {0xff}, firstAdmission.TxID}
+	missing := pool.MissingTxIDs(requested)
+	if len(missing) != 1 || missing[0] != ([32]byte{0xff}) {
+		t.Fatalf("missing txids = %x, want one miss", missing)
+	}
+
+	txs := pool.TransactionsByID(requested)
+	if len(txs) != 2 {
+		t.Fatalf("tx count = %d, want 2", len(txs))
+	}
+	if consensus.TxID(&txs[0]) != secondAdmission.TxID || consensus.TxID(&txs[1]) != firstAdmission.TxID {
+		t.Fatalf("returned tx order mismatch: got %x then %x", consensus.TxID(&txs[0]), consensus.TxID(&txs[1]))
+	}
+}
+
 func TestSelectionCandidateCountTracksIncrementalUpdates(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,
@@ -462,10 +589,11 @@ func TestAppendForBlockOnlyReturnsNewSelections(t *testing.T) {
 		t.Fatalf("accept child: %v", err)
 	}
 
+	preBlockUtxos := cloneUtxos(utxos)
 	currentUtxos := cloneUtxos(utxos)
 	selected, _ := pool.SelectForBlock(currentUtxos, consensus.DefaultConsensusRules(), 1_000_000)
-	if len(selected) != 2 {
-		t.Fatalf("initial selection len = %d, want 2", len(selected))
+	if len(selected) != 1 {
+		t.Fatalf("initial selection len = %d, want 1", len(selected))
 	}
 
 	late := spendTx(t, 4, otherPrev, 50, 5, 1)
@@ -474,7 +602,7 @@ func TestAppendForBlockOnlyReturnsNewSelections(t *testing.T) {
 		t.Fatalf("accept late tx: %v", err)
 	}
 
-	appended, appendedFees := pool.AppendForBlock(currentUtxos, consensus.DefaultConsensusRules(), 1_000_000, selected)
+	appended, appendedFees := pool.AppendForBlock(preBlockUtxos, currentUtxos, consensus.DefaultConsensusRules(), 1_000_000, selected)
 	if len(appended) != 1 {
 		t.Fatalf("appended len = %d, want 1", len(appended))
 	}
@@ -483,6 +611,46 @@ func TestAppendForBlockOnlyReturnsNewSelections(t *testing.T) {
 	}
 	if appendedFees != lateAdmission.Summary.Fee {
 		t.Fatalf("appended fees = %d, want %d", appendedFees, lateAdmission.Summary.Fee)
+	}
+}
+
+func TestSelectForBlockInPlaceAdvancesProvidedUTXOView(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	rootPrev := types.OutPoint{TxID: [32]byte{41}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		rootPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+	}
+	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+	child := spendTx(t, 2, types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}, 49, 3, 1)
+	childTxID := consensus.TxID(&child)
+	parentTxID := parentAdmission.TxID
+	if _, err := pool.AcceptTx(child, utxos, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept child: %v", err)
+	}
+
+	currentUtxos := cloneUtxos(utxos)
+	selected, _ := pool.SelectForBlockInPlace(currentUtxos, consensus.DefaultConsensusRules(), 1_000_000)
+	if len(selected) != 1 {
+		t.Fatalf("selected len = %d, want 1", len(selected))
+	}
+	if _, ok := currentUtxos[rootPrev]; ok {
+		t.Fatalf("expected original prevout to be spent from in-place view")
+	}
+	if _, ok := currentUtxos[types.OutPoint{TxID: childTxID, Vout: 0}]; ok {
+		t.Fatalf("did not expect descendant output to exist in selected block view")
+	}
+	if _, ok := currentUtxos[types.OutPoint{TxID: parentTxID, Vout: 0}]; !ok {
+		t.Fatalf("expected selected output to remain in in-place view")
 	}
 }
 

@@ -1,7 +1,9 @@
 package utreexo
 
 import (
-	"cmp"
+	"bytes"
+	"encoding/binary"
+	"fmt"
 	"slices"
 
 	"bitcoin-pure/internal/crypto"
@@ -9,8 +11,11 @@ import (
 )
 
 const (
-	UTXOLeafTag = "BPU/UtxoLeafV1"
-	UTXORootTag = "BPU/UtxoRootV1"
+	UTXOLeafTag   = "BPU/UtxoLeafV1"
+	UTXOBranchTag = "BPU/UtxoBranchV1"
+	UTXORootTag   = "BPU/UtxoRootV1"
+	outPointBytes = 36
+	keyBits       = outPointBytes * 8
 )
 
 type UtxoLeaf struct {
@@ -19,102 +24,269 @@ type UtxoLeaf struct {
 	KeyHash    [32]byte
 }
 
-func writeVarInt(out *[]byte, v uint64) {
-	switch {
-	case v <= 0xfc:
-		*out = append(*out, byte(v))
-	case v <= 0xffff:
-		*out = append(*out, 0xfd, byte(v), byte(v>>8))
-	case v <= 0xffff_ffff:
-		*out = append(*out, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-	default:
-		*out = append(*out, 0xff,
-			byte(v),
-			byte(v>>8),
-			byte(v>>16),
-			byte(v>>24),
-			byte(v>>32),
-			byte(v>>40),
-			byte(v>>48),
-			byte(v>>56),
-		)
-	}
+type keyedLeaf struct {
+	key  [outPointBytes]byte
+	hash [32]byte
 }
 
-func hashPair(left, right *[32]byte) [32]byte {
-	buf := make([]byte, 0, 64)
-	buf = append(buf, left[:]...)
-	buf = append(buf, right[:]...)
-	return crypto.Sha256d(buf)
+type Accumulator struct {
+	root  *accNode
+	count int
+}
+
+type accNode struct {
+	left  *accNode
+	right *accNode
+	leaf  *keyedLeaf
+	hash  [32]byte
+	count int
 }
 
 func LeafHash(leaf UtxoLeaf) [32]byte {
-	buf := make([]byte, 0, 76)
-	buf = append(buf, leaf.OutPoint.TxID[:]...)
-	buf = append(buf,
-		byte(leaf.OutPoint.Vout),
-		byte(leaf.OutPoint.Vout>>8),
-		byte(leaf.OutPoint.Vout>>16),
-		byte(leaf.OutPoint.Vout>>24),
-	)
-	buf = append(buf,
-		byte(leaf.ValueAtoms),
-		byte(leaf.ValueAtoms>>8),
-		byte(leaf.ValueAtoms>>16),
-		byte(leaf.ValueAtoms>>24),
-		byte(leaf.ValueAtoms>>32),
-		byte(leaf.ValueAtoms>>40),
-		byte(leaf.ValueAtoms>>48),
-		byte(leaf.ValueAtoms>>56),
-	)
+	buf := make([]byte, 0, outPointBytes+8+32)
+	key := leafKey(leaf.OutPoint)
+	buf = append(buf, key[:]...)
+	value := make([]byte, 8)
+	binary.LittleEndian.PutUint64(value, leaf.ValueAtoms)
+	buf = append(buf, value...)
 	buf = append(buf, leaf.KeyHash[:]...)
 	return crypto.TaggedHash(UTXOLeafTag, buf)
 }
 
-func ForestPeaks(leaves []UtxoLeaf) [][32]byte {
-	sorted := append([]UtxoLeaf(nil), leaves...)
-	slices.SortFunc(sorted, func(a, b UtxoLeaf) int {
-		if n := slices.Compare(a.OutPoint.TxID[:], b.OutPoint.TxID[:]); n != 0 {
-			return n
-		}
-		return cmp.Compare(a.OutPoint.Vout, b.OutPoint.Vout)
-	})
-
-	var peaks []*[32]byte
-	for _, leaf := range sorted {
-		carry := LeafHash(leaf)
-		level := 0
-		for {
-			if level == len(peaks) {
-				peaks = append(peaks, nil)
-			}
-			if peaks[level] == nil {
-				copyCarry := carry
-				peaks[level] = &copyCarry
-				break
-			}
-			next := hashPair(peaks[level], &carry)
-			peaks[level] = nil
-			carry = next
-			level++
-		}
-	}
-
-	out := make([][32]byte, 0, len(peaks))
-	for _, peak := range peaks {
-		if peak != nil {
-			out = append(out, *peak)
-		}
-	}
-	return out
+func BranchHash(left, right [32]byte) [32]byte {
+	buf := make([]byte, 0, 64)
+	buf = append(buf, left[:]...)
+	buf = append(buf, right[:]...)
+	return crypto.TaggedHash(UTXOBranchTag, buf)
 }
 
 func UtxoRoot(leaves []UtxoLeaf) [32]byte {
-	peaks := ForestPeaks(leaves)
-	buf := make([]byte, 0, 1+len(peaks)*32)
-	writeVarInt(&buf, uint64(len(peaks)))
-	for _, peak := range peaks {
-		buf = append(buf, peak[:]...)
+	if len(leaves) == 0 {
+		return crypto.TaggedHash(UTXORootTag, nil)
 	}
-	return crypto.TaggedHash(UTXORootTag, buf)
+
+	sorted := make([]keyedLeaf, 0, len(leaves))
+	for _, leaf := range leaves {
+		sorted = append(sorted, keyedLeaf{
+			key:  leafKey(leaf.OutPoint),
+			hash: LeafHash(leaf),
+		})
+	}
+	slices.SortFunc(sorted, func(a, b keyedLeaf) int {
+		return bytes.Compare(a.key[:], b.key[:])
+	})
+
+	nodeHash := merklixHash(sorted, 0)
+	return crypto.TaggedHash(UTXORootTag, nodeHash[:])
+}
+
+func NewAccumulator() *Accumulator {
+	return &Accumulator{}
+}
+
+func NewAccumulatorFromLeaves(leaves []UtxoLeaf) (*Accumulator, error) {
+	acc := NewAccumulator()
+	var err error
+	for _, leaf := range leaves {
+		acc, err = acc.Add(leaf)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return acc, nil
+}
+
+func (a *Accumulator) Root() [32]byte {
+	if a == nil || a.root == nil {
+		return crypto.TaggedHash(UTXORootTag, nil)
+	}
+	return crypto.TaggedHash(UTXORootTag, a.root.hash[:])
+}
+
+func (a *Accumulator) Count() int {
+	if a == nil {
+		return 0
+	}
+	return a.count
+}
+
+func (a *Accumulator) Add(leaf UtxoLeaf) (*Accumulator, error) {
+	if a == nil {
+		a = NewAccumulator()
+	}
+	keyed := keyedLeaf{
+		key:  leafKey(leaf.OutPoint),
+		hash: LeafHash(leaf),
+	}
+	root, err := insertLeaf(a.root, keyed, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &Accumulator{root: root, count: a.count + 1}, nil
+}
+
+func (a *Accumulator) Delete(outPoint types.OutPoint) (*Accumulator, error) {
+	if a == nil || a.root == nil {
+		return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
+	}
+	root, deleted, err := deleteLeaf(a.root, leafKey(outPoint), 0)
+	if err != nil {
+		return nil, err
+	}
+	if !deleted {
+		return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
+	}
+	return &Accumulator{root: root, count: a.count - 1}, nil
+}
+
+func (a *Accumulator) Apply(spent []types.OutPoint, created []UtxoLeaf) (*Accumulator, error) {
+	if a == nil {
+		a = NewAccumulator()
+	}
+	next := a
+	var err error
+	for _, outPoint := range spent {
+		next, err = next.Delete(outPoint)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, leaf := range created {
+		next, err = next.Add(leaf)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return next, nil
+}
+
+// Unary trie paths are compressed by advancing to the next distinguishing bit.
+func merklixHash(leaves []keyedLeaf, bitIndex int) [32]byte {
+	if len(leaves) == 1 {
+		return leaves[0].hash
+	}
+	if bitIndex >= outPointBytes*8 {
+		panic("duplicate outpoint in UTXO commitment")
+	}
+
+	split := splitAtBit(leaves, bitIndex)
+	switch {
+	case split == 0:
+		return merklixHash(leaves, bitIndex+1)
+	case split == len(leaves):
+		return merklixHash(leaves, bitIndex+1)
+	default:
+		left := merklixHash(leaves[:split], bitIndex+1)
+		right := merklixHash(leaves[split:], bitIndex+1)
+		return BranchHash(left, right)
+	}
+}
+
+func insertLeaf(node *accNode, leaf keyedLeaf, bitIndex int) (*accNode, error) {
+	if bitIndex == keyBits {
+		if node != nil && node.leaf != nil {
+			if node.leaf.key == leaf.key {
+				return nil, fmt.Errorf("duplicate outpoint in UTXO commitment")
+			}
+			return nil, fmt.Errorf("conflicting accumulator leaf at identical key depth")
+		}
+		leafCopy := leaf
+		return &accNode{
+			leaf:  &leafCopy,
+			hash:  leaf.hash,
+			count: 1,
+		}, nil
+	}
+	var left, right *accNode
+	if node != nil {
+		left = node.left
+		right = node.right
+	}
+	if bitSet(leaf.key, bitIndex) {
+		nextRight, err := insertLeaf(right, leaf, bitIndex+1)
+		if err != nil {
+			return nil, err
+		}
+		right = nextRight
+	} else {
+		nextLeft, err := insertLeaf(left, leaf, bitIndex+1)
+		if err != nil {
+			return nil, err
+		}
+		left = nextLeft
+	}
+	return makeAccNode(left, right), nil
+}
+
+func deleteLeaf(node *accNode, key [outPointBytes]byte, bitIndex int) (*accNode, bool, error) {
+	if node == nil {
+		return nil, false, nil
+	}
+	if bitIndex == keyBits {
+		if node.leaf == nil || node.leaf.key != key {
+			return nil, false, nil
+		}
+		return nil, true, nil
+	}
+	left := node.left
+	right := node.right
+	var deleted bool
+	var err error
+	if bitSet(key, bitIndex) {
+		right, deleted, err = deleteLeaf(right, key, bitIndex+1)
+	} else {
+		left, deleted, err = deleteLeaf(left, key, bitIndex+1)
+	}
+	if err != nil || !deleted {
+		return nil, deleted, err
+	}
+	return makeAccNode(left, right), true, nil
+}
+
+func makeAccNode(left, right *accNode) *accNode {
+	switch {
+	case left == nil && right == nil:
+		return nil
+	case left == nil:
+		return &accNode{
+			right: right,
+			hash:  right.hash,
+			count: right.count,
+		}
+	case right == nil:
+		return &accNode{
+			left:  left,
+			hash:  left.hash,
+			count: left.count,
+		}
+	default:
+		return &accNode{
+			left:  left,
+			right: right,
+			hash:  BranchHash(left.hash, right.hash),
+			count: left.count + right.count,
+		}
+	}
+}
+
+func splitAtBit(leaves []keyedLeaf, bitIndex int) int {
+	for i, leaf := range leaves {
+		if bitSet(leaf.key, bitIndex) {
+			return i
+		}
+	}
+	return len(leaves)
+}
+
+func bitSet(key [outPointBytes]byte, bitIndex int) bool {
+	byteIndex := bitIndex / 8
+	bitOffset := 7 - (bitIndex % 8)
+	return ((key[byteIndex] >> bitOffset) & 1) == 1
+}
+
+func leafKey(outPoint types.OutPoint) [outPointBytes]byte {
+	var key [outPointBytes]byte
+	copy(key[:32], outPoint.TxID[:])
+	binary.LittleEndian.PutUint32(key[32:], outPoint.Vout)
+	return key
 }

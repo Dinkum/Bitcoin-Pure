@@ -50,6 +50,9 @@ const (
 	CmdTxBatch
 	CmdTxRecon
 	CmdTxReq
+	CmdCompactBlock
+	CmdGetBlockTx
+	CmdBlockTx
 	CmdXThinBlock
 	CmdGetXBlockTx
 	CmdXBlockTx
@@ -176,6 +179,35 @@ type TxRequestMessage struct {
 
 func (TxRequestMessage) Command() Command { return CmdTxReq }
 
+type PrefilledTx struct {
+	Index uint32
+	Tx    types.Transaction
+}
+
+type CompactBlockMessage struct {
+	Header    types.BlockHeader
+	Nonce     uint64
+	Prefilled []PrefilledTx
+	ShortIDs  []uint64
+}
+
+func (CompactBlockMessage) Command() Command { return CmdCompactBlock }
+
+type GetBlockTxMessage struct {
+	BlockHash [32]byte
+	Indexes   []uint32
+}
+
+func (GetBlockTxMessage) Command() Command { return CmdGetBlockTx }
+
+type BlockTxMessage struct {
+	BlockHash [32]byte
+	Indexes   []uint32
+	Txs       []types.Transaction
+}
+
+func (BlockTxMessage) Command() Command { return CmdBlockTx }
+
 type XThinBlockMessage struct {
 	Header   types.BlockHeader
 	Nonce    uint64
@@ -209,7 +241,7 @@ type Conn struct {
 
 func NewConn(conn net.Conn, magic uint32, maxPayload int) *Conn {
 	if maxPayload <= 0 {
-		maxPayload = 8 << 20
+		maxPayload = 64_000_000
 	}
 	return &Conn{
 		Conn:       conn,
@@ -326,7 +358,7 @@ func encodeMessage(msg Message) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[20:28], m.Nonce)
 		buf = appendString(buf, m.UserAgent)
 		return buf, nil
-	case VerAckMessage, PingMessage, PongMessage, GetAddrMessage, AddrMessage, InvMessage, GetDataMessage, NotFoundMessage, GetHeadersMessage, HeadersMessage, GetBlocksMessage, BlockMessage, TxMessage, TxBatchMessage, TxReconMessage, TxRequestMessage, XThinBlockMessage, GetXBlockTxMessage, XBlockTxMessage:
+	case VerAckMessage, PingMessage, PongMessage, GetAddrMessage, AddrMessage, InvMessage, GetDataMessage, NotFoundMessage, GetHeadersMessage, HeadersMessage, GetBlocksMessage, BlockMessage, TxMessage, TxBatchMessage, TxReconMessage, TxRequestMessage, CompactBlockMessage, GetBlockTxMessage, BlockTxMessage, XThinBlockMessage, GetXBlockTxMessage, XBlockTxMessage:
 		return encodePayload(msg)
 	default:
 		return nil, fmt.Errorf("unsupported message type %T", msg)
@@ -373,6 +405,26 @@ func encodePayload(msg Message) ([]byte, error) {
 		return encodeHashes(m.TxIDs, maxInvPerMessage)
 	case TxRequestMessage:
 		return encodeHashes(m.TxIDs, maxInvPerMessage)
+	case CompactBlockMessage:
+		buf := append([]byte(nil), m.Header.Encode()...)
+		nonce := make([]byte, 8)
+		binary.LittleEndian.PutUint64(nonce, m.Nonce)
+		buf = append(buf, nonce...)
+		buf, err := encodePrefilledTxs(buf, m.Prefilled, maxThinBlockTxs)
+		if err != nil {
+			return nil, err
+		}
+		return encodeU64s(buf, m.ShortIDs, maxThinBlockTxs)
+	case GetBlockTxMessage:
+		buf := append([]byte(nil), m.BlockHash[:]...)
+		return encodeU32s(buf, m.Indexes, maxThinBlockTxs)
+	case BlockTxMessage:
+		buf := append([]byte(nil), m.BlockHash[:]...)
+		buf, err := encodeU32s(buf, m.Indexes, maxThinBlockTxs)
+		if err != nil {
+			return nil, err
+		}
+		return encodeTxsWithLimit(buf, m.Txs, maxThinBlockTxs)
 	case XThinBlockMessage:
 		buf := append([]byte(nil), m.Header.Encode()...)
 		nonce := make([]byte, 8)
@@ -510,6 +562,56 @@ func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Messa
 			return nil, err
 		}
 		return TxRequestMessage{TxIDs: txids}, nil
+	case CmdCompactBlock:
+		headerBytes, err := r.take(148)
+		if err != nil {
+			return nil, err
+		}
+		header, err := types.DecodeBlockHeader(headerBytes)
+		if err != nil {
+			return nil, err
+		}
+		nonce, err := r.readU64()
+		if err != nil {
+			return nil, err
+		}
+		prefilled, err := r.readPrefilledTxs(maxThinBlockTxs, limits)
+		if err != nil {
+			return nil, err
+		}
+		shortIDs, err := r.readU64s(maxThinBlockTxs)
+		if err != nil {
+			return nil, err
+		}
+		return CompactBlockMessage{Header: header, Nonce: nonce, Prefilled: prefilled, ShortIDs: shortIDs}, nil
+	case CmdGetBlockTx:
+		hashBytes, err := r.take(32)
+		if err != nil {
+			return nil, err
+		}
+		var blockHash [32]byte
+		copy(blockHash[:], hashBytes)
+		indexes, err := r.readU32s(maxThinBlockTxs)
+		if err != nil {
+			return nil, err
+		}
+		return GetBlockTxMessage{BlockHash: blockHash, Indexes: indexes}, nil
+	case CmdBlockTx:
+		hashBytes, err := r.take(32)
+		if err != nil {
+			return nil, err
+		}
+		var blockHash [32]byte
+		copy(blockHash[:], hashBytes)
+		indexes, err := r.readU32s(maxThinBlockTxs)
+		if err != nil {
+			return nil, err
+		}
+		txs, err := r.readTxs(maxThinBlockTxs, limits)
+		if err != nil {
+			return nil, err
+		}
+		return BlockTxMessage{BlockHash: blockHash, Indexes: indexes, Txs: txs}, nil
 	case CmdXThinBlock:
 		headerBytes, err := r.take(148)
 		if err != nil {
@@ -567,6 +669,22 @@ func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Messa
 	default:
 		return nil, ErrBadCommand
 	}
+}
+
+func encodePrefilledTxs(buf []byte, items []PrefilledTx, limit int) ([]byte, error) {
+	if len(items) > limit {
+		return nil, fmt.Errorf("too many prefilled txs: %d", len(items))
+	}
+	count := make([]byte, 4)
+	binary.LittleEndian.PutUint32(count, uint32(len(items)))
+	buf = append(buf, count...)
+	for _, item := range items {
+		index := make([]byte, 4)
+		binary.LittleEndian.PutUint32(index, item.Index)
+		buf = append(buf, index...)
+		buf = appendBytes(buf, item.Tx.Encode())
+	}
+	return buf, nil
 }
 
 func encodeInvs(items []InvVector) ([]byte, error) {
@@ -861,6 +979,33 @@ func (r *reader) readTxs(limit int, limits types.CodecLimits) ([]types.Transacti
 		txs = append(txs, tx)
 	}
 	return txs, nil
+}
+
+func (r *reader) readPrefilledTxs(limit int, limits types.CodecLimits) ([]PrefilledTx, error) {
+	count, err := r.readU32()
+	if err != nil {
+		return nil, err
+	}
+	if int(count) > limit {
+		return nil, ErrPayloadTooLarge
+	}
+	items := make([]PrefilledTx, 0, count)
+	for i := uint32(0); i < count; i++ {
+		index, err := r.readU32()
+		if err != nil {
+			return nil, err
+		}
+		txBytes, err := r.readBytes()
+		if err != nil {
+			return nil, err
+		}
+		tx, err := types.DecodeTransactionWithLimits(txBytes, limits)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, PrefilledTx{Index: index, Tx: tx})
+	}
+	return items, nil
 }
 
 func (r *reader) readHashes(limit int) ([][32]byte, error) {

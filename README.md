@@ -2,6 +2,8 @@
 
 Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to preserve the spirit of Bitcoin while making the system simpler, more scalable, and more focused on cash use.
 
+** DISCLAIMER: This project is in beta and very much a proof of concept **
+
 ## Protocol Highlights
 
 - One output type, one spend rule, no scripting
@@ -16,6 +18,7 @@ Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to pre
 
 - Full node runtime with persisted chainstate, restart-safe replay, and best-chain tracking.
 - Integrated miner and package-aware mempool management with orphan handling.
+- Local wallet management for receive addresses and signed transaction send flow.
 - Binary peer-to-peer transport with header-first sync, transaction reconciliation, batched relay, and short-ID block propagation with full-block fallback.
 - Authenticated HTTP JSON-RPC for node control and automation.
 - Public ASCII status page served directly from the node so you can watch tip, peers, mempool, mining, and host health from the server IP.
@@ -36,6 +39,8 @@ Useful flags:
 - `--peer <host:port>` seeds the node with a peer.
 - `--update` pulls a fresh checkout from Git and deploys it atomically.
 
+Fresh installs keep mining off until `miner_keyhash_hex` is configured, so a new node does not mine to an unknown destination by default.
+
 Examples:
 
 ```bash
@@ -52,6 +57,7 @@ What `./install` does:
 - installs system dependencies
 - builds `bpu-cli`
 - writes node config
+- keeps mining disabled until a destination key hash is configured
 - installs and enables a `systemd` service
 - brings up the node with the public monitor page and RPC surface
 - uses staged deploys and rollback checks for `--update`
@@ -69,7 +75,8 @@ Bitcoin-Pure/
 │   ├── node/          # service runtime, sync, RPC, mining, dashboard
 │   ├── p2p/           # wire protocol, relay, peer transport
 │   ├── storage/       # persisted chainstate and block metadata
-│   └── types/         # canonical node data structures
+│   ├── types/         # canonical node data structures
+│   └── wallet/        # local wallet storage, receive addresses, signing
 ├── fixtures/          # deterministic test and replay fixtures
 └── version.json       # release version source of truth
 ```
@@ -78,4 +85,4 @@ Bitcoin-Pure/
 
 - `GET /` serves the cached public ASCII node monitor.
 - `POST /` serves authenticated JSON-RPC.
-- `bpu-cli` exposes local chain, tx, block, and node commands.
+- `bpu-cli` exposes local chain, wallet, tx, block, and node commands.

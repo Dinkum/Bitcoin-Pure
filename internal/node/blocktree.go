@@ -29,6 +29,7 @@ func (c *ChainState) Clone() *ChainState {
 	}
 	out.blockSizeState = c.blockSizeState
 	out.utxos = cloneUtxos(c.utxos)
+	out.utxoAcc = c.utxoAcc
 	return out
 }
 
@@ -36,10 +37,11 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 	if c.height == nil || c.tipHeader == nil {
 		return ErrNoTip
 	}
+	workingUtxos := cloneUtxos(c.utxos)
 	for _, tx := range block.Txs {
 		txid := consensus.TxID(&tx)
 		for vout := range tx.Base.Outputs {
-			delete(c.utxos, types.OutPoint{TxID: txid, Vout: uint32(vout)})
+			delete(workingUtxos, types.OutPoint{TxID: txid, Vout: uint32(vout)})
 		}
 	}
 
@@ -61,7 +63,7 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 			if entry.OutPoint != input.PrevOut {
 				return fmt.Errorf("undo outpoint mismatch for input %v", input.PrevOut)
 			}
-			c.utxos[input.PrevOut] = entry.Entry
+			workingUtxos[input.PrevOut] = entry.Entry
 		}
 		txid := consensus.TxID(&block.Txs[i])
 		for vout := range block.Txs[i].Base.Outputs {
@@ -77,6 +79,12 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 	c.height = &height
 	c.tipHeader = &header
 	c.blockSizeState = parent.BlockSizeState
+	c.utxos = workingUtxos
+	acc, err := consensus.UtxoAccumulator(workingUtxos)
+	if err != nil {
+		return err
+	}
+	c.utxoAcc = acc
 	return nil
 }
 
@@ -142,15 +150,32 @@ func (p *PersistentChainState) ApplyBlock(block *types.Block) (consensus.BlockVa
 	if err != nil {
 		return consensus.BlockValidationSummary{}, err
 	}
+	isActiveTipExtension := forkHeight == oldTipHeightForState(p.state) && len(steps) == 1 && parentEntry.Height == bestTipEntry.Height &&
+		consensus.HeaderHash(&parentEntry.Header) == bestTipHash
 	oldTipHeight := *p.state.TipHeight()
-	if err := p.store.WriteFullState(storedState); err != nil {
-		return consensus.BlockValidationSummary{}, err
-	}
-	if err := p.store.RewriteActiveHeights(forkHeight, oldTipHeight, connectedEntries); err != nil {
-		return consensus.BlockValidationSummary{}, err
+	if isActiveTipExtension {
+		undo := undoByHash[blockHash]
+		spent, created := activeTipDelta(block, storedState.UTXOs, undo)
+		if err := p.store.AppendValidatedBlock(storedState, block, &newTipEntry, undo, spent, created); err != nil {
+			return consensus.BlockValidationSummary{}, err
+		}
+	} else {
+		if err := p.store.WriteFullState(storedState); err != nil {
+			return consensus.BlockValidationSummary{}, err
+		}
+		if err := p.store.RewriteActiveHeights(forkHeight, oldTipHeight, connectedEntries); err != nil {
+			return consensus.BlockValidationSummary{}, err
+		}
 	}
 	p.state = tempState
 	return summary, nil
+}
+
+func oldTipHeightForState(state *ChainState) uint64 {
+	if state == nil || state.TipHeight() == nil {
+		return 0
+	}
+	return *state.TipHeight()
 }
 
 func (p *PersistentChainState) branchSteps(parentEntry *storage.BlockIndexEntry, block *types.Block, existing *storage.BlockIndexEntry) ([]branchStep, uint64, error) {
@@ -311,6 +336,25 @@ func captureUndoEntries(block *types.Block, utxos consensus.UtxoSet) ([]storage.
 		}
 	}
 	return undo, nil
+}
+
+func activeTipDelta(block *types.Block, finalUTXOs consensus.UtxoSet, undo []storage.BlockUndoEntry) ([]types.OutPoint, map[types.OutPoint]consensus.UtxoEntry) {
+	spent := make([]types.OutPoint, 0, len(undo))
+	for _, entry := range undo {
+		spent = append(spent, entry.OutPoint)
+	}
+	created := make(map[types.OutPoint]consensus.UtxoEntry)
+	for _, tx := range block.Txs {
+		txid := consensus.TxID(&tx)
+		for vout := range tx.Base.Outputs {
+			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+			entry, ok := finalUTXOs[outPoint]
+			if ok {
+				created[outPoint] = entry
+			}
+		}
+	}
+	return spent, created
 }
 
 func reverseBranchSteps(steps []branchStep) {

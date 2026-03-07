@@ -38,6 +38,17 @@ func TestConnMessageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNewConnDefaultPayloadCeilingCoversConsensusFloor(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn := NewConn(left, MagicForProfile(types.Regtest), 0)
+	if conn.maxPayload < 32_000_000 {
+		t.Fatalf("max payload = %d, want at least 32000000", conn.maxPayload)
+	}
+}
+
 func TestHandshakeRoundTrip(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
