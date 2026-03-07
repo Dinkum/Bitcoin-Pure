@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -x "${REPO_ROOT}/scripts/bootstrap.sh" ]]; then
+	echo "install: missing scripts/bootstrap.sh" >&2
+	exit 1
+fi
+
+exec "${REPO_ROOT}/scripts/bootstrap.sh" --source "${REPO_ROOT}" "$@"

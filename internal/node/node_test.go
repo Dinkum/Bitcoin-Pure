@@ -121,6 +121,69 @@ func nextCoinbaseBlock(prevHeight uint64, prev types.BlockHeader, currentUTXOs c
 	}
 }
 
+func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHeader, currentUTXOs consensus.UtxoSet, txs []types.Transaction, timestamp uint64) types.Block {
+	t.Helper()
+	params := consensus.RegtestParams()
+	blockTxs := append([]types.Transaction(nil), txs...)
+	tempUtxos := cloneUtxos(currentUTXOs)
+	var totalFees uint64
+	for i := 1; i < len(blockTxs); i++ {
+		summary, err := consensus.ValidateTx(&blockTxs[i], tempUtxos, consensus.DefaultConsensusRules())
+		if err != nil {
+			t.Fatalf("validate tx %d: %v", i, err)
+		}
+		totalFees += summary.Fee
+		txid := consensus.TxID(&blockTxs[i])
+		for _, input := range blockTxs[i].Base.Inputs {
+			delete(tempUtxos, input.PrevOut)
+		}
+		for vout, output := range blockTxs[i].Base.Outputs {
+			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
+				ValueAtoms: output.ValueAtoms,
+				KeyHash:    output.KeyHash,
+			}
+		}
+	}
+
+	coinbase := blockTxs[0]
+	if len(coinbase.Base.Outputs) == 0 {
+		t.Fatal("coinbase missing outputs")
+	}
+	coinbase.Base.Outputs[0].ValueAtoms += totalFees
+	blockTxs[0] = coinbase
+	coinbaseTxID := consensus.TxID(&blockTxs[0])
+	for vout, output := range blockTxs[0].Base.Outputs {
+		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntry{
+			ValueAtoms: output.ValueAtoms,
+			KeyHash:    output.KeyHash,
+		}
+	}
+
+	txids := make([][32]byte, 0, len(blockTxs))
+	authids := make([][32]byte, 0, len(blockTxs))
+	for i := range blockTxs {
+		txids = append(txids, consensus.TxID(&blockTxs[i]))
+		authids = append(authids, consensus.AuthID(&blockTxs[i]))
+	}
+	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: prevHeight, Header: prev}, params)
+	if err != nil {
+		t.Fatalf("next work required: %v", err)
+	}
+	header := types.BlockHeader{
+		Version:        1,
+		PrevBlockHash:  consensus.HeaderHash(&prev),
+		MerkleTxIDRoot: consensus.MerkleRoot(txids),
+		MerkleAuthRoot: consensus.MerkleRoot(authids),
+		UTXORoot:       consensus.ComputedUTXORoot(tempUtxos),
+		Timestamp:      timestamp,
+		NBits:          nbits,
+	}
+	return types.Block{
+		Header: mineHeaderForNodeTest(header),
+		Txs:    blockTxs,
+	}
+}
+
 func TestApplyBlockRequiresTip(t *testing.T) {
 	state := NewChainState(types.Regtest)
 	_, err := state.ApplyBlock(&types.Block{})
@@ -372,6 +435,84 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	}
 }
 
+func TestPersistentChainStateAppliesAndDisconnectsBlockWithIntraBlockSpend(t *testing.T) {
+	path := t.TempDir()
+	persistent, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistent.Close()
+
+	params := consensus.RegtestParams()
+	genesisCoinbase := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Outputs: []types.TxOutput{{ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)}},
+		},
+	}
+	genesisTxID := consensus.TxID(&genesisCoinbase)
+	genesisAuthID := consensus.AuthID(&genesisCoinbase)
+	genesisUTXOs := consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
+	}
+	genesis := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			MerkleTxIDRoot: consensus.MerkleRoot([][32]byte{genesisTxID}),
+			MerkleAuthRoot: consensus.MerkleRoot([][32]byte{genesisAuthID}),
+			UTXORoot:       consensus.ComputedUTXORoot(genesisUTXOs),
+			Timestamp:      params.GenesisTimestamp,
+			NBits:          params.GenesisBits,
+		},
+		Txs: []types.Transaction{genesisCoinbase},
+	}
+	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+
+	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	parent := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
+	child := spendTxForNodeTest(t, 8, types.OutPoint{TxID: consensus.TxID(&parent), Vout: 0}, 49, 9, 1)
+	block := blockWithTxsForNodeTest(t, 0, genesis.Header, persistent.ChainState().UTXOs(), []types.Transaction{
+		{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}}}},
+		parent,
+		child,
+	}, genesis.Header.Timestamp+600)
+
+	if _, err := persistent.ApplyBlock(&block); err != nil {
+		t.Fatalf("apply block with intra-block spend: %v", err)
+	}
+	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != 1 {
+		t.Fatalf("unexpected tip after apply: %v", persistent.ChainState().TipHeight())
+	}
+
+	blockHash := consensus.HeaderHash(&block.Header)
+	undo, err := persistent.Store().GetUndo(&blockHash)
+	if err != nil {
+		t.Fatalf("get undo: %v", err)
+	}
+	if len(undo) != 1 {
+		t.Fatalf("undo entries = %d, want 1", len(undo))
+	}
+	if undo[0].OutPoint != genesisOut {
+		t.Fatalf("undo outpoint = %+v, want %+v", undo[0].OutPoint, genesisOut)
+	}
+
+	parentEntry, err := persistent.Store().GetBlockIndex(&block.Header.PrevBlockHash)
+	if err != nil {
+		t.Fatalf("get parent entry: %v", err)
+	}
+	if parentEntry == nil {
+		t.Fatal("missing parent entry")
+	}
+	if err := persistent.ChainState().DisconnectBlock(&block, undo, parentEntry); err != nil {
+		t.Fatalf("disconnect block with intra-block spend: %v", err)
+	}
+	if _, ok := persistent.ChainState().UTXOs()[genesisOut]; !ok {
+		t.Fatal("expected genesis outpoint to be restored after disconnect")
+	}
+}
+
 func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	pool := mempool.NewWithConfig(mempool.PoolConfig{
 		MinRelayFeePerByte: 0,
@@ -530,6 +671,74 @@ func TestOSReleaseLooksLikeUbuntu(t *testing.T) {
 	}
 }
 
+func TestOpenServiceDefaultsMinerWorkersWhenEnabled(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerEnabled: true,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	wantWorkers := defaultMinerWorkers()
+	if svc.cfg.MinerWorkers != wantWorkers {
+		t.Fatalf("miner workers = %d, want %d", svc.cfg.MinerWorkers, wantWorkers)
+	}
+	info := svc.Info()
+	if !info.MinerEnabled {
+		t.Fatal("expected miner to remain enabled")
+	}
+	if info.MinerWorkers != wantWorkers {
+		t.Fatalf("service info miner workers = %d, want %d", info.MinerWorkers, wantWorkers)
+	}
+}
+
+func TestOnInvMessageRequestsHeadersThroughLastUnknownBlock(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	first := [32]byte{0x11}
+	second := [32]byte{0x22}
+	msg := p2p.InvMessage{Items: []p2p.InvVector{
+		{Type: p2p.InvTypeBlock, Hash: first},
+		{Type: p2p.InvTypeBlock, Hash: second},
+	}}
+	if err := svc.onInvMessage(peer, msg); err != nil {
+		t.Fatalf("onInvMessage: %v", err)
+	}
+
+	select {
+	case envelope := <-peer.sendQ:
+		req, ok := envelope.msg.(p2p.GetHeadersMessage)
+		if !ok {
+			t.Fatalf("message type = %T, want GetHeadersMessage", envelope.msg)
+		}
+		if req.StopHash != second {
+			t.Fatalf("stop hash = %x, want %x", req.StopHash, second)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("timed out waiting for getheaders request")
+	}
+}
+
 func TestRenderBlockFlowMarksTip(t *testing.T) {
 	blocks := []dashboardBlock{
 		{Height: 10, Hash: [32]byte{0xaa}},
@@ -541,6 +750,166 @@ func TestRenderBlockFlowMarksTip(t *testing.T) {
 	}
 	if !strings.Contains(out, "aa000000") || !strings.Contains(out, "bb000000") {
 		t.Fatalf("expected short hashes in block flow: %q", out)
+	}
+}
+
+func TestDashboardSystemSummaryComputesWindowAverages(t *testing.T) {
+	now := time.Now()
+	stats := dashboardSystemStats{
+		samples: []dashboardSystemSample{
+			{
+				takenAt:       now.Add(-9 * time.Minute),
+				cpuBusyTicks:  100,
+				cpuTotalTicks: 200,
+				rxBytes:       1_000,
+				txBytes:       2_000,
+				memUsedBytes:  2 * 1024 * 1024 * 1024,
+				memTotalBytes: 8 * 1024 * 1024 * 1024,
+				load1:         0.8,
+				load5:         0.6,
+				load15:        0.4,
+				runningProcs:  2,
+				totalProcs:    120,
+				cores:         4,
+			},
+			{
+				takenAt:       now,
+				cpuBusyTicks:  180,
+				cpuTotalTicks: 300,
+				rxBytes:       61_000,
+				txBytes:       122_000,
+				memUsedBytes:  4 * 1024 * 1024 * 1024,
+				memTotalBytes: 8 * 1024 * 1024 * 1024,
+				load1:         1.2,
+				load5:         0.9,
+				load15:        0.7,
+				runningProcs:  3,
+				totalProcs:    128,
+				cores:         4,
+			},
+		},
+	}
+
+	summary := stats.summary(now, 10*time.Minute)
+	if !summary.HasCPU {
+		t.Fatal("expected cpu summary")
+	}
+	if summary.CPUPercent < 79.9 || summary.CPUPercent > 80.1 {
+		t.Fatalf("cpu percent = %.2f, want about 80", summary.CPUPercent)
+	}
+	if !summary.HasNetwork {
+		t.Fatal("expected network summary")
+	}
+	if summary.RxBytesPerSec < 110 || summary.RxBytesPerSec > 112 {
+		t.Fatalf("rx bytes/sec = %.2f, want about 111.11", summary.RxBytesPerSec)
+	}
+	if !summary.HasMemory {
+		t.Fatal("expected memory summary")
+	}
+	wantMem := uint64(3 * 1024 * 1024 * 1024)
+	if summary.AvgMemUsedBytes != wantMem {
+		t.Fatalf("avg mem = %d, want %d", summary.AvgMemUsedBytes, wantMem)
+	}
+	if summary.RunningProcs != 3 || summary.TotalProcs != 128 || summary.Cores != 4 {
+		t.Fatalf("unexpected process/core summary: %+v", summary)
+	}
+}
+
+func TestRenderDashboardSystemSectionIncludesHumanReadableStats(t *testing.T) {
+	section := renderDashboardSystemSection(dashboardSystemSummary{
+		Window:          10 * time.Minute,
+		CPUPercent:      42.5,
+		HasCPU:          true,
+		RxBytesPerSec:   2 * 1024 * 1024,
+		TxBytesPerSec:   512 * 1024,
+		HasNetwork:      true,
+		AvgMemUsedBytes: 3 * 1024 * 1024 * 1024,
+		MemTotalBytes:   8 * 1024 * 1024 * 1024,
+		HasMemory:       true,
+		Load1:           0.42,
+		Load5:           0.37,
+		Load15:          0.31,
+		HasLoad:         true,
+		RunningProcs:    2,
+		TotalProcs:      140,
+		Cores:           4,
+	})
+
+	for _, want := range []string{
+		"Node System (avg 10m)",
+		"42.5%",
+		"2.0 MB/s",
+		"512.0 KB/s",
+		"3.0 GB / 8.0 GB (38%)",
+		"0.42 / 0.37 / 0.31",
+		"2 run / 140 total",
+		"4 cores",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("expected %q in section:\n%s", want, section)
+		}
+	}
+}
+
+func TestPeerInfoUsesObservedHeight(t *testing.T) {
+	svc := &Service{
+		peers: make(map[string]*peerConn),
+	}
+	peer := &peerConn{
+		addr:     "127.0.0.1:18444",
+		outbound: true,
+		version:  p2p.VersionMessage{Height: 7, UserAgent: "bpu/go"},
+	}
+	peer.noteProgress(time.Unix(100, 0))
+	svc.peers[peer.addr] = peer
+
+	if got := svc.PeerInfo()[0].Height; got != 7 {
+		t.Fatalf("peer height = %d, want handshake height 7", got)
+	}
+
+	peer.noteHeight(11)
+	if got := svc.PeerInfo()[0].Height; got != 11 {
+		t.Fatalf("peer height = %d, want observed height 11", got)
+	}
+}
+
+func TestOnPeerHeadersUpdatesObservedPeerHeight(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	first := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := state.ApplyBlock(&first); err != nil {
+		t.Fatal(err)
+	}
+	second := nextCoinbaseBlock(1, first.Header, state.UTXOs(), 4, first.Header.Timestamp+600)
+
+	peer := &peerConn{
+		addr:        "127.0.0.1:18444",
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+		version:     p2p.VersionMessage{Height: 0, UserAgent: "bpu/go"},
+	}
+
+	if err := svc.onPeerMessage(peer, p2p.HeadersMessage{Headers: []types.BlockHeader{first.Header, second.Header}}); err != nil {
+		t.Fatalf("onPeerMessage headers: %v", err)
+	}
+	if got := peer.snapshotHeight(); got != 2 {
+		t.Fatalf("observed peer height = %d, want 2", got)
 	}
 }
 

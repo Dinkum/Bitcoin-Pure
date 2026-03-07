@@ -16,8 +16,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -51,8 +53,8 @@ type ServiceConfig struct {
 	MaxDescendants     int
 	MaxOrphans         int
 	MinerEnabled       bool
+	MinerWorkers       int
 	MinerKeyHash       [32]byte
-	MineInterval       time.Duration
 	GenesisFixture     string
 }
 
@@ -67,7 +69,7 @@ type ServiceInfo struct {
 	P2PAddr        string   `json:"p2p_addr"`
 	Peers          []string `json:"peers"`
 	MinerEnabled   bool     `json:"miner_enabled"`
-	MineIntervalMS int64    `json:"mine_interval_ms"`
+	MinerWorkers   int      `json:"miner_workers"`
 	GenesisFixture string   `json:"genesis_fixture"`
 }
 
@@ -117,6 +119,7 @@ type Service struct {
 	recentBlks    recentBlockCache
 	templateStats templateBuildTelemetry
 	dashboard     dashboardCache
+	systemStats   dashboardSystemStats
 	startedAt     time.Time
 	publicPage    bool
 	listener      net.Listener
@@ -133,7 +136,8 @@ type peerConn struct {
 	outbound        bool
 	wire            *p2p.Conn
 	version         p2p.VersionMessage
-	lastProgress    time.Time
+	lastProgress    atomic.Int64
+	bestHeight      atomic.Uint64
 	sendQ           chan outboundMessage
 	closed          chan struct{}
 	closeOnce       sync.Once
@@ -240,6 +244,52 @@ type dashboardBlock struct {
 	Hash   [32]byte
 }
 
+type dashboardSystemStats struct {
+	mu      sync.Mutex
+	samples []dashboardSystemSample
+}
+
+type dashboardSystemSample struct {
+	takenAt       time.Time
+	cpuBusyTicks  uint64
+	cpuTotalTicks uint64
+	rxBytes       uint64
+	txBytes       uint64
+	memUsedBytes  uint64
+	memTotalBytes uint64
+	load1         float64
+	load5         float64
+	load15        float64
+	runningProcs  int
+	totalProcs    int
+	cores         int
+}
+
+type dashboardSystemSummary struct {
+	Window          time.Duration
+	CPUPercent      float64
+	HasCPU          bool
+	RxBytesPerSec   float64
+	TxBytesPerSec   float64
+	HasNetwork      bool
+	AvgMemUsedBytes uint64
+	MemTotalBytes   uint64
+	HasMemory       bool
+	Load1           float64
+	Load5           float64
+	Load15          float64
+	HasLoad         bool
+	RunningProcs    int
+	TotalProcs      int
+	Cores           int
+}
+
+const (
+	dashboardSystemSampleInterval = 30 * time.Second
+	dashboardSystemWindow         = 10 * time.Minute
+	dashboardSystemRetention      = 12 * time.Minute
+)
+
 type pendingThinBlock struct {
 	hash   [32]byte
 	header types.BlockHeader
@@ -285,6 +335,9 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	}
 	if cfg.MaxOrphans <= 0 {
 		cfg.MaxOrphans = 128
+	}
+	if cfg.MinerEnabled && cfg.MinerWorkers <= 0 {
+		cfg.MinerWorkers = defaultMinerWorkers()
 	}
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 5 * time.Second
@@ -446,13 +499,25 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 		}(addr)
 	}
-	if s.cfg.MinerEnabled && s.cfg.MineInterval > 0 {
-		s.logger.Info("background miner enabled", slog.Duration("interval", s.cfg.MineInterval))
+	if s.publicPage {
+		if err := s.recordDashboardSystemSample(); err != nil {
+			s.logger.Debug("dashboard system sampler warmup failed", slog.Any("error", err))
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.minerLoop()
+			s.dashboardSystemLoop()
 		}()
+	}
+	if s.cfg.MinerEnabled {
+		s.logger.Info("continuous miner enabled", slog.Int("workers", s.cfg.MinerWorkers))
+		for workerID := 0; workerID < s.cfg.MinerWorkers; workerID++ {
+			s.wg.Add(1)
+			go func(workerID int) {
+				defer s.wg.Done()
+				s.minerLoop(workerID)
+			}(workerID)
+		}
 	}
 	select {
 	case <-ctx.Done():
@@ -541,18 +606,19 @@ func (s *Service) handlePeer(conn net.Conn, outbound bool) {
 		return
 	}
 	peer := &peerConn{
-		addr:         addr,
-		outbound:     outbound,
-		wire:         wire,
-		version:      remoteVersion,
-		lastProgress: time.Now(),
-		sendQ:        make(chan outboundMessage, 512),
-		closed:       make(chan struct{}),
-		queuedInv:    make(map[p2p.InvVector]int),
-		queuedTx:     make(map[[32]byte]int),
-		knownTx:      make(map[[32]byte]struct{}),
-		pendingThin:  make(map[[32]byte]*pendingThinBlock),
+		addr:        addr,
+		outbound:    outbound,
+		wire:        wire,
+		version:     remoteVersion,
+		sendQ:       make(chan outboundMessage, 512),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
 	}
+	peer.noteProgress(time.Now())
+	peer.noteHeight(remoteVersion.Height)
 	s.peerMu.Lock()
 	s.peers[addr] = peer
 	s.peerMu.Unlock()
@@ -590,7 +656,7 @@ func (s *Service) handlePeer(conn net.Conn, outbound bool) {
 			}
 			return
 		}
-		peer.lastProgress = time.Now()
+		peer.noteProgress(time.Now())
 		if err := s.onPeerMessage(peer, msg); err != nil {
 			s.logger.Warn("peer message handling failed", slog.String("addr", addr), slog.String("type", fmt.Sprintf("%T", msg)), slog.Any("error", err))
 			return
@@ -771,6 +837,9 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 			return err
 		}
 		if applied > 0 {
+			peer.noteHeight(s.headerHeight())
+		}
+		if applied > 0 {
 			s.logger.Info("applied peer headers", slog.String("addr", peer.addr), slog.Int("count", applied), slog.Uint64("header_height", s.headerHeight()))
 		}
 		return s.requestBlocks(peer)
@@ -841,7 +910,7 @@ func (s *Service) Info() ServiceInfo {
 		P2PAddr:        s.cfg.P2PAddr,
 		Peers:          peers,
 		MinerEnabled:   s.cfg.MinerEnabled,
-		MineIntervalMS: s.cfg.MineInterval.Milliseconds(),
+		MinerWorkers:   s.cfg.MinerWorkers,
 		GenesisFixture: s.cfg.GenesisFixture,
 	}
 }
@@ -968,11 +1037,21 @@ func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, snapshot me
 
 func (s *Service) MineBlocks(count int) ([]string, error) {
 	hashes := make([]string, 0, count)
-	items := make([]p2p.InvVector, 0, count)
 	for len(hashes) < count {
-		block, err := s.BuildBlockTemplate()
+		hash, err := s.mineOneBlock()
 		if err != nil {
 			return hashes, err
+		}
+		hashes = append(hashes, hex.EncodeToString(hash[:]))
+	}
+	return hashes, nil
+}
+
+func (s *Service) mineOneBlock() ([32]byte, error) {
+	for {
+		block, err := s.BuildBlockTemplate()
+		if err != nil {
+			return [32]byte{}, err
 		}
 		hash := consensus.HeaderHash(&block.Header)
 
@@ -980,7 +1059,7 @@ func (s *Service) MineBlocks(count int) ([]string, error) {
 		currentTip := s.chainState.ChainState().TipHeader()
 		if currentTip == nil {
 			s.stateMu.Unlock()
-			return hashes, ErrNoTip
+			return [32]byte{}, ErrNoTip
 		}
 		if block.Header.PrevBlockHash != consensus.HeaderHash(currentTip) {
 			s.stateMu.Unlock()
@@ -988,20 +1067,20 @@ func (s *Service) MineBlocks(count int) ([]string, error) {
 		}
 		if _, err := s.chainState.ApplyBlock(&block); err != nil {
 			s.stateMu.Unlock()
-			return hashes, err
+			return [32]byte{}, err
 		}
 		if err := s.headerChain.ApplyHeader(&block.Header); err != nil {
 			s.stateMu.Unlock()
-			return hashes, err
+			return [32]byte{}, err
 		}
 		stored, err := s.headerChain.StoredState()
 		if err != nil {
 			s.stateMu.Unlock()
-			return hashes, err
+			return [32]byte{}, err
 		}
 		if err := s.chainState.Store().WriteHeaderState(stored); err != nil {
 			s.stateMu.Unlock()
-			return hashes, err
+			return [32]byte{}, err
 		}
 		height := uint64(0)
 		if tip := s.chainState.ChainState().TipHeight(); tip != nil {
@@ -1012,17 +1091,15 @@ func (s *Service) MineBlocks(count int) ([]string, error) {
 		s.pool.RemoveConfirmed(&block)
 		s.cacheRecentBlock(block)
 		s.cacheRecentHeader(block.Header)
-		hashes = append(hashes, hex.EncodeToString(hash[:]))
-		items = append(items, p2p.InvVector{Type: p2p.InvTypeBlock, Hash: hash})
+		s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
 		s.logger.Info("block accepted",
 			slog.Uint64("height", height),
 			slog.String("hash", hex.EncodeToString(hash[:])),
 			slog.Int("txs", len(block.Txs)),
 			slog.Int("mempool_size", s.pool.Count()),
 		)
+		return hash, nil
 	}
-	s.broadcastInvToPeers(s.peerSnapshot(), items)
-	return hashes, nil
 }
 
 func (s *Service) BuildBlockTemplate() (types.Block, error) {
@@ -1054,18 +1131,28 @@ func (s *Service) BuildBlockTemplate() (types.Block, error) {
 	return cloneBlock(block), nil
 }
 
-func (s *Service) minerLoop() {
-	ticker := time.NewTicker(s.cfg.MineInterval)
-	defer ticker.Stop()
+func (s *Service) minerLoop(workerID int) {
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-ticker.C:
-			if _, err := s.MineBlocks(1); err != nil {
-				s.logger.Warn("background mining failed", slog.Any("error", err))
-			}
+		default:
 		}
+		hash, err := s.mineOneBlock()
+		if err != nil {
+			if errors.Is(err, ErrNoTip) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			s.logger.Warn("continuous mining failed", slog.Int("worker", workerID), slog.Any("error", err))
+			select {
+			case <-s.stopCh:
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+			continue
+		}
+		s.logger.Debug("miner worker found block", slog.Int("worker", workerID), slog.String("hash", hex.EncodeToString(hash[:])))
 	}
 }
 
@@ -1565,6 +1652,7 @@ func (s *Service) acceptPeerBlockMessage(peer *peerConn, block *types.Block) err
 		return err
 	}
 	if applied {
+		peer.noteHeight(s.blockHeight())
 		hash := consensus.HeaderHash(&block.Header)
 		s.logger.Info("applied peer block", slog.String("addr", peer.addr), slog.Uint64("block_height", s.blockHeight()))
 		s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
@@ -1663,6 +1751,30 @@ func (s *Service) cachedDashboardHTML() (string, time.Time, error) {
 	return s.dashboard.body, s.dashboard.renderedAt, nil
 }
 
+func (s *Service) dashboardSystemLoop() {
+	ticker := time.NewTicker(dashboardSystemSampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			if err := s.recordDashboardSystemSample(); err != nil {
+				s.logger.Debug("dashboard system sampler failed", slog.Any("error", err))
+			}
+		}
+	}
+}
+
+func (s *Service) recordDashboardSystemSample() error {
+	sample, err := readDashboardSystemSample(time.Now())
+	if err != nil {
+		return err
+	}
+	s.systemStats.record(sample)
+	return nil
+}
+
 func (s *Service) renderDashboardHTML() (string, error) {
 	info := s.Info()
 	peers := s.PeerInfo()
@@ -1672,6 +1784,7 @@ func (s *Service) renderDashboardHTML() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	system := s.systemStats.summary(time.Now(), dashboardSystemWindow)
 	mempoolEntries := s.pool.Snapshot()
 	health := s.dashboardHealth(info, peers)
 
@@ -1695,9 +1808,12 @@ func (s *Service) renderDashboardHTML() (string, error) {
 	body.WriteString(fmt.Sprintf(" UTXO Root     : %s\n", shortHexString(info.UTXORoot, 16)))
 	body.WriteString(fmt.Sprintf(" Mempool       : %-12d Orphans       : %-12d\n", s.pool.Count(), s.pool.OrphanCount()))
 	body.WriteString(fmt.Sprintf(" Peers         : %-12d Miner         : %-12t\n", len(peers), info.MinerEnabled))
-	body.WriteString(fmt.Sprintf(" Mine Interval : %-12d Template      : hits=%d rebuilds=%d frontier=%d\n",
-		info.MineIntervalMS, template.CacheHits, template.Rebuilds, template.FrontierCandidates))
+	body.WriteString(fmt.Sprintf(" Miner Workers : %-12d Template      : hits=%d rebuilds=%d frontier=%d\n",
+		info.MinerWorkers, template.CacheHits, template.Rebuilds, template.FrontierCandidates))
 	body.WriteString("+----------------------------------------------------+\n\n")
+
+	body.WriteString(renderDashboardSystemSection(system))
+	body.WriteString("\n")
 
 	body.WriteString("Block Flow\n")
 	body.WriteString(renderBlockFlow(blocks))
@@ -2010,9 +2126,9 @@ func (s *Service) PeerInfo() []PeerInfo {
 		out = append(out, PeerInfo{
 			Addr:         peer.addr,
 			Outbound:     peer.outbound,
-			Height:       peer.version.Height,
+			Height:       peer.snapshotHeight(),
 			UserAgent:    peer.version.UserAgent,
-			LastProgress: peer.lastProgress.Unix(),
+			LastProgress: peer.snapshotProgressUnix(),
 		})
 	}
 	slices.SortFunc(out, func(a, b PeerInfo) int {
@@ -2057,7 +2173,6 @@ func (s *Service) requestBlocks(peer *peerConn) error {
 
 func (s *Service) onInvMessage(peer *peerConn, msg p2p.InvMessage) error {
 	var getData []p2p.InvVector
-	var requestHeaders bool
 	var stopHash [32]byte
 	for _, item := range msg.Items {
 		switch item.Type {
@@ -2077,9 +2192,8 @@ func (s *Service) onInvMessage(peer *peerConn, msg p2p.InvMessage) error {
 				return err
 			}
 			if entry == nil {
-				requestHeaders = true
 				stopHash = item.Hash
-				break
+				continue
 			}
 			block, err := s.chainState.Store().GetBlock(&item.Hash)
 			if err != nil {
@@ -2089,17 +2203,46 @@ func (s *Service) onInvMessage(peer *peerConn, msg p2p.InvMessage) error {
 				getData = append(getData, item)
 			}
 		}
-		if requestHeaders {
-			break
-		}
 	}
-	if requestHeaders {
-		return peer.send(p2p.GetHeadersMessage{Locator: s.blockLocator(), StopHash: stopHash})
+	if stopHash != ([32]byte{}) {
+		if err := peer.send(p2p.GetHeadersMessage{Locator: s.blockLocator(), StopHash: stopHash}); err != nil {
+			return err
+		}
 	}
 	if len(getData) == 0 {
 		return nil
 	}
 	return peer.send(p2p.GetDataMessage{Items: getData})
+}
+
+func (p *peerConn) noteProgress(at time.Time) {
+	p.lastProgress.Store(at.Unix())
+}
+
+func (p *peerConn) noteHeight(height uint64) {
+	for {
+		current := p.bestHeight.Load()
+		if height <= current {
+			return
+		}
+		if p.bestHeight.CompareAndSwap(current, height) {
+			return
+		}
+	}
+}
+
+func (p *peerConn) snapshotHeight() uint64 {
+	if height := p.bestHeight.Load(); height > 0 {
+		return height
+	}
+	return p.version.Height
+}
+
+func (p *peerConn) snapshotProgressUnix() int64 {
+	if unix := p.lastProgress.Load(); unix > 0 {
+		return unix
+	}
+	return 0
 }
 
 func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error {
@@ -2954,6 +3097,22 @@ func renderDashboardBanner() string {
 	}, "\n")
 }
 
+func renderDashboardSystemSection(summary dashboardSystemSummary) string {
+	var out strings.Builder
+	title := fmt.Sprintf("Node System (avg %s)", formatDashboardWindow(summary.Window))
+	out.WriteString(title)
+	out.WriteString("\n")
+	out.WriteString("+-------------------- Host Stats --------------------+\n")
+	out.WriteString(fmt.Sprintf(" CPU         : %-12s Network      : up %-9s down %-9s\n",
+		formatDashboardCPU(summary), formatDashboardNetworkRate(summary.TxBytesPerSec, summary.HasNetwork), formatDashboardNetworkRate(summary.RxBytesPerSec, summary.HasNetwork)))
+	out.WriteString(fmt.Sprintf(" RAM         : %-12s Load Avg     : %s\n",
+		formatDashboardMemory(summary), formatDashboardLoad(summary)))
+	out.WriteString(fmt.Sprintf(" Processes   : %-12s Server       : %s\n",
+		formatDashboardProcesses(summary), formatDashboardCores(summary)))
+	out.WriteString("+----------------------------------------------------+\n")
+	return out.String()
+}
+
 func renderBlockFlow(blocks []dashboardBlock) string {
 	if len(blocks) == 0 {
 		return "  no blocks indexed yet\n"
@@ -3016,6 +3175,122 @@ func renderMempoolSketch(entries []mempool.SnapshotEntry) string {
 	return out.String()
 }
 
+func (stats *dashboardSystemStats) record(sample dashboardSystemSample) {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	stats.samples = append(stats.samples, sample)
+	cutoff := sample.takenAt.Add(-dashboardSystemRetention)
+	keep := 0
+	for keep < len(stats.samples) && stats.samples[keep].takenAt.Before(cutoff) {
+		keep++
+	}
+	if keep > 0 {
+		stats.samples = append([]dashboardSystemSample(nil), stats.samples[keep:]...)
+	}
+}
+
+func (stats *dashboardSystemStats) summary(now time.Time, window time.Duration) dashboardSystemSummary {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	if len(stats.samples) == 0 {
+		return dashboardSystemSummary{}
+	}
+	start := 0
+	cutoff := now.Add(-window)
+	for i := range stats.samples {
+		if !stats.samples[i].takenAt.Before(cutoff) {
+			if i > 0 {
+				start = i - 1
+			} else {
+				start = i
+			}
+			break
+		}
+		start = i
+	}
+	windowSamples := stats.samples[start:]
+	if len(windowSamples) == 0 {
+		return dashboardSystemSummary{}
+	}
+	first := windowSamples[0]
+	last := windowSamples[len(windowSamples)-1]
+	summary := dashboardSystemSummary{
+		Window:        last.takenAt.Sub(first.takenAt),
+		MemTotalBytes: last.memTotalBytes,
+		RunningProcs:  last.runningProcs,
+		TotalProcs:    last.totalProcs,
+		Cores:         last.cores,
+	}
+	var memUsedTotal uint64
+	var load1Total float64
+	var load5Total float64
+	var load15Total float64
+	for _, sample := range windowSamples {
+		memUsedTotal += sample.memUsedBytes
+		load1Total += sample.load1
+		load5Total += sample.load5
+		load15Total += sample.load15
+	}
+	summary.AvgMemUsedBytes = memUsedTotal / uint64(len(windowSamples))
+	summary.HasMemory = summary.MemTotalBytes > 0
+	summary.Load1 = load1Total / float64(len(windowSamples))
+	summary.Load5 = load5Total / float64(len(windowSamples))
+	summary.Load15 = load15Total / float64(len(windowSamples))
+	summary.HasLoad = true
+	if len(windowSamples) >= 2 {
+		totalDelta := last.cpuTotalTicks - first.cpuTotalTicks
+		busyDelta := last.cpuBusyTicks - first.cpuBusyTicks
+		if totalDelta > 0 {
+			summary.CPUPercent = (float64(busyDelta) / float64(totalDelta)) * 100
+			summary.HasCPU = true
+		}
+		elapsed := last.takenAt.Sub(first.takenAt).Seconds()
+		if elapsed > 0 {
+			summary.RxBytesPerSec = float64(last.rxBytes-first.rxBytes) / elapsed
+			summary.TxBytesPerSec = float64(last.txBytes-first.txBytes) / elapsed
+			summary.HasNetwork = true
+		}
+	}
+	return summary
+}
+
+func readDashboardSystemSample(now time.Time) (dashboardSystemSample, error) {
+	if runtime.GOOS != "linux" {
+		return dashboardSystemSample{}, errors.New("dashboard system stats are only supported on linux")
+	}
+	busyTicks, totalTicks, err := readProcCPUTicks()
+	if err != nil {
+		return dashboardSystemSample{}, err
+	}
+	rxBytes, txBytes, err := readProcNetworkBytes()
+	if err != nil {
+		return dashboardSystemSample{}, err
+	}
+	memUsedBytes, memTotalBytes, err := readProcMemoryUsage()
+	if err != nil {
+		return dashboardSystemSample{}, err
+	}
+	load1, load5, load15, runningProcs, totalProcs, err := readProcLoadAvg()
+	if err != nil {
+		return dashboardSystemSample{}, err
+	}
+	return dashboardSystemSample{
+		takenAt:       now,
+		cpuBusyTicks:  busyTicks,
+		cpuTotalTicks: totalTicks,
+		rxBytes:       rxBytes,
+		txBytes:       txBytes,
+		memUsedBytes:  memUsedBytes,
+		memTotalBytes: memTotalBytes,
+		load1:         load1,
+		load5:         load5,
+		load15:        load15,
+		runningProcs:  runningProcs,
+		totalProcs:    totalProcs,
+		cores:         runtime.NumCPU(),
+	}, nil
+}
+
 func formatDashboardDuration(d time.Duration) string {
 	if d < 0 {
 		d = 0
@@ -3025,6 +3300,238 @@ func formatDashboardDuration(d time.Duration) string {
 	minutes := (totalSeconds % 3600) / 60
 	seconds := totalSeconds % 60
 	return fmt.Sprintf("%02dh %02dm %02ds", hours, minutes, seconds)
+}
+
+func formatDashboardWindow(d time.Duration) string {
+	if d <= 0 {
+		return "warming up"
+	}
+	totalSeconds := int64(d / time.Second)
+	if totalSeconds >= 600 {
+		return "10m"
+	}
+	if totalSeconds >= 60 {
+		minutes := totalSeconds / 60
+		seconds := totalSeconds % 60
+		if seconds == 0 {
+			return fmt.Sprintf("%dm", minutes)
+		}
+		return fmt.Sprintf("%dm%02ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", totalSeconds)
+}
+
+func formatDashboardCPU(summary dashboardSystemSummary) string {
+	if !summary.HasCPU {
+		return "sampling..."
+	}
+	return fmt.Sprintf("%.1f%%", summary.CPUPercent)
+}
+
+func formatDashboardNetworkRate(rate float64, ok bool) string {
+	if !ok {
+		return "sampling..."
+	}
+	return formatHumanRate(rate)
+}
+
+func formatDashboardMemory(summary dashboardSystemSummary) string {
+	if !summary.HasMemory {
+		return "unavailable"
+	}
+	used := formatHumanBytes(summary.AvgMemUsedBytes)
+	total := formatHumanBytes(summary.MemTotalBytes)
+	if summary.MemTotalBytes == 0 {
+		return used
+	}
+	pct := (float64(summary.AvgMemUsedBytes) / float64(summary.MemTotalBytes)) * 100
+	return fmt.Sprintf("%s / %s (%.0f%%)", used, total, pct)
+}
+
+func formatDashboardLoad(summary dashboardSystemSummary) string {
+	if !summary.HasLoad {
+		return "unavailable"
+	}
+	return fmt.Sprintf("%.2f / %.2f / %.2f", summary.Load1, summary.Load5, summary.Load15)
+}
+
+func formatDashboardProcesses(summary dashboardSystemSummary) string {
+	if summary.TotalProcs == 0 {
+		return "unavailable"
+	}
+	return fmt.Sprintf("%d run / %d total", summary.RunningProcs, summary.TotalProcs)
+}
+
+func formatDashboardCores(summary dashboardSystemSummary) string {
+	if summary.Cores <= 0 {
+		return "host stats pending"
+	}
+	if summary.Cores == 1 {
+		return "1 core"
+	}
+	return fmt.Sprintf("%d cores", summary.Cores)
+}
+
+func formatHumanBytes(bytes uint64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(bytes)
+	unit := units[0]
+	for i := 1; i < len(units) && value >= 1024; i++ {
+		value /= 1024
+		unit = units[i]
+	}
+	if unit == "B" {
+		return fmt.Sprintf("%d %s", bytes, unit)
+	}
+	return fmt.Sprintf("%.1f %s", value, unit)
+}
+
+func formatHumanRate(bytesPerSecond float64) string {
+	units := []string{"B/s", "KB/s", "MB/s", "GB/s", "TB/s"}
+	value := bytesPerSecond
+	unit := units[0]
+	for i := 1; i < len(units) && value >= 1024; i++ {
+		value /= 1024
+		unit = units[i]
+	}
+	if unit == "B/s" {
+		return fmt.Sprintf("%.0f %s", value, unit)
+	}
+	return fmt.Sprintf("%.1f %s", value, unit)
+}
+
+func readProcCPUTicks() (uint64, uint64, error) {
+	buf, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, line := range strings.Split(string(buf), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 8 || fields[0] != "cpu" {
+			continue
+		}
+		values := make([]uint64, 0, len(fields)-1)
+		for _, raw := range fields[1:] {
+			value, err := strconv.ParseUint(raw, 10, 64)
+			if err != nil {
+				return 0, 0, err
+			}
+			values = append(values, value)
+		}
+		if len(values) < 8 {
+			return 0, 0, errors.New("proc stat cpu line missing counters")
+		}
+		busy := values[0] + values[1] + values[2] + values[5] + values[6] + values[7]
+		var total uint64
+		for _, value := range values {
+			total += value
+		}
+		return busy, total, nil
+	}
+	return 0, 0, errors.New("proc stat cpu line not found")
+}
+
+func readProcNetworkBytes() (uint64, uint64, error) {
+	buf, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return 0, 0, err
+	}
+	var rxTotal uint64
+	var txTotal uint64
+	for _, line := range strings.Split(string(buf), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, ":") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		iface := strings.TrimSpace(parts[0])
+		if iface == "" || iface == "lo" {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) < 16 {
+			continue
+		}
+		rx, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			return 0, 0, err
+		}
+		tx, err := strconv.ParseUint(fields[8], 10, 64)
+		if err != nil {
+			return 0, 0, err
+		}
+		rxTotal += rx
+		txTotal += tx
+	}
+	return rxTotal, txTotal, nil
+}
+
+func readProcMemoryUsage() (uint64, uint64, error) {
+	buf, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, err
+	}
+	values := make(map[string]uint64)
+	for _, line := range strings.Split(string(buf), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key := strings.TrimSuffix(fields[0], ":")
+		value, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, 0, err
+		}
+		values[key] = value * 1024
+	}
+	total := values["MemTotal"]
+	if total == 0 {
+		return 0, 0, errors.New("meminfo missing MemTotal")
+	}
+	available := values["MemAvailable"]
+	if available > total {
+		available = total
+	}
+	return total - available, total, nil
+}
+
+func readProcLoadAvg() (float64, float64, float64, int, int, error) {
+	buf, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	fields := strings.Fields(string(buf))
+	if len(fields) < 4 {
+		return 0, 0, 0, 0, 0, errors.New("loadavg missing fields")
+	}
+	load1, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	load5, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	load15, err := strconv.ParseFloat(fields[2], 64)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	processParts := strings.SplitN(fields[3], "/", 2)
+	if len(processParts) != 2 {
+		return 0, 0, 0, 0, 0, errors.New("loadavg missing process counts")
+	}
+	running, err := strconv.Atoi(processParts[0])
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	total, err := strconv.Atoi(processParts[1])
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	return load1, load5, load15, running, total, nil
 }
 
 func shortHash(hash [32]byte) string {
@@ -3056,6 +3563,14 @@ func osReleaseLooksLikeUbuntu(raw string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(info["ID_LIKE"]), "ubuntu")
+}
+
+func defaultMinerWorkers() int {
+	workers := runtime.NumCPU() / 2
+	if workers < 1 {
+		return 1
+	}
+	return workers
 }
 
 func parseOSRelease(raw string) map[string]string {

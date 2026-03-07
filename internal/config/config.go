@@ -26,8 +26,8 @@ type Config struct {
 	MaxMessageBytes    int      `json:"max_message_bytes"`
 	MinRelayFeePerByte uint64   `json:"min_relay_fee_per_byte"`
 	MinerEnabled       bool     `json:"miner_enabled"`
+	MinerWorkers       int      `json:"miner_workers"`
 	MinerKeyHashHex    string   `json:"miner_keyhash_hex"`
-	MineIntervalMS     int      `json:"mine_interval_ms"`
 	GenesisFixture     string   `json:"genesis_fixture"`
 }
 
@@ -48,7 +48,7 @@ func Default() Config {
 		StallTimeoutMS:     15000,
 		MaxMessageBytes:    8 << 20,
 		MinRelayFeePerByte: 1,
-		MineIntervalMS:     0,
+		MinerEnabled:       true,
 		GenesisFixture:     "fixtures/genesis/regtest.json",
 	}
 }
