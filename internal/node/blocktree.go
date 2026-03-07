@@ -36,14 +36,6 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 	if c.height == nil || c.tipHeader == nil {
 		return ErrNoTip
 	}
-	expectedUndo := 0
-	for i := 1; i < len(block.Txs); i++ {
-		expectedUndo += len(block.Txs[i].Base.Inputs)
-	}
-	if len(undo) != expectedUndo {
-		return fmt.Errorf("block undo mismatch: expected %d entries, got %d", expectedUndo, len(undo))
-	}
-
 	for _, tx := range block.Txs {
 		txid := consensus.TxID(&tx)
 		for vout := range tx.Base.Outputs {
@@ -52,8 +44,18 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 	}
 
 	undoIndex := 0
+	// Outputs created earlier in the same block are deleted above and should not be
+	// restored from undo; only spends that reached into the pre-block UTXO set
+	// consume undo entries.
+	intraBlockOutputs := make(map[types.OutPoint]struct{})
 	for i := 1; i < len(block.Txs); i++ {
 		for _, input := range block.Txs[i].Base.Inputs {
+			if _, ok := intraBlockOutputs[input.PrevOut]; ok {
+				continue
+			}
+			if undoIndex >= len(undo) {
+				return fmt.Errorf("block undo mismatch: missing undo entry for input %v", input.PrevOut)
+			}
 			entry := undo[undoIndex]
 			undoIndex++
 			if entry.OutPoint != input.PrevOut {
@@ -61,6 +63,13 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 			}
 			c.utxos[input.PrevOut] = entry.Entry
 		}
+		txid := consensus.TxID(&block.Txs[i])
+		for vout := range block.Txs[i].Base.Outputs {
+			intraBlockOutputs[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = struct{}{}
+		}
+	}
+	if undoIndex != len(undo) {
+		return fmt.Errorf("block undo mismatch: unused undo entries %d", len(undo)-undoIndex)
 	}
 
 	height := parent.Height
@@ -277,13 +286,28 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 
 func captureUndoEntries(block *types.Block, utxos consensus.UtxoSet) ([]storage.BlockUndoEntry, error) {
 	undo := make([]storage.BlockUndoEntry, 0)
+	preBlock := cloneUtxos(utxos)
+	tempUtxos := cloneUtxos(utxos)
 	for i := 1; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
+		txid := consensus.TxID(tx)
 		for _, input := range block.Txs[i].Base.Inputs {
-			entry, ok := utxos[input.PrevOut]
+			entry, ok := tempUtxos[input.PrevOut]
 			if !ok {
 				return nil, fmt.Errorf("missing utxo for undo capture: %v", input.PrevOut)
 			}
-			undo = append(undo, storage.BlockUndoEntry{OutPoint: input.PrevOut, Entry: entry})
+			// Only spends that reach into the pre-block UTXO set need an undo record.
+			// Same-block dependency edges are rewound by deleting this block's outputs.
+			if _, existed := preBlock[input.PrevOut]; existed {
+				undo = append(undo, storage.BlockUndoEntry{OutPoint: input.PrevOut, Entry: entry})
+			}
+			delete(tempUtxos, input.PrevOut)
+		}
+		for vout, output := range tx.Base.Outputs {
+			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
+				ValueAtoms: output.ValueAtoms,
+				KeyHash:    output.KeyHash,
+			}
 		}
 	}
 	return undo, nil

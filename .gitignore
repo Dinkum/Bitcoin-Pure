@@ -23,8 +23,11 @@
 # Previous releases
 /releases
 /works
+/Works
 /specs
 /benchmarks
+/REFERENCE_NODES
+/.codex-tmp
 
 # cargo default target dir
 target/

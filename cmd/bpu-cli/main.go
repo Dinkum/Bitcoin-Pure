@@ -239,7 +239,8 @@ func runServe(args []string) error {
 	stallTimeout := fs.Duration("stall-timeout", 0, "")
 	maxMessageBytes := fs.Int("max-message-bytes", 0, "")
 	minRelayFeePerByte := fs.Uint64("min-relay-fee-per-byte", 0, "")
-	mineInterval := fs.Duration("mine-interval", 0, "")
+	miningMode := fs.String("mining", "", "")
+	minerWorkers := fs.Int("miner-workers", 0, "")
 	minerKeyHashHex := fs.String("miner-keyhash", "", "")
 	genesisFixture := fs.String("genesis", "", "")
 	if err := fs.Parse(args); err != nil {
@@ -308,9 +309,19 @@ func runServe(args []string) error {
 	if *minRelayFeePerByte > 0 {
 		cfg.MinRelayFeePerByte = *minRelayFeePerByte
 	}
-	if *mineInterval > 0 {
+	if *miningMode != "" {
+		switch strings.ToLower(strings.TrimSpace(*miningMode)) {
+		case "on":
+			cfg.MinerEnabled = true
+		case "off":
+			cfg.MinerEnabled = false
+		default:
+			return fmt.Errorf("invalid --mining value %q: want on or off", *miningMode)
+		}
+	}
+	if *minerWorkers > 0 {
+		cfg.MinerWorkers = *minerWorkers
 		cfg.MinerEnabled = true
-		cfg.MineIntervalMS = int(mineInterval.Milliseconds())
 	}
 	if *minerKeyHashHex != "" {
 		cfg.MinerKeyHashHex = *minerKeyHashHex
@@ -365,8 +376,8 @@ func runServe(args []string) error {
 		MaxMessageBytes:    cfg.MaxMessageBytes,
 		MinRelayFeePerByte: cfg.MinRelayFeePerByte,
 		MinerEnabled:       cfg.MinerEnabled,
+		MinerWorkers:       cfg.MinerWorkers,
 		MinerKeyHash:       keyHash,
-		MineInterval:       time.Duration(cfg.MineIntervalMS) * time.Millisecond,
 		GenesisFixture:     cfg.GenesisFixture,
 	}, &loadedGenesis.Block)
 	if err != nil {
@@ -382,7 +393,7 @@ func runServe(args []string) error {
 		slog.Int("max_inbound_peers", cfg.MaxInboundPeers),
 		slog.Int("max_outbound_peers", cfg.MaxOutboundPeers),
 		slog.Bool("miner_enabled", cfg.MinerEnabled),
-		slog.Int("mine_interval_ms", cfg.MineIntervalMS),
+		slog.Int("miner_workers", cfg.MinerWorkers),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -397,7 +408,11 @@ func runServe(args []string) error {
 	}
 	fmt.Printf("log: %s\n", cfg.LogPath)
 	if cfg.MinerEnabled {
-		fmt.Printf("miner_interval_ms: %d\n", cfg.MineIntervalMS)
+		if cfg.MinerWorkers > 0 {
+			fmt.Printf("miner_workers: %d\n", cfg.MinerWorkers)
+		} else {
+			fmt.Println("miner_workers: auto")
+		}
 	}
 	return svc.Start(ctx)
 }
