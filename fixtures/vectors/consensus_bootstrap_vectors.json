@@ -1,0 +1,19 @@
+{
+  "vectors_version": 1,
+  "sighash_tag": "BPU/SigHashV1",
+  "utxo_root_tag": "BPU/UtxoRootV1",
+  "utxo_leaf_tag": "BPU/UtxoLeafV1",
+  "empty_utxo_root_hex": "46e434dabaa30352693810f5268acc33ab331b4353f849e5f56b2f296f16f8f4",
+  "mainnet": {
+    "genesis_header_hash_hex": "6a1162c93672b249606ac886a974895ba21b9b5aaa35485263136b561235c8fd",
+    "genesis_txid_hex": "16f76035f36bb4ec06d92d572e737d34e3dceff31e7dee25f229d8b04b1c78c3",
+    "genesis_authid_hex": "1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a",
+    "utxo_root_after_genesis_hex": "7bae2a2d0848a4e0c4dfdb1364884cdad3d708b7bf3abaac375503186846bde4"
+  },
+  "regtest": {
+    "genesis_header_hash_hex": "af6aa51bf7f4bf599eea2c9fcec7c7b9f6d23a06a7c0caced27ed69d73b3498e",
+    "genesis_txid_hex": "75eb5fbbc4f747ce393266b0b053110f455f590a15f463b7f363ee091adfc5a0",
+    "genesis_authid_hex": "1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a",
+    "utxo_root_after_genesis_hex": "69ed02462be95a5bc75e70125422f369d02a230bab01c4a353001e9962b224c7"
+  }
+}
