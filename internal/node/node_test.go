@@ -1,9 +1,13 @@
 package node
 
 import (
+	"encoding/hex"
 	"errors"
+	"io"
 	"math/big"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -696,6 +700,66 @@ func TestOpenServiceDefaultsMinerWorkersWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestOpenServiceDefaultsRPCHardening(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		RPCAddr:      "127.0.0.1:18443",
+		RPCAuthToken: "test-token",
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	if svc.cfg.RPCIdleTimeout != 30*time.Second {
+		t.Fatalf("rpc idle timeout = %s, want 30s", svc.cfg.RPCIdleTimeout)
+	}
+	if svc.cfg.RPCMaxHeaderBytes != 8<<10 {
+		t.Fatalf("rpc max header bytes = %d, want 8192", svc.cfg.RPCMaxHeaderBytes)
+	}
+}
+
+func TestPeerWriteLoopSetsWriteDeadline(t *testing.T) {
+	conn := &deadlineSpyConn{}
+	svc := &Service{
+		cfg:    ServiceConfig{Profile: types.Regtest, StallTimeout: time.Second},
+		stopCh: make(chan struct{}),
+	}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 1),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+		wire:        p2p.NewConn(conn, p2p.MagicForProfile(types.Regtest), 8<<20),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.peerWriteLoop(peer)
+	}()
+
+	peer.sendQ <- outboundMessage{msg: p2p.PingMessage{Nonce: 1}}
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if conn.sawNonZeroWriteDeadline() {
+			close(svc.stopCh)
+			<-done
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(svc.stopCh)
+	<-done
+	t.Fatal("expected peer write loop to set a write deadline")
+}
+
 func TestOnInvMessageRequestsHeadersThroughLastUnknownBlock(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -739,8 +803,42 @@ func TestOnInvMessageRequestsHeadersThroughLastUnknownBlock(t *testing.T) {
 	}
 }
 
+type deadlineSpyConn struct {
+	mu                  sync.Mutex
+	sawNonZeroWriteTime bool
+}
+
+func (c *deadlineSpyConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (c *deadlineSpyConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *deadlineSpyConn) Close() error                { return nil }
+func (c *deadlineSpyConn) LocalAddr() net.Addr         { return deadlineSpyAddr("local") }
+func (c *deadlineSpyConn) RemoteAddr() net.Addr        { return deadlineSpyAddr("remote") }
+func (c *deadlineSpyConn) SetDeadline(time.Time) error { return nil }
+func (c *deadlineSpyConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *deadlineSpyConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !deadline.IsZero() {
+		c.sawNonZeroWriteTime = true
+	}
+	return nil
+}
+
+func (c *deadlineSpyConn) sawNonZeroWriteDeadline() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sawNonZeroWriteTime
+}
+
+type deadlineSpyAddr string
+
+func (a deadlineSpyAddr) Network() string { return "tcp" }
+func (a deadlineSpyAddr) String() string  { return string(a) }
+
 func TestRenderBlockFlowMarksTip(t *testing.T) {
-	blocks := []dashboardBlock{
+	blocks := []dashboardBlockPage{
 		{Height: 10, Hash: [32]byte{0xaa}},
 		{Height: 11, Hash: [32]byte{0xbb}},
 	}
@@ -748,8 +846,11 @@ func TestRenderBlockFlowMarksTip(t *testing.T) {
 	if !strings.Contains(out, "tip:11") {
 		t.Fatalf("expected tip marker in block flow: %q", out)
 	}
-	if !strings.Contains(out, "aa000000") || !strings.Contains(out, "bb000000") {
+	if !strings.Contains(out, "aa0000000000") || !strings.Contains(out, "bb0000000000") {
 		t.Fatalf("expected short hashes in block flow: %q", out)
+	}
+	if !strings.Contains(out, "=======>") {
+		t.Fatalf("expected wide arrows in block flow: %q", out)
 	}
 }
 
@@ -836,7 +937,7 @@ func TestRenderDashboardSystemSectionIncludesHumanReadableStats(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"Node System (avg 10m)",
+		"NODE SYSTEM (AVG 10M)",
 		"42.5%",
 		"2.0 MB/s",
 		"512.0 KB/s",
@@ -848,6 +949,47 @@ func TestRenderDashboardSystemSectionIncludesHumanReadableStats(t *testing.T) {
 		if !strings.Contains(section, want) {
 			t.Fatalf("expected %q in section:\n%s", want, section)
 		}
+	}
+}
+
+func TestRenderPublicDashboardPagesExposeRecentBlockAndTxLinks(t *testing.T) {
+	blockHash := [32]byte{0xaa}
+	txID := [32]byte{0xbb}
+	view := &publicDashboardView{
+		nodeID:  "NODE1234",
+		info:    ServiceInfo{TipHeight: 12, TipHeaderHash: hex.EncodeToString(blockHash[:]), UTXORoot: strings.Repeat("c", 64)},
+		pow:     dashboardPowSummary{Algorithm: "ASERT per-block", TargetSpacing: 10 * time.Minute, AvgBlockInterval: 10 * time.Minute},
+		fees:    dashboardFeeSummary{Clear: dashboardMempoolClearEstimate{Blocks: 1, Time: 10 * time.Minute}},
+		mempool: dashboardMempoolSummary{},
+		tpsChart: dashboardTPSChart{
+			Label:     "TPS last 10m",
+			Buckets:   []float64{1, 2, 3},
+			BucketEnd: []time.Time{time.Now(), time.Now(), time.Now()},
+			MaxTPS:    3,
+		},
+		blocks: []dashboardBlockPage{{
+			Height:    12,
+			Hash:      blockHash,
+			Timestamp: time.Unix(100, 0).UTC(),
+			PreviewTxs: []dashboardTxPage{{
+				TxID:      txID,
+				BlockHash: blockHash,
+				Timestamp: time.Unix(100, 0).UTC(),
+			}},
+		}},
+	}
+
+	home, status := renderPublicDashboardPage(view, "/")
+	if status != 200 || !strings.Contains(home, "/block/"+hex.EncodeToString(blockHash[:])) {
+		t.Fatalf("home page missing block link:\n%s", home)
+	}
+	blockPage, status := renderPublicDashboardPage(view, "/block/"+hex.EncodeToString(blockHash[:]))
+	if status != 200 || !strings.Contains(blockPage, "/tx/"+hex.EncodeToString(txID[:])) {
+		t.Fatalf("block page missing tx link:\n%s", blockPage)
+	}
+	txPage, status := renderPublicDashboardPage(view, "/tx/"+hex.EncodeToString(txID[:]))
+	if status != 200 || !strings.Contains(txPage, "TRANSACTION") {
+		t.Fatalf("tx page missing transaction section:\n%s", txPage)
 	}
 }
 

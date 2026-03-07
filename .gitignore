@@ -27,7 +27,7 @@
 /specs
 /benchmarks
 /REFERENCE_NODES
-/.codex-tmp
+/.*-tmp/
 
 # cargo default target dir
 target/

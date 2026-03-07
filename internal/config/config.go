@@ -16,6 +16,8 @@ type Config struct {
 	RPCReadTimeoutMS   int      `json:"rpc_read_timeout_ms"`
 	RPCWriteTimeoutMS  int      `json:"rpc_write_timeout_ms"`
 	RPCHeaderTimeoutMS int      `json:"rpc_header_timeout_ms"`
+	RPCIdleTimeoutMS   int      `json:"rpc_idle_timeout_ms"`
+	RPCMaxHeaderBytes  int      `json:"rpc_max_header_bytes"`
 	RPCMaxBodyBytes    int      `json:"rpc_max_body_bytes"`
 	P2PAddr            string   `json:"p2p_addr"`
 	Peers              []string `json:"peers"`
@@ -40,6 +42,8 @@ func Default() Config {
 		RPCReadTimeoutMS:   5000,
 		RPCWriteTimeoutMS:  5000,
 		RPCHeaderTimeoutMS: 2000,
+		RPCIdleTimeoutMS:   30000,
+		RPCMaxHeaderBytes:  8 << 10,
 		RPCMaxBodyBytes:    1 << 20,
 		P2PAddr:            "0.0.0.0:18444",
 		MaxInboundPeers:    32,
