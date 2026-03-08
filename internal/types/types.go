@@ -59,8 +59,9 @@ type Block struct {
 type ChainProfile string
 
 const (
-	Mainnet ChainProfile = "mainnet"
-	Regtest ChainProfile = "regtest"
+	Mainnet     ChainProfile = "mainnet"
+	Regtest     ChainProfile = "regtest"
+	RegtestHard ChainProfile = "regtest_hard"
 )
 
 func ParseChainProfile(raw string) (ChainProfile, error) {
@@ -69,6 +70,8 @@ func ParseChainProfile(raw string) (ChainProfile, error) {
 		return Mainnet, nil
 	case Regtest:
 		return Regtest, nil
+	case RegtestHard:
+		return RegtestHard, nil
 	default:
 		return "", fmt.Errorf("unknown chain profile: %s", raw)
 	}
@@ -76,6 +79,10 @@ func ParseChainProfile(raw string) (ChainProfile, error) {
 
 func (p ChainProfile) String() string {
 	return string(p)
+}
+
+func (p ChainProfile) IsRegtestLike() bool {
+	return p == Regtest || p == RegtestHard
 }
 
 type CodecLimits struct {

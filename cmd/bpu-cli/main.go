@@ -1072,6 +1072,8 @@ func loadGenesisFixture(profile types.ChainProfile) (*loadedGenesisFixture, erro
 		return loadGenesisFixtureFromPath("fixtures/genesis/mainnet.json")
 	case types.Regtest:
 		return loadGenesisFixtureFromPath("fixtures/genesis/regtest.json")
+	case types.RegtestHard:
+		return loadGenesisFixtureFromPath("fixtures/genesis/regtest_hard.json")
 	default:
 		return nil, fmt.Errorf("unsupported profile: %s", profile)
 	}
@@ -1432,6 +1434,8 @@ func defaultGenesisFixture(profile types.ChainProfile) string {
 		return "fixtures/genesis/mainnet.json"
 	case types.Regtest:
 		return "fixtures/genesis/regtest.json"
+	case types.RegtestHard:
+		return "fixtures/genesis/regtest_hard.json"
 	default:
 		return ""
 	}

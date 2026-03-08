@@ -25,9 +25,11 @@
 /works
 /Works
 /specs
-/benchmarks
 /REFERENCE_NODES
+/CI/
+/bpu-cli
 /.*-tmp/
+/benchmarks/reports/
 
 # cargo default target dir
 target/

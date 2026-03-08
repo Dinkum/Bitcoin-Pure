@@ -238,3 +238,11 @@ func TestConnXBlockTxRoundTrip(t *testing.T) {
 		t.Fatalf("write message: %v", err)
 	}
 }
+
+func TestMagicForProfileDistinguishesRegtestHard(t *testing.T) {
+	if got := MagicForProfile(types.RegtestHard); got == 0 {
+		t.Fatal("regtest_hard magic should be non-zero")
+	} else if got == MagicForProfile(types.Regtest) {
+		t.Fatal("regtest_hard should use distinct network magic")
+	}
+}
