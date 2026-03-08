@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"bitcoin-pure/internal/config"
+	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/wallet"
 )
 
@@ -117,5 +118,21 @@ func TestEnsureMiningWalletProvisionedNoopsWhenMiningDisabled(t *testing.T) {
 	}
 	if addr != (wallet.Address{}) || walletPath != "" {
 		t.Fatalf("unexpected provisioning result: addr=%+v walletPath=%q", addr, walletPath)
+	}
+}
+
+func TestDefaultGenesisFixtureSupportsRegtestHard(t *testing.T) {
+	if got := defaultGenesisFixture(types.RegtestHard); got != "fixtures/genesis/regtest_hard.json" {
+		t.Fatalf("default genesis fixture = %q", got)
+	}
+}
+
+func TestLoadGenesisFixtureSupportsRegtestHard(t *testing.T) {
+	loaded, err := loadGenesisFixtureFromPath(filepath.Join("..", "..", "fixtures", "genesis", "regtest_hard.json"))
+	if err != nil {
+		t.Fatalf("loadGenesisFixture: %v", err)
+	}
+	if loaded.Fixture.Profile != string(types.RegtestHard) {
+		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.RegtestHard)
 	}
 }

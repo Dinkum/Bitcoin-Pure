@@ -266,7 +266,7 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 	return nil
 }
 
-func (s *ChainStore) WriteHeaderBatch(state *StoredHeaderState, entries []HeaderBatchEntry) error {
+func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []HeaderBatchEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []HeaderBatchEntry) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeHeaderMeta(batch, state); err != nil {
@@ -278,8 +278,24 @@ func (s *ChainStore) WriteHeaderBatch(state *StoredHeaderState, entries []Header
 			ParentHash: entry.Header.PrevBlockHash,
 			Header:     entry.Header,
 			ChainWork:  entry.ChainWork,
-		}, true); err != nil {
+		}, false); err != nil {
 			return err
+		}
+	}
+	if len(activeEntries) != 0 {
+		for height := forkHeight + 1; height <= oldTipHeight; height++ {
+			if err := batch.Delete(heightIndexKey(height), nil); err != nil {
+				return err
+			}
+			if height == ^uint64(0) {
+				break
+			}
+		}
+		for _, entry := range activeEntries {
+			hash := consensus.HeaderHash(&entry.Header)
+			if err := batch.Set(heightIndexKey(entry.Height), hash[:], nil); err != nil {
+				return err
+			}
 		}
 	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
@@ -734,12 +750,54 @@ func encodeBlockSizeState(state consensus.BlockSizeState) []byte {
 }
 
 func decodeBlockSizeState(buf []byte) (consensus.BlockSizeState, error) {
-	if len(buf) != 24 {
-		return consensus.BlockSizeState{}, errors.New("invalid block size state encoding")
+	switch len(buf) {
+	case 24:
+		if looksLikeLegacyBlockSizeState(buf) {
+			return decodeLegacyBlockSizeState(buf)
+		}
+		return consensus.BlockSizeState{
+			BlockSize: binary.LittleEndian.Uint64(buf[:8]),
+			Epsilon:   binary.LittleEndian.Uint64(buf[8:16]),
+			Beta:      binary.LittleEndian.Uint64(buf[16:24]),
+		}, nil
+	default:
+		if len(buf) < 24 {
+			return consensus.BlockSizeState{}, errors.New("invalid block size state encoding")
+		}
+		return decodeLegacyBlockSizeState(buf)
 	}
+}
+
+func looksLikeLegacyBlockSizeState(buf []byte) bool {
+	// The old encoding was {limit, ewma, recent_count}. A 24-byte payload with a
+	// very small third word is almost certainly that legacy form because modern
+	// ABLA state keeps Beta at or above the multi-megabyte floor, not a tiny
+	// recent-block counter.
+	return binary.LittleEndian.Uint64(buf[16:24]) <= 65_536
+}
+
+func decodeLegacyBlockSizeState(buf []byte) (consensus.BlockSizeState, error) {
+	count := binary.LittleEndian.Uint64(buf[16:24])
+	expected := 24 + int(count)*8
+	if len(buf) != expected {
+		return consensus.BlockSizeState{}, fmt.Errorf("invalid block size state length: %d", len(buf))
+	}
+	limit := binary.LittleEndian.Uint64(buf[:8])
+	ewma := binary.LittleEndian.Uint64(buf[8:16])
+	blockSize := ewma
+	if count > 0 {
+		start := 24 + (int(count)-1)*8
+		blockSize = binary.LittleEndian.Uint64(buf[start : start+8])
+	}
+	epsilon := limit / 2
+	beta := limit - epsilon
+	// Legacy nodes stored only the current limit, EWMA, and recent block sizes.
+	// Seed the newer ABLA state with the same total limit and the latest observed
+	// block size (or EWMA when history is empty) so reopen/migration preserves the
+	// operator-visible ceiling instead of failing on decode.
 	return consensus.BlockSizeState{
-		BlockSize: binary.LittleEndian.Uint64(buf[:8]),
-		Epsilon:   binary.LittleEndian.Uint64(buf[8:16]),
-		Beta:      binary.LittleEndian.Uint64(buf[16:24]),
+		BlockSize: blockSize,
+		Epsilon:   epsilon,
+		Beta:      beta,
 	}, nil
 }

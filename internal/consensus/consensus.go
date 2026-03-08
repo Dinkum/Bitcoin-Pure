@@ -51,12 +51,24 @@ func RegtestParams() ChainParams {
 	return params
 }
 
+func RegtestHardParams() ChainParams {
+	params := RegtestParams()
+	params.Profile = types.RegtestHard
+	// Harder than the default regtest floor, but still practical for small VPS
+	// live-network tests where a roughly minute-scale block cadence is useful.
+	params.PowLimitBits = 0x1d02ffff
+	params.GenesisBits = 0x1d02ffff
+	return params
+}
+
 func ParamsForProfile(profile types.ChainProfile) ChainParams {
 	switch profile {
 	case types.Mainnet:
 		return MainnetParams()
 	case types.Regtest:
 		return RegtestParams()
+	case types.RegtestHard:
+		return RegtestHardParams()
 	default:
 		panic("unknown chain profile")
 	}

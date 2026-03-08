@@ -78,3 +78,16 @@ func TestRejectsTrailingBytes(t *testing.T) {
 		t.Fatalf("expected trailing bytes error, got %v", err)
 	}
 }
+
+func TestParseChainProfileAcceptsRegtestHard(t *testing.T) {
+	profile, err := ParseChainProfile("regtest_hard")
+	if err != nil {
+		t.Fatalf("ParseChainProfile: %v", err)
+	}
+	if profile != RegtestHard {
+		t.Fatalf("profile = %q, want %q", profile, RegtestHard)
+	}
+	if !profile.IsRegtestLike() {
+		t.Fatal("regtest_hard should be treated as regtest-like")
+	}
+}

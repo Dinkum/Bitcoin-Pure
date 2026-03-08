@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"bitcoin-pure/internal/consensus"
@@ -37,6 +38,45 @@ func sampleBlockSizeState() consensus.BlockSizeState {
 		BlockSize: 148,
 		Epsilon:   16_000_000,
 		Beta:      16_000_000,
+	}
+}
+
+func encodeLegacyBlockSizeState(limit, ewma uint64, recent []uint64) []byte {
+	buf := make([]byte, 24, 24+len(recent)*8)
+	binary.LittleEndian.PutUint64(buf[:8], limit)
+	binary.LittleEndian.PutUint64(buf[8:16], ewma)
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(len(recent)))
+	for _, size := range recent {
+		next := make([]byte, 8)
+		binary.LittleEndian.PutUint64(next, size)
+		buf = append(buf, next...)
+	}
+	return buf
+}
+
+func TestDecodeLegacyBlockSizeStateUsesLastRecentBlock(t *testing.T) {
+	state, err := decodeBlockSizeState(encodeLegacyBlockSizeState(64_000_000, 40_000_000, []uint64{12_000_000, 18_000_000}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.BlockSize != 18_000_000 {
+		t.Fatalf("block size = %d, want %d", state.BlockSize, 18_000_000)
+	}
+	if state.Epsilon+state.Beta != 64_000_000 {
+		t.Fatalf("limit = %d, want %d", state.Epsilon+state.Beta, 64_000_000)
+	}
+}
+
+func TestDecodeLegacyBlockSizeStateFallsBackToEWMA(t *testing.T) {
+	state, err := decodeBlockSizeState(encodeLegacyBlockSizeState(32_000_000, 21_000_000, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.BlockSize != 21_000_000 {
+		t.Fatalf("block size = %d, want %d", state.BlockSize, 21_000_000)
+	}
+	if state.Epsilon != 16_000_000 || state.Beta != 16_000_000 {
+		t.Fatalf("epsilon/beta = %d/%d, want 16000000/16000000", state.Epsilon, state.Beta)
 	}
 }
 
@@ -173,7 +213,7 @@ func TestPutValidatedBlockRoundtrip(t *testing.T) {
 	}
 }
 
-func TestWriteHeaderBatchPersistsChainWorkAndTip(t *testing.T) {
+func TestCommitHeaderChainPersistsChainWorkAndTip(t *testing.T) {
 	path := t.TempDir()
 	store, err := Open(path)
 	if err != nil {
@@ -205,11 +245,15 @@ func TestWriteHeaderBatchPersistsChainWorkAndTip(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondChainWork := consensus.AddChainWork(genesisWork, secondWork)
-	if err := store.WriteHeaderBatch(&StoredHeaderState{
+	if err := store.CommitHeaderChain(&StoredHeaderState{
 		Profile:   types.Regtest,
 		Height:    1,
 		TipHeader: secondHeader,
 	}, []HeaderBatchEntry{{
+		Height:    1,
+		Header:    secondHeader,
+		ChainWork: secondChainWork,
+	}}, 0, 0, []HeaderBatchEntry{{
 		Height:    1,
 		Header:    secondHeader,
 		ChainWork: secondChainWork,
@@ -238,6 +282,71 @@ func TestWriteHeaderBatchPersistsChainWorkAndTip(t *testing.T) {
 	}
 	if secondEntry == nil || secondEntry.ChainWork != secondChainWork {
 		t.Fatal("batched header chainwork mismatch")
+	}
+}
+
+func TestCommitHeaderChainInactiveBatchDoesNotRewriteActiveHeightIndex(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	genesis, _ := sampleBlockAndUTXOs()
+	if err := store.WriteHeaderState(&StoredHeaderState{
+		Profile:   types.Regtest,
+		Height:    0,
+		TipHeader: genesis.Header,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutHeader(0, &genesis.Header); err != nil {
+		t.Fatal(err)
+	}
+
+	mainHeader := genesis.Header
+	mainHeader.PrevBlockHash = consensus.HeaderHash(&genesis.Header)
+	mainHeader.Timestamp = genesis.Header.Timestamp + 1
+	mainHash := consensus.HeaderHash(&mainHeader)
+	if err := store.CommitHeaderChain(&StoredHeaderState{
+		Profile:   types.Regtest,
+		Height:    1,
+		TipHeader: mainHeader,
+	}, []HeaderBatchEntry{{
+		Height:    1,
+		Header:    mainHeader,
+		ChainWork: [32]byte{1},
+	}}, 0, 0, []HeaderBatchEntry{{
+		Height:    1,
+		Header:    mainHeader,
+		ChainWork: [32]byte{1},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	sideHeader := genesis.Header
+	sideHeader.PrevBlockHash = consensus.HeaderHash(&genesis.Header)
+	sideHeader.Timestamp = genesis.Header.Timestamp + 2
+	sideHeader.Nonce = 9
+	if err := store.CommitHeaderChain(&StoredHeaderState{
+		Profile:   types.Regtest,
+		Height:    1,
+		TipHeader: mainHeader,
+	}, []HeaderBatchEntry{{
+		Height:    1,
+		Header:    sideHeader,
+		ChainWork: [32]byte{1},
+	}}, 0, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	hashAtHeight, err := store.GetBlockHashByHeight(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashAtHeight == nil || *hashAtHeight != mainHash {
+		t.Fatalf("active height hash = %x, want %x", hashAtHeight, mainHash)
 	}
 }
 

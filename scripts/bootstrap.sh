@@ -31,7 +31,7 @@ DEPLOY_RESULT=""
 
 usage() {
 	cat <<'EOF'
-Usage: ./install [--update] [--repo-url URL] [--ref REF] [--mining on|off] [--profile regtest|mainnet] [--peer host:port]
+Usage: ./install [--update] [--repo-url URL] [--ref REF] [--mining on|off] [--profile regtest|regtest_hard|mainnet] [--peer host:port]
 
 No flags are required for a normal Ubuntu install from the current checkout.
 The installer keeps existing config where possible and uses sane defaults otherwise.
@@ -584,12 +584,12 @@ parse_args() {
 		--profile)
 			[[ $# -ge 2 ]] || fail "--profile requires a value"
 			case "$2" in
-			regtest|mainnet)
+			regtest|regtest_hard|mainnet)
 				PROFILE="$2"
 				shift 2
 				;;
 			*)
-				fail "--profile must be regtest or mainnet"
+				fail "--profile must be regtest, regtest_hard, or mainnet"
 				;;
 			esac
 			;;
