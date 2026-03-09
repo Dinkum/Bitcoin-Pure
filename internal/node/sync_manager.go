@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -16,6 +17,9 @@ import (
 // watchdog that repairs or nudges stalled catch-up.
 type syncManager struct {
 	svc *Service
+
+	pollMu             sync.Mutex
+	lastIdleHeaderPoll time.Time
 }
 
 type syncRequestClass string
@@ -25,6 +29,8 @@ const (
 	syncRequestBlocks  syncRequestClass = "blocks"
 	syncRequestTxs     syncRequestClass = "txs"
 )
+
+const idleHeaderPollInterval = 15 * time.Second
 
 type peerSyncSnapshot struct {
 	LastUsefulAt       time.Time
@@ -191,6 +197,16 @@ func (m *syncManager) requestSync(peer *peerConn) {
 	_ = m.requestHeaders(peer, [32]byte{})
 }
 
+func (m *syncManager) shouldPollIdleHeaders(now time.Time) bool {
+	m.pollMu.Lock()
+	defer m.pollMu.Unlock()
+	if !m.lastIdleHeaderPoll.IsZero() && now.Sub(m.lastIdleHeaderPoll) < idleHeaderPollInterval {
+		return false
+	}
+	m.lastIdleHeaderPoll = now
+	return true
+}
+
 func (m *syncManager) requestHeaders(peer *peerConn, stopHash [32]byte) error {
 	if err := peer.send(p2p.GetHeadersMessage{Locator: m.svc.blockLocator(), StopHash: stopHash}); err != nil {
 		return err
@@ -254,7 +270,10 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 	)
 	items := make([]p2p.InvVector, 0, len(hashes))
 	for _, hash := range hashes {
-		items = append(items, p2p.InvVector{Type: p2p.InvTypeBlock, Hash: hash})
+		// Catch-up requests prefer full blocks. Compact/short-ID relay is still
+		// useful for steady-state propagation, but explicit sync recovery should
+		// bias toward deterministic block delivery over relay efficiency.
+		items = append(items, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: hash})
 	}
 	if err := peer.send(p2p.GetDataMessage{Items: items}); err != nil {
 		for _, hash := range hashes {
@@ -477,6 +496,21 @@ func (m *syncManager) runSyncWatchdogStep() {
 	blockHeight := m.svc.blockHeight()
 	headerHeight := m.svc.headerHeight()
 	if headerHeight <= blockHeight {
+		peers := m.preferredDownloadPeers(2)
+		if len(peers) == 0 {
+			peers = m.svc.peerSnapshot()
+		}
+		now := time.Now()
+		if len(peers) == 0 || !m.shouldPollIdleHeaders(now) {
+			return
+		}
+		m.svc.logger.Debug("sync watchdog polling headers while tip appears current",
+			slog.Uint64("tip_height", blockHeight),
+			slog.Int("peers", len(peers)),
+		)
+		for _, peer := range peers {
+			m.requestSync(peer)
+		}
 		return
 	}
 

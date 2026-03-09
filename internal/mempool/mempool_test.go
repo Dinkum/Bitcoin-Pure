@@ -15,6 +15,16 @@ func signerKeyHash(seed byte) [32]byte {
 	return crypto.KeyHash(&pubKey)
 }
 
+func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
+	return types.Transaction{
+		Base: types.TxBase{
+			Version:        1,
+			CoinbaseHeight: &height,
+			Outputs:        outputs,
+		},
+	}
+}
+
 func spendTx(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint64, recipientSeed byte, fee uint64) types.Transaction {
 	t.Helper()
 	if fee >= value {
@@ -299,7 +309,7 @@ func TestRemoveConfirmedEvictsConflictsAndDescendants(t *testing.T) {
 	confirmed := spendTx(t, 1, prevOut, 50, 9, 1)
 	block := &types.Block{
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: signerKeyHash(9)}}}},
+			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: signerKeyHash(9)}}),
 			confirmed,
 		},
 	}
@@ -611,6 +621,98 @@ func TestAppendForBlockOnlyReturnsNewSelections(t *testing.T) {
 	}
 	if appendedFees != lateAdmission.Summary.Fee {
 		t.Fatalf("appended fees = %d, want %d", appendedFees, lateAdmission.Summary.Fee)
+	}
+}
+
+func TestSelectForBlockOverlayKeepsBaseUTXOMapImmutable(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	rootPrev := types.OutPoint{TxID: [32]byte{33}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		rootPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+	}
+
+	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+
+	selected, totalFees, overlay := pool.SelectForBlockOverlay(utxos, consensus.DefaultConsensusRules(), 1_000_000)
+	if len(selected) != 1 {
+		t.Fatalf("selected len = %d, want 1", len(selected))
+	}
+	if totalFees != parentAdmission.Summary.Fee {
+		t.Fatalf("selected fees = %d, want %d", totalFees, parentAdmission.Summary.Fee)
+	}
+	if _, ok := utxos[rootPrev]; !ok {
+		t.Fatal("base utxo map was mutated during overlay selection")
+	}
+	parentOut := types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}
+	if _, ok := overlay.Lookup(parentOut); !ok {
+		t.Fatal("overlay missing selected transaction output")
+	}
+	if _, ok := overlay.Lookup(rootPrev); ok {
+		t.Fatal("overlay still exposes spent root prevout")
+	}
+}
+
+func TestAppendForBlockOverlayExtendsTentativeSelectionWithoutMaterializingBase(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	rootPrev := types.OutPoint{TxID: [32]byte{34}, Vout: 0}
+	otherPrev := types.OutPoint{TxID: [32]byte{35}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		rootPrev:  {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		otherPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(4)},
+	}
+
+	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+	selected, _, overlay := pool.SelectForBlockOverlay(utxos, consensus.DefaultConsensusRules(), 1_000_000)
+	if len(selected) != 1 {
+		t.Fatalf("initial selected len = %d, want 1", len(selected))
+	}
+
+	late := spendTx(t, 4, otherPrev, 50, 5, 1)
+	lateAdmission, err := pool.AcceptTx(late, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept late tx: %v", err)
+	}
+
+	appended, appendedFees := pool.AppendForBlockOverlay(utxos, overlay, consensus.DefaultConsensusRules(), 1_000_000, selected)
+	if len(appended) != 1 {
+		t.Fatalf("appended len = %d, want 1", len(appended))
+	}
+	if appended[0].TxID != lateAdmission.TxID {
+		t.Fatalf("appended txid = %x, want %x", appended[0].TxID, lateAdmission.TxID)
+	}
+	if appendedFees != lateAdmission.Summary.Fee {
+		t.Fatalf("appended fees = %d, want %d", appendedFees, lateAdmission.Summary.Fee)
+	}
+	if _, ok := utxos[otherPrev]; !ok {
+		t.Fatal("base utxo map was mutated during overlay append")
+	}
+	lateOut := types.OutPoint{TxID: lateAdmission.TxID, Vout: 0}
+	if _, ok := overlay.Lookup(lateOut); !ok {
+		t.Fatal("overlay missing appended transaction output")
+	}
+	parentOut := types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}
+	if _, ok := overlay.Lookup(parentOut); !ok {
+		t.Fatal("overlay lost earlier tentative selection output")
 	}
 }
 

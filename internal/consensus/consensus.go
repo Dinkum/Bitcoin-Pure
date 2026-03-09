@@ -54,10 +54,11 @@ func RegtestParams() ChainParams {
 func RegtestHardParams() ChainParams {
 	params := RegtestParams()
 	params.Profile = types.RegtestHard
-	// Harder than the default regtest floor, but still practical for small VPS
-	// live-network tests where a roughly minute-scale block cadence is useful.
-	params.PowLimitBits = 0x1d02ffff
-	params.GenesisBits = 0x1d02ffff
+	// Harder than default regtest, but intentionally tuned so the current
+	// small Scaleway VPS pair lands in roughly minute-scale territory before
+	// ASERT has time to pull the chain toward the 10-minute target.
+	params.PowLimitBits = 0x1d4fffff
+	params.GenesisBits = 0x1d4fffff
 	return params
 }
 
@@ -253,6 +254,7 @@ var (
 	ErrFirstTxNotCoinbase    = errors.New("first transaction must be coinbase")
 	ErrTxOrderInvalid        = errors.New("non-coinbase transactions must be in ascending txid order")
 	ErrCoinbaseHasAuth       = errors.New("coinbase must not have auth entries")
+	ErrCoinbaseHeightInvalid = errors.New("coinbase height does not match block height")
 	ErrCoinbaseNoOutputs     = errors.New("coinbase has no outputs")
 	ErrEmptyInputs           = errors.New("non-coinbase transaction has zero inputs")
 	ErrEmptyOutputs          = errors.New("transaction has zero outputs")
@@ -1082,6 +1084,9 @@ func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 	coinbase := &block.Txs[0]
 	if len(coinbase.Base.Inputs) != 0 {
 		return BlockValidationSummary{}, nil, nil, ErrFirstTxNotCoinbase
+	}
+	if coinbase.Base.CoinbaseHeight == nil || *coinbase.Base.CoinbaseHeight != prev.Height+1 {
+		return BlockValidationSummary{}, nil, nil, ErrCoinbaseHeightInvalid
 	}
 	if len(coinbase.Auth.Entries) != 0 {
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseHasAuth

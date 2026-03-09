@@ -149,7 +149,7 @@ func (p *PersistentChainState) ApplyBlock(block *types.Block) (consensus.BlockVa
 		return summary, nil
 	}
 
-	storedState, err := tempState.StoredState()
+	nextStateMeta, err := tempState.StoredStateMeta()
 	if err != nil {
 		return consensus.BlockValidationSummary{}, err
 	}
@@ -158,12 +158,18 @@ func (p *PersistentChainState) ApplyBlock(block *types.Block) (consensus.BlockVa
 	oldTipHeight := *p.state.TipHeight()
 	if isActiveTipExtension {
 		undo := undoByHash[blockHash]
-		spent, created := activeTipDelta(block, storedState.UTXOs, undo)
-		if err := p.store.AppendValidatedBlock(storedState, block, &newTipEntry, undo, spent, created); err != nil {
+		spent, created := activeTipDelta(block, tempState.UTXOs(), undo)
+		if err := p.store.AppendValidatedBlock(nextStateMeta, block, &newTipEntry, undo, spent, created); err != nil {
 			return consensus.BlockValidationSummary{}, err
 		}
 	} else {
-		if err := p.store.WriteFullState(storedState); err != nil {
+		currentStateMeta, err := p.state.StoredStateMeta()
+		if err != nil {
+			return consensus.BlockValidationSummary{}, err
+		}
+		currentStateMeta.UTXOs = p.state.UTXOs()
+		nextStateMeta.UTXOs = tempState.UTXOs()
+		if err := p.store.RewriteFullStateDelta(currentStateMeta, nextStateMeta); err != nil {
 			return consensus.BlockValidationSummary{}, err
 		}
 		if err := p.store.RewriteActiveHeights(forkHeight, oldTipHeight, connectedEntries); err != nil {

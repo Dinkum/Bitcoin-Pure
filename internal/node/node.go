@@ -113,6 +113,9 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 	if len(coinbase.Auth.Entries) != 0 {
 		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: coinbase must not have auth")
 	}
+	if coinbase.Base.CoinbaseHeight == nil || *coinbase.Base.CoinbaseHeight != 0 {
+		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: coinbase height must be 0")
+	}
 	if len(coinbase.Base.Outputs) == 0 {
 		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: coinbase has no outputs")
 	}
@@ -281,6 +284,18 @@ func (c *ChainState) StoredState() (*storage.StoredChainState, error) {
 	}, nil
 }
 
+func (c *ChainState) StoredStateMeta() (*storage.StoredChainState, error) {
+	if c.height == nil || c.tipHeader == nil {
+		return nil, ErrNoTip
+	}
+	return &storage.StoredChainState{
+		Profile:        c.Profile(),
+		Height:         *c.height,
+		TipHeader:      *c.tipHeader,
+		BlockSizeState: c.blockSizeState,
+	}, nil
+}
+
 func OpenPersistentChainState(path string, profile types.ChainProfile) (*PersistentChainState, error) {
 	return OpenPersistentChainStateWithRules(path, profile, consensus.DefaultConsensusRules())
 }
@@ -334,10 +349,11 @@ func (p *PersistentChainState) InitializeFromGenesisBlock(genesis *types.Block) 
 	if err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
-	stored, err := p.state.StoredState()
+	stored, err := p.state.StoredStateMeta()
 	if err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
+	stored.UTXOs = p.state.UTXOs()
 	if err := p.store.WriteFullState(stored); err != nil {
 		return GenesisBootstrapSummary{}, err
 	}

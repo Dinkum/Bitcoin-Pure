@@ -288,18 +288,18 @@ type peerRelayTelemetry struct {
 }
 
 type blockTemplateCache struct {
-	tipHash        [32]byte
-	mempoolEpoch   uint64
-	generation     uint64
-	builtAt        time.Time
-	block          types.Block
-	selected       []mempool.SnapshotEntry
-	totalFees      uint64
-	usedTxBytes    int
-	baseUtxos      consensus.UtxoSet
-	selectionUtxos consensus.UtxoSet
-	baseAcc        *utreexo.Accumulator
-	selectionAcc   *utreexo.Accumulator
+	tipHash       [32]byte
+	mempoolEpoch  uint64
+	generation    uint64
+	builtAt       time.Time
+	block         types.Block
+	selected      []mempool.SnapshotEntry
+	totalFees     uint64
+	usedTxBytes   int
+	baseUtxos     consensus.UtxoSet
+	selectionView *consensus.UtxoOverlay
+	baseAcc       *utreexo.Accumulator
+	selectionAcc  *utreexo.Accumulator
 }
 
 type blockDownloadRequest struct {
@@ -1897,11 +1897,11 @@ func (s *Service) buildBlockTemplateWithGeneration() (types.Block, uint64, error
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionUtxos, selectionAcc, err := s.buildBlockCandidate(snapshot)
+	block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, err := s.buildBlockCandidate(snapshot)
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	generation := s.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionUtxos, snapshot.utxoAcc, selectionAcc)
+	generation := s.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, snapshot.utxoAcc, selectionAcc)
 	s.templateStats.noteRebuild(s.pool.SelectionCandidateCount())
 	return cloneBlock(block), generation, nil
 }
@@ -1931,13 +1931,13 @@ func (s *Service) minerLoop(workerID int) {
 	}
 }
 
-func (s *Service) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, uint64, int, consensus.UtxoSet, consensus.UtxoSet, *utreexo.Accumulator, error) {
+func (s *Service) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, uint64, int, consensus.UtxoSet, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
 	baseUtxos := snapshot.utxos
 	maxTemplateBytes := int(consensus.NextBlockSizeLimit(snapshot.blockSizeState, consensus.ParamsForProfile(s.cfg.Profile)))
 	if maxTemplateBytes > 1024 {
 		maxTemplateBytes -= 1024
 	}
-	selectedEntries, totalFees, selectionUtxos := s.pool.SelectForBlockFromBase(baseUtxos, consensus.DefaultConsensusRules(), maxTemplateBytes)
+	selectedEntries, totalFees, selectionView := s.pool.SelectForBlockOverlay(baseUtxos, consensus.DefaultConsensusRules(), maxTemplateBytes)
 	selectionAcc, err := snapshot.utxoAcc.Apply(selectedEntrySpends(selectedEntries), selectedEntryLeaves(selectedEntries))
 	if err != nil {
 		return types.Block{}, nil, 0, 0, nil, nil, nil, err
@@ -1947,7 +1947,7 @@ func (s *Service) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Bl
 		height:         snapshot.height,
 		tipHeader:      snapshot.tipHeader,
 		blockSizeState: snapshot.blockSizeState,
-	}, selectedEntries, totalFees, selectionUtxos, selectionAcc)
+	}, selectedEntries, totalFees, selectionAcc)
 	if err != nil {
 		return types.Block{}, nil, 0, 0, nil, nil, nil, err
 	}
@@ -1956,10 +1956,10 @@ func (s *Service) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Bl
 		slog.Int("selected_txs", len(selectedEntries)),
 		slog.Uint64("total_fees", totalFees),
 	)
-	return block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionUtxos, selectionAcc, nil
+	return block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, nil
 }
 
-func (s *Service) assembleBlockTemplate(ctx chainTemplateContext, selectedEntries []mempool.SnapshotEntry, totalFees uint64, selectionUtxos consensus.UtxoSet, selectionAcc *utreexo.Accumulator) (types.Block, int, error) {
+func (s *Service) assembleBlockTemplate(ctx chainTemplateContext, selectedEntries []mempool.SnapshotEntry, totalFees uint64, selectionAcc *utreexo.Accumulator) (types.Block, int, error) {
 	params := consensus.ParamsForProfile(s.cfg.Profile)
 	nextTimestamp := ctx.tipHeader.Timestamp + uint64(params.TargetSpacingSecs)
 	if nextTimestamp <= ctx.tipHeader.Timestamp {
@@ -2096,12 +2096,11 @@ func (s *Service) chainUtxoSnapshot() consensus.UtxoSet {
 }
 
 func coinbaseTxForHeight(height uint64, outputs []types.TxOutput) types.Transaction {
-	// Coinbase transactions have no inputs in this protocol, so they need an
-	// internal height tag to stay distinct across consecutive mined blocks.
 	return types.Transaction{
 		Base: types.TxBase{
-			Version: uint32(height),
-			Outputs: outputs,
+			Version:        1,
+			CoinbaseHeight: &height,
+			Outputs:        outputs,
 		},
 	}
 }
@@ -2184,10 +2183,10 @@ func (s *Service) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoch uin
 		return types.Block{}, 0, false, nil
 	}
 
-	added, addedFees := s.pool.AppendForBlock(s.template.baseUtxos, s.template.selectionUtxos, consensus.DefaultConsensusRules(), maxTemplateBytes, s.template.selected)
+	added, addedFees := s.pool.AppendForBlockOverlay(s.template.baseUtxos, s.template.selectionView, consensus.DefaultConsensusRules(), maxTemplateBytes, s.template.selected)
 	if len(added) == 0 {
 		s.template.mempoolEpoch = mempoolEpoch
-		block, _, err := s.assembleBlockTemplate(ctx, s.template.selected, s.template.totalFees, s.template.selectionUtxos, s.template.selectionAcc)
+		block, _, err := s.assembleBlockTemplate(ctx, s.template.selected, s.template.totalFees, s.template.selectionAcc)
 		if err != nil {
 			return types.Block{}, 0, false, err
 		}
@@ -2207,7 +2206,7 @@ func (s *Service) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoch uin
 		return types.Block{}, 0, false, err
 	}
 	s.template.selectionAcc = nextAcc
-	block, _, err := s.assembleBlockTemplate(ctx, s.template.selected, s.template.totalFees, s.template.selectionUtxos, s.template.selectionAcc)
+	block, _, err := s.assembleBlockTemplate(ctx, s.template.selected, s.template.totalFees, s.template.selectionAcc)
 	if err != nil {
 		return types.Block{}, 0, false, err
 	}
@@ -2218,7 +2217,7 @@ func (s *Service) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoch uin
 	return cloneBlock(s.template.block), s.template.generation, true, nil
 }
 
-func (s *Service) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, totalFees uint64, usedTxBytes int, baseUtxos consensus.UtxoSet, selectionUtxos consensus.UtxoSet, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
+func (s *Service) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, totalFees uint64, usedTxBytes int, baseUtxos consensus.UtxoSet, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
 	s.templateMu.Lock()
 	defer s.templateMu.Unlock()
 	if s.templateGeneration == 0 {
@@ -2226,18 +2225,18 @@ func (s *Service) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, bloc
 	}
 	generation := s.templateGeneration
 	s.template = &blockTemplateCache{
-		tipHash:        tipHash,
-		mempoolEpoch:   mempoolEpoch,
-		generation:     generation,
-		builtAt:        time.Now(),
-		block:          cloneBlock(block),
-		selected:       append([]mempool.SnapshotEntry(nil), selected...),
-		totalFees:      totalFees,
-		usedTxBytes:    usedTxBytes,
-		baseUtxos:      baseUtxos,
-		selectionUtxos: selectionUtxos,
-		baseAcc:        baseAcc,
-		selectionAcc:   selectionAcc,
+		tipHash:       tipHash,
+		mempoolEpoch:  mempoolEpoch,
+		generation:    generation,
+		builtAt:       time.Now(),
+		block:         cloneBlock(block),
+		selected:      append([]mempool.SnapshotEntry(nil), selected...),
+		totalFees:     totalFees,
+		usedTxBytes:   usedTxBytes,
+		baseUtxos:     baseUtxos,
+		selectionView: selectionView,
+		baseAcc:       baseAcc,
+		selectionAcc:  selectionAcc,
 	}
 	s.templateStats.noteBuildTime(s.template.builtAt)
 	return generation
@@ -3349,6 +3348,22 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			"hash":   params.Hash,
 			"nbits":  entry.Header.NBits,
 		}, nil
+	case "getblockhashbyheight":
+		var params struct {
+			Height uint64 `json:"height"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, err
+		}
+		entry, err := s.blockIndexByHeight(params.Height)
+		if err != nil {
+			return nil, err
+		}
+		hash := consensus.HeaderHash(&entry.Header)
+		return map[string]any{
+			"height": params.Height,
+			"hash":   hex.EncodeToString(hash[:]),
+		}, nil
 	case "getblock":
 		var params struct {
 			Hash string `json:"hash"`
@@ -3749,7 +3764,7 @@ func (s *Service) onInvMessage(peer *peerConn, msg p2p.InvMessage) error {
 		case p2p.InvTypeBlock:
 			if _, ok := s.recentHeader(item.Hash); ok {
 				if _, ok := s.recentBlock(item.Hash); !ok {
-					blockItems = append(blockItems, item)
+					blockItems = append(blockItems, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: item.Hash})
 				}
 				continue
 			}
@@ -3766,7 +3781,7 @@ func (s *Service) onInvMessage(peer *peerConn, msg p2p.InvMessage) error {
 				return err
 			}
 			if block == nil {
-				blockItems = append(blockItems, item)
+				blockItems = append(blockItems, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: item.Hash})
 			}
 		}
 	}
@@ -4889,6 +4904,19 @@ func (s *Service) blockIndexByHashHex(raw string) (*storage.BlockIndexEntry, err
 	}
 	if entry == nil {
 		return nil, errors.New("unknown block hash")
+	}
+	return entry, nil
+}
+
+func (s *Service) blockIndexByHeight(height uint64) (*storage.BlockIndexEntry, error) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	entry, err := s.chainState.Store().GetBlockIndexByHeight(height)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, errors.New("unknown block height")
 	}
 	return entry, nil
 }

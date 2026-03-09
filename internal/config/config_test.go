@@ -21,6 +21,13 @@ func TestDefaultMaxMessageBytesCoversConsensusFloor(t *testing.T) {
 	}
 }
 
+func TestDefaultRPCWriteTimeoutAllowsLongAdminCalls(t *testing.T) {
+	cfg := Default()
+	if cfg.RPCWriteTimeoutMS < int((10 * 60 * 1000)) {
+		t.Fatalf("rpc write timeout = %dms, want at least 10 minutes", cfg.RPCWriteTimeoutMS)
+	}
+}
+
 func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	cfg := Default()

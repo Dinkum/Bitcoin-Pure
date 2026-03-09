@@ -9,6 +9,16 @@ import (
 	"bitcoin-pure/internal/types"
 )
 
+func testCoinbaseTx(height uint64, value uint64) types.Transaction {
+	return types.Transaction{
+		Base: types.TxBase{
+			Version:        1,
+			CoinbaseHeight: &height,
+			Outputs:        []types.TxOutput{{ValueAtoms: value}},
+		},
+	}
+}
+
 func TestConnMessageRoundTrip(t *testing.T) {
 	left, right := net.Pipe()
 	defer left.Close()
@@ -111,8 +121,8 @@ func TestConnTxBatchRoundTrip(t *testing.T) {
 	receiver := NewConn(right, MagicForProfile(types.Regtest), 1<<20)
 	msg := TxBatchMessage{
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}},
-			{Base: types.TxBase{Version: 2, Outputs: []types.TxOutput{{ValueAtoms: 2}}}},
+			testCoinbaseTx(1, 1),
+			testCoinbaseTx(2, 2),
 		},
 	}
 
@@ -129,7 +139,7 @@ func TestConnTxBatchRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatalf("message type = %T, want TxBatchMessage", received)
 	}
-	if len(batch.Txs) != 2 || batch.Txs[0].Base.Version != 1 || batch.Txs[1].Base.Version != 2 {
+	if len(batch.Txs) != 2 || batch.Txs[0].Base.CoinbaseHeight == nil || *batch.Txs[0].Base.CoinbaseHeight != 1 || batch.Txs[1].Base.CoinbaseHeight == nil || *batch.Txs[1].Base.CoinbaseHeight != 2 {
 		t.Fatalf("unexpected tx batch payload: %+v", batch.Txs)
 	}
 	if err := <-done; err != nil {
@@ -177,7 +187,7 @@ func TestConnXThinRoundTrip(t *testing.T) {
 	msg := XThinBlockMessage{
 		Header:   types.BlockHeader{Version: 3, Timestamp: 42},
 		Nonce:    99,
-		Coinbase: types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 50}}}},
+		Coinbase: testCoinbaseTx(1, 50),
 		ShortIDs: []uint64{11, 22, 33},
 	}
 
@@ -213,8 +223,8 @@ func TestConnXBlockTxRoundTrip(t *testing.T) {
 		BlockHash: [32]byte{9},
 		Indexes:   []uint32{1, 3},
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}},
-			{Base: types.TxBase{Version: 2, Outputs: []types.TxOutput{{ValueAtoms: 2}}}},
+			testCoinbaseTx(1, 1),
+			testCoinbaseTx(2, 2),
 		},
 	}
 
@@ -231,7 +241,7 @@ func TestConnXBlockTxRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatalf("message type = %T, want XBlockTxMessage", received)
 	}
-	if len(resp.Indexes) != 2 || resp.Indexes[1] != 3 || len(resp.Txs) != 2 || resp.Txs[1].Base.Version != 2 {
+	if len(resp.Indexes) != 2 || resp.Indexes[1] != 3 || len(resp.Txs) != 2 || resp.Txs[0].Base.CoinbaseHeight == nil || *resp.Txs[0].Base.CoinbaseHeight != 1 || resp.Txs[1].Base.CoinbaseHeight == nil || *resp.Txs[1].Base.CoinbaseHeight != 2 {
 		t.Fatalf("unexpected xblocktx payload: %+v", resp)
 	}
 	if err := <-done; err != nil {
