@@ -34,6 +34,16 @@ type ChainReplaySummary struct {
 	BlockSizeLimit uint64
 }
 
+type CommittedChainView struct {
+	Height         uint64
+	TipHeader      types.BlockHeader
+	TipHash        [32]byte
+	BlockSizeState consensus.BlockSizeState
+	UTXOs          consensus.UtxoSet
+	UTXOAcc        *utreexo.Accumulator
+	UTXORoot       [32]byte
+}
+
 type ChainState struct {
 	params         consensus.ChainParams
 	rules          consensus.ConsensusRules
@@ -160,14 +170,14 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 	if c.height == nil || c.tipHeader == nil {
 		return consensus.BlockValidationSummary{}, ErrNoTip
 	}
-	// The published chain UTXO map is treated as immutable so admission/template
-	// readers can hold a shared view without cloning the full set first.
-	workingUtxos := cloneUtxos(c.utxos)
-	summary, nextAcc, err := consensus.ValidateAndApplyBlockWithAccumulator(
+	// The published chain UTXO map is immutable. Validation runs against that
+	// shared base view and only swaps in a freshly materialized post-block map
+	// once the block is fully validated.
+	summary, finalUtxos, nextAcc, err := consensus.ValidateAndApplyBlockViewWithAccumulator(
 		block,
 		consensus.PrevBlockContext{Height: *c.height, Header: *c.tipHeader},
 		c.blockSizeState,
-		workingUtxos,
+		c.utxos,
 		c.utxoAcc,
 		c.params,
 		c.rules,
@@ -180,7 +190,7 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 	tip := block.Header
 	c.tipHeader = &tip
 	c.blockSizeState = summary.NextBlockSizeState
-	c.utxos = workingUtxos
+	c.utxos = finalUtxos
 	c.utxoAcc = nextAcc
 	hash := consensus.HeaderHash(&block.Header)
 	logger.Info("validated block",
@@ -236,6 +246,22 @@ func (c *ChainState) UTXORoot() [32]byte {
 		return consensus.ComputedUTXORoot(c.utxos)
 	}
 	return c.utxoAcc.Root()
+}
+
+func (c *ChainState) CommittedView() (CommittedChainView, bool) {
+	if c.height == nil || c.tipHeader == nil {
+		return CommittedChainView{}, false
+	}
+	view := CommittedChainView{
+		Height:         *c.height,
+		TipHeader:      *c.tipHeader,
+		TipHash:        consensus.HeaderHash(c.tipHeader),
+		BlockSizeState: c.blockSizeState,
+		UTXOs:          c.utxos,
+		UTXOAcc:        c.utxoAcc,
+		UTXORoot:       c.UTXORoot(),
+	}
+	return view, true
 }
 
 func (c *ChainState) UTXOAccumulator() *utreexo.Accumulator {
@@ -351,6 +377,13 @@ func (p *PersistentChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySu
 
 func (p *PersistentChainState) ChainState() *ChainState {
 	return p.state
+}
+
+func (p *PersistentChainState) CommittedView() (CommittedChainView, bool) {
+	if p == nil || p.state == nil {
+		return CommittedChainView{}, false
+	}
+	return p.state.CommittedView()
 }
 
 func (p *PersistentChainState) Store() *storage.ChainStore {

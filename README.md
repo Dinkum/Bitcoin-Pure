@@ -18,7 +18,7 @@ Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to pre
 
 - Full node runtime with persisted chainstate, restart-safe replay, and best-chain tracking.
 - Integrated miner and package-aware mempool management with orphan handling.
-- Local wallet management for receive addresses and signed transaction send flow.
+- Local wallet management for receive addresses, balance/history, fee estimation, and signed transaction send flow.
 - Binary peer-to-peer transport with header-first sync, transaction reconciliation, batched relay, and short-ID block propagation with full-block fallback.
 - Authenticated HTTP JSON-RPC for node control and automation.
 - Public ASCII status page served directly from the node so you can watch tip, peers, mempool, mining, and host health from the server IP.

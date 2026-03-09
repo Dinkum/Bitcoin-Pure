@@ -136,3 +136,13 @@ func TestLoadGenesisFixtureSupportsRegtestHard(t *testing.T) {
 		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.RegtestHard)
 	}
 }
+
+func TestLoadGenesisFixtureSupportsMainnet(t *testing.T) {
+	loaded, err := loadGenesisFixtureFromPath(filepath.Join("..", "..", "fixtures", "genesis", "mainnet.json"))
+	if err != nil {
+		t.Fatalf("loadGenesisFixture: %v", err)
+	}
+	if loaded.Fixture.Profile != string(types.Mainnet) {
+		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.Mainnet)
+	}
+}

@@ -294,8 +294,9 @@ func AdvanceAdmissionSnapshot(snapshot *AdmissionSnapshot, chainUtxos consensus.
 	if snapshot == nil {
 		return nil
 	}
+	chainLookup := consensus.LookupFromSet(chainUtxos)
 	for _, entry := range accepted {
-		view, parents, missing, err := resolveInputsWithView(entry.Tx, chainUtxos, snapshot.Entries, snapshot.Spent)
+		view, parents, missing, err := resolveInputsWithView(entry.Tx, chainLookup, snapshot.Entries, snapshot.Spent)
 		if err != nil {
 			return err
 		}
@@ -340,7 +341,7 @@ func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot
 		return PreparedAdmission{}, ErrTxTooLarge
 	}
 
-	view, parents, missing, err := resolveInputsWithView(tx, chainUtxos, snapshot.Entries, snapshot.Spent)
+	view, parents, missing, err := resolveInputsWithView(tx, consensus.LookupFromSet(chainUtxos), snapshot.Entries, snapshot.Spent)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -398,7 +399,7 @@ func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.U
 		return Admission{}, ErrTxTooLarge
 	}
 
-	view, parents, missing, err := p.resolveInputs(prepared.Tx, chainUtxos)
+	view, parents, missing, err := p.resolveInputs(prepared.Tx, consensus.LookupFromSet(chainUtxos))
 	if err != nil {
 		return Admission{}, err
 	}
@@ -417,7 +418,7 @@ func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.U
 		Summary:  accepted.Summary,
 		Accepted: []AcceptedTx{accepted},
 	}
-	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainUtxos, rules)...)
+	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), consensus.LookupFromSet(chainUtxos), rules)...)
 	p.bumpEpochLocked()
 	return admission, nil
 }
@@ -441,7 +442,7 @@ func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rule
 		return Admission{}, ErrTxTooLarge
 	}
 
-	view, parents, missing, err := p.resolveInputs(tx, chainUtxos)
+	view, parents, missing, err := p.resolveInputs(tx, consensus.LookupFromSet(chainUtxos))
 	if err != nil {
 		return Admission{}, err
 	}
@@ -461,7 +462,7 @@ func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rule
 		Summary:  accepted.Summary,
 		Accepted: []AcceptedTx{accepted},
 	}
-	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(txid, tx), chainUtxos, rules)...)
+	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(txid, tx), consensus.LookupFromSet(chainUtxos), rules)...)
 	p.bumpEpochLocked()
 	return admission, nil
 }
@@ -471,17 +472,34 @@ func (p *Pool) SelectForBlock(chainUtxos consensus.UtxoSet, rules consensus.Cons
 	return p.SelectForBlockInPlace(tempUtxos, rules, maxTxBytes)
 }
 
+// SelectForBlockFromBase builds block candidates against an immutable base UTXO
+// view and returns the post-selection UTXO set without mutating the caller's
+// published chain map.
+func (p *Pool) SelectForBlockFromBase(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, consensus.UtxoSet) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.selectForBlockLocked(baseUtxos, rules, maxTxBytes)
+}
+
 // SelectForBlockInPlace consumes a mutable chain view and advances it as eligible
 // transactions are accepted. Eligibility is still checked against the original
 // pre-block UTXO set so block assembly cannot create same-block dependency edges.
 func (p *Pool) SelectForBlockInPlace(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.selectForBlockLocked(currentUtxos, rules, maxTxBytes)
+	selected, totalFees, finalUtxos := p.selectForBlockLocked(currentUtxos, rules, maxTxBytes)
+	for outPoint := range currentUtxos {
+		delete(currentUtxos, outPoint)
+	}
+	for outPoint, entry := range finalUtxos {
+		currentUtxos[outPoint] = entry
+	}
+	return selected, totalFees
 }
 
-func (p *Pool) selectForBlockLocked(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
-	preBlockUtxos := cloneUtxos(currentUtxos)
+func (p *Pool) selectForBlockLocked(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, consensus.UtxoSet) {
+	preBlockUtxos := consensus.LookupFromSet(baseUtxos)
+	overlay := consensus.NewUtxoOverlay(baseUtxos)
 	selected := make([]SnapshotEntry, 0, len(p.entries))
 	included := make(map[[32]byte]struct{}, len(p.entries))
 	claimed := make(map[types.OutPoint]struct{})
@@ -506,7 +524,7 @@ func (p *Pool) selectForBlockLocked(currentUtxos consensus.UtxoSet, rules consen
 				continue
 			}
 
-			packageFees, ok := applyCandidatePackage(preBlockUtxos, currentUtxos, claimed, filtered, rules)
+			packageFees, ok := applyCandidatePackage(preBlockUtxos, overlay, claimed, filtered, rules)
 			if !ok {
 				next = append(next, candidate)
 				continue
@@ -526,13 +544,16 @@ func (p *Pool) selectForBlockLocked(currentUtxos consensus.UtxoSet, rules consen
 		pending = next
 	}
 
+	finalUtxos := overlay.Materialize()
 	sortSnapshotEntriesByTxID(selected)
-	return selected, totalFees
+	return selected, totalFees, finalUtxos
 }
 
 func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	preBlockLookup := consensus.LookupFromSet(preBlockUtxos)
+	overlay := consensus.NewUtxoOverlay(currentUtxos)
 	appendOnly := make([]SnapshotEntry, 0, len(p.entries))
 	included := make(map[[32]byte]struct{}, len(selected))
 	claimed := claimedOutPointsForSnapshots(selected)
@@ -561,7 +582,7 @@ func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos cons
 				continue
 			}
 
-			packageFees, ok := applyCandidatePackage(preBlockUtxos, currentUtxos, claimed, filtered, rules)
+			packageFees, ok := applyCandidatePackage(preBlockLookup, overlay, claimed, filtered, rules)
 			if !ok {
 				next = append(next, candidate)
 				continue
@@ -581,6 +602,13 @@ func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos cons
 		pending = next
 	}
 
+	finalUtxos := overlay.Materialize()
+	for outPoint := range currentUtxos {
+		delete(currentUtxos, outPoint)
+	}
+	for outPoint, entry := range finalUtxos {
+		currentUtxos[outPoint] = entry
+	}
 	sortSnapshotEntriesByTxID(appendOnly)
 	return appendOnly, totalFees
 }
@@ -722,7 +750,7 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 	}, nil
 }
 
-func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) []AcceptedTx {
+func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) []AcceptedTx {
 	promoted := make([]AcceptedTx, 0)
 	queued := append([]types.OutPoint(nil), outputs...)
 	seen := make(map[[32]byte]struct{})
@@ -741,7 +769,7 @@ func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainUtxos consensu
 			if orphan == nil {
 				continue
 			}
-			view, parents, missing, err := p.resolveInputs(orphan.Tx, chainUtxos)
+			view, parents, missing, err := p.resolveInputs(orphan.Tx, chainLookup)
 			if err != nil {
 				p.deleteOrphan(txid)
 				continue
@@ -764,7 +792,7 @@ func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainUtxos consensu
 	return promoted
 }
 
-func (p *Pool) resolveInputs(tx types.Transaction, chainUtxos consensus.UtxoSet) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
+func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLookup) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
 	view := make(consensus.UtxoSet, len(tx.Base.Inputs))
 	parents := make(map[[32]byte]struct{})
 	missing := make(map[types.OutPoint]struct{})
@@ -773,7 +801,7 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainUtxos consensus.UtxoSet)
 		if _, ok := p.spent[input.PrevOut]; ok {
 			return nil, nil, nil, ErrInputAlreadySpent
 		}
-		if utxo, ok := chainUtxos[input.PrevOut]; ok {
+		if utxo, ok := chainLookup(input.PrevOut); ok {
 			view[input.PrevOut] = utxo
 			continue
 		}
@@ -799,7 +827,7 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainUtxos consensus.UtxoSet)
 	return view, parents, missing, nil
 }
 
-func resolveInputsWithView(tx types.Transaction, chainUtxos consensus.UtxoSet, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
+func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLookup, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
 	view := make(consensus.UtxoSet, len(tx.Base.Inputs))
 	parents := make(map[[32]byte]struct{})
 	missing := make(map[types.OutPoint]struct{})
@@ -808,7 +836,7 @@ func resolveInputsWithView(tx types.Transaction, chainUtxos consensus.UtxoSet, e
 		if _, ok := spent[input.PrevOut]; ok {
 			return nil, nil, nil, ErrInputAlreadySpent
 		}
-		if utxo, ok := chainUtxos[input.PrevOut]; ok {
+		if utxo, ok := chainLookup(input.PrevOut); ok {
 			view[input.PrevOut] = utxo
 			continue
 		}
@@ -1151,14 +1179,10 @@ type appliedTxUndo struct {
 	created []types.OutPoint
 }
 
-func applyCandidatePackage(preBlockUtxos consensus.UtxoSet, currentUtxos consensus.UtxoSet, claimed map[types.OutPoint]struct{}, entries []*Entry, rules consensus.ConsensusRules) (uint64, bool) {
+func applyCandidatePackage(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []*Entry, rules consensus.ConsensusRules) (uint64, bool) {
 	undos := make([]appliedTxUndo, 0, len(entries))
 	newlyClaimed := make([]types.OutPoint, 0, len(entries))
 	var totalFees uint64
-	lookup := func(out types.OutPoint) (consensus.UtxoEntry, bool) {
-		utxo, ok := preBlockUtxos[out]
-		return utxo, ok
-	}
 	for _, entry := range entries {
 		for _, input := range entry.Tx.Base.Inputs {
 			if _, ok := claimed[input.PrevOut]; ok {
@@ -1167,7 +1191,7 @@ func applyCandidatePackage(preBlockUtxos consensus.UtxoSet, currentUtxos consens
 				return 0, false
 			}
 		}
-		summary, err := consensus.ValidateTxWithLookup(&entry.Tx, lookup, rules)
+		summary, err := consensus.ValidateTxWithLookup(&entry.Tx, preBlockUtxos, rules)
 		if err != nil {
 			rollbackAppliedPackage(currentUtxos, undos)
 			rollbackClaimedInputs(claimed, newlyClaimed)
@@ -1183,36 +1207,36 @@ func applyCandidatePackage(preBlockUtxos consensus.UtxoSet, currentUtxos consens
 	return totalFees, true
 }
 
-func applyTxWithUndo(utxos consensus.UtxoSet, tx types.Transaction, txid [32]byte) appliedTxUndo {
+func applyTxWithUndo(utxos *consensus.UtxoOverlay, tx types.Transaction, txid [32]byte) appliedTxUndo {
 	undo := appliedTxUndo{
 		spent:   make(map[types.OutPoint]consensus.UtxoEntry, len(tx.Base.Inputs)),
 		created: make([]types.OutPoint, 0, len(tx.Base.Outputs)),
 	}
 	for _, input := range tx.Base.Inputs {
-		if entry, ok := utxos[input.PrevOut]; ok {
+		if entry, ok := utxos.Lookup(input.PrevOut); ok {
 			undo.spent[input.PrevOut] = entry
 		}
-		delete(utxos, input.PrevOut)
+		utxos.Spend(input.PrevOut)
 	}
 	for vout, output := range tx.Base.Outputs {
 		out := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-		utxos[out] = consensus.UtxoEntry{
+		utxos.Set(out, consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
 			KeyHash:    output.KeyHash,
-		}
+		})
 		undo.created = append(undo.created, out)
 	}
 	return undo
 }
 
-func rollbackAppliedPackage(utxos consensus.UtxoSet, undos []appliedTxUndo) {
+func rollbackAppliedPackage(utxos *consensus.UtxoOverlay, undos []appliedTxUndo) {
 	for i := len(undos) - 1; i >= 0; i-- {
 		undo := undos[i]
 		for _, out := range undo.created {
-			delete(utxos, out)
+			utxos.Spend(out)
 		}
 		for out, entry := range undo.spent {
-			utxos[out] = entry
+			utxos.Restore(out, entry)
 		}
 	}
 }

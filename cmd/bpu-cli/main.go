@@ -95,6 +95,8 @@ func runBench(args []string) error {
 		return runBenchRun(args[1:])
 	case "suite":
 		return runBenchSuite(args[1:])
+	case "sim":
+		return runBenchSimulation(args[1:])
 	default:
 		return errors.New("unknown bench subcommand")
 	}
@@ -220,6 +222,68 @@ func runBenchSuite(args []string) error {
 	}
 	fmt.Println()
 	fmt.Println(benchmarks.RenderSuiteASCIISummary(report))
+	return nil
+}
+
+func runBenchSimulation(args []string) error {
+	fs := flag.NewFlagSet("bench sim", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	topologyRaw := fs.String("topology", string(benchmarks.DefaultSimulationOptions().Topology), "")
+	nodes := fs.Int("nodes", benchmarks.DefaultSimulationOptions().NodeCount, "")
+	seed := fs.Int64("seed", benchmarks.DefaultSimulationOptions().Seed, "")
+	txs := fs.Int("txs", benchmarks.DefaultSimulationOptions().TxCount, "")
+	blocks := fs.Int("blocks", benchmarks.DefaultSimulationOptions().BlockCount, "")
+	baseLatency := fs.Duration("base-latency", benchmarks.DefaultSimulationOptions().BaseLatency, "")
+	latencyJitter := fs.Duration("latency-jitter", benchmarks.DefaultSimulationOptions().LatencyJitter, "")
+	txProcessing := fs.Duration("tx-processing", benchmarks.DefaultSimulationOptions().TxProcessingDelay, "")
+	blockProcessing := fs.Duration("block-processing", benchmarks.DefaultSimulationOptions().BlockProcessingDelay, "")
+	txSpacing := fs.Duration("tx-spacing", benchmarks.DefaultSimulationOptions().TxSpacing, "")
+	blockSpacing := fs.Duration("block-spacing", benchmarks.DefaultSimulationOptions().BlockSpacing, "")
+	churnEvents := fs.Int("churn-events", benchmarks.DefaultSimulationOptions().ChurnEvents, "")
+	churnDuration := fs.Duration("churn-duration", benchmarks.DefaultSimulationOptions().ChurnDuration, "")
+	smallWorldDegree := fs.Int("small-world-degree", benchmarks.DefaultSimulationOptions().SmallWorldDegree, "")
+	reportDir := fs.String("out", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	report, err := benchmarks.RunSimulation(context.Background(), benchmarks.SimulationOptions{
+		NodeCount:            *nodes,
+		Topology:             benchmarks.SimulationTopology(*topologyRaw),
+		Seed:                 *seed,
+		TxCount:              *txs,
+		BlockCount:           *blocks,
+		BaseLatency:          *baseLatency,
+		LatencyJitter:        *latencyJitter,
+		TxProcessingDelay:    *txProcessing,
+		BlockProcessingDelay: *blockProcessing,
+		TxSpacing:            *txSpacing,
+		BlockSpacing:         *blockSpacing,
+		ChurnEvents:          *churnEvents,
+		ChurnDuration:        *churnDuration,
+		SmallWorldDegree:     *smallWorldDegree,
+	})
+	if err != nil {
+		return err
+	}
+	if *reportDir == "" {
+		*reportDir = filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-simulation")
+	}
+	if err := benchmarks.WriteSimulationReportDir(report, *reportDir); err != nil {
+		return err
+	}
+
+	fmt.Printf("topology: %s\n", report.Config.Topology)
+	fmt.Printf("nodes: %d\n", report.Config.NodeCount)
+	fmt.Printf("seed: %d\n", report.Config.Seed)
+	fmt.Printf("tx_items: %d\n", report.Config.TxCount)
+	fmt.Printf("block_items: %d\n", report.Config.BlockCount)
+	fmt.Printf("tx_p95_to_90pct_ms: %.2f\n", report.Summary.Tx.P95TargetMS)
+	fmt.Printf("block_p95_to_90pct_ms: %.2f\n", report.Summary.Block.P95TargetMS)
+	fmt.Printf("message_drops: %d\n", report.Summary.Messages.Dropped)
+	fmt.Printf("report_dir: %s\n", *reportDir)
+	fmt.Println()
+	fmt.Println(benchmarks.RenderSimulationASCIISummary(report))
 	return nil
 }
 
@@ -526,6 +590,12 @@ func runWallet(args []string) error {
 		return runWalletCreate(args[1:])
 	case "list":
 		return runWalletList(args[1:])
+	case "balance":
+		return runWalletBalance(args[1:])
+	case "history":
+		return runWalletHistory(args[1:])
+	case "fee":
+		return runWalletFee(args[1:])
 	case "receive":
 		return runWalletReceive(args[1:])
 	case "send":
@@ -593,6 +663,131 @@ func runWalletList(args []string) error {
 		}
 		fmt.Printf("%s  addresses=%d  pending=%d  receive=%s\n", entry.Name, len(entry.Addresses), len(entry.Pending), receive)
 	}
+	return nil
+}
+
+func runWalletBalance(args []string) error {
+	fs := flag.NewFlagSet("wallet balance", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli wallet balance [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] <wallet>")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
+	if err := reconcileWalletPending(store, client, fs.Arg(0)); err != nil {
+		return err
+	}
+	keyHashes, err := store.SpendableKeyHashes(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	utxos, err := rpcUTXOsByKeyHashes(client, keyHashes)
+	if err != nil {
+		return err
+	}
+	balance, err := store.Balance(fs.Arg(0), utxos)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wallet: %s\n", fs.Arg(0))
+	fmt.Printf("confirmed: %d\n", balance.Confirmed)
+	fmt.Printf("available: %d\n", balance.Available)
+	fmt.Printf("reserved: %d\n", balance.Reserved)
+	fmt.Printf("pending_txs: %d\n", balance.PendingCount)
+	fmt.Printf("addresses: %d\n", balance.AddressCount)
+	return nil
+}
+
+func runWalletHistory(args []string) error {
+	fs := flag.NewFlagSet("wallet history", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	limit := fs.Int("limit", 20, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli wallet history [--limit N] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] <wallet>")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	keyHashes, err := store.SpendableKeyHashes(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
+	activity, err := rpcWalletActivityByKeyHashes(client, keyHashes, *limit)
+	if err != nil {
+		return err
+	}
+	if len(activity) == 0 {
+		fmt.Println("no wallet activity")
+		return nil
+	}
+	for _, item := range activity {
+		fmt.Printf("%d  %s  tx=%s  received=%d  sent=%d  fee=%d  net=%d  %s\n",
+			item.Height,
+			item.Timestamp,
+			item.TxID,
+			item.Received,
+			item.Sent,
+			item.Fee,
+			item.Net,
+			item.BlockHash,
+		)
+	}
+	return nil
+}
+
+func runWalletFee(args []string) error {
+	fs := flag.NewFlagSet("wallet fee", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	targetBlocks := fs.Int("target-blocks", 1, "")
+	txBytes := fs.Int("tx-bytes", 250, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
+	feePerByte, err := rpcEstimateFee(client, *targetBlocks)
+	if err != nil {
+		return err
+	}
+	if *txBytes < 0 {
+		return errors.New("tx-bytes must be non-negative")
+	}
+	fmt.Printf("target_blocks: %d\n", *targetBlocks)
+	fmt.Printf("fee_per_byte: %d\n", feePerByte)
+	fmt.Printf("estimated_fee: %d\n", feePerByte*uint64(*txBytes))
 	return nil
 }
 
@@ -1369,6 +1564,45 @@ func rpcUTXOsByKeyHashes(client *cliRPCClient, keyHashes [][32]byte) ([]wallet.S
 		})
 	}
 	return out, nil
+}
+
+type walletActivityRPCItem struct {
+	TxID      string `json:"txid"`
+	BlockHash string `json:"block_hash"`
+	Height    uint64 `json:"height"`
+	Timestamp string `json:"timestamp"`
+	Coinbase  bool   `json:"coinbase"`
+	Received  uint64 `json:"received"`
+	Sent      uint64 `json:"sent"`
+	Fee       uint64 `json:"fee"`
+	Net       int64  `json:"net"`
+}
+
+func rpcWalletActivityByKeyHashes(client *cliRPCClient, keyHashes [][32]byte, limit int) ([]walletActivityRPCItem, error) {
+	params := struct {
+		KeyHashes []string `json:"keyhashes"`
+		Limit     int      `json:"limit"`
+	}{KeyHashes: make([]string, 0, len(keyHashes)), Limit: limit}
+	for _, keyHash := range keyHashes {
+		params.KeyHashes = append(params.KeyHashes, hex.EncodeToString(keyHash[:]))
+	}
+	var result struct {
+		Activity []walletActivityRPCItem `json:"activity"`
+	}
+	if err := client.Call("getwalletactivitybykeyhashes", params, &result); err != nil {
+		return nil, err
+	}
+	return result.Activity, nil
+}
+
+func rpcEstimateFee(client *cliRPCClient, targetBlocks int) (uint64, error) {
+	var result struct {
+		FeePerByte uint64 `json:"fee_per_byte"`
+	}
+	if err := client.Call("estimatefee", map[string]int{"target_blocks": targetBlocks}, &result); err != nil {
+		return 0, err
+	}
+	return result.FeePerByte, nil
 }
 
 func maybeConfirmSend(plan wallet.SendPlan, yes bool) error {

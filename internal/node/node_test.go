@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/mempool"
 	"bitcoin-pure/internal/p2p"
+	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
 )
 
@@ -313,6 +315,30 @@ func TestRejectBadGenesisUTXORoot(t *testing.T) {
 	_, err := state.InitializeFromGenesisBlock(&block)
 	if err == nil {
 		t.Fatal("expected invalid genesis")
+	}
+}
+
+func TestCommittedViewReusesPublishedChainState(t *testing.T) {
+	state := NewChainState(types.Regtest)
+	block := genesisBlock()
+	if _, err := state.InitializeFromGenesisBlock(&block); err != nil {
+		t.Fatal(err)
+	}
+	view, ok := state.CommittedView()
+	if !ok {
+		t.Fatal("expected committed view")
+	}
+	if got, want := view.TipHash, consensus.HeaderHash(&block.Header); got != want {
+		t.Fatalf("tip hash = %x, want %x", got, want)
+	}
+	if got, want := view.UTXORoot, block.Header.UTXORoot; got != want {
+		t.Fatalf("utxo root = %x, want %x", got, want)
+	}
+	if got := len(view.UTXOs); got != 1 {
+		t.Fatalf("utxo count = %d, want 1", got)
+	}
+	if view.UTXOAcc == nil {
+		t.Fatal("expected maintained accumulator")
 	}
 }
 
@@ -1159,6 +1185,215 @@ func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
 	}
 }
 
+func TestGetChainStateRPC(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	result, err := svc.dispatchRPC(rpcRequest{Method: "getchainstate"})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(ChainStateInfo)
+	if !ok {
+		t.Fatalf("result type = %T, want ChainStateInfo", result)
+	}
+	if out.TipHeight != 0 {
+		t.Fatalf("tip height = %d, want 0", out.TipHeight)
+	}
+	if out.UTXOCount != 1 {
+		t.Fatalf("utxo count = %d, want 1", out.UTXOCount)
+	}
+	if out.NextBlockSizeLimit == 0 {
+		t.Fatal("expected next block size limit")
+	}
+}
+
+func TestGetMempoolInfoRPC(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, KeyHash: nodeSignerKeyHash(7)},
+	})
+	svc, err := OpenService(ServiceConfig{
+		Profile:            types.Regtest,
+		DBPath:             t.TempDir(),
+		MinRelayFeePerByte: 1,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 1_000, 8, 200)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{Method: "getmempoolinfo"})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(MempoolInfo)
+	if !ok {
+		t.Fatalf("result type = %T, want MempoolInfo", result)
+	}
+	if out.Count != 1 {
+		t.Fatalf("count = %d, want 1", out.Count)
+	}
+	if out.Bytes <= 0 {
+		t.Fatalf("bytes = %d, want > 0", out.Bytes)
+	}
+	if out.CandidateFrontier <= 0 {
+		t.Fatalf("candidate frontier = %d, want > 0", out.CandidateFrontier)
+	}
+}
+
+func TestGetMiningInfoRPC(t *testing.T) {
+	genesis := genesisBlock()
+	keyHash := nodeSignerKeyHash(9)
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerEnabled: true,
+		MinerWorkers: 2,
+		MinerKeyHash: keyHash,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	result, err := svc.dispatchRPC(rpcRequest{Method: "getmininginfo"})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(MiningInfo)
+	if !ok {
+		t.Fatalf("result type = %T, want MiningInfo", result)
+	}
+	if !out.Enabled {
+		t.Fatal("expected mining enabled")
+	}
+	if out.Workers != 2 {
+		t.Fatalf("workers = %d, want 2", out.Workers)
+	}
+	if out.MinerKeyHash != hex.EncodeToString(keyHash[:]) {
+		t.Fatalf("miner keyhash = %q", out.MinerKeyHash)
+	}
+	if out.CurrentBits == 0 || out.NextBits == 0 {
+		t.Fatal("expected current and next bits")
+	}
+}
+
+func TestGetWalletActivityByKeyHashesRPC(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	spend := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}})
+	block := blockWithTxsForNodeTest(t, 0, genesis.Header, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, spend}, genesis.Header.Timestamp+600)
+	if _, _, err := svc.acceptMinedBlock(block); err != nil {
+		t.Fatalf("acceptMinedBlock: %v", err)
+	}
+
+	keyHash7 := nodeSignerKeyHash(7)
+	params, err := json.Marshal(map[string]any{
+		"keyhashes": []string{hex.EncodeToString(keyHash7[:])},
+		"limit":     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "getwalletactivitybykeyhashes",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	raw, err := json.Marshal(out["activity"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("activity count = %d, want 1", len(decoded))
+	}
+	if got := decoded[0]["sent"].(float64); got != 50 {
+		t.Fatalf("sent = %v, want 50", got)
+	}
+	if got := decoded[0]["fee"].(float64); got != 1 {
+		t.Fatalf("fee = %v, want 1", got)
+	}
+}
+
+func TestEstimateFeeRPC(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 5_000
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 5_000, KeyHash: nodeSignerKeyHash(7)},
+	})
+	svc, err := OpenService(ServiceConfig{
+		Profile:            types.Regtest,
+		DBPath:             t.TempDir(),
+		MinRelayFeePerByte: 2,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	txA := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 5_000, 8, 2_000)
+	if _, err := svc.SubmitTx(txA); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+	params, err := json.Marshal(map[string]any{"target_blocks": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "estimatefee",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	if got := out["fee_per_byte"].(uint64); got < 2 {
+		t.Fatalf("fee_per_byte = %d, want at least 2", got)
+	}
+}
+
 func TestSubmitDecodedTxsAcceptsDependentChainBatch(t *testing.T) {
 	genesis := genesisBlock()
 	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
@@ -1306,6 +1541,165 @@ func TestMineBlocksProducesDistinctCoinbaseOutpoints(t *testing.T) {
 	}
 }
 
+func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
+	minerKey := nodeSignerKeyHash(9)
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerKeyHash: minerKey,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	before, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate before tx wave: %v", err)
+	}
+	if len(before.Txs) != 1 {
+		t.Fatalf("template tx count before wave = %d, want 1", len(before.Txs))
+	}
+
+	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+
+	after, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate after tx wave: %v", err)
+	}
+	if len(after.Txs) != 2 {
+		t.Fatalf("template tx count after wave = %d, want 2", len(after.Txs))
+	}
+	if got := consensus.TxID(&after.Txs[1]); got != consensus.TxID(&tx) {
+		t.Fatalf("template txid = %x, want %x", got, consensus.TxID(&tx))
+	}
+	stats := svc.BlockTemplateStats()
+	if stats.Invalidations == 0 {
+		t.Fatal("expected tx admission to invalidate block template")
+	}
+	if stats.LastReason != "tx_admission" {
+		t.Fatalf("last template reason = %q, want tx_admission", stats.LastReason)
+	}
+}
+
+func TestMineOneBlockRefreshesInterruptedTemplate(t *testing.T) {
+	minerKey := nodeSignerKeyHash(9)
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerKeyHash: minerKey,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	var calls int
+	svc.mineHeaderFn = func(header types.BlockHeader, params consensus.ChainParams, shouldContinue func(uint32) bool) (types.BlockHeader, bool, error) {
+		calls++
+		switch calls {
+		case 1:
+			if _, err := svc.SubmitTx(tx); err != nil {
+				return types.BlockHeader{}, false, err
+			}
+			if shouldContinue(0) {
+				return types.BlockHeader{}, false, errors.New("template should have been invalidated by tx wave")
+			}
+			return types.BlockHeader{}, false, nil
+		case 2:
+			return mineHeaderForNodeTest(header), true, nil
+		default:
+			return types.BlockHeader{}, false, errors.New("unexpected extra mining attempt")
+		}
+	}
+
+	hash, err := svc.mineOneBlock()
+	if err != nil {
+		t.Fatalf("mineOneBlock: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("mine calls = %d, want 2", calls)
+	}
+	block, err := svc.chainState.Store().GetBlock(&hash)
+	if err != nil {
+		t.Fatalf("GetBlock: %v", err)
+	}
+	if block == nil {
+		t.Fatal("mined block missing from store")
+	}
+	if len(block.Txs) != 2 {
+		t.Fatalf("mined block tx count = %d, want 2", len(block.Txs))
+	}
+	if got := consensus.TxID(&block.Txs[1]); got != consensus.TxID(&tx) {
+		t.Fatalf("mined block txid = %x, want %x", got, consensus.TxID(&tx))
+	}
+	stats := svc.BlockTemplateStats()
+	if stats.Interruptions == 0 {
+		t.Fatal("expected interrupted mining telemetry")
+	}
+}
+
+func TestAcceptPeerBlockInvalidatesMinerTemplate(t *testing.T) {
+	minerKey := nodeSignerKeyHash(9)
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerKeyHash: minerKey,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	before, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate before peer block: %v", err)
+	}
+	genesisHash := consensus.HeaderHash(&genesis.Header)
+	if before.Header.PrevBlockHash != genesisHash {
+		t.Fatalf("template prev hash before peer block = %x, want %x", before.Header.PrevBlockHash, genesisHash)
+	}
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	peerBlock := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 4, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{peerBlock.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.controlQ = make(chan outboundMessage, 8)
+	if err := svc.acceptPeerBlockMessage(peer, &peerBlock); err != nil {
+		t.Fatalf("acceptPeerBlockMessage: %v", err)
+	}
+
+	after, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate after peer block: %v", err)
+	}
+	peerHash := consensus.HeaderHash(&peerBlock.Header)
+	if after.Header.PrevBlockHash != peerHash {
+		t.Fatalf("template prev hash after peer block = %x, want %x", after.Header.PrevBlockHash, peerHash)
+	}
+	stats := svc.BlockTemplateStats()
+	if stats.Invalidations == 0 {
+		t.Fatal("expected peer block to invalidate block template")
+	}
+	if stats.LastReason != "peer_block" {
+		t.Fatalf("last template reason = %q, want peer_block", stats.LastReason)
+	}
+}
+
 func TestConnectPeerReconnectsAfterDisconnect(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -1368,6 +1762,157 @@ func TestConnectPeerReconnectsAfterDisconnect(t *testing.T) {
 	got := accepts
 	mu.Unlock()
 	t.Fatalf("accepted connections = %d, want at least 2", got)
+}
+
+func TestScheduleBlockRequestsReassignsExpiredInflight(t *testing.T) {
+	svc := &Service{
+		cfg:           ServiceConfig{Profile: types.Regtest, StallTimeout: time.Second},
+		stopCh:        make(chan struct{}),
+		blockRequests: make(map[[32]byte]blockDownloadRequest),
+	}
+	hashA := [32]byte{1}
+	hashB := [32]byte{2}
+
+	first := svc.scheduleBlockRequests("peer-a", [][32]byte{hashA, hashB}, 8)
+	if len(first) != 2 {
+		t.Fatalf("first scheduled count = %d, want 2", len(first))
+	}
+
+	second := svc.scheduleBlockRequests("peer-b", [][32]byte{hashA, hashB}, 8)
+	if len(second) != 0 {
+		t.Fatalf("second scheduled count = %d, want 0 while requests are still inflight", len(second))
+	}
+
+	req := svc.blockRequests[hashA]
+	req.requestedAt = time.Now().Add(-svc.blockRequestTimeout() - time.Second)
+	svc.blockRequests[hashA] = req
+
+	third := svc.scheduleBlockRequests("peer-b", [][32]byte{hashA}, 8)
+	if len(third) != 1 || third[0] != hashA {
+		t.Fatalf("expired reassignment = %v, want [%x]", third, hashA)
+	}
+	if got := svc.blockRequests[hashA].peerAddr; got != "peer-b" {
+		t.Fatalf("reassigned peer = %q, want peer-b", got)
+	}
+}
+
+func TestScheduleTxInvRequestsReassignsExpiredInflight(t *testing.T) {
+	svc := &Service{
+		cfg:        ServiceConfig{Profile: types.Regtest, StallTimeout: time.Second},
+		stopCh:     make(chan struct{}),
+		txRequests: make(map[[32]byte]blockDownloadRequest),
+	}
+	itemA := p2p.InvVector{Type: p2p.InvTypeTx, Hash: [32]byte{1}}
+	itemB := p2p.InvVector{Type: p2p.InvTypeTx, Hash: [32]byte{2}}
+
+	first := svc.scheduleTxInvRequests("peer-a", []p2p.InvVector{itemA, itemB}, 8)
+	if len(first) != 2 {
+		t.Fatalf("first scheduled count = %d, want 2", len(first))
+	}
+
+	second := svc.scheduleTxInvRequests("peer-b", []p2p.InvVector{itemA, itemB}, 8)
+	if len(second) != 0 {
+		t.Fatalf("second scheduled count = %d, want 0 while requests are still inflight", len(second))
+	}
+
+	req := svc.txRequests[itemA.Hash]
+	req.requestedAt = time.Now().Add(-svc.txRequestTimeout() - time.Second)
+	svc.txRequests[itemA.Hash] = req
+
+	third := svc.scheduleTxInvRequests("peer-b", []p2p.InvVector{itemA}, 8)
+	if len(third) != 1 || third[0] != itemA {
+		t.Fatalf("expired reassignment = %v, want [%+v]", third, itemA)
+	}
+	if got := svc.txRequests[itemA.Hash].peerAddr; got != "peer-b" {
+		t.Fatalf("reassigned peer = %q, want peer-b", got)
+	}
+}
+
+func TestOpenServiceRestoresPersistedVettedPeers(t *testing.T) {
+	path := t.TempDir()
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  path,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	svc.recordKnownPeerSuccess("127.0.0.1:18444", time.Unix(1_700_000_000, 0))
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  path,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("reopen service: %v", err)
+	}
+	defer reopened.Close()
+
+	addrs := reopened.knownPeerAddrs()
+	if len(addrs) != 1 || addrs[0] != "127.0.0.1:18444" {
+		t.Fatalf("known peers after reopen = %v, want [127.0.0.1:18444]", addrs)
+	}
+	loaded, err := reopened.chainState.Store().LoadKnownPeers()
+	if err != nil {
+		t.Fatalf("LoadKnownPeers: %v", err)
+	}
+	if _, ok := loaded["127.0.0.1:18444"]; !ok {
+		t.Fatal("persisted vetted peer missing after reopen")
+	}
+}
+
+func TestRefillOutboundPeersDialsLearnedCandidates(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:          types.Regtest,
+		DBPath:           t.TempDir(),
+		MaxOutboundPeers: 1,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		wire := p2p.NewConn(conn, p2p.MagicForProfile(types.Regtest), 8<<20)
+		if _, err := p2p.Handshake(wire, p2p.VersionMessage{
+			Protocol:  1,
+			Height:    0,
+			Nonce:     1,
+			UserAgent: "learned-peer-test",
+		}, 2*time.Second); err == nil {
+			accepted <- struct{}{}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	svc.rememberKnownPeers([]string{ln.Addr().String()})
+	svc.refillOutboundPeers()
+
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for learned peer dial")
+	}
+	if got := svc.outboundPeerCount(); got != 1 {
+		t.Fatalf("outbound peer count = %d, want 1", got)
+	}
 }
 
 func TestPeerWriteLoopSetsWriteDeadline(t *testing.T) {
@@ -2170,6 +2715,74 @@ func TestApplyPeerHeadersInactiveBranchDoesNotRewriteActiveLocatorBase(t *testin
 	}
 }
 
+func TestOpenServiceRestoresPromotedHigherWorkHeaderBranch(t *testing.T) {
+	path := t.TempDir()
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  path,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+
+	baseState := NewChainState(types.Regtest)
+	if _, err := baseState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	mainFirst := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{mainFirst.Header}); err != nil {
+		t.Fatalf("apply main header: %v", err)
+	}
+
+	altFirst := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	altState := baseState.Clone()
+	if _, err := altState.ApplyBlock(&altFirst); err != nil {
+		t.Fatal(err)
+	}
+	altSecond := nextCoinbaseBlock(1, altFirst.Header, altState.UTXOs(), 5, altFirst.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{altFirst.Header, altSecond.Header}); err != nil {
+		t.Fatalf("apply competing headers: %v", err)
+	}
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  path,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("reopen service: %v", err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.HeaderHeight(); got != 2 {
+		t.Fatalf("reopened header height = %d, want 2", got)
+	}
+	if got := consensus.HeaderHash(reopened.headerChain.TipHeader()); got != consensus.HeaderHash(&altSecond.Header) {
+		t.Fatalf("reopened header tip = %x, want %x", got, consensus.HeaderHash(&altSecond.Header))
+	}
+
+	altFirstHash := consensus.HeaderHash(&altFirst.Header)
+	hashAtHeight, err := reopened.chainState.Store().GetBlockHashByHeight(1)
+	if err != nil {
+		t.Fatalf("GetBlockHashByHeight(1): %v", err)
+	}
+	if hashAtHeight == nil || *hashAtHeight != altFirstHash {
+		t.Fatalf("active header hash at height 1 = %x, want %x", hashAtHeight, altFirstHash)
+	}
+
+	altSecondHash := consensus.HeaderHash(&altSecond.Header)
+	hashAtHeight, err = reopened.chainState.Store().GetBlockHashByHeight(2)
+	if err != nil {
+		t.Fatalf("GetBlockHashByHeight(2): %v", err)
+	}
+	if hashAtHeight == nil || *hashAtHeight != altSecondHash {
+		t.Fatalf("active header hash at height 2 = %x, want %x", hashAtHeight, altSecondHash)
+	}
+}
+
 func TestOnPeerTxBatchIgnoresDuplicateAdmissionError(t *testing.T) {
 	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
 	svc, err := OpenService(ServiceConfig{
@@ -2319,6 +2932,250 @@ func TestOnPeerBlockMessageRequestsCatchUpForUnavailableParentState(t *testing.T
 	}
 	if !sawGetData {
 		t.Fatal("expected catch-up GetData request")
+	}
+}
+
+func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+
+	genesisHash := consensus.HeaderHash(&genesis.Header)
+	genesisEntry, err := svc.chainState.Store().GetBlockIndex(&genesisHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if genesisEntry == nil {
+		t.Fatal("missing genesis entry")
+	}
+	if err := svc.chainState.Store().RewriteActiveHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
+		t.Fatalf("RewriteActiveHeights: %v", err)
+	}
+
+	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
+	if err != nil {
+		t.Fatalf("missingBlockHashesDetailed: %v", err)
+	}
+	if !gapDetected {
+		t.Fatal("expected active height gap to be detected")
+	}
+	if len(hashes) != 0 {
+		t.Fatalf("hashes before repair = %d, want 0", len(hashes))
+	}
+
+	repaired, err := svc.repairActiveHeightIndex()
+	if err != nil {
+		t.Fatalf("repairActiveHeightIndex: %v", err)
+	}
+	if repaired == 0 {
+		t.Fatal("expected repaired entries")
+	}
+
+	hashes, gapDetected, err = svc.missingBlockHashesDetailed(8)
+	if err != nil {
+		t.Fatalf("missingBlockHashesDetailed after repair: %v", err)
+	}
+	if gapDetected {
+		t.Fatal("did not expect active height gap after repair")
+	}
+	if len(hashes) != 1 {
+		t.Fatalf("hash count after repair = %d, want 1", len(hashes))
+	}
+	if hashes[0] != consensus.HeaderHash(&block.Header) {
+		t.Fatalf("missing block hash = %x, want %x", hashes[0], consensus.HeaderHash(&block.Header))
+	}
+}
+
+func TestSyncWatchdogRepairsGapAndRequestsBlocks(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		StallTimeout: time.Second,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+
+	genesisHash := consensus.HeaderHash(&genesis.Header)
+	genesisEntry, err := svc.chainState.Store().GetBlockIndex(&genesisHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if genesisEntry == nil {
+		t.Fatal("missing genesis entry")
+	}
+	if err := svc.chainState.Store().RewriteActiveHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
+		t.Fatalf("RewriteActiveHeights: %v", err)
+	}
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.controlQ = make(chan outboundMessage, 8)
+	svc.peerMu.Lock()
+	svc.peers[peer.addr] = peer
+	svc.peerMu.Unlock()
+
+	svc.runSyncWatchdogStep()
+
+	gotGetData := false
+	for {
+		select {
+		case envelope := <-peer.controlQ:
+			if msg, ok := envelope.msg.(p2p.GetDataMessage); ok {
+				gotGetData = true
+				if len(msg.Items) != 1 || msg.Items[0].Hash != consensus.HeaderHash(&block.Header) {
+					t.Fatalf("GetData items = %+v, want block hash %x", msg.Items, consensus.HeaderHash(&block.Header))
+				}
+			}
+		default:
+			if !gotGetData {
+				t.Fatal("expected sync watchdog to request missing block")
+			}
+			return
+		}
+	}
+}
+
+func TestSyncWatchdogRotatesAwayFromTimedOutHeaderPeer(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		StallTimeout: time.Second,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+
+	stalled := newPeerConnForTests("127.0.0.1:18444")
+	stalled.controlQ = make(chan outboundMessage, 8)
+	stalled.noteHeight(5)
+	stalled.markHeadersRequested(time.Now().Add(-3 * svc.syncStallThreshold()))
+
+	healthy := newPeerConnForTests("127.0.0.1:18445")
+	healthy.controlQ = make(chan outboundMessage, 8)
+	healthy.noteHeight(5)
+	healthy.noteUsefulHeaders(2, time.Now())
+
+	svc.peerMu.Lock()
+	svc.peers[stalled.addr] = stalled
+	svc.peers[healthy.addr] = healthy
+	svc.peerMu.Unlock()
+
+	svc.runSyncWatchdogStep()
+
+	if got := stalled.syncSnapshot().HeaderStalls; got == 0 {
+		t.Fatal("expected stalled peer header stall count to increment")
+	}
+	if got := stalled.syncSnapshot().cooldownRemainingMS(time.Now()); got <= 0 {
+		t.Fatal("expected stalled peer cooldown")
+	}
+	if len(stalled.controlQ) != 0 {
+		t.Fatalf("expected stalled peer to be skipped during sync rotation, queued=%d", len(stalled.controlQ))
+	}
+	if len(healthy.controlQ) == 0 {
+		t.Fatal("expected healthy peer to receive sync work")
+	}
+}
+
+func TestExpireStaleBlockRequestsDemotesOwningPeer(t *testing.T) {
+	svc := &Service{
+		cfg:           ServiceConfig{StallTimeout: time.Second},
+		logger:        slog.Default(),
+		peers:         make(map[string]*peerConn),
+		blockRequests: make(map[[32]byte]blockDownloadRequest),
+	}
+	svc.syncMgr = &syncManager{svc: svc}
+
+	stalled := newPeerConnForTests("127.0.0.1:18444")
+	healthy := newPeerConnForTests("127.0.0.1:18445")
+	svc.peers[stalled.addr] = stalled
+	svc.peers[healthy.addr] = healthy
+
+	hash := [32]byte{0xaa}
+	svc.blockRequests[hash] = blockDownloadRequest{
+		peerAddr:    stalled.addr,
+		requestedAt: time.Now().Add(-11 * time.Second),
+	}
+
+	svc.expireStaleBlockRequests()
+
+	if got := stalled.syncSnapshot().BlockStalls; got != 1 {
+		t.Fatalf("stalled block stalls = %d, want 1", got)
+	}
+	if got := stalled.syncSnapshot().cooldownRemainingMS(time.Now()); got <= 0 {
+		t.Fatal("expected stalled peer cooldown after expired block request")
+	}
+	if got := healthy.syncSnapshot().BlockStalls; got != 0 {
+		t.Fatalf("healthy block stalls = %d, want 0", got)
+	}
+}
+
+func TestPreferredDownloadPeersExcludeCooledPeer(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	cool := newPeerConnForTests("127.0.0.1:18444")
+	cool.noteHeight(10)
+	cool.noteStall(syncRequestBlocks, time.Now())
+
+	healthy := newPeerConnForTests("127.0.0.1:18445")
+	healthy.noteHeight(5)
+	healthy.noteUsefulBlocks(1, time.Now())
+
+	svc.peerMu.Lock()
+	svc.peers[cool.addr] = cool
+	svc.peers[healthy.addr] = healthy
+	svc.peerMu.Unlock()
+
+	preferred := svc.syncManager().preferredDownloadPeers(1)
+	if len(preferred) != 1 {
+		t.Fatalf("preferred peer count = %d, want 1", len(preferred))
+	}
+	if preferred[0].addr != healthy.addr {
+		t.Fatalf("preferred peer = %s, want %s", preferred[0].addr, healthy.addr)
 	}
 }
 

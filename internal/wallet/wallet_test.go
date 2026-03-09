@@ -173,3 +173,51 @@ func TestBuildSendRejectsInsufficientFunds(t *testing.T) {
 		t.Fatalf("BuildSend err = %v, want ErrInsufficientFunds", err)
 	}
 }
+
+func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	plan, err := store.BuildSend("alice", first.Address, 10, 1, []SpendableUTXO{
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, KeyHash: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1}, Value: 25, KeyHash: keyHash},
+	})
+	if err != nil {
+		t.Fatalf("BuildSend: %v", err)
+	}
+	spent := make([]types.OutPoint, 0, len(plan.Inputs))
+	for _, input := range plan.Inputs {
+		spent = append(spent, input.OutPoint)
+	}
+	if err := store.MarkSubmitted("alice", plan.TransactionID, spent); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	summary, err := store.Balance("alice", []SpendableUTXO{
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, KeyHash: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1}, Value: 25, KeyHash: keyHash},
+	})
+	if err != nil {
+		t.Fatalf("Balance: %v", err)
+	}
+	if summary.Confirmed != 75 {
+		t.Fatalf("confirmed = %d, want 75", summary.Confirmed)
+	}
+	if summary.Reserved == 0 {
+		t.Fatal("expected reserved balance from pending spend")
+	}
+	if summary.Available >= summary.Confirmed {
+		t.Fatalf("available = %d, want less than confirmed %d", summary.Available, summary.Confirmed)
+	}
+	if summary.PendingCount != 1 {
+		t.Fatalf("pending count = %d, want 1", summary.PendingCount)
+	}
+}

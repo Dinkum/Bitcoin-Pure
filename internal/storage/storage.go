@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
@@ -25,6 +26,7 @@ var (
 	blockIndexPrefix       = []byte("block_index/")
 	blockUndoPrefix        = []byte("block_undo/")
 	heightIndexPrefix      = []byte("height_index/")
+	knownPeerPrefix        = []byte("known_peer/")
 	utxoPrefix             = []byte("utxo/")
 )
 
@@ -215,6 +217,69 @@ func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
 		Height:    height,
 		TipHeader: header,
 	}, nil
+}
+
+func (s *ChainStore) LoadKnownPeers() (map[string]time.Time, error) {
+	iter, err := s.db.NewIter(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	peers := make(map[string]time.Time)
+	for iter.First(); iter.Valid(); iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), knownPeerPrefix) {
+			continue
+		}
+		addr := string(iter.Key()[len(knownPeerPrefix):])
+		if addr == "" {
+			continue
+		}
+		lastSeenUnix, err := decodeI64(iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		peers[addr] = time.Unix(0, lastSeenUnix).UTC()
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return peers, nil
+}
+
+func (s *ChainStore) WriteKnownPeers(peers map[string]time.Time) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	iter, err := s.db.NewIter(nil)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), knownPeerPrefix) {
+			continue
+		}
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	for addr, lastSeen := range peers {
+		if addr == "" {
+			continue
+		}
+		if err := batch.Set(knownPeerKey(addr), encodeI64(lastSeen.UTC().UnixNano()), nil); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	logging.Component("storage").Info("wrote known peers", slog.Int("count", len(peers)))
+	return nil
 }
 
 func (s *ChainStore) WriteFullState(state *StoredChainState) error {
@@ -568,11 +633,24 @@ func encodeU64(v uint64) []byte {
 	return out
 }
 
+func encodeI64(v int64) []byte {
+	out := make([]byte, 8)
+	binary.LittleEndian.PutUint64(out, uint64(v))
+	return out
+}
+
 func decodeU64(buf []byte) (uint64, error) {
 	if len(buf) != 8 {
 		return 0, errors.New("invalid u64 encoding")
 	}
 	return binary.LittleEndian.Uint64(buf), nil
+}
+
+func decodeI64(buf []byte) (int64, error) {
+	if len(buf) != 8 {
+		return 0, errors.New("invalid i64 encoding")
+	}
+	return int64(binary.LittleEndian.Uint64(buf)), nil
 }
 
 func blockKey(hash [32]byte) []byte {
@@ -589,6 +667,10 @@ func blockUndoKey(hash [32]byte) []byte {
 
 func heightIndexKey(height uint64) []byte {
 	return append(append([]byte(nil), heightIndexPrefix...), encodeU64(height)...)
+}
+
+func knownPeerKey(addr string) []byte {
+	return append(append([]byte(nil), knownPeerPrefix...), []byte(addr)...)
 }
 
 func utxoKey(outPoint types.OutPoint) []byte {
