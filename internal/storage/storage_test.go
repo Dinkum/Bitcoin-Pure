@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
@@ -163,6 +164,41 @@ func TestWriteAndLoadHeaderStateRoundtrip(t *testing.T) {
 	}
 	if index == nil || index.Height != 0 || index.Header != block.Header {
 		t.Fatal("header index mismatch")
+	}
+}
+
+func TestWriteAndLoadKnownPeersRoundtrip(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Unix(1_700_000_000, 123).UTC()
+	peers := map[string]time.Time{
+		"127.0.0.1:18444": base,
+		"127.0.0.1:18445": base.Add(5 * time.Minute),
+	}
+	if err := store.WriteKnownPeers(peers); err != nil {
+		t.Fatalf("WriteKnownPeers: %v", err)
+	}
+
+	loaded, err := store.LoadKnownPeers()
+	if err != nil {
+		t.Fatalf("LoadKnownPeers: %v", err)
+	}
+	if len(loaded) != len(peers) {
+		t.Fatalf("loaded peer count = %d, want %d", len(loaded), len(peers))
+	}
+	for addr, want := range peers {
+		got, ok := loaded[addr]
+		if !ok {
+			t.Fatalf("missing loaded peer %q", addr)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("loaded peer %q time = %v, want %v", addr, got, want)
+		}
 	}
 }
 

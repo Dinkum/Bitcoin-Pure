@@ -6,10 +6,10 @@
   "utxo_branch_tag": "BPU/UtxoBranchV1",
   "empty_utxo_root_hex": "5661a0245c35fb1fddfb49fd6b3a42327c1ceaecdf07b2c92da72569835b9d6f",
   "mainnet": {
-    "genesis_header_hash_hex": "3139c660a14e02ae1ac03f30667706e4de9e68ef29f0e09b25dfdf5630f7a6dc",
-    "genesis_txid_hex": "16f76035f36bb4ec06d92d572e737d34e3dceff31e7dee25f229d8b04b1c78c3",
+    "genesis_header_hash_hex": "96c3f9fca62a403e1fce183139f12c39ad2748187182db5aed75c56b452b76db",
+    "genesis_txid_hex": "0c29df9916ae569e29d8ad8d1263d8ef426259d49e5a670e9ba82b79b294492e",
     "genesis_authid_hex": "1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a",
-    "utxo_root_after_genesis_hex": "ef43dd7f0718db4ac1e5e4b4b82a52e9e88a9305cb197aa7ceebc1600ac770d2"
+    "utxo_root_after_genesis_hex": "b20b6ee612e0ca9a6a1d11b1304283daa9910f75870695a29aece933135181dc"
   },
   "regtest": {
     "genesis_header_hash_hex": "d9f06e0df5db04f78a9b9949779e4911435af4a75b50b67d7cdb028341ebfa91",

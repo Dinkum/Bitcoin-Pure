@@ -90,6 +90,14 @@ type SendPlan struct {
 	TransactionHex string
 }
 
+type BalanceSummary struct {
+	Confirmed    uint64
+	Reserved     uint64
+	Available    uint64
+	PendingCount int
+	AddressCount int
+}
+
 func Open(path string) (*Store, error) {
 	store := &Store{path: filepath.Clean(path)}
 	buf, err := os.ReadFile(store.path)
@@ -335,6 +343,36 @@ func (s *Store) SpendableKeyHashes(name string) ([][32]byte, error) {
 		out = append(out, keyHash)
 	}
 	return out, nil
+}
+
+func (s *Store) Balance(name string, utxos []SpendableUTXO) (BalanceSummary, error) {
+	wallet, _, ok := s.findWallet(name)
+	if !ok {
+		return BalanceSummary{}, ErrWalletNotFound
+	}
+	confirmed := uint64(0)
+	for _, utxo := range utxos {
+		confirmed += utxo.Value
+	}
+	availableCoins, err := spendableCoins(*wallet, utxos)
+	if err != nil {
+		return BalanceSummary{}, err
+	}
+	available := uint64(0)
+	for _, coin := range availableCoins {
+		available += coin.Value
+	}
+	reserved := uint64(0)
+	if confirmed > available {
+		reserved = confirmed - available
+	}
+	return BalanceSummary{
+		Confirmed:    confirmed,
+		Reserved:     reserved,
+		Available:    available,
+		PendingCount: len(wallet.Pending),
+		AddressCount: len(wallet.Addresses),
+	}, nil
 }
 
 func (w Wallet) LatestReceiveAddress() *Address {

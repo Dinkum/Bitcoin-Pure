@@ -167,6 +167,40 @@ func TestValidateSignedSpend(t *testing.T) {
 	}
 }
 
+func TestSubsidyAtomsMatchesSpecSchedule(t *testing.T) {
+	params := MainnetParams()
+	if got := SubsidyAtoms(0, params); got != 1_000_000_000_000 {
+		t.Fatalf("genesis subsidy = %d, want %d", got, uint64(1_000_000_000_000))
+	}
+	if got := SubsidyAtoms(params.HalvingInterval, params); got != 500_000_000_000 {
+		t.Fatalf("first halving subsidy = %d, want %d", got, uint64(500_000_000_000))
+	}
+	if got := SubsidyAtoms(params.HalvingInterval*39, params); got != 1 {
+		t.Fatalf("39th halving subsidy = %d, want 1", got)
+	}
+	if got := SubsidyAtoms(params.HalvingInterval*40, params); got != 1 {
+		t.Fatalf("tail-emission subsidy = %d, want 1", got)
+	}
+	if got := SubsidyAtoms(params.HalvingInterval*80, params); got != 1 {
+		t.Fatalf("far-future subsidy = %d, want 1", got)
+	}
+}
+
+func TestMineHeaderInterruptibleStopsWhenTemplateTurnsStale(t *testing.T) {
+	params := RegtestParams()
+	header := types.BlockHeader{NBits: params.GenesisBits}
+	mined, ok, err := MineHeaderInterruptible(header, params, func(uint32) bool { return false })
+	if err != nil {
+		t.Fatalf("MineHeaderInterruptible: %v", err)
+	}
+	if ok {
+		t.Fatal("expected interruptible mining to stop before finding work")
+	}
+	if mined != (types.BlockHeader{}) {
+		t.Fatalf("interrupted header = %+v, want zero header", mined)
+	}
+}
+
 func TestComputedUTXORootOrderInvariant(t *testing.T) {
 	a := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
 	b := types.OutPoint{TxID: [32]byte{2}, Vout: 1}

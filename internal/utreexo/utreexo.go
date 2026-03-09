@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"slices"
+	"sync"
 
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
@@ -16,6 +18,9 @@ const (
 	UTXORootTag   = "BPU/UtxoRootV1"
 	outPointBytes = 36
 	keyBits       = outPointBytes * 8
+
+	parallelLeafHashThreshold  = 512
+	parallelTreeBuildThreshold = 256
 )
 
 type UtxoLeaf struct {
@@ -64,20 +69,12 @@ func UtxoRoot(leaves []UtxoLeaf) [32]byte {
 	if len(leaves) == 0 {
 		return crypto.TaggedHash(UTXORootTag, nil)
 	}
-
-	sorted := make([]keyedLeaf, 0, len(leaves))
-	for _, leaf := range leaves {
-		sorted = append(sorted, keyedLeaf{
-			key:  leafKey(leaf.OutPoint),
-			hash: LeafHash(leaf),
-		})
+	sorted := sortedKeyedLeaves(leaves)
+	if err := ensureUniqueSortedLeaves(sorted); err != nil {
+		panic(err.Error())
 	}
-	slices.SortFunc(sorted, func(a, b keyedLeaf) int {
-		return bytes.Compare(a.key[:], b.key[:])
-	})
-
-	nodeHash := merklixHash(sorted, 0)
-	return crypto.TaggedHash(UTXORootTag, nodeHash[:])
+	root := buildAccumulatorTree(sorted, 0, parallelBuildBudget())
+	return crypto.TaggedHash(UTXORootTag, root.hash[:])
 }
 
 func NewAccumulator() *Accumulator {
@@ -85,15 +82,17 @@ func NewAccumulator() *Accumulator {
 }
 
 func NewAccumulatorFromLeaves(leaves []UtxoLeaf) (*Accumulator, error) {
-	acc := NewAccumulator()
-	var err error
-	for _, leaf := range leaves {
-		acc, err = acc.Add(leaf)
-		if err != nil {
-			return nil, err
-		}
+	if len(leaves) == 0 {
+		return NewAccumulator(), nil
 	}
-	return acc, nil
+	sorted := sortedKeyedLeaves(leaves)
+	if err := ensureUniqueSortedLeaves(sorted); err != nil {
+		return nil, err
+	}
+	return &Accumulator{
+		root:  buildAccumulatorTree(sorted, 0, parallelBuildBudget()),
+		count: len(sorted),
+	}, nil
 }
 
 func (a *Accumulator) Root() [32]byte {
@@ -160,10 +159,65 @@ func (a *Accumulator) Apply(spent []types.OutPoint, created []UtxoLeaf) (*Accumu
 	return next, nil
 }
 
-// Unary trie paths are compressed by advancing to the next distinguishing bit.
-func merklixHash(leaves []keyedLeaf, bitIndex int) [32]byte {
+func sortedKeyedLeaves(leaves []UtxoLeaf) []keyedLeaf {
+	sorted := make([]keyedLeaf, len(leaves))
+	workers := runtime.GOMAXPROCS(0)
+	if workers <= 1 || len(leaves) < parallelLeafHashThreshold {
+		for i, leaf := range leaves {
+			sorted[i] = keyedLeaf{
+				key:  leafKey(leaf.OutPoint),
+				hash: LeafHash(leaf),
+			}
+		}
+	} else {
+		if workers > len(leaves) {
+			workers = len(leaves)
+		}
+		chunkSize := (len(leaves) + workers - 1) / workers
+		var wg sync.WaitGroup
+		for worker := 0; worker < workers; worker++ {
+			start := worker * chunkSize
+			if start >= len(leaves) {
+				break
+			}
+			end := start + chunkSize
+			if end > len(leaves) {
+				end = len(leaves)
+			}
+			wg.Add(1)
+			go func(start, end int) {
+				defer wg.Done()
+				for i := start; i < end; i++ {
+					sorted[i] = keyedLeaf{
+						key:  leafKey(leaves[i].OutPoint),
+						hash: LeafHash(leaves[i]),
+					}
+				}
+			}(start, end)
+		}
+		wg.Wait()
+	}
+	slices.SortFunc(sorted, func(a, b keyedLeaf) int {
+		return bytes.Compare(a.key[:], b.key[:])
+	})
+	return sorted
+}
+
+func ensureUniqueSortedLeaves(sorted []keyedLeaf) error {
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i-1].key == sorted[i].key {
+			return fmt.Errorf("duplicate outpoint in UTXO commitment")
+		}
+	}
+	return nil
+}
+
+// The accumulator keeps an explicit bit-by-bit trie so later Add/Delete calls
+// can walk it deterministically, but unary nodes reuse their child hash so the
+// committed root matches the compressed Merklix form.
+func buildAccumulatorTree(leaves []keyedLeaf, bitIndex int, budget int) *accNode {
 	if len(leaves) == 1 {
-		return leaves[0].hash
+		return buildLeafPath(leaves[0], bitIndex)
 	}
 	if bitIndex >= outPointBytes*8 {
 		panic("duplicate outpoint in UTXO commitment")
@@ -172,14 +226,59 @@ func merklixHash(leaves []keyedLeaf, bitIndex int) [32]byte {
 	split := splitAtBit(leaves, bitIndex)
 	switch {
 	case split == 0:
-		return merklixHash(leaves, bitIndex+1)
+		return makeAccNode(nil, buildAccumulatorTree(leaves, bitIndex+1, budget))
 	case split == len(leaves):
-		return merklixHash(leaves, bitIndex+1)
+		return makeAccNode(buildAccumulatorTree(leaves, bitIndex+1, budget), nil)
 	default:
-		left := merklixHash(leaves[:split], bitIndex+1)
-		right := merklixHash(leaves[split:], bitIndex+1)
-		return BranchHash(left, right)
+		leftBudget, rightBudget := splitParallelBudget(budget)
+		if budget > 0 && len(leaves) >= parallelTreeBuildThreshold {
+			var left *accNode
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				left = buildAccumulatorTree(leaves[:split], bitIndex+1, leftBudget)
+			}()
+			right := buildAccumulatorTree(leaves[split:], bitIndex+1, rightBudget)
+			wg.Wait()
+			return makeAccNode(left, right)
+		}
+		left := buildAccumulatorTree(leaves[:split], bitIndex+1, 0)
+		right := buildAccumulatorTree(leaves[split:], bitIndex+1, 0)
+		return makeAccNode(left, right)
 	}
+}
+
+func buildLeafPath(leaf keyedLeaf, bitIndex int) *accNode {
+	if bitIndex == keyBits {
+		leafCopy := leaf
+		return &accNode{
+			leaf:  &leafCopy,
+			hash:  leafCopy.hash,
+			count: 1,
+		}
+	}
+	if bitSet(leaf.key, bitIndex) {
+		return makeAccNode(nil, buildLeafPath(leaf, bitIndex+1))
+	}
+	return makeAccNode(buildLeafPath(leaf, bitIndex+1), nil)
+}
+
+func parallelBuildBudget() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers <= 1 {
+		return 0
+	}
+	return workers - 1
+}
+
+func splitParallelBudget(budget int) (int, int) {
+	if budget <= 1 {
+		return 0, 0
+	}
+	left := (budget - 1) / 2
+	right := budget - 1 - left
+	return left, right
 }
 
 func insertLeaf(node *accNode, leaf keyedLeaf, bitIndex int) (*accNode, error) {

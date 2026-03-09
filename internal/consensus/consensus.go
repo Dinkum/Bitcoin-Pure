@@ -34,7 +34,7 @@ func MainnetParams() ChainParams {
 		TargetSpacingSecs:   600,
 		AsertHalfLifeSecs:   86_400,
 		HalvingInterval:     2_500_000,
-		InitialSubsidyAtoms: 1_000_000,
+		InitialSubsidyAtoms: 1_000_000_000_000,
 		BlockSizeFloor:      32_000_000,
 		PowLimitBits:        0x1d00ffff,
 		GenesisTimestamp:    1_700_000_000,
@@ -144,6 +144,97 @@ type TxValidationSummary struct {
 }
 
 type UtxoLookup func(types.OutPoint) (UtxoEntry, bool)
+
+// LookupFromSet adapts a concrete UTXO map to the generic lookup surface used
+// by validation and overlay-backed tentative state transitions.
+func LookupFromSet(utxos UtxoSet) UtxoLookup {
+	return func(out types.OutPoint) (UtxoEntry, bool) {
+		utxo, ok := utxos[out]
+		return utxo, ok
+	}
+}
+
+// UtxoOverlay records only the spent/created delta on top of an immutable base
+// UTXO set. Hot paths can validate and tentatively apply state changes without
+// cloning the whole live set up front.
+type UtxoOverlay struct {
+	base    UtxoSet
+	lookup  UtxoLookup
+	created map[types.OutPoint]UtxoEntry
+	deleted map[types.OutPoint]struct{}
+}
+
+func NewUtxoOverlay(base UtxoSet) *UtxoOverlay {
+	return &UtxoOverlay{
+		base:    base,
+		lookup:  LookupFromSet(base),
+		created: make(map[types.OutPoint]UtxoEntry),
+		deleted: make(map[types.OutPoint]struct{}),
+	}
+}
+
+func (o *UtxoOverlay) Lookup(out types.OutPoint) (UtxoEntry, bool) {
+	if o == nil {
+		return UtxoEntry{}, false
+	}
+	if entry, ok := o.created[out]; ok {
+		return entry, true
+	}
+	if _, ok := o.deleted[out]; ok {
+		return UtxoEntry{}, false
+	}
+	return o.lookup(out)
+}
+
+func (o *UtxoOverlay) Spend(out types.OutPoint) {
+	if o == nil {
+		return
+	}
+	delete(o.created, out)
+	o.deleted[out] = struct{}{}
+}
+
+func (o *UtxoOverlay) Restore(out types.OutPoint, entry UtxoEntry) {
+	if o == nil {
+		return
+	}
+	delete(o.deleted, out)
+	o.created[out] = entry
+}
+
+func (o *UtxoOverlay) Set(out types.OutPoint, entry UtxoEntry) {
+	if o == nil {
+		return
+	}
+	delete(o.deleted, out)
+	o.created[out] = entry
+}
+
+func (o *UtxoOverlay) ApplyTx(tx types.Transaction, txid [32]byte) {
+	for _, input := range tx.Base.Inputs {
+		o.Spend(input.PrevOut)
+	}
+	for vout, output := range tx.Base.Outputs {
+		o.Set(types.OutPoint{TxID: txid, Vout: uint32(vout)}, UtxoEntry{
+			ValueAtoms: output.ValueAtoms,
+			KeyHash:    output.KeyHash,
+		})
+	}
+}
+
+func (o *UtxoOverlay) Materialize() UtxoSet {
+	if o == nil {
+		return nil
+	}
+	out := cloneUtxos(o.base)
+	for outPoint := range o.deleted {
+		delete(out, outPoint)
+	}
+	for outPoint, entry := range o.created {
+		out[outPoint] = entry
+	}
+	return out
+}
 
 type BlockValidationSummary struct {
 	Height             uint64
@@ -318,9 +409,13 @@ func parallelWorkers(units int) int {
 func SubsidyAtoms(height uint64, params ChainParams) uint64 {
 	halvings := height / params.HalvingInterval
 	if halvings >= 64 {
-		return 0
+		return 1
 	}
-	return params.InitialSubsidyAtoms >> halvings
+	subsidy := params.InitialSubsidyAtoms >> halvings
+	if subsidy == 0 {
+		return 1
+	}
+	return subsidy
 }
 
 func writeVarInt(out *[]byte, v uint64) {
@@ -858,25 +953,39 @@ func ValidateHeader(header *types.BlockHeader, prev PrevBlockContext, params Cha
 }
 
 func MineHeader(header types.BlockHeader, params ChainParams) (types.BlockHeader, error) {
-	target, err := compactToTarget(header.NBits)
+	mined, ok, err := MineHeaderInterruptible(header, params, func(uint32) bool { return true })
 	if err != nil {
 		return types.BlockHeader{}, err
+	}
+	if !ok {
+		return types.BlockHeader{}, ErrInvalidPow
+	}
+	return mined, nil
+}
+
+func MineHeaderInterruptible(header types.BlockHeader, params ChainParams, shouldContinue func(uint32) bool) (types.BlockHeader, bool, error) {
+	target, err := compactToTarget(header.NBits)
+	if err != nil {
+		return types.BlockHeader{}, false, err
 	}
 	powLimit, err := compactToTarget(params.PowLimitBits)
 	if err != nil {
-		return types.BlockHeader{}, err
+		return types.BlockHeader{}, false, err
 	}
 	if target.Cmp(powLimit) > 0 {
-		return types.BlockHeader{}, ErrInvalidPow
+		return types.BlockHeader{}, false, ErrInvalidPow
 	}
 	for nonce := uint32(0); nonce < ^uint32(0); nonce++ {
+		if shouldContinue != nil && nonce&0x0fff == 0 && !shouldContinue(nonce) {
+			return types.BlockHeader{}, false, nil
+		}
 		header.Nonce = nonce
 		hash := HeaderHash(&header)
 		if new(big.Int).SetBytes(hash[:]).Cmp(target) <= 0 {
-			return header, nil
+			return header, true, nil
 		}
 	}
-	return types.BlockHeader{}, ErrInvalidPow
+	return types.BlockHeader{}, false, ErrInvalidPow
 }
 
 func sumCoinbaseOutputs(tx *types.Transaction) (uint64, error) {
@@ -929,126 +1038,134 @@ func blockUtxoDelta(block *types.Block) ([]types.OutPoint, []utreexo.UtxoLeaf) {
 }
 
 func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, params ChainParams, rules ConsensusRules) (BlockValidationSummary, error) {
-	summary, _, err := validateAndApplyBlock(block, prev, blockSizeState, utxos, nil, params, rules)
-	return summary, err
+	summary, finalUtxos, _, err := validateAndApplyBlock(block, prev, blockSizeState, utxos, nil, params, rules)
+	if err != nil {
+		return BlockValidationSummary{}, err
+	}
+	replaceUtxoSet(utxos, finalUtxos)
+	return summary, nil
 }
 
 func ValidateAndApplyBlockWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *utreexo.Accumulator, error) {
+	summary, finalUtxos, nextAcc, err := validateAndApplyBlock(block, prev, blockSizeState, utxos, accumulator, params, rules)
+	if err != nil {
+		return BlockValidationSummary{}, nil, err
+	}
+	replaceUtxoSet(utxos, finalUtxos)
+	return summary, nextAcc, nil
+}
+
+func ValidateAndApplyBlockViewWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, UtxoSet, *utreexo.Accumulator, error) {
 	return validateAndApplyBlock(block, prev, blockSizeState, utxos, accumulator, params, rules)
 }
 
-func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *utreexo.Accumulator, error) {
+func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, UtxoSet, *utreexo.Accumulator, error) {
 	if len(block.Txs) == 0 {
-		return BlockValidationSummary{}, nil, ErrEmptyBlock
+		return BlockValidationSummary{}, nil, nil, ErrEmptyBlock
 	}
 	if len(block.Encode()) > int(NextBlockSizeLimit(blockSizeState, params)) {
-		return BlockValidationSummary{}, nil, ErrBlockTooLarge
+		return BlockValidationSummary{}, nil, nil, ErrBlockTooLarge
 	}
 
 	txids, _, txRoot, authRoot := BuildBlockRoots(block.Txs)
 	if txRoot != block.Header.MerkleTxIDRoot {
-		return BlockValidationSummary{}, nil, ErrMerkleTxIDMismatch
+		return BlockValidationSummary{}, nil, nil, ErrMerkleTxIDMismatch
 	}
 	if authRoot != block.Header.MerkleAuthRoot {
-		return BlockValidationSummary{}, nil, ErrMerkleAuthMismatch
+		return BlockValidationSummary{}, nil, nil, ErrMerkleAuthMismatch
 	}
 
 	if err := ValidateHeader(&block.Header, prev, params); err != nil {
-		return BlockValidationSummary{}, nil, err
+		return BlockValidationSummary{}, nil, nil, err
 	}
 
 	coinbase := &block.Txs[0]
 	if len(coinbase.Base.Inputs) != 0 {
-		return BlockValidationSummary{}, nil, ErrFirstTxNotCoinbase
+		return BlockValidationSummary{}, nil, nil, ErrFirstTxNotCoinbase
 	}
 	if len(coinbase.Auth.Entries) != 0 {
-		return BlockValidationSummary{}, nil, ErrCoinbaseHasAuth
+		return BlockValidationSummary{}, nil, nil, ErrCoinbaseHasAuth
 	}
 	if len(coinbase.Base.Outputs) == 0 {
-		return BlockValidationSummary{}, nil, ErrCoinbaseNoOutputs
+		return BlockValidationSummary{}, nil, nil, ErrCoinbaseNoOutputs
 	}
 
-	tempUtxos := cloneUtxos(utxos)
+	baseLookup := LookupFromSet(utxos)
+	tempUtxos := NewUtxoOverlay(utxos)
 	claimedInputs := make(map[types.OutPoint]struct{})
 	var totalFees uint64
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		if i > 1 && bytes.Compare(txids[i-1][:], txids[i][:]) >= 0 {
-			return BlockValidationSummary{}, nil, ErrTxOrderInvalid
+			return BlockValidationSummary{}, nil, nil, ErrTxOrderInvalid
 		}
 		for _, input := range tx.Base.Inputs {
 			if _, ok := claimedInputs[input.PrevOut]; ok {
-				return BlockValidationSummary{}, nil, ErrDuplicateInput
+				return BlockValidationSummary{}, nil, nil, ErrDuplicateInput
 			}
 			claimedInputs[input.PrevOut] = struct{}{}
 		}
-		txSummary, err := ValidateTx(tx, utxos, rules)
+		txSummary, err := ValidateTxWithLookup(tx, baseLookup, rules)
 		if err != nil {
-			return BlockValidationSummary{}, nil, err
+			return BlockValidationSummary{}, nil, nil, err
 		}
 		nextFees := totalFees + txSummary.Fee
 		if nextFees < totalFees {
-			return BlockValidationSummary{}, nil, ErrAmountOverflow
+			return BlockValidationSummary{}, nil, nil, ErrAmountOverflow
 		}
 		totalFees = nextFees
 
 	}
 
 	for spent := range claimedInputs {
-		delete(tempUtxos, spent)
+		tempUtxos.Spend(spent)
 	}
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		txHash := TxID(tx)
 		for vout, output := range tx.Base.Outputs {
-			tempUtxos[types.OutPoint{TxID: txHash, Vout: uint32(vout)}] = UtxoEntry{
+			tempUtxos.Set(types.OutPoint{TxID: txHash, Vout: uint32(vout)}, UtxoEntry{
 				ValueAtoms: output.ValueAtoms,
 				KeyHash:    output.KeyHash,
-			}
+			})
 		}
 	}
 
 	coinbaseValue, err := sumCoinbaseOutputs(coinbase)
 	if err != nil {
-		return BlockValidationSummary{}, nil, err
+		return BlockValidationSummary{}, nil, nil, err
 	}
 	subsidy := SubsidyAtoms(prev.Height+1, params)
 	if coinbaseValue > subsidy+totalFees {
-		return BlockValidationSummary{}, nil, ErrCoinbaseOverpay
+		return BlockValidationSummary{}, nil, nil, ErrCoinbaseOverpay
 	}
 
 	coinbaseTxID := TxID(coinbase)
 	for vout, output := range coinbase.Base.Outputs {
-		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = UtxoEntry{
+		tempUtxos.Set(types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}, UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
 			KeyHash:    output.KeyHash,
-		}
+		})
 	}
+	finalUtxos := tempUtxos.Materialize()
 
 	var nextAccumulator *utreexo.Accumulator
 	if accumulator != nil {
 		spent, created := blockUtxoDelta(block)
 		nextAccumulator, err = accumulator.Apply(spent, created)
 		if err != nil {
-			return BlockValidationSummary{}, nil, err
+			return BlockValidationSummary{}, nil, nil, err
 		}
 	}
 	if rules.EnforceUTXORoot {
 		root := block.Header.UTXORoot
 		if nextAccumulator != nil {
 			if nextAccumulator.Root() != root {
-				return BlockValidationSummary{}, nil, ErrUTXORootMismatch
+				return BlockValidationSummary{}, nil, nil, ErrUTXORootMismatch
 			}
-		} else if ComputedUTXORoot(tempUtxos) != root {
-			return BlockValidationSummary{}, nil, ErrUTXORootMismatch
+		} else if ComputedUTXORoot(finalUtxos) != root {
+			return BlockValidationSummary{}, nil, nil, ErrUTXORootMismatch
 		}
-	}
-
-	for k := range utxos {
-		delete(utxos, k)
-	}
-	for k, v := range tempUtxos {
-		utxos[k] = v
 	}
 
 	nextState := AdvanceBlockSizeState(blockSizeState, uint64(len(block.Encode())), params)
@@ -1057,7 +1174,16 @@ func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 		TotalFees:          totalFees,
 		CoinbaseValue:      coinbaseValue,
 		NextBlockSizeState: nextState,
-	}, nextAccumulator, nil
+	}, finalUtxos, nextAccumulator, nil
+}
+
+func replaceUtxoSet(dst UtxoSet, src UtxoSet) {
+	for k := range dst {
+		delete(dst, k)
+	}
+	for k, v := range src {
+		dst[k] = v
+	}
 }
 
 func DecodeTxHex(raw string, limits types.CodecLimits) (types.Transaction, error) {

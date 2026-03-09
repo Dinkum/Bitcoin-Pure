@@ -125,19 +125,18 @@ func ReplayBlocksHeadersFirstPersistent(path string, profile types.ChainProfile,
 		}
 	}
 
-	tipHeight := chainState.ChainState().TipHeight()
-	tipHeader := chainState.ChainState().TipHeader()
-	if tipHeight == nil || tipHeader == nil {
+	view, ok := chainState.CommittedView()
+	if !ok {
 		return HeadersFirstIBDSummary{}, ErrNoTip
 	}
 
 	summary := HeadersFirstIBDSummary{
 		HeaderTipHeight: headerSummary.TipHeight,
-		BlockTipHeight:  *tipHeight,
-		TipHeaderHash:   consensus.HeaderHash(tipHeader),
-		UTXORoot:        chainState.ChainState().UTXORoot(),
-		UTXOCount:       len(chainState.ChainState().UTXOs()),
-		BlockSizeLimit:  consensus.NextBlockSizeLimit(chainState.ChainState().BlockSizeState(), consensus.ParamsForProfile(profile)),
+		BlockTipHeight:  view.Height,
+		TipHeaderHash:   view.TipHash,
+		UTXORoot:        view.UTXORoot,
+		UTXOCount:       len(view.UTXOs),
+		BlockSizeLimit:  consensus.NextBlockSizeLimit(view.BlockSizeState, consensus.ParamsForProfile(profile)),
 	}
 	logger.Info("completed persistent headers-first replay",
 		slog.Uint64("header_tip_height", summary.HeaderTipHeight),

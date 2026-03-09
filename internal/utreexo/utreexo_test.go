@@ -2,6 +2,7 @@ package utreexo
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 
 	"bitcoin-pure/internal/crypto"
@@ -99,6 +100,30 @@ func TestAccumulatorMatchesBulkRoot(t *testing.T) {
 	}
 }
 
+func TestBulkAccumulatorMatchesIncrementalBuilder(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("parallel accumulator build needs multiple workers to exercise")
+	}
+	leaves := make([]UtxoLeaf, 0, 2048)
+	for i := 0; i < 2048; i++ {
+		leaves = append(leaves, testLeaf(byte(i), uint32(i>>8), uint64(i+1), byte(i+17)))
+	}
+	bulk, err := NewAccumulatorFromLeaves(leaves)
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	incremental := NewAccumulator()
+	for _, leaf := range leaves {
+		incremental, err = incremental.Add(leaf)
+		if err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	if got, want := bulk.Root(), incremental.Root(); got != want {
+		t.Fatalf("bulk accumulator root = %x, want %x", got, want)
+	}
+}
+
 func TestAccumulatorApplyMatchesBulkRootAfterUpdates(t *testing.T) {
 	original := []UtxoLeaf{
 		testLeaf(1, 0, 10, 11),
@@ -133,5 +158,15 @@ func TestAccumulatorRejectsMissingDelete(t *testing.T) {
 	}
 	if _, err := acc.Delete(types.OutPoint{TxID: [32]byte{9}, Vout: 0}); err == nil {
 		t.Fatal("expected missing delete error")
+	}
+}
+
+func TestAccumulatorRejectsDuplicateOutPointInBulkBuild(t *testing.T) {
+	_, err := NewAccumulatorFromLeaves([]UtxoLeaf{
+		testLeaf(1, 0, 10, 11),
+		testLeaf(1, 0, 20, 22),
+	})
+	if err == nil {
+		t.Fatal("expected duplicate outpoint error")
 	}
 }
