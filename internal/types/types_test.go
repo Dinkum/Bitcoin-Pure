@@ -7,6 +7,10 @@ import (
 	"testing"
 )
 
+func testCoinbaseHeight(height uint64) *uint64 {
+	return &height
+}
+
 func sampleTx() Transaction {
 	return Transaction{
 		Base: TxBase{
@@ -54,7 +58,8 @@ func TestBlockRoundtrip(t *testing.T) {
 		},
 		Txs: []Transaction{{
 			Base: TxBase{
-				Version: 1,
+				Version:        1,
+				CoinbaseHeight: testCoinbaseHeight(0),
 				Outputs: []TxOutput{{
 					ValueAtoms: 50,
 					KeyHash:    [32]byte{5},
@@ -68,6 +73,28 @@ func TestBlockRoundtrip(t *testing.T) {
 	}
 	if !bytes.Equal(got.Encode(), block.Encode()) {
 		t.Fatalf("block mismatch")
+	}
+}
+
+func TestCoinbaseTransactionRoundtripPreservesHeight(t *testing.T) {
+	tx := Transaction{
+		Base: TxBase{
+			Version:        7,
+			CoinbaseHeight: testCoinbaseHeight(123),
+			Inputs:         []TxInput{},
+			Outputs: []TxOutput{{
+				ValueAtoms: 50,
+				KeyHash:    [32]byte{9},
+			}},
+		},
+		Auth: TxAuth{Entries: []TxAuthEntry{}},
+	}
+	got, err := DecodeTransactionWithLimits(tx.Encode(), DefaultCodecLimits())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(got, tx) {
+		t.Fatalf("coinbase transaction mismatch")
 	}
 }
 

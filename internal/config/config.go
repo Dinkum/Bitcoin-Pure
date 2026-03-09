@@ -38,12 +38,15 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		Profile:            "regtest",
-		DBPath:             "data/chain",
-		LogLevel:           "info",
-		RPCAddr:            "127.0.0.1:18443",
-		RPCReadTimeoutMS:   5000,
-		RPCWriteTimeoutMS:  5000,
+		Profile:          "regtest",
+		DBPath:           "data/chain",
+		LogLevel:         "info",
+		RPCAddr:          "127.0.0.1:18443",
+		RPCReadTimeoutMS: 5000,
+		// Mining and some wallet/history RPCs can legitimately run for much
+		// longer than a few seconds on small nodes. Keep writes bounded, but
+		// high enough that long admin calls do not get cut off mid-response.
+		RPCWriteTimeoutMS:  15 * 60 * 1000,
 		RPCHeaderTimeoutMS: 2000,
 		RPCIdleTimeoutMS:   30000,
 		RPCMaxHeaderBytes:  8 << 10,

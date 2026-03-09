@@ -26,9 +26,10 @@ type TxAuthEntry struct {
 }
 
 type TxBase struct {
-	Version uint32
-	Inputs  []TxInput
-	Outputs []TxOutput
+	Version        uint32
+	CoinbaseHeight *uint64
+	Inputs         []TxInput
+	Outputs        []TxOutput
 }
 
 type TxAuth struct {
@@ -352,6 +353,12 @@ func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
 func (b TxBase) Encode(out *[]byte) {
 	writeU32LE(out, b.Version)
 	writeVarInt(out, uint64(len(b.Inputs)))
+	if len(b.Inputs) == 0 {
+		// Coinbase transactions structurally commit the block height inside the
+		// base encoding so the txid changes across heights without overloading
+		// unrelated fields.
+		writeVarInt(out, *b.CoinbaseHeight)
+	}
 	for _, input := range b.Inputs {
 		input.Encode(out)
 	}
@@ -369,6 +376,15 @@ func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
 	inputCount, err := readCount(r, limits.MaxInputs, "tx.inputs")
 	if err != nil {
 		return TxBase{}, err
+	}
+	var coinbaseHeight *uint64
+	if inputCount == 0 {
+		height, err := r.readVarInt()
+		if err != nil {
+			return TxBase{}, err
+		}
+		coinbaseHeight = new(uint64)
+		*coinbaseHeight = height
 	}
 	inputs := make([]TxInput, 0, inputCount)
 	for range inputCount {
@@ -390,7 +406,7 @@ func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
 		}
 		outputs = append(outputs, output)
 	}
-	return TxBase{Version: version, Inputs: inputs, Outputs: outputs}, nil
+	return TxBase{Version: version, CoinbaseHeight: coinbaseHeight, Inputs: inputs, Outputs: outputs}, nil
 }
 
 func (a TxAuth) Encode(out *[]byte) {
@@ -417,7 +433,7 @@ func decodeTxAuth(r *reader, maxEntries int) (TxAuth, error) {
 }
 
 func (t Transaction) IsCoinbase() bool {
-	return len(t.Base.Inputs) == 0
+	return len(t.Base.Inputs) == 0 && t.Base.CoinbaseHeight != nil
 }
 
 func (t Transaction) EncodeBase() []byte {
@@ -448,11 +464,19 @@ func decodeTransactionFromReader(r *reader, limits CodecLimits) (Transaction, er
 		return Transaction{}, err
 	}
 	if len(base.Inputs) == 0 {
+		if base.CoinbaseHeight == nil {
+			return Transaction{}, InvalidFormatError{Reason: "coinbase tx must include coinbase_height"}
+		}
 		if len(auth.Entries) != 0 {
 			return Transaction{}, InvalidFormatError{Reason: "coinbase tx must have empty auth"}
 		}
-	} else if len(auth.Entries) != len(base.Inputs) {
+	} else {
+		if base.CoinbaseHeight != nil {
+			return Transaction{}, InvalidFormatError{Reason: "non-coinbase tx must not include coinbase_height"}
+		}
+		if len(auth.Entries) != len(base.Inputs) {
 		return Transaction{}, InvalidFormatError{Reason: "auth entry count must equal input count"}
+		}
 	}
 	return Transaction{Base: base, Auth: auth}, nil
 }

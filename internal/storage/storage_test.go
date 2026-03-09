@@ -9,13 +9,18 @@ import (
 	"bitcoin-pure/internal/types"
 )
 
-func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {
-	coinbase := types.Transaction{
+func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
+	return types.Transaction{
 		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}},
+			Version:        1,
+			CoinbaseHeight: &height,
+			Outputs:        outputs,
 		},
 	}
+}
+
+func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {
+	coinbase := testCoinbase(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}})
 	coinbaseTxID := consensus.TxID(&coinbase)
 	utxos := consensus.UtxoSet{
 		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: [32]byte{7}},
@@ -421,22 +426,18 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	nextCoinbase := testCoinbase(1, []types.TxOutput{{ValueAtoms: 25, KeyHash: [32]byte{9}}})
 	next := types.Block{
 		Header: types.BlockHeader{
 			Version:        1,
 			PrevBlockHash:  consensus.HeaderHash(&genesis.Header),
-			MerkleTxIDRoot: consensus.MerkleRoot([][32]byte{consensus.TxID(&types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 25, KeyHash: [32]byte{9}}}}})}),
-			MerkleAuthRoot: consensus.MerkleRoot([][32]byte{consensus.AuthID(&types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 25, KeyHash: [32]byte{9}}}}})}),
+			MerkleTxIDRoot: consensus.MerkleRoot([][32]byte{consensus.TxID(&nextCoinbase)}),
+			MerkleAuthRoot: consensus.MerkleRoot([][32]byte{consensus.AuthID(&nextCoinbase)}),
 			UTXORoot:       [32]byte{1},
 			Timestamp:      2,
 			NBits:          genesis.Header.NBits,
 		},
-		Txs: []types.Transaction{{
-			Base: types.TxBase{
-				Version: 1,
-				Outputs: []types.TxOutput{{ValueAtoms: 25, KeyHash: [32]byte{9}}},
-			},
-		}},
+		Txs: []types.Transaction{nextCoinbase},
 	}
 	nextTxID := consensus.TxID(&next.Txs[0])
 	nextOut := types.OutPoint{TxID: nextTxID, Vout: 0}
@@ -494,5 +495,74 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	}
 	if hashAtHeight == nil || *hashAtHeight != blockHash {
 		t.Fatal("active height index mismatch after delta append")
+	}
+}
+
+func TestRewriteFullStateDeltaReplacesOnlyChangedUTXOs(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, _ := sampleBlockAndUTXOs()
+	unchangedOut := types.OutPoint{TxID: [32]byte{7}, Vout: 0}
+	updatedOut := types.OutPoint{TxID: [32]byte{8}, Vout: 0}
+	deletedOut := types.OutPoint{TxID: [32]byte{9}, Vout: 0}
+	createdOut := types.OutPoint{TxID: [32]byte{10}, Vout: 0}
+	initial := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         1,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs: consensus.UtxoSet{
+			unchangedOut: {ValueAtoms: 11, KeyHash: [32]byte{1}},
+			updatedOut:   {ValueAtoms: 12, KeyHash: [32]byte{2}},
+			deletedOut:   {ValueAtoms: 13, KeyHash: [32]byte{3}},
+		},
+	}
+	if err := store.WriteFullState(initial); err != nil {
+		t.Fatalf("WriteFullState: %v", err)
+	}
+
+	nextHeader := block.Header
+	nextHeader.Timestamp++
+	next := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         2,
+		TipHeader:      nextHeader,
+		BlockSizeState: consensus.BlockSizeState{BlockSize: 512, Epsilon: 16_000_000, Beta: 16_000_000},
+		UTXOs: consensus.UtxoSet{
+			unchangedOut: {ValueAtoms: 11, KeyHash: [32]byte{1}},
+			updatedOut:   {ValueAtoms: 99, KeyHash: [32]byte{4}},
+			createdOut:   {ValueAtoms: 21, KeyHash: [32]byte{5}},
+		},
+	}
+	if err := store.RewriteFullStateDelta(initial, next); err != nil {
+		t.Fatalf("RewriteFullStateDelta: %v", err)
+	}
+
+	loaded, err := store.LoadChainState()
+	if err != nil {
+		t.Fatalf("LoadChainState: %v", err)
+	}
+	if loaded == nil || loaded.Height != next.Height || loaded.TipHeader != next.TipHeader {
+		t.Fatal("rewritten state metadata mismatch")
+	}
+	if len(loaded.UTXOs) != len(next.UTXOs) {
+		t.Fatalf("utxo count = %d, want %d", len(loaded.UTXOs), len(next.UTXOs))
+	}
+	if got := loaded.UTXOs[unchangedOut]; got != next.UTXOs[unchangedOut] {
+		t.Fatal("unchanged utxo mismatch after delta rewrite")
+	}
+	if got := loaded.UTXOs[updatedOut]; got != next.UTXOs[updatedOut] {
+		t.Fatal("updated utxo mismatch after delta rewrite")
+	}
+	if _, ok := loaded.UTXOs[deletedOut]; ok {
+		t.Fatal("deleted utxo should not remain after delta rewrite")
+	}
+	if got := loaded.UTXOs[createdOut]; got != next.UTXOs[createdOut] {
+		t.Fatal("created utxo mismatch after delta rewrite")
 	}
 }

@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -28,6 +27,11 @@ var (
 	heightIndexPrefix      = []byte("height_index/")
 	knownPeerPrefix        = []byte("known_peer/")
 	utxoPrefix             = []byte("utxo/")
+)
+
+var (
+	knownPeerPrefixEnd = prefixUpperBound(knownPeerPrefix)
+	utxoPrefixEnd      = prefixUpperBound(utxoPrefix)
 )
 
 type StoredChainState struct {
@@ -137,15 +141,15 @@ func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
 	}
 
 	utxos := make(consensus.UtxoSet)
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: utxoPrefix,
+		UpperBound: utxoPrefixEnd,
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), utxoPrefix) {
-			continue
-		}
 		outpoint, err := decodeOutPoint(iter.Key()[len(utxoPrefix):])
 		if err != nil {
 			return nil, err
@@ -220,7 +224,10 @@ func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
 }
 
 func (s *ChainStore) LoadKnownPeers() (map[string]time.Time, error) {
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: knownPeerPrefix,
+		UpperBound: knownPeerPrefixEnd,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -228,9 +235,6 @@ func (s *ChainStore) LoadKnownPeers() (map[string]time.Time, error) {
 
 	peers := make(map[string]time.Time)
 	for iter.First(); iter.Valid(); iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), knownPeerPrefix) {
-			continue
-		}
 		addr := string(iter.Key()[len(knownPeerPrefix):])
 		if addr == "" {
 			continue
@@ -251,15 +255,15 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]time.Time) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: knownPeerPrefix,
+		UpperBound: knownPeerPrefixEnd,
+	})
 	if err != nil {
 		return err
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), knownPeerPrefix) {
-			continue
-		}
 		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
 			return err
 		}
@@ -288,16 +292,17 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 	if err := writeMeta(batch, state); err != nil {
 		return err
 	}
-	iter, err := s.db.NewIter(nil)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: utxoPrefix,
+		UpperBound: utxoPrefixEnd,
+	})
 	if err != nil {
 		return err
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		if bytes.HasPrefix(iter.Key(), utxoPrefix) {
-			if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-				return err
-			}
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
 		}
 	}
 	if err := iter.Error(); err != nil {
@@ -314,6 +319,63 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 	logging.Component("storage").Info("wrote full chain state",
 		slog.Uint64("height", state.Height),
 		slog.Int("utxo_count", len(state.UTXOs)),
+	)
+	return nil
+}
+
+func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *StoredChainState) error {
+	if next == nil {
+		return errors.New("next chain state is required")
+	}
+	if previous == nil {
+		return s.WriteFullState(next)
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := writeMeta(batch, next); err != nil {
+		return err
+	}
+
+	deleted := 0
+	written := 0
+	for outPoint, previousEntry := range previous.UTXOs {
+		nextEntry, ok := next.UTXOs[outPoint]
+		if !ok {
+			if err := batch.Delete(utxoKey(outPoint), nil); err != nil {
+				return err
+			}
+			deleted++
+			continue
+		}
+		if nextEntry == previousEntry {
+			continue
+		}
+		if err := batch.Set(utxoKey(outPoint), encodeUTXOEntry(nextEntry), nil); err != nil {
+			return err
+		}
+		written++
+	}
+	for outPoint, nextEntry := range next.UTXOs {
+		if previousEntry, ok := previous.UTXOs[outPoint]; ok && previousEntry == nextEntry {
+			continue
+		}
+		if _, ok := previous.UTXOs[outPoint]; ok {
+			continue
+		}
+		if err := batch.Set(utxoKey(outPoint), encodeUTXOEntry(nextEntry), nil); err != nil {
+			return err
+		}
+		written++
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	logging.Component("storage").Info("rewrote chain state via utxo delta",
+		slog.Uint64("height", next.Height),
+		slog.Int("deleted_utxos", deleted),
+		slog.Int("written_utxos", written),
+		slog.Int("final_utxo_count", len(next.UTXOs)),
 	)
 	return nil
 }
@@ -625,6 +687,21 @@ func putHeaderBatch(batch *pebble.Batch, entry BlockIndexEntry, active bool) err
 
 func cloneBytes(buf []byte) []byte {
 	return append([]byte(nil), buf...)
+}
+
+func prefixUpperBound(prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return nil
+	}
+	out := append([]byte(nil), prefix...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] == 0xff {
+			continue
+		}
+		out[i]++
+		return out[:i+1]
+	}
+	return nil
 }
 
 func encodeU64(v uint64) []byte {

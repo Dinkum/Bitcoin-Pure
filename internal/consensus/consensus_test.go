@@ -16,6 +16,16 @@ func consensusTestKeyHash(seed byte) [32]byte {
 	return crypto.KeyHash(&pubKey)
 }
 
+func coinbaseTxForConsensusTest(height uint64, outputs []types.TxOutput) types.Transaction {
+	return types.Transaction{
+		Base: types.TxBase{
+			Version:        1,
+			CoinbaseHeight: &height,
+			Outputs:        outputs,
+		},
+	}
+}
+
 func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint64, recipientSeed byte, fee uint64) types.Transaction {
 	t.Helper()
 	if fee >= value {
@@ -217,12 +227,84 @@ func TestComputedUTXORootOrderInvariant(t *testing.T) {
 	}
 }
 
+func TestComputedUTXORootMatchesAccumulatorRoot(t *testing.T) {
+	utxos := UtxoSet{
+		types.OutPoint{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 10, KeyHash: [32]byte{1}},
+		types.OutPoint{TxID: [32]byte{2}, Vout: 1}: {ValueAtoms: 20, KeyHash: [32]byte{2}},
+		types.OutPoint{TxID: [32]byte{3}, Vout: 2}: {ValueAtoms: 30, KeyHash: [32]byte{3}},
+	}
+	acc, err := UtxoAccumulator(utxos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ComputedUTXORoot(utxos), acc.Root(); got != want {
+		t.Fatalf("utxo root = %x, want %x", got, want)
+	}
+}
+
 func compactTargetForTest(compact uint32) *big.Int {
 	target, err := compactToTarget(compact)
 	if err != nil {
 		panic(err)
 	}
 	return target
+}
+
+func referenceAsertBits(t *testing.T, anchor AsertAnchor, prev PrevBlockContext, params ChainParams) uint32 {
+	t.Helper()
+	anchorTarget, err := compactToTarget(anchor.Bits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	powLimit, err := compactToTarget(params.PowLimitBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeDelta := int64(prev.Header.Timestamp) - anchor.ParentTime
+	heightDelta := int64(prev.Height - anchor.Height)
+	exponentFP := ((timeDelta - params.TargetSpacingSecs*(heightDelta+1)) * (1 << 16)) / params.AsertHalfLifeSecs
+
+	// Implement the required arithmetic shift explicitly so this helper stays
+	// independent from the production fixed-point decomposition.
+	numShifts := exponentFP / (1 << 16)
+	if exponentFP < 0 && exponentFP%(1<<16) != 0 {
+		numShifts--
+	}
+	frac := exponentFP - numShifts*(1<<16)
+
+	poly := new(big.Int).Mul(big.NewInt(195766423245049), big.NewInt(frac))
+	fracSquared := frac * frac
+	fracCubed := fracSquared * frac
+	poly.Add(poly, new(big.Int).Mul(big.NewInt(971821376), big.NewInt(fracSquared)))
+	poly.Add(poly, new(big.Int).Mul(big.NewInt(5127), big.NewInt(fracCubed)))
+	poly.Add(poly, new(big.Int).Lsh(big.NewInt(1), 47))
+	poly.Rsh(poly, 48)
+	poly.Add(poly, big.NewInt(1<<16))
+
+	nextTarget := new(big.Int).Mul(new(big.Int).Set(anchorTarget), poly)
+	if numShifts < 0 {
+		nextTarget.Rsh(nextTarget, uint(-numShifts))
+	} else if numShifts > 0 {
+		nextTarget.Lsh(nextTarget, uint(numShifts))
+	}
+	nextTarget.Rsh(nextTarget, 16)
+
+	if nextTarget.Sign() <= 0 {
+		bits, err := targetToCompact(big.NewInt(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bits
+	}
+	if nextTarget.Cmp(powLimit) > 0 {
+		return params.PowLimitBits
+	}
+	bits, err := targetToCompact(nextTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bits
 }
 
 func mineHeaderForTest(header types.BlockHeader) types.BlockHeader {
@@ -240,10 +322,7 @@ func mineHeaderForTest(header types.BlockHeader) types.BlockHeader {
 func TestCoinbaseOnlyBlockValidatesOnRegtest(t *testing.T) {
 	params := RegtestParams()
 	genesisTx := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}},
-		},
+		Base: coinbaseTxForConsensusTest(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}}).Base,
 	}
 	genesisTxID := TxID(&genesisTx)
 	genesisUTXOs := UtxoSet{
@@ -259,12 +338,7 @@ func TestCoinbaseOnlyBlockValidatesOnRegtest(t *testing.T) {
 	}
 	prev := PrevBlockContext{Height: 0, Header: genesisHeader}
 
-	blockTx := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{3}}},
-		},
-	}
+	blockTx := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{3}}})
 	nextUTXOs := cloneUtxos(genesisUTXOs)
 	blockTxID := TxID(&blockTx)
 	nextUTXOs[types.OutPoint{TxID: blockTxID, Vout: 0}] = UtxoEntry{ValueAtoms: 1, KeyHash: [32]byte{3}}
@@ -303,10 +377,7 @@ func TestUTXORootMismatchRejects(t *testing.T) {
 			NBits:         params.GenesisBits,
 		},
 		Txs: []types.Transaction{{
-			Base: types.TxBase{
-				Version: 1,
-				Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{1}}},
-			},
+			Base: coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{1}}}).Base,
 		}},
 	}
 	txid := TxID(&block.Txs[0])
@@ -341,12 +412,7 @@ func TestValidateAndApplyBlockRejectsNonLTOROrder(t *testing.T) {
 	if bytes.Compare(txAID[:], txBID[:]) < 0 {
 		ordered = []types.Transaction{txB, txA}
 	}
-	coinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{9}}},
-		},
-	}
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{9}}})
 	txs := append([]types.Transaction{coinbase}, ordered...)
 	_, _, txRoot, authRoot := BuildBlockRoots(txs)
 
@@ -423,12 +489,7 @@ func TestValidateAndApplyBlockRejectsSameBlockSpend(t *testing.T) {
 	if !foundLTORPair {
 		t.Fatal("failed to construct LTOR-compliant same-block spend fixture")
 	}
-	coinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{8}}},
-		},
-	}
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{8}}})
 	txs := []types.Transaction{coinbase, parent, child}
 	_, _, txRoot, authRoot := BuildBlockRoots(txs)
 
@@ -464,6 +525,43 @@ func TestValidateAndApplyBlockRejectsSameBlockSpend(t *testing.T) {
 	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), cloneUtxos(utxos), params, DefaultConsensusRules())
 	if !errors.Is(err, ErrMissingUTXO) {
 		t.Fatalf("expected missing utxo error, got %v", err)
+	}
+}
+
+func TestValidateAndApplyBlockRejectsCoinbaseHeightMismatch(t *testing.T) {
+	params := RegtestParams()
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	blockTx := coinbaseTxForConsensusTest(2, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{3}}})
+	blockTxID := TxID(&blockTx)
+	nextUTXOs := UtxoSet{
+		types.OutPoint{TxID: blockTxID, Vout: 0}: {ValueAtoms: 1, KeyHash: [32]byte{3}},
+	}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: MerkleRoot([][32]byte{blockTxID}),
+			MerkleAuthRoot: MerkleRoot([][32]byte{AuthID(&blockTx)}),
+			UTXORoot:       ComputedUTXORoot(nextUTXOs),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: []types.Transaction{blockTx},
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
+	if !errors.Is(err, ErrCoinbaseHeightInvalid) {
+		t.Fatalf("expected coinbase height error, got %v", err)
 	}
 }
 
@@ -573,6 +671,44 @@ func TestNextWorkRequiredASERTLateParentEasesDifficulty(t *testing.T) {
 	}
 	if gotTarget.Cmp(genesisTarget) < 0 {
 		t.Fatalf("expected easier or equal target than genesis, got genesis=%s current=%s", genesisTarget.String(), gotTarget.String())
+	}
+}
+
+func TestNextWorkRequiredASERTMatchesReferenceCases(t *testing.T) {
+	params := RegtestParams()
+	anchor := GenesisAsertAnchor(params)
+	cases := []struct {
+		name      string
+		height    uint64
+		timestamp uint64
+	}{
+		{name: "block1 on schedule", height: 0, timestamp: params.GenesisTimestamp},
+		{name: "block1 early", height: 0, timestamp: params.GenesisTimestamp - 300},
+		{name: "block1 late", height: 0, timestamp: params.GenesisTimestamp + 3600},
+		{name: "several blocks on schedule", height: 143, timestamp: params.GenesisTimestamp + 143*600},
+		{name: "large positive delta", height: 500, timestamp: params.GenesisTimestamp + 500*600 + 14*86400},
+		{name: "large negative delta", height: 500, timestamp: params.GenesisTimestamp + 500*600 - 12*3600},
+		{name: "overflow saturates", height: 20_000, timestamp: params.GenesisTimestamp + 20_000*600 + 10*365*86400},
+		{name: "underflow clamps to one", height: 20_000, timestamp: params.GenesisTimestamp},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := PrevBlockContext{
+				Height: tc.height,
+				Header: types.BlockHeader{
+					Timestamp: tc.timestamp,
+					NBits:     params.GenesisBits,
+				},
+			}
+			got, err := NextWorkRequiredASERT(anchor, prev, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := referenceAsertBits(t, anchor, prev, params)
+			if got != want {
+				t.Fatalf("bits = 0x%08x, want 0x%08x", got, want)
+			}
+		})
 	}
 }
 

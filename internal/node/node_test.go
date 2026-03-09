@@ -78,12 +78,7 @@ func spendTxForNodeTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, 
 
 func genesisBlock() types.Block {
 	params := consensus.RegtestParams()
-	coinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}},
-		},
-	}
+	coinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}})
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	utxos := consensus.UtxoSet{
@@ -104,12 +99,7 @@ func genesisBlock() types.Block {
 
 func genesisBlockForKeyHash(keyHash [32]byte) types.Block {
 	params := consensus.RegtestParams()
-	coinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 50, KeyHash: keyHash}},
-		},
-	}
+	coinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: keyHash}})
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	utxos := consensus.UtxoSet{
@@ -130,12 +120,7 @@ func genesisBlockForKeyHash(keyHash [32]byte) types.Block {
 
 func nextCoinbaseBlock(prevHeight uint64, prev types.BlockHeader, currentUTXOs consensus.UtxoSet, keyHashByte byte, timestamp uint64) types.Block {
 	params := consensus.RegtestParams()
-	coinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{keyHashByte}}},
-		},
-	}
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{keyHashByte}}})
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	nextUTXOs := cloneUtxos(currentUTXOs)
@@ -562,12 +547,7 @@ func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
 	defer persistent.Close()
 
 	params := consensus.RegtestParams()
-	genesisCoinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)}},
-		},
-	}
+	genesisCoinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)}})
 	genesisTxID := consensus.TxID(&genesisCoinbase)
 	genesisAuthID := consensus.AuthID(&genesisCoinbase)
 	genesisUTXOs := consensus.UtxoSet{
@@ -609,12 +589,7 @@ func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
 	if !foundLTORPair {
 		t.Fatal("failed to construct LTOR-compliant same-block spend fixture")
 	}
-	coinbase := types.Transaction{
-		Base: types.TxBase{
-			Version: 1,
-			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}},
-		},
-	}
+	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}})
 	txs := []types.Transaction{coinbase, parent, child}
 	txids, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
 	nextUTXOs := cloneUtxos(persistent.ChainState().UTXOs())
@@ -683,7 +658,7 @@ func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 99},
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}}},
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
 			parent,
 			child,
 		},
@@ -739,7 +714,7 @@ func TestReconstructCompactBlockFromMempoolOverlap(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 199},
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}}},
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
 			parent,
 			child,
 		},
@@ -787,7 +762,7 @@ func TestOnXThinBlockRequestsMissingIndexes(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 100},
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}}},
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
 			parent,
 			child,
 		},
@@ -831,7 +806,7 @@ func TestOnXThinBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 101},
-		Txs:    []types.Transaction{{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
 	}
 	for i := 0; i < 8; i++ {
 		block.Txs = append(block.Txs, types.Transaction{
@@ -877,7 +852,7 @@ func TestOnCompactBlockRequestsMissingIndexes(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 200},
 		Txs: []types.Transaction{
-			{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}}},
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
 			parent,
 			child,
 		},
@@ -917,7 +892,7 @@ func TestOnCompactBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 	}
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 201},
-		Txs:    []types.Transaction{{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
 	}
 	for i := 0; i < 8; i++ {
 		block.Txs = append(block.Txs, types.Transaction{
@@ -1291,6 +1266,42 @@ func TestGetMiningInfoRPC(t *testing.T) {
 	}
 	if out.CurrentBits == 0 || out.NextBits == 0 {
 		t.Fatal("expected current and next bits")
+	}
+}
+
+func TestGetBlockHashByHeightRPC(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	params, err := json.Marshal(map[string]any{"height": uint64(0)})
+	if err != nil {
+		t.Fatalf("Marshal params: %v", err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "getblockhashbyheight",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if got, ok := out["height"].(uint64); !ok || got != 0 {
+		t.Fatalf("height = %#v, want 0", out["height"])
+	}
+	hash := consensus.HeaderHash(&genesis.Header)
+	want := hex.EncodeToString(hash[:])
+	if got, ok := out["hash"].(string); !ok || got != want {
+		t.Fatalf("hash = %#v, want %q", out["hash"], want)
 	}
 }
 
@@ -2048,7 +2059,7 @@ func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
 		svc.peerWriteLoop(peer)
 	}()
 
-	tx := types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
 	peer.sendQ <- outboundMessage{
 		msg:        p2p.TxBatchMessage{Txs: []types.Transaction{tx}},
 		enqueuedAt: time.Now(),
@@ -2115,7 +2126,7 @@ func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 		msg:      p2p.InvMessage{Items: inv},
 		invItems: inv,
 	}
-	tx := types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
 	filteredTxs := peer.filterQueuedTxs([]types.Transaction{tx})
 	peer.sendQ <- outboundMessage{
 		msg: p2p.TxBatchMessage{Txs: filteredTxs},
@@ -2193,6 +2204,47 @@ func TestOnInvMessageRequestsHeadersThroughLastUnknownBlock(t *testing.T) {
 		}
 	case <-time.After(50 * time.Millisecond):
 		t.Fatal("timed out waiting for getheaders request")
+	}
+}
+
+func TestOnInvMessageRequestsFullBlockForKnownHeader(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	svc.cacheRecentHeader(block.Header)
+
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+	hash := consensus.HeaderHash(&block.Header)
+	if err := svc.onInvMessage(peer, p2p.InvMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}}}); err != nil {
+		t.Fatalf("onInvMessage: %v", err)
+	}
+
+	envelope := <-peer.sendQ
+	req, ok := envelope.msg.(p2p.GetDataMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want GetDataMessage", envelope.msg)
+	}
+	if len(req.Items) != 1 || req.Items[0].Hash != hash || req.Items[0].Type != p2p.InvTypeBlockFull {
+		t.Fatalf("GetData items = %+v, want full block request for %x", req.Items, hash)
 	}
 }
 
@@ -3048,7 +3100,7 @@ func TestSyncWatchdogRepairsGapAndRequestsBlocks(t *testing.T) {
 		case envelope := <-peer.controlQ:
 			if msg, ok := envelope.msg.(p2p.GetDataMessage); ok {
 				gotGetData = true
-				if len(msg.Items) != 1 || msg.Items[0].Hash != consensus.HeaderHash(&block.Header) {
+				if len(msg.Items) != 1 || msg.Items[0].Hash != consensus.HeaderHash(&block.Header) || msg.Items[0].Type != p2p.InvTypeBlockFull {
 					t.Fatalf("GetData items = %+v, want block hash %x", msg.Items, consensus.HeaderHash(&block.Header))
 				}
 			}
@@ -3110,6 +3162,41 @@ func TestSyncWatchdogRotatesAwayFromTimedOutHeaderPeer(t *testing.T) {
 	}
 	if len(healthy.controlQ) == 0 {
 		t.Fatal("expected healthy peer to receive sync work")
+	}
+}
+
+func TestSyncWatchdogPollsHeadersWhenTipLooksCurrent(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.controlQ = make(chan outboundMessage, 8)
+	svc.peerMu.Lock()
+	svc.peers[peer.addr] = peer
+	svc.peerMu.Unlock()
+
+	svc.runSyncWatchdogStep()
+
+	gotHeaders := false
+	for {
+		select {
+		case envelope := <-peer.controlQ:
+			if _, ok := envelope.msg.(p2p.GetHeadersMessage); ok {
+				gotHeaders = true
+			}
+		default:
+			if !gotHeaders {
+				t.Fatal("expected sync watchdog to poll headers while tip appears current")
+			}
+			return
+		}
 	}
 }
 
@@ -3199,8 +3286,8 @@ func TestPeerConnCoalescesTxBatches(t *testing.T) {
 		queuedTx: make(map[[32]byte]int),
 		knownTx:  make(map[[32]byte]struct{}),
 	}
-	first := types.Transaction{Base: types.TxBase{Version: 1, Outputs: []types.TxOutput{{ValueAtoms: 1}}}}
-	second := types.Transaction{Base: types.TxBase{Version: 2, Outputs: []types.TxOutput{{ValueAtoms: 2}}}}
+	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
+	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2}})
 
 	if err := peer.enqueueTxBatch(p2p.TxBatchMessage{Txs: []types.Transaction{first}}); err != nil {
 		t.Fatalf("enqueue first tx: %v", err)

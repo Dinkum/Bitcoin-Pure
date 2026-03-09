@@ -472,22 +472,29 @@ func (p *Pool) SelectForBlock(chainUtxos consensus.UtxoSet, rules consensus.Cons
 	return p.SelectForBlockInPlace(tempUtxos, rules, maxTxBytes)
 }
 
+// SelectForBlockOverlay builds block candidates against an immutable base UTXO
+// map and returns the post-selection overlay so callers can keep extending the
+// tentative block state without materializing the full live set.
+func (p *Pool) SelectForBlockOverlay(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.selectForBlockLocked(baseUtxos, rules, maxTxBytes)
+}
+
 // SelectForBlockFromBase builds block candidates against an immutable base UTXO
 // view and returns the post-selection UTXO set without mutating the caller's
 // published chain map.
 func (p *Pool) SelectForBlockFromBase(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, consensus.UtxoSet) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.selectForBlockLocked(baseUtxos, rules, maxTxBytes)
+	selected, totalFees, overlay := p.SelectForBlockOverlay(baseUtxos, rules, maxTxBytes)
+	return selected, totalFees, overlay.Materialize()
 }
 
 // SelectForBlockInPlace consumes a mutable chain view and advances it as eligible
 // transactions are accepted. Eligibility is still checked against the original
 // pre-block UTXO set so block assembly cannot create same-block dependency edges.
 func (p *Pool) SelectForBlockInPlace(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	selected, totalFees, finalUtxos := p.selectForBlockLocked(currentUtxos, rules, maxTxBytes)
+	selected, totalFees, overlay := p.SelectForBlockOverlay(currentUtxos, rules, maxTxBytes)
+	finalUtxos := overlay.Materialize()
 	for outPoint := range currentUtxos {
 		delete(currentUtxos, outPoint)
 	}
@@ -497,7 +504,7 @@ func (p *Pool) SelectForBlockInPlace(currentUtxos consensus.UtxoSet, rules conse
 	return selected, totalFees
 }
 
-func (p *Pool) selectForBlockLocked(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, consensus.UtxoSet) {
+func (p *Pool) selectForBlockLocked(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
 	preBlockUtxos := consensus.LookupFromSet(baseUtxos)
 	overlay := consensus.NewUtxoOverlay(baseUtxos)
 	selected := make([]SnapshotEntry, 0, len(p.entries))
@@ -544,16 +551,16 @@ func (p *Pool) selectForBlockLocked(baseUtxos consensus.UtxoSet, rules consensus
 		pending = next
 	}
 
-	finalUtxos := overlay.Materialize()
 	sortSnapshotEntriesByTxID(selected)
-	return selected, totalFees, finalUtxos
+	return selected, totalFees, overlay
 }
 
-func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
+// AppendForBlockOverlay extends a previously-built tentative block state
+// without forcing the caller to materialize a full post-selection UTXO map.
+func (p *Pool) AppendForBlockOverlay(preBlockUtxos consensus.UtxoSet, currentUtxos *consensus.UtxoOverlay, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	preBlockLookup := consensus.LookupFromSet(preBlockUtxos)
-	overlay := consensus.NewUtxoOverlay(currentUtxos)
 	appendOnly := make([]SnapshotEntry, 0, len(p.entries))
 	included := make(map[[32]byte]struct{}, len(selected))
 	claimed := claimedOutPointsForSnapshots(selected)
@@ -582,7 +589,7 @@ func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos cons
 				continue
 			}
 
-			packageFees, ok := applyCandidatePackage(preBlockLookup, overlay, claimed, filtered, rules)
+			packageFees, ok := applyCandidatePackage(preBlockLookup, currentUtxos, claimed, filtered, rules)
 			if !ok {
 				next = append(next, candidate)
 				continue
@@ -602,6 +609,13 @@ func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos cons
 		pending = next
 	}
 
+	sortSnapshotEntriesByTxID(appendOnly)
+	return appendOnly, totalFees
+}
+
+func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
+	overlay := consensus.NewUtxoOverlay(currentUtxos)
+	appendOnly, totalFees := p.AppendForBlockOverlay(preBlockUtxos, overlay, rules, maxTxBytes, selected)
 	finalUtxos := overlay.Materialize()
 	for outPoint := range currentUtxos {
 		delete(currentUtxos, outPoint)
@@ -609,7 +623,6 @@ func (p *Pool) AppendForBlock(preBlockUtxos consensus.UtxoSet, currentUtxos cons
 	for outPoint, entry := range finalUtxos {
 		currentUtxos[outPoint] = entry
 	}
-	sortSnapshotEntriesByTxID(appendOnly)
 	return appendOnly, totalFees
 }
 
