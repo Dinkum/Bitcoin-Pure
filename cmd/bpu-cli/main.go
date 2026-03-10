@@ -10,10 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	netpprof "net/http/pprof"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -115,6 +119,7 @@ func runBenchRun(args []string) error {
 	reportPath := fs.String("report", "", "")
 	markdownPath := fs.String("markdown", "", "")
 	dbRoot := fs.String("db-root", "", "")
+	profileDir := fs.String("profile-dir", "", "")
 	suppressLogs := fs.Bool("suppress-logs", true, "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -133,6 +138,7 @@ func runBenchRun(args []string) error {
 		BatchSize:    *batchSize,
 		Timeout:      *timeout,
 		DBRoot:       *dbRoot,
+		ProfileDir:   *profileDir,
 		SuppressLogs: *suppressLogs,
 	}
 
@@ -167,6 +173,9 @@ func runBenchRun(args []string) error {
 	fmt.Printf("end_to_end_tps: %.2f\n", report.EndToEndTPS)
 	fmt.Printf("submission_duration_ms: %.2f\n", report.SubmissionDurationMS)
 	fmt.Printf("convergence_duration_ms: %.2f\n", report.ConvergenceDurationMS)
+	if len(report.Profiling.Artifacts) != 0 {
+		fmt.Printf("profile_dir: %s\n", filepath.Dir(report.Profiling.Artifacts[0].Path))
+	}
 	fmt.Printf("report_json: %s\n", *reportPath)
 	fmt.Printf("report_markdown: %s\n", *markdownPath)
 	fmt.Println()
@@ -184,6 +193,7 @@ func runBenchSuite(args []string) error {
 	timeout := fs.Duration("timeout", benchmarks.DefaultSuiteOptions().Timeout, "")
 	reportDir := fs.String("out", "", "")
 	dbRoot := fs.String("db-root", "", "")
+	profileDir := fs.String("profile-dir", "", "")
 	suppressLogs := fs.Bool("suppress-logs", true, "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -200,6 +210,7 @@ func runBenchSuite(args []string) error {
 		BatchSize:    *batchSize,
 		Timeout:      *timeout,
 		DBRoot:       *dbRoot,
+		ProfileDir:   *profileDir,
 		SuppressLogs: *suppressLogs,
 	}
 	report, err := benchmarks.RunSuite(context.Background(), opts)
@@ -215,6 +226,9 @@ func runBenchSuite(args []string) error {
 
 	fmt.Printf("profile: %s\n", report.Profile)
 	fmt.Printf("cases: %d\n", len(report.Cases))
+	if *profileDir != "" {
+		fmt.Printf("profile_dir: %s\n", *profileDir)
+	}
 	fmt.Printf("report_dir: %s\n", *reportDir)
 	for _, suiteCase := range report.Cases {
 		fmt.Printf("%s_submit_tps: %.2f\n", strings.ReplaceAll(suiteCase.Name, "-", "_"), suiteCase.Report.SubmitTPS)
@@ -295,6 +309,8 @@ func runServe(args []string) error {
 	db := fs.String("db", "", "")
 	logPath := fs.String("log", "", "")
 	logLevel := fs.String("log-level", "", "")
+	logFormat := fs.String("log-format", "", "")
+	pprofAddr := fs.String("pprof", "", "")
 	rpcAddr := fs.String("rpc", "", "")
 	rpcAuthToken := fs.String("rpc-auth-token", "", "")
 	rpcReadTimeout := fs.Duration("rpc-read-timeout", 0, "")
@@ -342,6 +358,12 @@ func runServe(args []string) error {
 	}
 	if *logLevel != "" {
 		cfg.LogLevel = *logLevel
+	}
+	if *logFormat != "" {
+		cfg.LogFormat = *logFormat
+	}
+	if *pprofAddr != "" {
+		cfg.PprofAddr = *pprofAddr
 	}
 	if *rpcAddr != "" {
 		cfg.RPCAddr = *rpcAddr
@@ -425,12 +447,21 @@ func runServe(args []string) error {
 	logger, logCloser, err := logging.Setup(logging.Config{
 		Path:         cfg.LogPath,
 		Level:        cfg.LogLevel,
+		Format:       cfg.LogFormat,
 		MaxSizeBytes: logging.DefaultMaxSizeBytes,
 	})
 	if err != nil {
 		return err
 	}
 	defer logCloser.Close()
+
+	pprofServer, err := maybeStartPprofServer(cfg.PprofAddr, logger)
+	if err != nil {
+		return err
+	}
+	if pprofServer != nil {
+		defer pprofServer.Close()
+	}
 
 	loadedGenesis, err := loadGenesisFixtureFromPath(cfg.GenesisFixture)
 	if err != nil {
@@ -451,31 +482,32 @@ func runServe(args []string) error {
 		return err
 	}
 	svc, err := node.OpenService(node.ServiceConfig{
-		Profile:            profile,
-		DBPath:             cfg.DBPath,
-		RPCAddr:            cfg.RPCAddr,
-		RPCAuthToken:       cfg.RPCAuthToken,
-		RPCReadTimeout:     time.Duration(cfg.RPCReadTimeoutMS) * time.Millisecond,
-		RPCWriteTimeout:    time.Duration(cfg.RPCWriteTimeoutMS) * time.Millisecond,
-		RPCHeaderTimeout:   time.Duration(cfg.RPCHeaderTimeoutMS) * time.Millisecond,
-		RPCIdleTimeout:     time.Duration(cfg.RPCIdleTimeoutMS) * time.Millisecond,
-		RPCMaxHeaderBytes:  cfg.RPCMaxHeaderBytes,
-		RPCMaxBodyBytes:    cfg.RPCMaxBodyBytes,
-		P2PAddr:            cfg.P2PAddr,
-		Peers:              cfg.Peers,
-		MaxInboundPeers:    cfg.MaxInboundPeers,
-		MaxOutboundPeers:   cfg.MaxOutboundPeers,
-		HandshakeTimeout:   time.Duration(cfg.HandshakeTimeoutMS) * time.Millisecond,
-		StallTimeout:       time.Duration(cfg.StallTimeoutMS) * time.Millisecond,
-		MaxMessageBytes:    cfg.MaxMessageBytes,
-		MinRelayFeePerByte: cfg.MinRelayFeePerByte,
-		MaxAncestors:       cfg.MaxAncestors,
-		MaxDescendants:     cfg.MaxDescendants,
-		MaxOrphans:         cfg.MaxOrphans,
-		MinerEnabled:       cfg.MinerEnabled,
-		MinerWorkers:       cfg.MinerWorkers,
-		MinerKeyHash:       keyHash,
-		GenesisFixture:     cfg.GenesisFixture,
+		Profile:                   profile,
+		DBPath:                    cfg.DBPath,
+		ThroughputSummaryInterval: time.Duration(cfg.ThroughputSummaryIntervalMS) * time.Millisecond,
+		RPCAddr:                   cfg.RPCAddr,
+		RPCAuthToken:              cfg.RPCAuthToken,
+		RPCReadTimeout:            time.Duration(cfg.RPCReadTimeoutMS) * time.Millisecond,
+		RPCWriteTimeout:           time.Duration(cfg.RPCWriteTimeoutMS) * time.Millisecond,
+		RPCHeaderTimeout:          time.Duration(cfg.RPCHeaderTimeoutMS) * time.Millisecond,
+		RPCIdleTimeout:            time.Duration(cfg.RPCIdleTimeoutMS) * time.Millisecond,
+		RPCMaxHeaderBytes:         cfg.RPCMaxHeaderBytes,
+		RPCMaxBodyBytes:           cfg.RPCMaxBodyBytes,
+		P2PAddr:                   cfg.P2PAddr,
+		Peers:                     cfg.Peers,
+		MaxInboundPeers:           cfg.MaxInboundPeers,
+		MaxOutboundPeers:          cfg.MaxOutboundPeers,
+		HandshakeTimeout:          time.Duration(cfg.HandshakeTimeoutMS) * time.Millisecond,
+		StallTimeout:              time.Duration(cfg.StallTimeoutMS) * time.Millisecond,
+		MaxMessageBytes:           cfg.MaxMessageBytes,
+		MinRelayFeePerByte:        cfg.MinRelayFeePerByte,
+		MaxAncestors:              cfg.MaxAncestors,
+		MaxDescendants:            cfg.MaxDescendants,
+		MaxOrphans:                cfg.MaxOrphans,
+		MinerEnabled:              cfg.MinerEnabled,
+		MinerWorkers:              cfg.MinerWorkers,
+		MinerKeyHash:              keyHash,
+		GenesisFixture:            cfg.GenesisFixture,
 	}, &loadedGenesis.Block)
 	if err != nil {
 		return err
@@ -506,7 +538,11 @@ func runServe(args []string) error {
 	if cfg.P2PAddr != "" {
 		fmt.Printf("p2p: %s\n", cfg.P2PAddr)
 	}
+	if cfg.PprofAddr != "" {
+		fmt.Printf("pprof: %s\n", cfg.PprofAddr)
+	}
 	fmt.Printf("log: %s\n", cfg.LogPath)
+	fmt.Printf("log_format: %s\n", cfg.LogFormat)
 	if cfg.MinerEnabled {
 		if cfg.MinerWorkers > 0 {
 			fmt.Printf("miner_workers: %d\n", cfg.MinerWorkers)
@@ -515,6 +551,85 @@ func runServe(args []string) error {
 		}
 	}
 	return svc.Start(ctx)
+}
+
+type pprofServer struct {
+	server *http.Server
+	ln     net.Listener
+}
+
+func maybeStartPprofServer(addr string, logger *slog.Logger) (*pprofServer, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil, nil
+	}
+	if err := validateLoopbackListenAddr(addr); err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", netpprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", netpprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", netpprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", netpprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", netpprof.Trace)
+	mux.Handle("/debug/pprof/allocs", netpprof.Handler("allocs"))
+	mux.Handle("/debug/pprof/block", netpprof.Handler("block"))
+	mux.Handle("/debug/pprof/goroutine", netpprof.Handler("goroutine"))
+	mux.Handle("/debug/pprof/heap", netpprof.Handler("heap"))
+	mux.Handle("/debug/pprof/mutex", netpprof.Handler("mutex"))
+	mux.Handle("/debug/pprof/threadcreate", netpprof.Handler("threadcreate"))
+	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(1)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 2 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+	go func() {
+		err := srv.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && logger != nil {
+			logger.Warn("pprof server stopped unexpectedly", slog.String("addr", addr), slog.Any("error", err))
+		}
+	}()
+	if logger != nil {
+		logger.Info("pprof server listening", slog.String("addr", addr))
+	}
+	return &pprofServer{server: srv, ln: ln}, nil
+}
+
+func (s *pprofServer) Close() error {
+	if s == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := s.server.Shutdown(ctx)
+	runtime.SetMutexProfileFraction(0)
+	runtime.SetBlockProfileRate(0)
+	return err
+}
+
+func validateLoopbackListenAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("pprof listen addr must use loopback host: %s", addr)
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("pprof listen addr must use loopback host: %s", addr)
+	}
+	return nil
 }
 
 func runValidateTx(args []string) error {
@@ -1267,6 +1382,8 @@ func loadGenesisFixture(profile types.ChainProfile) (*loadedGenesisFixture, erro
 		return loadGenesisFixtureFromPath("fixtures/genesis/mainnet.json")
 	case types.Regtest:
 		return loadGenesisFixtureFromPath("fixtures/genesis/regtest.json")
+	case types.RegtestMedium:
+		return loadGenesisFixtureFromPath("fixtures/genesis/regtest_medium.json")
 	case types.RegtestHard:
 		return loadGenesisFixtureFromPath("fixtures/genesis/regtest_hard.json")
 	default:
@@ -1668,6 +1785,8 @@ func defaultGenesisFixture(profile types.ChainProfile) string {
 		return "fixtures/genesis/mainnet.json"
 	case types.Regtest:
 		return "fixtures/genesis/regtest.json"
+	case types.RegtestMedium:
+		return "fixtures/genesis/regtest_medium.json"
 	case types.RegtestHard:
 		return "fixtures/genesis/regtest_hard.json"
 	default:

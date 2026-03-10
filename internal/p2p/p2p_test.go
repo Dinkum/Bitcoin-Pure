@@ -249,10 +249,15 @@ func TestConnXBlockTxRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMagicForProfileDistinguishesRegtestHard(t *testing.T) {
+func TestMagicForProfileDistinguishesRegtestProfiles(t *testing.T) {
+	if got := MagicForProfile(types.RegtestMedium); got == 0 {
+		t.Fatal("regtest_medium magic should be non-zero")
+	} else if got == MagicForProfile(types.Regtest) {
+		t.Fatal("regtest_medium should use distinct network magic")
+	}
 	if got := MagicForProfile(types.RegtestHard); got == 0 {
 		t.Fatal("regtest_hard magic should be non-zero")
-	} else if got == MagicForProfile(types.Regtest) {
+	} else if got == MagicForProfile(types.Regtest) || got == MagicForProfile(types.RegtestMedium) {
 		t.Fatal("regtest_hard should use distinct network magic")
 	}
 }

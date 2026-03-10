@@ -6,6 +6,7 @@ import (
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 )
 
 var (
@@ -41,40 +42,9 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 		return ErrNoTip
 	}
 	workingUtxos := consensus.NewUtxoOverlay(c.utxos)
-	for _, tx := range block.Txs {
-		txid := consensus.TxID(&tx)
-		for vout := range tx.Base.Outputs {
-			workingUtxos.Spend(types.OutPoint{TxID: txid, Vout: uint32(vout)})
-		}
-	}
-
-	undoIndex := 0
-	// Outputs created earlier in the same block are deleted above and should not be
-	// restored from undo; only spends that reached into the pre-block UTXO set
-	// consume undo entries.
-	intraBlockOutputs := make(map[types.OutPoint]struct{})
-	for i := 1; i < len(block.Txs); i++ {
-		for _, input := range block.Txs[i].Base.Inputs {
-			if _, ok := intraBlockOutputs[input.PrevOut]; ok {
-				continue
-			}
-			if undoIndex >= len(undo) {
-				return fmt.Errorf("block undo mismatch: missing undo entry for input %v", input.PrevOut)
-			}
-			entry := undo[undoIndex]
-			undoIndex++
-			if entry.OutPoint != input.PrevOut {
-				return fmt.Errorf("undo outpoint mismatch for input %v", input.PrevOut)
-			}
-			workingUtxos.Restore(input.PrevOut, entry.Entry)
-		}
-		txid := consensus.TxID(&block.Txs[i])
-		for vout := range block.Txs[i].Base.Outputs {
-			intraBlockOutputs[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = struct{}{}
-		}
-	}
-	if undoIndex != len(undo) {
-		return fmt.Errorf("block undo mismatch: unused undo entries %d", len(undo)-undoIndex)
+	nextAcc, err := disconnectBlockOverlay(workingUtxos, c.utxoAcc, block, undo)
+	if err != nil {
+		return err
 	}
 
 	height := parent.Height
@@ -83,11 +53,7 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 	c.tipHeader = &header
 	c.blockSizeState = parent.BlockSizeState
 	c.utxos = workingUtxos.Materialize()
-	acc, err := consensus.UtxoAccumulator(c.utxos)
-	if err != nil {
-		return err
-	}
-	c.utxoAcc = acc
+	c.utxoAcc = nextAcc
 	return nil
 }
 
@@ -284,6 +250,15 @@ func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uin
 }
 
 func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeight uint64) error {
+	workingUtxos := consensus.NewUtxoOverlay(state.utxos)
+	workingAcc := state.utxoAcc
+	if workingAcc == nil {
+		var err error
+		workingAcc, err = consensus.UtxoAccumulator(state.utxos)
+		if err != nil {
+			return err
+		}
+	}
 	for state.TipHeight() != nil && *state.TipHeight() > targetHeight {
 		height := *state.TipHeight()
 		hash, err := p.store.GetBlockHashByHeight(height)
@@ -311,11 +286,77 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 		if parentEntry == nil {
 			return fmt.Errorf("missing parent entry for active block %x", *hash)
 		}
-		if err := state.DisconnectBlock(block, undo, parentEntry); err != nil {
+		workingAcc, err = disconnectBlockOverlay(workingUtxos, workingAcc, block, undo)
+		if err != nil {
 			return err
 		}
+		parentHeight := parentEntry.Height
+		parentHeader := parentEntry.Header
+		state.height = &parentHeight
+		state.tipHeader = &parentHeader
+		state.blockSizeState = parentEntry.BlockSizeState
 	}
+	state.utxos = workingUtxos.Materialize()
+	state.utxoAcc = workingAcc
 	return nil
+}
+
+func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utreexo.Accumulator, block *types.Block, undo []storage.BlockUndoEntry) (*utreexo.Accumulator, error) {
+	if currentUtxos == nil {
+		return nil, fmt.Errorf("missing rollback utxo overlay")
+	}
+	if currentAcc == nil {
+		return nil, fmt.Errorf("missing rollback utxo accumulator")
+	}
+
+	spentOutputs := make([]types.OutPoint, 0)
+	for _, tx := range block.Txs {
+		txid := consensus.TxID(&tx)
+		for vout := range tx.Base.Outputs {
+			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+			if _, ok := currentUtxos.Lookup(outPoint); ok {
+				currentUtxos.Spend(outPoint)
+				spentOutputs = append(spentOutputs, outPoint)
+			}
+		}
+	}
+
+	undoIndex := 0
+	restoredLeaves := make([]utreexo.UtxoLeaf, 0, len(undo))
+	// Outputs created earlier in the same block are removed above and should not be
+	// restored from undo; only spends that reached into the pre-block UTXO set
+	// consume undo entries.
+	intraBlockOutputs := make(map[types.OutPoint]struct{})
+	for i := 1; i < len(block.Txs); i++ {
+		for _, input := range block.Txs[i].Base.Inputs {
+			if _, ok := intraBlockOutputs[input.PrevOut]; ok {
+				continue
+			}
+			if undoIndex >= len(undo) {
+				return nil, fmt.Errorf("block undo mismatch: missing undo entry for input %v", input.PrevOut)
+			}
+			entry := undo[undoIndex]
+			undoIndex++
+			if entry.OutPoint != input.PrevOut {
+				return nil, fmt.Errorf("undo outpoint mismatch for input %v", input.PrevOut)
+			}
+			currentUtxos.Restore(input.PrevOut, entry.Entry)
+			restoredLeaves = append(restoredLeaves, utreexo.UtxoLeaf{
+				OutPoint:   entry.OutPoint,
+				ValueAtoms: entry.Entry.ValueAtoms,
+				KeyHash:    entry.Entry.KeyHash,
+			})
+		}
+		txid := consensus.TxID(&block.Txs[i])
+		for vout := range block.Txs[i].Base.Outputs {
+			intraBlockOutputs[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = struct{}{}
+		}
+	}
+	if undoIndex != len(undo) {
+		return nil, fmt.Errorf("block undo mismatch: unused undo entries %d", len(undo)-undoIndex)
+	}
+
+	return currentAcc.Apply(spentOutputs, restoredLeaves)
 }
 
 func captureUndoEntries(block *types.Block, utxos consensus.UtxoSet) ([]storage.BlockUndoEntry, error) {

@@ -106,10 +106,21 @@ func TestRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
-func TestParseChainProfileAcceptsRegtestHard(t *testing.T) {
-	profile, err := ParseChainProfile("regtest_hard")
+func TestParseChainProfileAcceptsRegtestMediumAndHard(t *testing.T) {
+	profile, err := ParseChainProfile("regtest_medium")
 	if err != nil {
-		t.Fatalf("ParseChainProfile: %v", err)
+		t.Fatalf("ParseChainProfile(regtest_medium): %v", err)
+	}
+	if profile != RegtestMedium {
+		t.Fatalf("profile = %q, want %q", profile, RegtestMedium)
+	}
+	if !profile.IsRegtestLike() {
+		t.Fatal("regtest_medium should be treated as regtest-like")
+	}
+
+	profile, err = ParseChainProfile("regtest_hard")
+	if err != nil {
+		t.Fatalf("ParseChainProfile(regtest_hard): %v", err)
 	}
 	if profile != RegtestHard {
 		t.Fatalf("profile = %q, want %q", profile, RegtestHard)

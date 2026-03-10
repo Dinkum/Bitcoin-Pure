@@ -36,9 +36,12 @@ func MainnetParams() ChainParams {
 		HalvingInterval:     2_500_000,
 		InitialSubsidyAtoms: 1_000_000_000_000,
 		BlockSizeFloor:      32_000_000,
-		PowLimitBits:        0x1d00ffff,
+		PowLimitBits:        0x1d0f930c,
 		GenesisTimestamp:    1_700_000_000,
-		GenesisBits:         0x1d00ffff,
+		// Retuned from the measured DEV1-S hash rate so genesis lands around a
+		// practical ~10 minute solve on the test VPSes. The max target moves with
+		// it so genesis remains valid under the chain's compact target bounds.
+		GenesisBits: 0x1d0f930c,
 	}
 }
 
@@ -51,14 +54,25 @@ func RegtestParams() ChainParams {
 	return params
 }
 
+func RegtestMediumParams() ChainParams {
+	params := RegtestParams()
+	params.Profile = types.RegtestMedium
+	// Retuned upward after live two-miner medium-profile testing showed blocks
+	// landing in roughly 1-2 seconds on the DEV1-S pair. This aims for a truer
+	// medium fork-debug cadence closer to ~15 seconds before ASERT retargeting
+	// takes over.
+	params.PowLimitBits = 0x1d4ddf20
+	params.GenesisBits = 0x1d4ddf20
+	return params
+}
+
 func RegtestHardParams() ChainParams {
 	params := RegtestParams()
 	params.Profile = types.RegtestHard
-	// Harder than default regtest, but intentionally tuned so the current
-	// small Scaleway VPS pair lands in roughly minute-scale territory before
-	// ASERT has time to pull the chain toward the 10-minute target.
-	params.PowLimitBits = 0x1d4fffff
-	params.GenesisBits = 0x1d4fffff
+	// Calibrated from the same measured DEV1-S hash rate so the starting cadence
+	// lands near ~2 minutes for the slower TPS-focused live runs.
+	params.PowLimitBits = 0x1d4ddf3d
+	params.GenesisBits = 0x1d4ddf3d
 	return params
 }
 
@@ -68,6 +82,8 @@ func ParamsForProfile(profile types.ChainProfile) ChainParams {
 		return MainnetParams()
 	case types.Regtest:
 		return RegtestParams()
+	case types.RegtestMedium:
+		return RegtestMediumParams()
 	case types.RegtestHard:
 		return RegtestHardParams()
 	default:

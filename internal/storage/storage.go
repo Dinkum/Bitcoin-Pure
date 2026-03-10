@@ -15,18 +15,19 @@ import (
 )
 
 var (
-	metaProfileKey         = []byte("meta/profile")
-	metaHeaderTipHeightKey = []byte("meta/header_tip_height")
-	metaHeaderTipHeaderKey = []byte("meta/header_tip_header")
-	metaTipHeightKey       = []byte("meta/tip_height")
-	metaTipHeaderKey       = []byte("meta/tip_header")
-	metaBlockSizeStateKey  = []byte("meta/block_size_state")
-	blockPrefix            = []byte("blocks/")
-	blockIndexPrefix       = []byte("block_index/")
-	blockUndoPrefix        = []byte("block_undo/")
-	heightIndexPrefix      = []byte("height_index/")
-	knownPeerPrefix        = []byte("known_peer/")
-	utxoPrefix             = []byte("utxo/")
+	metaProfileKey          = []byte("meta/profile")
+	metaHeaderTipHeightKey  = []byte("meta/header_tip_height")
+	metaHeaderTipHeaderKey  = []byte("meta/header_tip_header")
+	metaTipHeightKey        = []byte("meta/tip_height")
+	metaTipHeaderKey        = []byte("meta/tip_header")
+	metaBlockSizeStateKey   = []byte("meta/block_size_state")
+	blockPrefix             = []byte("blocks/")
+	blockIndexPrefix        = []byte("block_index/")
+	blockUndoPrefix         = []byte("block_undo/")
+	headerHeightIndexPrefix = []byte("header_height_index/")
+	heightIndexPrefix       = []byte("height_index/")
+	knownPeerPrefix         = []byte("known_peer/")
+	utxoPrefix              = []byte("utxo/")
 )
 
 var (
@@ -40,6 +41,14 @@ type StoredChainState struct {
 	TipHeader      types.BlockHeader
 	BlockSizeState consensus.BlockSizeState
 	UTXOs          consensus.UtxoSet
+}
+
+type KnownPeerRecord struct {
+	LastSeen     time.Time
+	LastSuccess  time.Time
+	LastAttempt  time.Time
+	FailureCount uint32
+	Manual       bool
 }
 
 type StoredHeaderState struct {
@@ -223,7 +232,7 @@ func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
 	}, nil
 }
 
-func (s *ChainStore) LoadKnownPeers() (map[string]time.Time, error) {
+func (s *ChainStore) LoadKnownPeers() (map[string]KnownPeerRecord, error) {
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: knownPeerPrefix,
 		UpperBound: knownPeerPrefixEnd,
@@ -233,17 +242,17 @@ func (s *ChainStore) LoadKnownPeers() (map[string]time.Time, error) {
 	}
 	defer iter.Close()
 
-	peers := make(map[string]time.Time)
+	peers := make(map[string]KnownPeerRecord)
 	for iter.First(); iter.Valid(); iter.Next() {
 		addr := string(iter.Key()[len(knownPeerPrefix):])
 		if addr == "" {
 			continue
 		}
-		lastSeenUnix, err := decodeI64(iter.Value())
+		record, err := decodeKnownPeerRecord(iter.Value())
 		if err != nil {
 			return nil, err
 		}
-		peers[addr] = time.Unix(0, lastSeenUnix).UTC()
+		peers[addr] = record
 	}
 	if err := iter.Error(); err != nil {
 		return nil, err
@@ -251,7 +260,7 @@ func (s *ChainStore) LoadKnownPeers() (map[string]time.Time, error) {
 	return peers, nil
 }
 
-func (s *ChainStore) WriteKnownPeers(peers map[string]time.Time) error {
+func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
@@ -271,11 +280,11 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]time.Time) error {
 	if err := iter.Error(); err != nil {
 		return err
 	}
-	for addr, lastSeen := range peers {
+	for addr, record := range peers {
 		if addr == "" {
 			continue
 		}
-		if err := batch.Set(knownPeerKey(addr), encodeI64(lastSeen.UTC().UnixNano()), nil); err != nil {
+		if err := batch.Set(knownPeerKey(addr), encodeKnownPeerRecord(record), nil); err != nil {
 			return err
 		}
 	}
@@ -400,18 +409,23 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 		return err
 	}
 	for _, entry := range entries {
-		if err := putHeaderBatch(batch, BlockIndexEntry{
+		indexEntry := BlockIndexEntry{
 			Height:     entry.Height,
 			ParentHash: entry.Header.PrevBlockHash,
 			Header:     entry.Header,
 			ChainWork:  entry.ChainWork,
-		}, false); err != nil {
+		}
+		preserved, err := s.preserveValidatedBlockIndex(indexEntry)
+		if err != nil {
+			return err
+		}
+		if err := putHeaderBatch(batch, preserved, false); err != nil {
 			return err
 		}
 	}
 	if len(activeEntries) != 0 {
 		for height := forkHeight + 1; height <= oldTipHeight; height++ {
-			if err := batch.Delete(heightIndexKey(height), nil); err != nil {
+			if err := batch.Delete(headerHeightIndexKey(height), nil); err != nil {
 				return err
 			}
 			if height == ^uint64(0) {
@@ -420,7 +434,7 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 		}
 		for _, entry := range activeEntries {
 			hash := consensus.HeaderHash(&entry.Header)
-			if err := batch.Set(heightIndexKey(entry.Height), hash[:], nil); err != nil {
+			if err := batch.Set(headerHeightIndexKey(entry.Height), hash[:], nil); err != nil {
 				return err
 			}
 		}
@@ -463,13 +477,20 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 	if err != nil {
 		return err
 	}
-	if err := putHeaderBatch(batch, entry, true); err != nil {
+	entry, err = s.preserveValidatedBlockIndex(entry)
+	if err != nil {
+		return err
+	}
+	if err := putHeaderBatch(batch, entry, false); err != nil {
+		return err
+	}
+	hash := consensus.HeaderHash(header)
+	if err := batch.Set(headerHeightIndexKey(height), hash[:], nil); err != nil {
 		return err
 	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
-	hash := consensus.HeaderHash(header)
 	logging.Component("storage").Info("stored header",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
@@ -533,6 +554,22 @@ func (s *ChainStore) PutValidatedBlock(block *types.Block, entry *BlockIndexEntr
 	return batch.Commit(pebble.NoSync)
 }
 
+func (s *ChainStore) preserveValidatedBlockIndex(entry BlockIndexEntry) (BlockIndexEntry, error) {
+	hash := consensus.HeaderHash(&entry.Header)
+	existing, err := s.GetBlockIndex(&hash)
+	if err != nil {
+		return BlockIndexEntry{}, err
+	}
+	if existing == nil || !existing.Validated {
+		return entry, nil
+	}
+	// Header-only persistence must never downgrade an already validated block
+	// index entry back to header-only state for the same hash.
+	entry.Validated = true
+	entry.BlockSizeState = existing.BlockSizeState
+	return entry, nil
+}
+
 func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
@@ -549,6 +586,35 @@ func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64
 		if err := batch.Set(heightIndexKey(entry.Height), hash[:], nil); err != nil {
 			return err
 		}
+	}
+	return batch.Commit(pebble.NoSync)
+}
+
+func (s *ChainStore) RewriteActiveHeaderHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for height := forkHeight + 1; height <= oldTipHeight; height++ {
+		if err := batch.Delete(headerHeightIndexKey(height), nil); err != nil {
+			return err
+		}
+		if height == ^uint64(0) {
+			break
+		}
+	}
+	for _, entry := range entries {
+		hash := consensus.HeaderHash(&entry.Header)
+		if err := batch.Set(headerHeightIndexKey(entry.Height), hash[:], nil); err != nil {
+			return err
+		}
+	}
+	return batch.Commit(pebble.NoSync)
+}
+
+func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(headerHeightIndexKey(height), hash[:], nil); err != nil {
+		return err
 	}
 	return batch.Commit(pebble.NoSync)
 }
@@ -589,6 +655,22 @@ func (s *ChainStore) GetBlockHashByHeight(height uint64) (*[32]byte, error) {
 	}
 	if len(buf) != 32 {
 		return nil, errors.New("invalid height index encoding")
+	}
+	var hash [32]byte
+	copy(hash[:], buf)
+	return &hash, nil
+}
+
+func (s *ChainStore) GetHeaderHashByHeight(height uint64) (*[32]byte, error) {
+	buf, err := s.get(headerHeightIndexKey(height))
+	if err != nil {
+		return nil, err
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	if len(buf) != 32 {
+		return nil, errors.New("invalid header height index encoding")
 	}
 	var hash [32]byte
 	copy(hash[:], buf)
@@ -646,6 +728,10 @@ func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
 		Height:    state.Height,
 		TipHeader: state.TipHeader,
 	}); err != nil {
+		return err
+	}
+	tipHash := consensus.HeaderHash(&state.TipHeader)
+	if err := batch.Set(headerHeightIndexKey(state.Height), tipHash[:], nil); err != nil {
 		return err
 	}
 	if err := batch.Set(metaTipHeightKey, encodeU64(state.Height), nil); err != nil {
@@ -744,6 +830,10 @@ func blockUndoKey(hash [32]byte) []byte {
 
 func heightIndexKey(height uint64) []byte {
 	return append(append([]byte(nil), heightIndexPrefix...), encodeU64(height)...)
+}
+
+func headerHeightIndexKey(height uint64) []byte {
+	return append(append([]byte(nil), headerHeightIndexPrefix...), encodeU64(height)...)
 }
 
 func knownPeerKey(addr string) []byte {
@@ -958,5 +1048,42 @@ func decodeLegacyBlockSizeState(buf []byte) (consensus.BlockSizeState, error) {
 		BlockSize: blockSize,
 		Epsilon:   epsilon,
 		Beta:      beta,
+	}, nil
+}
+
+func encodeKnownPeerRecord(record KnownPeerRecord) []byte {
+	buf := make([]byte, 29)
+	binary.LittleEndian.PutUint64(buf[:8], uint64(record.LastSeen.UTC().UnixNano()))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(record.LastSuccess.UTC().UnixNano()))
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(record.LastAttempt.UTC().UnixNano()))
+	binary.LittleEndian.PutUint32(buf[24:28], record.FailureCount)
+	if record.Manual {
+		buf[28] = 1
+	}
+	return buf
+}
+
+func decodeKnownPeerRecord(buf []byte) (KnownPeerRecord, error) {
+	if len(buf) == 8 {
+		// Legacy encoding only stored the last-seen timestamp.
+		lastSeenUnix, err := decodeI64(buf)
+		if err != nil {
+			return KnownPeerRecord{}, err
+		}
+		lastSeen := time.Unix(0, lastSeenUnix).UTC()
+		return KnownPeerRecord{
+			LastSeen:    lastSeen,
+			LastSuccess: lastSeen,
+		}, nil
+	}
+	if len(buf) != 29 {
+		return KnownPeerRecord{}, fmt.Errorf("invalid known peer encoding length: %d", len(buf))
+	}
+	return KnownPeerRecord{
+		LastSeen:     time.Unix(0, int64(binary.LittleEndian.Uint64(buf[:8]))).UTC(),
+		LastSuccess:  time.Unix(0, int64(binary.LittleEndian.Uint64(buf[8:16]))).UTC(),
+		LastAttempt:  time.Unix(0, int64(binary.LittleEndian.Uint64(buf[16:24]))).UTC(),
+		FailureCount: binary.LittleEndian.Uint32(buf[24:28]),
+		Manual:       buf[28] == 1,
 	}, nil
 }

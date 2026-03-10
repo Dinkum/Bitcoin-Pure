@@ -193,6 +193,12 @@ func (p *peerConn) canServeDownloads(now time.Time) bool {
 }
 
 func (m *syncManager) requestSync(peer *peerConn) {
+	m.svc.logger.Debug("nudging peer sync",
+		slog.String("addr", peer.addr),
+		slog.Uint64("tip_height", m.svc.blockHeight()),
+		slog.Uint64("header_height", m.svc.headerHeight()),
+		slog.Uint64("peer_best_height", peer.snapshotHeight()),
+	)
 	_ = peer.send(p2p.GetAddrMessage{})
 	_ = m.requestHeaders(peer, [32]byte{})
 }
@@ -208,14 +214,32 @@ func (m *syncManager) shouldPollIdleHeaders(now time.Time) bool {
 }
 
 func (m *syncManager) requestHeaders(peer *peerConn, stopHash [32]byte) error {
-	if err := peer.send(p2p.GetHeadersMessage{Locator: m.svc.blockLocator(), StopHash: stopHash}); err != nil {
+	startedAt := time.Now()
+	locator := m.svc.blockLocator()
+	if err := peer.send(p2p.GetHeadersMessage{Locator: locator, StopHash: stopHash}); err != nil {
 		return err
 	}
 	peer.markHeadersRequested(time.Now())
+	stop := "-"
+	if stopHash != ([32]byte{}) {
+		stop = shortHexBytes(stopHash, 16)
+	}
+	m.svc.logger.Debug("requested headers",
+		slog.String("addr", peer.addr),
+		slog.Int("locator_count", len(locator)),
+		slog.String("locator_head", hashesDebugSummary(locator, 3)),
+		slog.String("stop_hash", stop),
+		slog.Uint64("tip_height", m.svc.blockHeight()),
+		slog.Uint64("header_height", m.svc.headerHeight()),
+		slog.Uint64("peer_best_height", peer.snapshotHeight()),
+		slog.Duration("request_duration", time.Since(startedAt)),
+	)
+	m.svc.perf.noteSyncRequestDuration(time.Since(startedAt))
 	return nil
 }
 
 func (m *syncManager) requestBlocks(peer *peerConn) error {
+	startedAt := time.Now()
 	hashes, gapDetected, err := m.svc.missingBlockHashesDetailed(blockRequestBatchSize)
 	if err != nil {
 		return err
@@ -225,6 +249,8 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 			slog.String("addr", peer.addr),
 			slog.Uint64("tip_height", m.svc.blockHeight()),
 			slog.Uint64("header_height", m.svc.headerHeight()),
+			slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
+			slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 		)
 		repaired, repairErr := m.svc.repairActiveHeightIndex()
 		if repairErr != nil {
@@ -233,6 +259,7 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 				slog.Any("error", repairErr),
 				slog.Uint64("tip_height", m.svc.blockHeight()),
 				slog.Uint64("header_height", m.svc.headerHeight()),
+				slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 			)
 		} else if repaired > 0 {
 			m.svc.logger.Warn("repaired active header height index before requesting blocks",
@@ -240,6 +267,7 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 				slog.Int("entries", repaired),
 				slog.Uint64("tip_height", m.svc.blockHeight()),
 				slog.Uint64("header_height", m.svc.headerHeight()),
+				slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 			)
 			hashes, gapDetected, err = m.svc.missingBlockHashesDetailed(blockRequestBatchSize)
 			if err != nil {
@@ -256,18 +284,16 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 				slog.Uint64("header_height", m.svc.headerHeight()),
 				slog.Bool("index_gap", gapDetected),
 				slog.Int("inflight_blocks", m.inflightBlockRequestCount()),
+				slog.String("inflight_detail", m.svc.inflightBlockDebugSummary(6)),
+				slog.Int("pending_blocks", m.svc.pendingPeerBlockCount()),
+				slog.String("pending_detail", m.svc.pendingPeerBlockDebugSummary(6)),
+				slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
+				slog.Duration("request_duration", time.Since(startedAt)),
 			)
 		}
+		m.svc.perf.noteSyncRequestDuration(time.Since(startedAt))
 		return nil
 	}
-	m.svc.logger.Info("requesting missing blocks",
-		slog.String("addr", peer.addr),
-		slog.Int("count", len(hashes)),
-		slog.String("first_hash", shortHexBytes(hashes[0], 16)),
-		slog.String("last_hash", shortHexBytes(hashes[len(hashes)-1], 16)),
-		slog.Uint64("tip_height", m.svc.blockHeight()),
-		slog.Uint64("header_height", m.svc.headerHeight()),
-	)
 	items := make([]p2p.InvVector, 0, len(hashes))
 	for _, hash := range hashes {
 		// Catch-up requests prefer full blocks. Compact/short-ID relay is still
@@ -281,6 +307,18 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 		}
 		return err
 	}
+	m.svc.logger.Info("requesting missing blocks",
+		slog.String("addr", peer.addr),
+		slog.Int("count", len(hashes)),
+		slog.String("first_hash", shortHexBytes(hashes[0], 16)),
+		slog.String("last_hash", shortHexBytes(hashes[len(hashes)-1], 16)),
+		slog.String("hashes", hashesDebugSummary(hashes, 6)),
+		slog.Uint64("tip_height", m.svc.blockHeight()),
+		slog.Uint64("header_height", m.svc.headerHeight()),
+		slog.String("inflight_before", m.svc.inflightBlockDebugSummary(6)),
+		slog.Duration("request_duration", time.Since(startedAt)),
+	)
+	m.svc.perf.noteSyncRequestDuration(time.Since(startedAt))
 	return nil
 }
 
@@ -301,6 +339,7 @@ func (m *syncManager) txRequestTimeout() time.Duration {
 }
 
 func (m *syncManager) scheduleBlockRequests(peerAddr string, hashes [][32]byte, limit int) [][32]byte {
+	startedAt := time.Now()
 	if len(hashes) == 0 || limit <= 0 {
 		return nil
 	}
@@ -326,6 +365,17 @@ func (m *syncManager) scheduleBlockRequests(peerAddr string, hashes [][32]byte, 
 		m.svc.blockRequests[hash] = req
 		selected = append(selected, hash)
 	}
+	if len(selected) > 0 && m.svc.logger != nil {
+		m.svc.logger.Debug("scheduled block requests",
+			slog.String("addr", peerAddr),
+			slog.Int("selected", len(selected)),
+			slog.Int("candidates", len(hashes)),
+			slog.Duration("request_duration", time.Since(startedAt)),
+		)
+	}
+	if len(selected) > 0 {
+		m.svc.perf.noteSyncRequestDuration(time.Since(startedAt))
+	}
 	return selected
 }
 
@@ -350,6 +400,7 @@ func (m *syncManager) releasePeerBlockRequests(addr string) {
 }
 
 func (m *syncManager) scheduleTxInvRequests(peerAddr string, items []p2p.InvVector, limit int) []p2p.InvVector {
+	startedAt := time.Now()
 	if len(items) == 0 || limit <= 0 {
 		return nil
 	}
@@ -374,6 +425,17 @@ func (m *syncManager) scheduleTxInvRequests(peerAddr string, items []p2p.InvVect
 		req.attempts++
 		m.svc.txRequests[item.Hash] = req
 		selected = append(selected, item)
+	}
+	if len(selected) > 0 && m.svc.logger != nil {
+		m.svc.logger.Debug("scheduled tx inventory requests",
+			slog.String("addr", peerAddr),
+			slog.Int("selected", len(selected)),
+			slog.Int("candidates", len(items)),
+			slog.Duration("request_duration", time.Since(startedAt)),
+		)
+	}
+	if len(selected) > 0 {
+		m.svc.perf.noteSyncRequestDuration(time.Since(startedAt))
 	}
 	return selected
 }
@@ -414,6 +476,7 @@ func (m *syncManager) expireStaleBlockRequests() {
 	now := time.Now()
 	expired := 0
 	expiredByPeer := make(map[string]int)
+	expiredHashes := make([][32]byte, 0)
 	m.svc.downloadMu.Lock()
 	for hash, req := range m.svc.blockRequests {
 		if now.Sub(req.requestedAt) < timeout {
@@ -421,6 +484,7 @@ func (m *syncManager) expireStaleBlockRequests() {
 		}
 		delete(m.svc.blockRequests, hash)
 		expired++
+		expiredHashes = append(expiredHashes, hash)
 		if req.peerAddr != "" {
 			expiredByPeer[req.peerAddr]++
 		}
@@ -433,6 +497,8 @@ func (m *syncManager) expireStaleBlockRequests() {
 		m.svc.logger.Warn("expired stale in-flight block requests",
 			slog.Int("count", expired),
 			slog.Duration("timeout", timeout),
+			slog.String("hashes", hashesDebugSummary(expiredHashes, 6)),
+			slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 		)
 	}
 }
@@ -519,6 +585,22 @@ func (m *syncManager) runSyncWatchdogStep() {
 		m.svc.logger.Warn("sync watchdog failed to inspect missing blocks", slog.Any("error", err))
 		return
 	}
+	if len(hashes) == 0 && m.svc.pendingPeerBlockCount() > 0 {
+		if tip := m.svc.chainState.ChainState().TipHeader(); tip != nil {
+			m.svc.logger.Warn("sync watchdog retrying queued competing-branch blocks",
+				slog.Uint64("tip_height", blockHeight),
+				slog.Uint64("header_height", headerHeight),
+				slog.Int("pending_blocks", m.svc.pendingPeerBlockCount()),
+				slog.String("pending_detail", m.svc.pendingPeerBlockDebugSummary(6)),
+			)
+			m.svc.drainPendingPeerBlocks(consensus.HeaderHash(tip))
+			hashes, gapDetected, err = m.svc.missingBlockHashesDetailed(128)
+			if err != nil {
+				m.svc.logger.Warn("sync watchdog failed to re-scan missing blocks after queued-block drain", slog.Any("error", err))
+				return
+			}
+		}
+	}
 	if gapDetected {
 		repaired, repairErr := m.svc.repairActiveHeightIndex()
 		if repairErr != nil {
@@ -547,6 +629,8 @@ func (m *syncManager) runSyncWatchdogStep() {
 			slog.Uint64("tip_height", blockHeight),
 			slog.Uint64("header_height", headerHeight),
 			slog.Int("missing_blocks", len(hashes)),
+			slog.String("missing_hashes", hashesDebugSummary(hashes, 6)),
+			slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 			slog.Any("known_peers", m.svc.knownPeerAddrs()),
 		)
 		m.svc.restartKnownPeers()
@@ -581,6 +665,9 @@ func (m *syncManager) runSyncWatchdogStep() {
 		slog.Uint64("header_height", headerHeight),
 		slog.Int("missing_blocks", len(hashes)),
 		slog.Int("peers", len(peers)),
+		slog.String("missing_hashes", hashesDebugSummary(hashes, 6)),
+		slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
+		slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 	)
 	for _, peer := range peers {
 		m.requestSync(peer)
@@ -615,8 +702,10 @@ func (m *syncManager) onNotFoundMessage(peer *peerConn, msg p2p.NotFoundMessage)
 		m.svc.logger.Warn("peer reported missing blocks during catch-up",
 			slog.String("addr", peer.addr),
 			slog.Int("released_requests", releasedBlocks),
+			slog.String("items", invItemsDebugSummary(msg.Items, p2p.InvTypeBlockFull, 6)),
 			slog.Uint64("tip_height", m.svc.blockHeight()),
 			slog.Uint64("header_height", m.svc.headerHeight()),
+			slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 		)
 		return m.requestBlocks(peer)
 	}
@@ -625,7 +714,9 @@ func (m *syncManager) onNotFoundMessage(peer *peerConn, msg p2p.NotFoundMessage)
 		m.svc.logger.Warn("peer reported missing transactions during tx catch-up",
 			slog.String("addr", peer.addr),
 			slog.Int("released_requests", releasedTxs),
+			slog.String("items", invItemsDebugSummary(msg.Items, p2p.InvTypeTx, 6)),
 			slog.Int("inflight_txs", m.inflightTxRequestCount()),
+			slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 		)
 	}
 	return nil
@@ -738,6 +829,10 @@ func (m *syncManager) recordPeerStall(addr string, class syncRequestClass, count
 		slog.Int("tx_stalls", stats.TxStalls),
 		slog.Duration("cooldown", time.Until(stats.CooldownUntil)),
 		slog.Uint64("peer_best_height", peer.snapshotHeight()),
+		slog.Uint64("tip_height", m.svc.blockHeight()),
+		slog.Uint64("header_height", m.svc.headerHeight()),
+		slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
+		slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 	)
 }
 
@@ -805,7 +900,7 @@ func (m *syncManager) repairActiveHeightIndexLocked() (int, error) {
 		cursor = parent
 	}
 	slices.Reverse(entries)
-	if err := m.svc.chainState.Store().RewriteActiveHeights(0, tipEntry.Height, entries); err != nil {
+	if err := m.svc.chainState.Store().RewriteActiveHeaderHeights(0, tipEntry.Height, entries); err != nil {
 		return 0, err
 	}
 	return len(entries), nil

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/crypto"
+	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/mempool"
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/storage"
@@ -343,6 +345,49 @@ func TestReplayBlocksAdvancesTip(t *testing.T) {
 	}
 }
 
+func TestDisconnectBlockRestoresAccumulatorState(t *testing.T) {
+	state := NewChainState(types.Regtest)
+	genesis := genesisBlock()
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	genesisUTXOs := cloneUtxos(state.UTXOs())
+	genesisBlockSizeState := state.BlockSizeState()
+
+	first := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := state.ApplyBlock(&first); err != nil {
+		t.Fatal(err)
+	}
+	undo, err := captureUndoEntries(&first, genesisUTXOs)
+	if err != nil {
+		t.Fatalf("capture undo: %v", err)
+	}
+	parentEntry := &storage.BlockIndexEntry{
+		Height:         0,
+		Header:         genesis.Header,
+		BlockSizeState: genesisBlockSizeState,
+	}
+
+	if err := state.DisconnectBlock(&first, undo, parentEntry); err != nil {
+		t.Fatalf("disconnect block: %v", err)
+	}
+	if state.TipHeight() == nil || *state.TipHeight() != 0 {
+		t.Fatalf("tip height after disconnect = %v, want 0", state.TipHeight())
+	}
+	if got, want := consensus.HeaderHash(state.TipHeader()), consensus.HeaderHash(&genesis.Header); got != want {
+		t.Fatalf("tip after disconnect = %x, want %x", got, want)
+	}
+	if got, want := state.UTXORoot(), consensus.ComputedUTXORoot(state.UTXOs()); got != want {
+		t.Fatalf("utxo root after disconnect = %x, want %x", got, want)
+	}
+	if state.UTXOAccumulator() == nil {
+		t.Fatal("expected maintained accumulator after disconnect")
+	}
+	if got, want := state.BlockSizeState(), parentEntry.BlockSizeState; got != want {
+		t.Fatalf("block size state after disconnect = %+v, want %+v", got, want)
+	}
+}
+
 func TestPersistentRoundtrip(t *testing.T) {
 	path := t.TempDir()
 	persistent, err := OpenPersistentChainState(path, types.Regtest)
@@ -524,6 +569,9 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	if got := len(persistent.ChainState().UTXOs()); got != 4 {
 		t.Fatalf("unexpected utxo count after reorg: got %d want 4", got)
 	}
+	if got, want := persistent.ChainState().UTXORoot(), consensus.ComputedUTXORoot(persistent.ChainState().UTXOs()); got != want {
+		t.Fatalf("unexpected reorged utxo root: got %x want %x", got, want)
+	}
 
 	if err := persistent.Close(); err != nil {
 		t.Fatal(err)
@@ -535,6 +583,9 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	defer reopened.Close()
 	if got := consensus.HeaderHash(reopened.ChainState().TipHeader()); got != sideTipHash {
 		t.Fatalf("unexpected reopened tip after reorg: got %x want %x", got, sideTipHash)
+	}
+	if got, want := reopened.ChainState().UTXORoot(), consensus.ComputedUTXORoot(reopened.ChainState().UTXOs()); got != want {
+		t.Fatalf("unexpected reopened utxo root after reorg: got %x want %x", got, want)
 	}
 }
 
@@ -1160,6 +1211,60 @@ func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
 	}
 }
 
+func TestSeedStressLanesRPCAndInfo(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	keyHash := nodeSignerKeyHash(7)
+	params, err := json.Marshal(map[string]any{
+		"keyhashes":             []string{hex.EncodeToString(keyHash[:]), hex.EncodeToString(keyHash[:])},
+		"wait_for_confirmation": false,
+		"reserve_top_up":        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "seedstresslanes",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC seedstresslanes: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	if got := out["count"].(int); got != 2 {
+		t.Fatalf("output count = %d, want 2", got)
+	}
+	if got := out["confirmed"].(bool); got {
+		t.Fatal("expected unconfirmed seedstresslanes result")
+	}
+
+	infoResult, err := svc.dispatchRPC(rpcRequest{Method: "getstresslaneinfo"})
+	if err != nil {
+		t.Fatalf("dispatchRPC getstresslaneinfo: %v", err)
+	}
+	info, ok := infoResult.(StressLaneInfo)
+	if !ok {
+		t.Fatalf("result type = %T, want StressLaneInfo", infoResult)
+	}
+	if info.PendingBatches != 1 {
+		t.Fatalf("pending batches = %d, want 1", info.PendingBatches)
+	}
+	if info.ReserveUTXOs == 0 {
+		t.Fatal("expected reserve utxo info")
+	}
+}
+
 func TestGetChainStateRPC(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -1266,6 +1371,102 @@ func TestGetMiningInfoRPC(t *testing.T) {
 	}
 	if out.CurrentBits == 0 || out.NextBits == 0 {
 		t.Fatal("expected current and next bits")
+	}
+}
+
+func TestGetMetricsRPC(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, KeyHash: nodeSignerKeyHash(7)},
+	})
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 1_000, 8, 200)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+	svc.noteRelaySent(relayMessageClass{txBatchItems: 4, blockInvItems: 1})
+	svc.noteBlockAccepted()
+	svc.noteTemplateRebuild()
+	svc.noteTemplateInterruption()
+	svc.noteTxReconRetry(2)
+	svc.noteDirectFallback(1, 3)
+	svc.noteTxRequestsReceived(5)
+	svc.noteTxNotFoundSent(2)
+	svc.noteTxNotFoundReceived(1)
+	svc.noteKnownTxClears(4)
+	svc.noteDuplicateSuppression(6)
+	svc.noteWriterStarvation(1)
+	svc.perf.noteAdmissionDuration(15 * time.Millisecond)
+	svc.perf.noteTemplateDuration(25 * time.Millisecond)
+	svc.perf.noteBlockApplyDuration(35 * time.Millisecond)
+	svc.perf.noteBlockApplyLockWaitDuration(7 * time.Millisecond)
+	svc.perf.noteRelayFlushDuration(5 * time.Millisecond)
+	svc.perf.noteSyncRequestDuration(8 * time.Millisecond)
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.svc = svc
+	peer.controlQ = make(chan outboundMessage, 4)
+	peer.relayPriorityQ = make(chan outboundMessage, 4)
+	peer.controlQ <- outboundMessage{}
+	peer.relayPriorityQ <- outboundMessage{}
+	peer.sendQ <- outboundMessage{}
+	peer.localRelayTxs[[32]byte{9}] = localRelayFallbackState{announcedAt: time.Now()}
+	svc.peers[peer.addr] = peer
+
+	result, err := svc.dispatchRPC(rpcRequest{Method: "getmetrics"})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(PerformanceMetrics)
+	if !ok {
+		t.Fatalf("result type = %T, want PerformanceMetrics", result)
+	}
+	if out.Counters.AdmittedTxs == 0 {
+		t.Fatal("expected admitted tx counter")
+	}
+	if out.Counters.RelayedTxItems != 4 {
+		t.Fatalf("relayed tx items = %d, want 4", out.Counters.RelayedTxItems)
+	}
+	if out.Counters.RelayedBlockItems != 1 {
+		t.Fatalf("relayed block items = %d, want 1", out.Counters.RelayedBlockItems)
+	}
+	if out.Counters.BlocksAccepted != 1 {
+		t.Fatalf("blocks accepted = %d, want 1", out.Counters.BlocksAccepted)
+	}
+	if out.Counters.TemplateRebuilds != 1 || out.Counters.TemplateInterruptions != 1 {
+		t.Fatalf("unexpected template counters: %+v", out.Counters)
+	}
+	if out.Counters.TxReconRetries != 2 || out.Counters.DirectFallbackBatches != 1 || out.Counters.DirectFallbackTxs != 3 {
+		t.Fatalf("unexpected relay counters: %+v", out.Counters)
+	}
+	if out.Counters.TxRequestsReceived != 5 || out.Counters.TxNotFoundSent != 2 || out.Counters.TxNotFoundReceived != 1 {
+		t.Fatalf("unexpected tx request/notfound counters: %+v", out.Counters)
+	}
+	if out.Counters.KnownTxClears != 4 || out.Counters.DuplicateSuppressions != 6 || out.Counters.WriterStarvation != 1 {
+		t.Fatalf("unexpected duplicate/starvation counters: %+v", out.Counters)
+	}
+	if out.Gauges.MempoolTxs != 1 {
+		t.Fatalf("mempool txs = %d, want 1", out.Gauges.MempoolTxs)
+	}
+	if out.Gauges.CandidateFrontier <= 0 {
+		t.Fatalf("candidate frontier = %d, want > 0", out.Gauges.CandidateFrontier)
+	}
+	if out.Gauges.ControlQueueDepth != 1 || out.Gauges.PriorityQueueDepth != 1 || out.Gauges.SendQueueDepth != 1 || out.Gauges.PendingLocalRelayTxs != 1 {
+		t.Fatalf("unexpected relay gauges: %+v", out.Gauges)
+	}
+	if out.Latency.Admission.Count == 0 || out.Latency.Template.Count == 0 || out.Latency.BlockApply.Count == 0 || out.Latency.BlockApplyLockWait.Count == 0 || out.Latency.RelayFlush.Count == 0 || out.Latency.SyncReq.Count == 0 {
+		t.Fatalf("expected latency samples in all metric groups: %+v", out.Latency)
 	}
 }
 
@@ -1517,6 +1718,116 @@ func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
 	}
 }
 
+func TestSeedStressLanesProducesConfirmedOutputs(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	requested := [][32]byte{nodeSignerKeyHash(7), nodeSignerKeyHash(8), nodeSignerKeyHash(9)}
+	outputs, info, txid, err := svc.SeedStressLanes(requested, true, false)
+	if err != nil {
+		t.Fatalf("SeedStressLanes: %v", err)
+	}
+	if got, want := info.PendingBatches, 1; got != want {
+		t.Fatalf("pending batches = %d, want %d", got, want)
+	}
+	if info.ReserveUTXOs == 0 {
+		t.Fatal("expected a seeded reserve utxo")
+	}
+	if _, err := svc.MineBlocks(1); err != nil {
+		t.Fatalf("MineBlocks: %v", err)
+	}
+	confirmed, info, err := svc.waitForStressLaneBatch(stressLaneBatch{TxID: txid, Outputs: outputs}, time.Second)
+	if err != nil {
+		t.Fatalf("waitForStressLaneBatch: %v", err)
+	}
+	if got, want := len(confirmed), len(requested); got != want {
+		t.Fatalf("confirmed outputs = %d, want %d", got, want)
+	}
+	if info.ReadyOutputs != len(requested) {
+		t.Fatalf("ready outputs = %d, want %d", info.ReadyOutputs, len(requested))
+	}
+	utxos := svc.chainUtxoSnapshot()
+	for i, output := range confirmed {
+		entry, ok := utxos[output.OutPoint]
+		if !ok {
+			t.Fatalf("confirmed output %d missing from utxo set", i)
+		}
+		if entry.ValueAtoms != output.Value || entry.KeyHash != output.KeyHash {
+			t.Fatalf("confirmed output %d mismatch", i)
+		}
+		if output.BlockHash == ([32]byte{}) {
+			t.Fatalf("confirmed output %d missing block hash", i)
+		}
+	}
+	if got := svc.stressLaneInfo().PendingBatches; got != 0 {
+		t.Fatalf("pending batches after confirmation = %d, want 0", got)
+	}
+}
+
+func TestSeedStressLanesConfirmsViaPeerBlock(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	requested := [][32]byte{nodeSignerKeyHash(7), nodeSignerKeyHash(8)}
+	outputs, info, txid, err := svc.SeedStressLanes(requested, true, false)
+	if err != nil {
+		t.Fatalf("SeedStressLanes: %v", err)
+	}
+	if info.PendingBatches != 1 {
+		t.Fatalf("pending batches = %d, want 1", info.PendingBatches)
+	}
+	snapshot := svc.pool.Snapshot()
+	var fanout *types.Transaction
+	for _, entry := range snapshot {
+		candidate := entry.Tx
+		if consensus.TxID(&candidate) == txid {
+			copied := candidate
+			fanout = &copied
+			break
+		}
+	}
+	if fanout == nil {
+		t.Fatal("expected stress funding tx in mempool snapshot")
+	}
+	prevHeight := svc.BlockHeight()
+	prevHeader := *svc.chainState.ChainState().TipHeader()
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}})
+	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, *fanout}, prevHeader.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	if err := svc.acceptPeerBlockMessage(peer, &block); err != nil {
+		t.Fatalf("acceptPeerBlockMessage: %v", err)
+	}
+	confirmed, info, err := svc.waitForStressLaneBatch(stressLaneBatch{TxID: txid, Outputs: outputs}, time.Second)
+	if err != nil {
+		t.Fatalf("waitForStressLaneBatch: %v", err)
+	}
+	if info.ReadyOutputs != len(requested) {
+		t.Fatalf("ready outputs = %d, want %d", info.ReadyOutputs, len(requested))
+	}
+	for i, output := range confirmed {
+		if output.BlockHash != consensus.HeaderHash(&block.Header) {
+			t.Fatalf("confirmed output %d block hash = %x, want %x", i, output.BlockHash, consensus.HeaderHash(&block.Header))
+		}
+	}
+}
+
 func TestMineBlocksProducesDistinctCoinbaseOutpoints(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -1595,6 +1906,99 @@ func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
 	}
 	if stats.LastReason != "tx_admission" {
 		t.Fatalf("last template reason = %q, want tx_admission", stats.LastReason)
+	}
+}
+
+func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
+	minerKey := nodeSignerKeyHash(9)
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerKeyHash: minerKey,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	if _, err := svc.MineBlocks(1); err != nil {
+		t.Fatalf("MineBlocks: %v", err)
+	}
+	firstBlockHashPtr, err := svc.chainState.Store().GetBlockHashByHeight(1)
+	if err != nil {
+		t.Fatalf("BlockHashByHeight: %v", err)
+	}
+	if firstBlockHashPtr == nil {
+		t.Fatal("expected block hash at height 1")
+	}
+	firstBlockHashArr := *firstBlockHashPtr
+	firstBlock, err := svc.chainState.Store().GetBlock(&firstBlockHashArr)
+	if err != nil {
+		t.Fatalf("GetBlock: %v", err)
+	}
+	if firstBlock == nil {
+		t.Fatal("expected mined block at height 1")
+	}
+	firstCoinbaseTxID := consensus.TxID(&firstBlock.Txs[0])
+	firstCoinbaseValue := firstBlock.Txs[0].Base.Outputs[0].ValueAtoms
+
+	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	firstCoinbaseOut := types.OutPoint{TxID: firstCoinbaseTxID, Vout: 0}
+
+	var firstTx types.Transaction
+	var secondTx types.Transaction
+	foundOrder := false
+	for firstSeed := byte(10); firstSeed < 96 && !foundOrder; firstSeed++ {
+		candidateFirst := spendTxForNodeTest(t, 7, genesisOut, 50, firstSeed, 1)
+		firstTxID := consensus.TxID(&candidateFirst)
+		for secondSeed := byte(96); secondSeed < 160; secondSeed++ {
+			candidateSecond := spendTxForNodeTest(t, 9, firstCoinbaseOut, firstCoinbaseValue, secondSeed, 1)
+			secondTxID := consensus.TxID(&candidateSecond)
+			if bytes.Compare(secondTxID[:], firstTxID[:]) < 0 {
+				firstTx = candidateFirst
+				secondTx = candidateSecond
+				foundOrder = true
+				break
+			}
+		}
+	}
+	if !foundOrder {
+		t.Fatal("failed to construct incremental LTOR append fixture")
+	}
+
+	if _, err := svc.SubmitTx(firstTx); err != nil {
+		t.Fatalf("SubmitTx first: %v", err)
+	}
+	before, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate before append: %v", err)
+	}
+	if len(before.Txs) != 2 {
+		t.Fatalf("template tx count before append = %d, want 2", len(before.Txs))
+	}
+	if got := consensus.TxID(&before.Txs[1]); got != consensus.TxID(&firstTx) {
+		t.Fatalf("template txid before append = %x, want %x", got, consensus.TxID(&firstTx))
+	}
+
+	if _, err := svc.SubmitTx(secondTx); err != nil {
+		t.Fatalf("SubmitTx second: %v", err)
+	}
+	after, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate after append: %v", err)
+	}
+	if len(after.Txs) != 3 {
+		t.Fatalf("template tx count after append = %d, want 3", len(after.Txs))
+	}
+	firstTxID := consensus.TxID(&firstTx)
+	secondTxID := consensus.TxID(&secondTx)
+	if got := consensus.TxID(&after.Txs[1]); got != secondTxID {
+		t.Fatalf("first non-coinbase tx after append = %x, want %x", got, secondTxID)
+	}
+	if got := consensus.TxID(&after.Txs[2]); got != firstTxID {
+		t.Fatalf("second non-coinbase tx after append = %x, want %x", got, firstTxID)
 	}
 }
 
@@ -1871,8 +2275,12 @@ func TestOpenServiceRestoresPersistedVettedPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadKnownPeers: %v", err)
 	}
-	if _, ok := loaded["127.0.0.1:18444"]; !ok {
+	record, ok := loaded["127.0.0.1:18444"]
+	if !ok {
 		t.Fatal("persisted vetted peer missing after reopen")
+	}
+	if record.LastSuccess.IsZero() {
+		t.Fatal("persisted vetted peer missing last-success metadata")
 	}
 }
 
@@ -1923,6 +2331,121 @@ func TestRefillOutboundPeersDialsLearnedCandidates(t *testing.T) {
 	}
 	if got := svc.outboundPeerCount(); got != 1 {
 		t.Fatalf("outbound peer count = %d, want 1", got)
+	}
+}
+
+func TestOutboundRefillCandidatesPreferDistinctNetgroupsAndHealthyPeers(t *testing.T) {
+	svc := &Service{
+		cfg: ServiceConfig{P2PAddr: "127.0.0.1:18444"},
+		knownPeers: map[string]storage.KnownPeerRecord{
+			"10.1.1.1:18444": {
+				LastSeen:    time.Unix(1_700_000_000, 0).UTC(),
+				LastSuccess: time.Unix(1_700_000_000, 0).UTC(),
+			},
+			"10.1.9.9:18444": {
+				LastSeen:    time.Unix(1_700_000_100, 0).UTC(),
+				LastSuccess: time.Unix(1_700_000_100, 0).UTC(),
+			},
+			"10.2.1.1:18444": {
+				LastSeen:    time.Unix(1_700_000_050, 0).UTC(),
+				LastSuccess: time.Unix(1_700_000_050, 0).UTC(),
+			},
+			"10.3.1.1:18444": {
+				LastSeen:     time.Unix(1_700_000_200, 0).UTC(),
+				LastSuccess:  time.Unix(1_700_000_200, 0).UTC(),
+				LastAttempt:  time.Now().UTC(),
+				FailureCount: 5,
+			},
+		},
+		outboundPeers: make(map[string]struct{}),
+		peers:         make(map[string]*peerConn),
+		stopCh:        make(chan struct{}),
+	}
+	manager := &peerManager{svc: svc}
+
+	addrs := manager.outboundRefillCandidates(2)
+	if len(addrs) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(addrs))
+	}
+	if peerNetgroup(addrs[0]) == peerNetgroup(addrs[1]) {
+		t.Fatalf("candidate netgroups should differ, got %v", addrs)
+	}
+	for _, addr := range addrs {
+		if addr == "10.3.1.1:18444" {
+			t.Fatalf("unhealthy peer should be deprioritized, got %v", addrs)
+		}
+	}
+}
+
+func TestKnownPeerAddrsSkipsSelfEquivalentAddresses(t *testing.T) {
+	svc := &Service{
+		cfg: ServiceConfig{
+			P2PAddr: "0.0.0.0:18444",
+			Peers:   []string{"127.0.0.1:18444", "10.9.0.2:18444"},
+		},
+		knownPeers: map[string]storage.KnownPeerRecord{
+			"localhost:18444": {},
+			"10.9.0.3:18444":  {},
+		},
+	}
+	manager := &peerManager{svc: svc}
+
+	addrs := manager.knownPeerAddrs()
+	if len(addrs) != 2 {
+		t.Fatalf("known peer count = %d, want 2 (%v)", len(addrs), addrs)
+	}
+	for _, addr := range addrs {
+		if addr == "127.0.0.1:18444" || addr == "localhost:18444" || addr == "0.0.0.0:18444" {
+			t.Fatalf("self-equivalent address leaked into known peers: %v", addrs)
+		}
+	}
+}
+
+func TestOutboundRefillCandidatesSkipSelfEquivalentAddresses(t *testing.T) {
+	svc := &Service{
+		cfg: ServiceConfig{P2PAddr: "0.0.0.0:18444"},
+		knownPeers: map[string]storage.KnownPeerRecord{
+			"127.0.0.1:18444": {
+				LastSeen:    time.Unix(1_700_000_000, 0).UTC(),
+				LastSuccess: time.Unix(1_700_000_000, 0).UTC(),
+			},
+			"10.9.0.2:18444": {
+				LastSeen:    time.Unix(1_700_000_010, 0).UTC(),
+				LastSuccess: time.Unix(1_700_000_010, 0).UTC(),
+			},
+		},
+		outboundPeers: make(map[string]struct{}),
+		peers:         make(map[string]*peerConn),
+		stopCh:        make(chan struct{}),
+	}
+	manager := &peerManager{svc: svc}
+
+	addrs := manager.outboundRefillCandidates(2)
+	if len(addrs) != 1 || addrs[0] != "10.9.0.2:18444" {
+		t.Fatalf("outbound refill candidates = %v, want [10.9.0.2:18444]", addrs)
+	}
+}
+
+func TestConnectPeerSkipsSelfEquivalentAddress(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+		P2PAddr: "0.0.0.0:18444",
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	if err := svc.ConnectPeer("127.0.0.1:18444"); err != nil {
+		t.Fatalf("ConnectPeer: %v", err)
+	}
+	if got := svc.outboundPeerCount(); got != 0 {
+		t.Fatalf("outbound peer count = %d, want 0", got)
+	}
+	if addrs := svc.knownPeerAddrs(); len(addrs) != 0 {
+		t.Fatalf("known peers = %v, want none", addrs)
 	}
 }
 
@@ -2131,7 +2654,8 @@ func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 	peer.sendQ <- outboundMessage{
 		msg: p2p.TxBatchMessage{Txs: filteredTxs},
 	}
-	peer.pendingTxs = []types.Transaction{tx}
+	peer.pendingTxOrder = [][32]byte{consensus.TxID(&tx)}
+	peer.pendingTxByID = map[[32]byte]types.Transaction{consensus.TxID(&tx): tx}
 	peer.pendingRecon = [][32]byte{{2}}
 	peer.txFlushArmed = true
 	peer.reconFlushArmed = true
@@ -2150,7 +2674,7 @@ func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 	if len(peer.queuedTx) != 0 {
 		t.Fatalf("queued tx len = %d, want 0", len(peer.queuedTx))
 	}
-	if len(peer.pendingTxs) != 0 || len(peer.pendingRecon) != 0 {
+	if len(peer.pendingTxOrder) != 0 || len(peer.pendingTxByID) != 0 || len(peer.pendingRecon) != 0 {
 		t.Fatalf("expected pending relay buffers cleared")
 	}
 	if peer.txFlushArmed || peer.reconFlushArmed {
@@ -2386,14 +2910,34 @@ func TestRenderBlockFlowMarksTip(t *testing.T) {
 		{Height: 11, Hash: [32]byte{0xbb}},
 	}
 	out := renderBlockFlow(blocks)
-	if !strings.Contains(out, "tip:11") {
+	if !strings.Contains(out, "tip 11") {
 		t.Fatalf("expected tip marker in block flow: %q", out)
 	}
-	if !strings.Contains(out, "aa0000000000") || !strings.Contains(out, "bb0000000000") {
-		t.Fatalf("expected short hashes in block flow: %q", out)
+	if !strings.Contains(out, "height 10") {
+		t.Fatalf("expected height label in block flow: %q", out)
+	}
+	if !strings.Contains(out, "...") {
+		t.Fatalf("expected ellipsis-truncated hashes in block flow: %q", out)
 	}
 	if strings.Count(out, "--->") != 1 {
 		t.Fatalf("expected single arrows in block flow: %q", out)
+	}
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("expected four block flow rows, got %d: %q", len(lines), out)
+	}
+	if !strings.Contains(lines[2], "--->") {
+		t.Fatalf("expected hash row to include arrows: %q", out)
+	}
+	tagPattern := regexp.MustCompile(`<[^>]+>`)
+	plainLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		plainLines = append(plainLines, tagPattern.ReplaceAllString(line, ""))
+	}
+	for i := 1; i < len(plainLines); i++ {
+		if len(plainLines[i]) != len(plainLines[0]) {
+			t.Fatalf("expected aligned block flow rows, got %d vs %d: %q", len(plainLines[i]), len(plainLines[0]), out)
+		}
 	}
 }
 
@@ -2528,7 +3072,8 @@ func TestRenderDashboardSystemSectionIncludesHumanReadableStats(t *testing.T) {
 	for _, want := range []string{
 		"NODE SYSTEM (AVG 10M)",
 		"CPU Avg      : 42.5%",
-		"Network Avg  : up 512.0 KB/s",
+		"Network Up   : 512.0 KB/s",
+		"Network Down : 2.0 MB/s",
 		"42.5%",
 		"2.0 MB/s",
 		"512.0 KB/s",
@@ -2546,33 +3091,253 @@ func TestRenderDashboardSystemSectionIncludesHumanReadableStats(t *testing.T) {
 	}
 }
 
-func TestRenderMempoolSectionUsesStackedMetrics(t *testing.T) {
+func TestRenderMempoolSectionUsesQueuedFeeList(t *testing.T) {
 	section := renderMempoolSection(dashboardMempoolSummary{
 		Count:         256,
+		Bytes:         2_190,
 		Orphans:       3,
-		MedianFee:     179,
-		LowFee:        120,
-		HighFee:       240,
+		MedianFee:     1_000,
+		LowFee:        1_000,
+		HighFee:       1_000,
 		EstimatedNext: 10 * time.Minute,
 		Top: []mempool.SnapshotEntry{{
 			Tx:   types.Transaction{},
 			TxID: [32]byte{0xaa},
-			Fee:  240,
-			Size: 180,
+			Fee:  219,
+			Size: 219,
 		}},
 	})
 
 	for _, want := range []string{
-		"Tx Count     : 256",
-		"Orphans      : 3",
-		"Median Fee   : 179",
-		"Fee Low / Hi : 120 / 240",
-		"Next Block   : est 00h 10m 00s",
-		"Queue Top    :",
-		"aa00000000",
+		"Tx Count                          : 256",
+		"Total Size                        : 2,190 bytes",
+		"Orphan Tx Count                   : 3",
+		"Fee Min / Median / Max (atoms/kB) : 1,000 / 1,000 / 1,000",
+		"top queued tx by fee",
+		"aa00000...",
+		"1,000 atoms/kB",
+		"219 B",
 	} {
 		if !strings.Contains(section, want) {
 			t.Fatalf("expected %q in mempool section:\n%s", want, section)
+		}
+	}
+	if strings.Contains(section, "Next Block") || strings.Contains(section, "Queue Top") {
+		t.Fatalf("expected legacy mempool labels to be removed:\n%s", section)
+	}
+}
+
+func TestRenderCandidateBlockSectionUsesDedicatedLabels(t *testing.T) {
+	section := renderCandidateBlockSection(BlockTemplateStats{
+		FrontierCandidates: 10,
+		Rebuilds:           253,
+		Interruptions:      157,
+		Invalidations:      269,
+		LastBuildAgeMS:     int((38 * time.Second).Milliseconds()),
+		LastReason:         "interrupted",
+	})
+
+	for _, want := range []string{
+		"Status",
+		"rebuilding",
+		"Age",
+		"38s",
+		"Tx Candidate Txs",
+		"10",
+		"Rebuilds (1h)",
+		"253",
+		"Interrupts (1h)",
+		"157",
+		"Invalidations (1h)",
+		"269",
+		"Last Reason",
+		"interrupted",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("expected %q in candidate block section:\n%s", want, section)
+		}
+	}
+}
+
+func TestRenderPerformanceSectionShowsCountersGaugesAndLatency(t *testing.T) {
+	section := renderPerformanceSection(PerformanceMetrics{
+		GeneratedAt: time.Unix(1_700_000_000, 0).UTC(),
+		Counters: PerformanceCounters{
+			AdmittedTxs:           128,
+			OrphanPromotions:      7,
+			RelayedTxItems:        256,
+			RelayedBlockItems:     4,
+			BlocksAccepted:        3,
+			TemplateRebuilds:      5,
+			TemplateInterruptions: 2,
+			PeerStallEvents:       6,
+		},
+		Gauges: PerformanceGauges{
+			MempoolTxs:          512,
+			MempoolOrphans:      9,
+			CandidateFrontier:   64,
+			PeerCount:           8,
+			UsefulPeers:         3,
+			RelayQueueDepth:     14,
+			RelayQueueDepthPeak: 29,
+			PendingPeerBlocks:   2,
+			InflightBlockReqs:   5,
+			InflightTxReqs:      11,
+		},
+		Latency: PerformanceLatencyGroup{
+			Admission:  DurationHistogramSummary{Count: 8, AvgMS: 12.5, P50MS: 11, P95MS: 19, MaxMS: 22},
+			Template:   DurationHistogramSummary{Count: 5, AvgMS: 40, P50MS: 35, P95MS: 70, MaxMS: 72},
+			BlockApply: DurationHistogramSummary{Count: 3, AvgMS: 55, P50MS: 54, P95MS: 61, MaxMS: 61},
+			RelayFlush: DurationHistogramSummary{Count: 10, AvgMS: 2.5, P50MS: 2.2, P95MS: 4.8, MaxMS: 5.1},
+			SyncReq:    DurationHistogramSummary{Count: 7, AvgMS: 7.5, P50MS: 7.0, P95MS: 11.2, MaxMS: 12.0},
+		},
+	})
+
+	for _, want := range []string{
+		"Generated    : 2023-11-14 22:13:20 UTC",
+		"Throughput   : admitted tx",
+		"Relay        : tx items",
+		"Template     : rebuilds",
+		"Peers        : connected",
+		"Queues       : relay now",
+		"Admission : count 8",
+		"Template  : count 5",
+		"Relay     : count 10",
+		"Sync      : count 7",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("expected %q in performance section:\n%s", want, section)
+		}
+	}
+}
+
+func TestRenderTPSChartUsesBlockThroughputLayout(t *testing.T) {
+	section := renderTPSChart(dashboardTPSChart{
+		Label: "THROUGHPUT (BY BLOCK)",
+		Blocks: []dashboardThroughputBlock{
+			{TxCount: 121, BarWidth: 12},
+			{TxCount: 167, BarWidth: 17},
+			{TxCount: 38, BarWidth: 4},
+			{TxCount: 241, BarWidth: 24},
+			{TxCount: 92, BarWidth: 9},
+			{TxCount: 184, Candidate: true, BarWidth: 18},
+		},
+		TotalTx:     843,
+		AvgTPS:      0.23,
+		AvgTxPerBlk: 140.5,
+	})
+
+	for _, want := range []string{
+		"121 tx  |",
+		"167 tx  |",
+		"38 tx  |",
+		"241 tx  |",
+		"92 tx  |",
+		"184 tx* |",
+		"843 tx total over last 6 blocks (0.23 avg TPS)",
+		"140.5 tx avg/block",
+		"* candidate block",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("expected %q in throughput section:\n%s", want, section)
+		}
+	}
+}
+
+func TestDashboardFeeSummaryUsesRecent24Blocks(t *testing.T) {
+	var svc Service
+	blocks := make([]dashboardBlockPage, 0, 30)
+	for i := 0; i < 30; i++ {
+		blocks = append(blocks, dashboardBlockPage{
+			Height:        uint64(300 - i),
+			MedianFeeRate: uint64(i * 100),
+			LowFeeRate:    uint64(i * 50),
+			HighFeeRate:   uint64(i * 150),
+			PaidTxs:       min(i, 2),
+			TotalUserTxs:  3,
+			TxCount:       2 + (i % 3),
+		})
+	}
+
+	summary := svc.dashboardFeeSummary(blocks, 20, dashboardPowSummary{
+		TargetSpacing:    10 * time.Minute,
+		AvgBlockInterval: 10 * time.Minute,
+	}, dashboardCandidateFeeLine{
+		Height:    301,
+		MedianFee: 900,
+		LowFee:    100,
+		HighFee:   1500,
+		PaidTxs:   4,
+		TotalTxs:  4,
+		Available: true,
+	}, []mempool.SnapshotEntry{
+		{Fee: 2000, Size: 1_000},
+		{Fee: 700, Size: 1_000},
+		{Fee: 300, Size: 1_000},
+		{Fee: 50, Size: 1_000},
+		{Fee: 0, Size: 1_000},
+	})
+
+	if summary.TotalBlocks != 24 {
+		t.Fatalf("expected 24 fee blocks, got %d", summary.TotalBlocks)
+	}
+	if summary.CurrentMedian != 900 {
+		t.Fatalf("expected current median from candidate block, got %d", summary.CurrentMedian)
+	}
+	if summary.Median6 != 300 {
+		t.Fatalf("expected 6-block median 300, got %d", summary.Median6)
+	}
+	if summary.Median24 != 1200 {
+		t.Fatalf("expected 24-block median 1200, got %d", summary.Median24)
+	}
+	if summary.RecentMin != 0 || summary.RecentMax != 3450 {
+		t.Fatalf("expected recent min/max 0/3450, got %d/%d", summary.RecentMin, summary.RecentMax)
+	}
+	if summary.PaidBlocks != 23 {
+		t.Fatalf("expected 23 paid blocks, got %d", summary.PaidBlocks)
+	}
+	if summary.FeePayingTxs != 45 || summary.TotalTxs != 72 {
+		t.Fatalf("expected fee-paying ratio inputs 45/72, got %d/%d", summary.FeePayingTxs, summary.TotalTxs)
+	}
+	if summary.Bands.Above1000 != 1 || summary.Bands.Band500 != 1 || summary.Bands.Band100 != 1 || summary.Bands.Band1 != 1 || summary.Bands.Zero != 1 {
+		t.Fatalf("unexpected fee bands: %+v", summary.Bands)
+	}
+	if summary.Recent[0].Height != 277 || summary.Recent[len(summary.Recent)-1].Height != 300 {
+		t.Fatalf("expected oldest-to-newest fee window, got first=%d last=%d", summary.Recent[0].Height, summary.Recent[len(summary.Recent)-1].Height)
+	}
+}
+
+func TestRenderFeeSectionUsesFeeMarketLayout(t *testing.T) {
+	recent := make([]dashboardBlockFeeLine, 0, 24)
+	for i := 0; i < 24; i++ {
+		recent = append(recent, dashboardBlockFeeLine{
+			Height:    uint64(230 + i),
+			MedianFee: uint64(i * 25),
+			LowFee:    uint64(i * 10),
+			HighFee:   uint64(i * 40),
+		})
+	}
+	section := renderFeeSection(dashboardFeeSummary{
+		Recent:        recent,
+		CurrentMedian: 300,
+		Median6:       200,
+		PaidBlocks:    8,
+		TotalBlocks:   24,
+	})
+
+	for _, want := range []string{
+		"24-block medians",
+		"current / 6-block median",
+		"300 atoms/kB / 200 atoms/kB",
+		"paid blocks",
+		"8 / 24",
+		"Full fee chart",
+		"/fees",
+		"▁",
+		"█",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("expected %q in fee market section:\n%s", want, section)
 		}
 	}
 }
@@ -2580,17 +3345,78 @@ func TestRenderMempoolSectionUsesStackedMetrics(t *testing.T) {
 func TestRenderPublicDashboardPagesExposeRecentBlockAndTxLinks(t *testing.T) {
 	blockHash := [32]byte{0xaa}
 	txID := [32]byte{0xbb}
+	generatedAt := time.Unix(1_000, 0).UTC()
+	recentFees := make([]dashboardBlockFeeLine, 0, 24)
+	for i := 0; i < 24; i++ {
+		recentFees = append(recentFees, dashboardBlockFeeLine{
+			Height:    uint64(100 + i),
+			MedianFee: uint64(i * 10),
+			LowFee:    uint64(i * 5),
+			HighFee:   uint64(i * 15),
+			PaidTxs:   i,
+			TotalTxs:  i + 1,
+		})
+	}
 	view := &publicDashboardView{
-		nodeID:  "NODE1234",
-		info:    ServiceInfo{TipHeight: 12, TipHeaderHash: hex.EncodeToString(blockHash[:]), UTXORoot: strings.Repeat("c", 64)},
-		pow:     dashboardPowSummary{Algorithm: "ASERT per-block", TargetSpacing: 10 * time.Minute, AvgBlockInterval: 10 * time.Minute, HasObservedGap: true},
-		fees:    dashboardFeeSummary{Clear: dashboardMempoolClearEstimate{Blocks: 1, Time: 10 * time.Minute}},
-		mempool: dashboardMempoolSummary{},
+		generatedAt: generatedAt,
+		nodeID:      "NODE1234",
+		health:      "HEALTHY",
+		info:        ServiceInfo{TipHeight: 12, TipHeaderHash: hex.EncodeToString(blockHash[:]), UTXORoot: strings.Repeat("c", 64)},
+		pow: dashboardPowSummary{
+			Algorithm:          "ASERT per-block",
+			TargetSpacing:      10 * time.Minute,
+			AvgBlockInterval:   10 * time.Minute,
+			RecentBlockGap:     10 * time.Minute,
+			HasObservedGap:     true,
+			LastBlockTimestamp: generatedAt.Add(-38 * time.Second),
+			NetworkHashrate:    12.4e12,
+		},
+		fees: dashboardFeeSummary{
+			Recent:        recentFees,
+			CurrentMedian: 300,
+			Median6:       50,
+			Median24:      120,
+			RecentMin:     0,
+			RecentMax:     345,
+			PaidBlocks:    23,
+			TotalBlocks:   24,
+			FeePayingTxs:  100,
+			TotalTxs:      150,
+			Candidate: dashboardCandidateFeeLine{
+				Height:    13,
+				MedianFee: 300,
+				LowFee:    100,
+				HighFee:   600,
+				PaidTxs:   14,
+				TotalTxs:  14,
+				Available: true,
+			},
+			Bands: dashboardMempoolFeeBands{
+				Above1000: 2,
+				Band500:   11,
+				Band100:   39,
+				Band1:     22,
+				Zero:      8,
+			},
+			Clear: dashboardMempoolClearEstimate{Blocks: 1, Time: 10 * time.Minute},
+		},
+		mempool: dashboardMempoolSummary{Count: 10},
+		performance: PerformanceMetrics{
+			Gauges: PerformanceGauges{PendingPeerBlocks: 0},
+		},
 		tpsChart: dashboardTPSChart{
-			Label:     "TPS last 10m",
-			Buckets:   []float64{1, 2, 3},
-			BucketEnd: []time.Time{time.Now(), time.Now(), time.Now()},
-			MaxTPS:    3,
+			Label: "THROUGHPUT (BY BLOCK)",
+			Blocks: []dashboardThroughputBlock{
+				{TxCount: 121, BarWidth: 12},
+				{TxCount: 167, BarWidth: 17},
+				{TxCount: 38, BarWidth: 4},
+				{TxCount: 241, BarWidth: 24},
+				{TxCount: 92, BarWidth: 9},
+				{TxCount: 184, Candidate: true, BarWidth: 18},
+			},
+			TotalTx:     843,
+			AvgTPS:      0.23,
+			AvgTxPerBlk: 140.5,
 		},
 		blocks: []dashboardBlockPage{{
 			Height:    12,
@@ -2602,11 +3428,58 @@ func TestRenderPublicDashboardPagesExposeRecentBlockAndTxLinks(t *testing.T) {
 				Timestamp: time.Unix(100, 0).UTC(),
 			}},
 		}},
+		peerHosts: []dashboardPeerHostPage{{
+			Host:           "151.115.80.188",
+			Health:         "MIXED",
+			Direction:      "in/out",
+			Sockets:        2,
+			LastSeenUnix:   time.Now().Add(-time.Second).Unix(),
+			BlocksBehind:   0,
+			BestHeight:     12,
+			TipHash:        "0000000d1b...",
+			LatencyAvgS:    0.05,
+			LatencyP95S:    0.09,
+			TxSent:         5,
+			TxRequested:    2,
+			BlockSent:      0,
+			BlockRequested: 1,
+			BytesIn:        184 * 1024,
+			BytesOut:       231 * 1024,
+			Reason:         "healthy and current",
+		}},
 	}
 
 	home, status := renderPublicDashboardPage(view, "/")
 	if status != 200 || !strings.Contains(home, "/block/"+hex.EncodeToString(blockHash[:])) {
 		t.Fatalf("home page missing block link:\n%s", home)
+	}
+	for _, want := range []string{
+		"Health",
+		"HEALTHY",
+		"Tip Height",
+		"12",
+		"Last Block",
+		"38s ago",
+		"Network Hashrate",
+		"12.4 TH/s",
+		"Peers",
+		"Mempool",
+		"10 tx",
+		"Current Orphan Blocks",
+		"Tx Relay Mode",
+		"reconciled batches",
+		"Block Relay Mode",
+		"short-id blocks",
+	} {
+		if !strings.Contains(home, want) {
+			t.Fatalf("home page missing %q:\n%s", want, home)
+		}
+	}
+	if !strings.Contains(home, "/peer/151.115.80.188") {
+		t.Fatalf("home page missing peer link:\n%s", home)
+	}
+	if !strings.Contains(home, "/fees") || !strings.Contains(home, "FEE MARKET") {
+		t.Fatalf("home page missing fee market link:\n%s", home)
 	}
 	blockPage, status := renderPublicDashboardPage(view, "/block/"+hex.EncodeToString(blockHash[:]))
 	if status != 200 || !strings.Contains(blockPage, "/tx/"+hex.EncodeToString(txID[:])) {
@@ -2616,6 +3489,72 @@ func TestRenderPublicDashboardPagesExposeRecentBlockAndTxLinks(t *testing.T) {
 	if status != 200 || !strings.Contains(txPage, "TRANSACTION") {
 		t.Fatalf("tx page missing transaction section:\n%s", txPage)
 	}
+	peerPage, status := renderPublicDashboardPage(view, "/peer/151.115.80.188")
+	if status != 200 || !strings.Contains(peerPage, "PEER DETAIL") || !strings.Contains(peerPage, "bytes in") {
+		t.Fatalf("peer page missing detail section:\n%s", peerPage)
+	}
+	feePage, status := renderPublicDashboardPage(view, "/fees")
+	if status != 200 || !strings.Contains(feePage, "FEE MARKET DETAILS") || !strings.Contains(feePage, "mempool by fee band") || !strings.Contains(feePage, "candidate block fee") {
+		t.Fatalf("fee page missing detail section:\n%s", feePage)
+	}
+}
+
+func TestSummarizeDashboardPeerHostUsesHostLevelHealthAndTraffic(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	info := ServiceInfo{TipHeight: 253, TipHeaderHash: strings.Repeat("a", 64)}
+	host := summarizeDashboardPeerHost(now, "151.115.80.188", info, []dashboardPeerSocketPage{
+		{
+			Addr:         "151.115.80.188:18444",
+			Outbound:     true,
+			Height:       253,
+			Lag:          0,
+			LastSeenUnix: now.Unix(),
+			SessionAge:   102 * time.Minute,
+			LatencyAvgS:  0.05,
+			LatencyP95S:  0.07,
+			TxSent:       5,
+			TxRequested:  3,
+			BytesIn:      80 * 1024,
+			BytesOut:     90 * 1024,
+		},
+		{
+			Addr:           "151.115.80.188:49346",
+			Outbound:       false,
+			Height:         2,
+			Lag:            251,
+			LastSeenUnix:   now.Unix() - 1,
+			SessionAge:     100 * time.Minute,
+			LatencyAvgS:    0.04,
+			LatencyP95S:    0.09,
+			TxSent:         6,
+			TxRequested:    2,
+			BlockRequested: 1,
+			BytesIn:        104 * 1024,
+			BytesOut:       141 * 1024,
+		},
+	})
+
+	if host.Health != "MIXED" {
+		t.Fatalf("health = %q, want MIXED", host.Health)
+	}
+	if host.Direction != "in/out" {
+		t.Fatalf("direction = %q, want in/out", host.Direction)
+	}
+	if host.BlocksBehind != 0 {
+		t.Fatalf("blocks behind = %d, want 0", host.BlocksBehind)
+	}
+	if host.TxSent != 5 || host.TxRequested != 2 {
+		t.Fatalf("traffic summary = sent %d requested %d, want 5/2", host.TxSent, host.TxRequested)
+	}
+	if host.LatencyAvgS < 0.044 || host.LatencyAvgS > 0.046 {
+		t.Fatalf("latency avg = %.3f, want about 0.045", host.LatencyAvgS)
+	}
+	if host.LatencyP95S != 0.09 {
+		t.Fatalf("latency p95 = %.2f, want 0.09", host.LatencyP95S)
+	}
+	if host.BytesIn != 184*1024 || host.BytesOut != 231*1024 {
+		t.Fatalf("bytes summary = %d/%d, want %d/%d", host.BytesIn, host.BytesOut, 184*1024, 231*1024)
+	}
 }
 
 func TestPeerInfoUsesObservedHeight(t *testing.T) {
@@ -2623,15 +3562,33 @@ func TestPeerInfoUsesObservedHeight(t *testing.T) {
 		peers: make(map[string]*peerConn),
 	}
 	peer := &peerConn{
-		addr:     "127.0.0.1:18444",
-		outbound: true,
-		version:  p2p.VersionMessage{Height: 7, UserAgent: "bpu/go"},
+		addr:           "127.0.0.1:18444",
+		outbound:       true,
+		version:        p2p.VersionMessage{Height: 7, UserAgent: "bpu/go"},
+		controlQ:       make(chan outboundMessage, 1),
+		relayPriorityQ: make(chan outboundMessage, 1),
+		sendQ:          make(chan outboundMessage, 1),
+		localRelayTxs:  make(map[[32]byte]localRelayFallbackState),
 	}
 	peer.noteProgress(time.Unix(100, 0))
+	peer.controlQ <- outboundMessage{}
+	peer.relayPriorityQ <- outboundMessage{}
+	peer.sendQ <- outboundMessage{}
+	peer.localRelayTxs[[32]byte{1}] = localRelayFallbackState{announcedAt: time.Unix(101, 0)}
+	peer.telemetry.noteTxRequestReceived(2)
+	peer.telemetry.noteTxNotFoundReceived(1)
+	peer.telemetry.noteKnownTxClears(3)
 	svc.peers[peer.addr] = peer
 
-	if got := svc.PeerInfo()[0].Height; got != 7 {
+	info := svc.PeerInfo()[0]
+	if got := info.Height; got != 7 {
 		t.Fatalf("peer height = %d, want handshake height 7", got)
+	}
+	if info.RelayQueueDepth != 3 || info.ControlQueueDepth != 1 || info.PriorityQueueDepth != 1 || info.SendQueueDepth != 1 {
+		t.Fatalf("unexpected relay queue snapshot: %+v", info)
+	}
+	if info.PendingLocalRelayTxs != 1 || info.TxReqRecvItems != 2 || info.TxNotFoundReceived != 1 || info.KnownTxClears != 3 {
+		t.Fatalf("unexpected peer relay details: %+v", info)
 	}
 
 	peer.noteHeight(11)
@@ -2757,9 +3714,9 @@ func TestApplyPeerHeadersInactiveBranchDoesNotRewriteActiveLocatorBase(t *testin
 		t.Fatalf("locator height = %d, want 0 because competing header is not active", height)
 	}
 
-	hashAtHeight, err := svc.chainState.Store().GetBlockHashByHeight(1)
+	hashAtHeight, err := svc.chainState.Store().GetHeaderHashByHeight(1)
 	if err != nil {
-		t.Fatalf("GetBlockHashByHeight: %v", err)
+		t.Fatalf("GetHeaderHashByHeight: %v", err)
 	}
 	mainHash := consensus.HeaderHash(&mainFirst.Header)
 	if hashAtHeight == nil || *hashAtHeight != mainHash {
@@ -2817,18 +3774,18 @@ func TestOpenServiceRestoresPromotedHigherWorkHeaderBranch(t *testing.T) {
 	}
 
 	altFirstHash := consensus.HeaderHash(&altFirst.Header)
-	hashAtHeight, err := reopened.chainState.Store().GetBlockHashByHeight(1)
+	hashAtHeight, err := reopened.chainState.Store().GetHeaderHashByHeight(1)
 	if err != nil {
-		t.Fatalf("GetBlockHashByHeight(1): %v", err)
+		t.Fatalf("GetHeaderHashByHeight(1): %v", err)
 	}
 	if hashAtHeight == nil || *hashAtHeight != altFirstHash {
 		t.Fatalf("active header hash at height 1 = %x, want %x", hashAtHeight, altFirstHash)
 	}
 
 	altSecondHash := consensus.HeaderHash(&altSecond.Header)
-	hashAtHeight, err = reopened.chainState.Store().GetBlockHashByHeight(2)
+	hashAtHeight, err = reopened.chainState.Store().GetHeaderHashByHeight(2)
 	if err != nil {
-		t.Fatalf("GetBlockHashByHeight(2): %v", err)
+		t.Fatalf("GetHeaderHashByHeight(2): %v", err)
 	}
 	if hashAtHeight == nil || *hashAtHeight != altSecondHash {
 		t.Fatalf("active header hash at height 2 = %x, want %x", hashAtHeight, altSecondHash)
@@ -2858,6 +3815,244 @@ func TestOnPeerTxBatchIgnoresDuplicateAdmissionError(t *testing.T) {
 	}
 }
 
+func TestSubmitTxTracksAndRebroadcastsLocalOriginTransactions(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	svc.peerMu.Lock()
+	svc.peers[peer.addr] = peer
+	svc.peerMu.Unlock()
+
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	txid := consensus.TxID(&tx)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+
+	svc.rebroadcastMu.Lock()
+	if _, ok := svc.localRebroadcast[txid]; !ok {
+		svc.rebroadcastMu.Unlock()
+		t.Fatalf("local rebroadcast set missing %x", txid)
+	}
+	svc.rebroadcastMu.Unlock()
+
+	select {
+	case <-peer.sendQ:
+	default:
+	}
+
+	svc.rebroadcastLocalTxs()
+
+	select {
+	case envelope := <-peer.sendQ:
+		recon, ok := envelope.msg.(p2p.TxReconMessage)
+		if !ok {
+			t.Fatalf("message type = %T, want TxReconMessage", envelope.msg)
+		}
+		if len(recon.TxIDs) != 1 || recon.TxIDs[0] != txid {
+			t.Fatalf("rebroadcast txids = %x, want [%x]", recon.TxIDs, txid)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("timed out waiting for local rebroadcast")
+	}
+}
+
+func TestRebroadcastLocalTxsRetriesPeersMarkedKnown(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	svc.peerMu.Lock()
+	svc.peers[peer.addr] = peer
+	svc.peerMu.Unlock()
+
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	txid := consensus.TxID(&tx)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+
+	select {
+	case <-peer.sendQ:
+	default:
+	}
+
+	peer.noteKnownTxIDs([][32]byte{txid})
+	svc.rebroadcastLocalTxs()
+
+	select {
+	case envelope := <-peer.sendQ:
+		recon, ok := envelope.msg.(p2p.TxReconMessage)
+		if !ok {
+			t.Fatalf("message type = %T, want TxReconMessage", envelope.msg)
+		}
+		if len(recon.TxIDs) != 1 || recon.TxIDs[0] != txid {
+			t.Fatalf("rebroadcast txids = %x, want [%x]", recon.TxIDs, txid)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("timed out waiting for retry rebroadcast")
+	}
+}
+
+func TestPeerOriginTransactionsAreNotTrackedForLocalRebroadcast(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	admissions, errs, _, _ := svc.submitDecodedTxsFrom([]types.Transaction{tx}, peer)
+	if errs[0] != nil {
+		t.Fatalf("submitDecodedTxsFrom: %v", errs[0])
+	}
+	if admissions[0].Orphaned {
+		t.Fatal("peer-origin tx unexpectedly orphaned")
+	}
+
+	svc.rebroadcastMu.Lock()
+	defer svc.rebroadcastMu.Unlock()
+	if len(svc.localRebroadcast) != 0 {
+		t.Fatalf("local rebroadcast set size = %d, want 0", len(svc.localRebroadcast))
+	}
+}
+
+func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	txid := consensus.TxID(&tx)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 9, genesis.Header.Timestamp+600)
+	block.Txs = append(block.Txs, tx)
+	block.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{
+		consensus.TxID(&block.Txs[0]),
+		txid,
+	})
+	block.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{
+		consensus.AuthID(&block.Txs[0]),
+		consensus.AuthID(&tx),
+	})
+	utxos := make(consensus.UtxoSet, len(state.UTXOs()))
+	for outPoint, entry := range state.UTXOs() {
+		utxos[outPoint] = entry
+	}
+	delete(utxos, prevOut)
+	utxos[types.OutPoint{TxID: txid, Vout: 0}] = consensus.UtxoEntry{
+		ValueAtoms: tx.Base.Outputs[0].ValueAtoms,
+		KeyHash:    tx.Base.Outputs[0].KeyHash,
+	}
+	coinbaseTxID := consensus.TxID(&block.Txs[0])
+	utxos[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
+		ValueAtoms: block.Txs[0].Base.Outputs[0].ValueAtoms,
+		KeyHash:    block.Txs[0].Base.Outputs[0].KeyHash,
+	}
+	block.Header.UTXORoot = consensus.ComputedUTXORoot(utxos)
+	block.Header = mineHeaderForNodeTest(block.Header)
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+	if applied, _, err := svc.applyPeerBlock(&block); err != nil || !applied {
+		t.Fatalf("applyPeerBlock = (%v, %v), want (true, nil)", applied, err)
+	}
+
+	svc.rebroadcastMu.Lock()
+	defer svc.rebroadcastMu.Unlock()
+	if _, ok := svc.localRebroadcast[txid]; ok {
+		t.Fatalf("confirmed tx %x still tracked for rebroadcast", txid)
+	}
+}
+
+func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	chainUTXOs := consensus.UtxoSet{
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {
+			ValueAtoms: 50,
+			KeyHash:    nodeSignerKeyHash(7),
+		},
+	}
+	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}})
+	block := blockWithTxsForNodeTest(t, 0, genesis.Header, chainUTXOs, []types.Transaction{coinbase}, genesis.Header.Timestamp+1)
+	orphanTx := spendTxForNodeTest(t, 9, types.OutPoint{TxID: consensus.TxID(&coinbase), Vout: 0}, 1, 8, 0)
+	peer := newPeerConnForTests("127.0.0.1:18444")
+
+	if err := svc.onPeerMessage(peer, p2p.TxBatchMessage{Txs: []types.Transaction{orphanTx}}); err != nil {
+		t.Fatalf("onPeerMessage orphan batch: %v", err)
+	}
+	if got := svc.pool.Count(); got != 0 {
+		t.Fatalf("mempool count before parent block = %d, want 0", got)
+	}
+	if got := svc.pool.OrphanCount(); got != 1 {
+		t.Fatalf("orphan count before parent block = %d, want 1", got)
+	}
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+	if err := svc.acceptPeerBlockMessage(peer, &block); err != nil {
+		t.Fatalf("acceptPeerBlockMessage: %v", err)
+	}
+	if got := svc.pool.Count(); got != 1 {
+		t.Fatalf("mempool count after parent block = %d, want 1", got)
+	}
+	if got := svc.pool.OrphanCount(); got != 0 {
+		t.Fatalf("orphan count after parent block = %d, want 0", got)
+	}
+	if !svc.pool.Contains(consensus.TxID(&orphanTx)) {
+		t.Fatal("promoted orphan tx missing from mempool")
+	}
+}
+
 func TestOnPeerBlockMessageIgnoresKnownBlock(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -2877,7 +4072,7 @@ func TestOnPeerBlockMessageIgnoresKnownBlock(t *testing.T) {
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders: %v", err)
 	}
-	if applied, err := svc.applyPeerBlock(&block); err != nil || !applied {
+	if applied, _, err := svc.applyPeerBlock(&block); err != nil || !applied {
 		t.Fatalf("applyPeerBlock = (%v, %v), want (true, nil)", applied, err)
 	}
 
@@ -2987,6 +4182,149 @@ func TestOnPeerBlockMessageRequestsCatchUpForUnavailableParentState(t *testing.T
 	}
 }
 
+func TestQueuedPeerBlocksDrainAfterParentArrives(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	baseState := NewChainState(types.Regtest)
+	if _, err := baseState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	first := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	firstState := baseState.Clone()
+	if _, err := firstState.ApplyBlock(&first); err != nil {
+		t.Fatal(err)
+	}
+	second := nextCoinbaseBlock(1, first.Header, firstState.UTXOs(), 4, first.Header.Timestamp+600)
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{first.Header, second.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.controlQ = make(chan outboundMessage, 16)
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: second}); err != nil {
+		t.Fatalf("onPeerMessage child before parent block: %v", err)
+	}
+	if got := svc.pendingPeerBlockCount(); got != 1 {
+		t.Fatalf("pending queued peer blocks = %d, want 1", got)
+	}
+	if got := svc.blockHeight(); got != 0 {
+		t.Fatalf("block height after child = %d, want 0", got)
+	}
+
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: first}); err != nil {
+		t.Fatalf("onPeerMessage parent block: %v", err)
+	}
+	if got := svc.pendingPeerBlockCount(); got != 0 {
+		t.Fatalf("pending queued peer blocks after parent = %d, want 0", got)
+	}
+	if got := svc.blockHeight(); got != 2 {
+		t.Fatalf("block height after queued drain = %d, want 2", got)
+	}
+	if got := svc.headerHeight(); got != 2 {
+		t.Fatalf("header height after queued drain = %d, want 2", got)
+	}
+	tip := svc.chainState.ChainState().TipHeader()
+	if tip == nil {
+		t.Fatal("missing tip header after queued drain")
+	}
+	if got, want := consensus.HeaderHash(tip), consensus.HeaderHash(&second.Header); got != want {
+		t.Fatalf("tip hash = %x, want %x", got, want)
+	}
+}
+
+func TestCompetingBranchQueuedBlocksConvergeToHigherWorkTip(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	activeState := NewChainState(types.Regtest)
+	if _, err := activeState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	active := nextCoinbaseBlock(0, genesis.Header, activeState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders active: %v", err)
+	}
+	activePeer := newPeerConnForTests("127.0.0.1:18444")
+	activePeer.controlQ = make(chan outboundMessage, 16)
+	if err := svc.onPeerMessage(activePeer, p2p.BlockMessage{Block: active}); err != nil {
+		t.Fatalf("onPeerMessage active block: %v", err)
+	}
+	if got := svc.blockHeight(); got != 1 {
+		t.Fatalf("active block height = %d, want 1", got)
+	}
+
+	altState := NewChainState(types.Regtest)
+	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	if _, err := altState.ApplyBlock(&alt1); err != nil {
+		t.Fatal(err)
+	}
+	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt2); err != nil {
+		t.Fatal(err)
+	}
+	alt3 := nextCoinbaseBlock(2, alt2.Header, altState.UTXOs(), 6, alt2.Header.Timestamp+600)
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{alt1.Header, alt2.Header, alt3.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders competing branch: %v", err)
+	}
+
+	peer := newPeerConnForTests("127.0.0.1:18445")
+	peer.controlQ = make(chan outboundMessage, 16)
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt3}); err != nil {
+		t.Fatalf("onPeerMessage alt3 before ancestors: %v", err)
+	}
+	if got := svc.pendingPeerBlockCount(); got != 1 {
+		t.Fatalf("pending queued peer blocks after alt3 = %d, want 1", got)
+	}
+
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt1}); err != nil {
+		t.Fatalf("onPeerMessage alt1: %v", err)
+	}
+	if got := svc.blockHeight(); got != 1 {
+		t.Fatalf("block height after alt1 = %d, want 1", got)
+	}
+
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt2}); err != nil {
+		t.Fatalf("onPeerMessage alt2: %v", err)
+	}
+
+	if got := svc.pendingPeerBlockCount(); got != 0 {
+		t.Fatalf("pending queued peer blocks after competing branch drain = %d, want 0", got)
+	}
+	if got := svc.blockHeight(); got != 3 {
+		t.Fatalf("block height after competing branch catch-up = %d, want 3", got)
+	}
+	if got := svc.headerHeight(); got != 3 {
+		t.Fatalf("header height after competing branch catch-up = %d, want 3", got)
+	}
+	tip := svc.chainState.ChainState().TipHeader()
+	if tip == nil {
+		t.Fatal("missing tip header after competing branch catch-up")
+	}
+	if got, want := consensus.HeaderHash(tip), consensus.HeaderHash(&alt3.Header); got != want {
+		t.Fatalf("tip hash = %x, want %x", got, want)
+	}
+}
+
 func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -3015,8 +4353,8 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	if genesisEntry == nil {
 		t.Fatal("missing genesis entry")
 	}
-	if err := svc.chainState.Store().RewriteActiveHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
-		t.Fatalf("RewriteActiveHeights: %v", err)
+	if err := svc.chainState.Store().RewriteActiveHeaderHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
+		t.Fatalf("RewriteActiveHeaderHeights: %v", err)
 	}
 
 	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
@@ -3053,6 +4391,69 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	}
 }
 
+func TestMissingBlockHashesIncludeForkPointForPromotedBranch(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	activeState := NewChainState(types.Regtest)
+	if _, err := activeState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	active1 := nextCoinbaseBlock(0, genesis.Header, activeState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active1.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders active: %v", err)
+	}
+	if _, _, err := svc.applyPeerBlock(&active1); err != nil {
+		t.Fatalf("applyPeerBlock active: %v", err)
+	}
+
+	branchState := NewChainState(types.Regtest)
+	if _, err := branchState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	branch1 := nextCoinbaseBlock(0, genesis.Header, branchState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	if _, err := branchState.ApplyBlock(&branch1); err != nil {
+		t.Fatal(err)
+	}
+	branch2 := nextCoinbaseBlock(1, branch1.Header, branchState.UTXOs(), 5, branch1.Header.Timestamp+600)
+	if _, err := branchState.ApplyBlock(&branch2); err != nil {
+		t.Fatal(err)
+	}
+	branch3 := nextCoinbaseBlock(2, branch2.Header, branchState.UTXOs(), 6, branch2.Header.Timestamp+600)
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{branch1.Header, branch2.Header, branch3.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders branch: %v", err)
+	}
+
+	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
+	if err != nil {
+		t.Fatalf("missingBlockHashesDetailed: %v", err)
+	}
+	if gapDetected {
+		t.Fatal("did not expect active height gap")
+	}
+	if len(hashes) != 3 {
+		t.Fatalf("missing block hash count = %d, want 3", len(hashes))
+	}
+	want := [][32]byte{
+		consensus.HeaderHash(&branch1.Header),
+		consensus.HeaderHash(&branch2.Header),
+		consensus.HeaderHash(&branch3.Header),
+	}
+	for i := range want {
+		if hashes[i] != want[i] {
+			t.Fatalf("missing block hash[%d] = %x, want %x", i, hashes[i], want[i])
+		}
+	}
+}
+
 func TestSyncWatchdogRepairsGapAndRequestsBlocks(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -3082,8 +4483,8 @@ func TestSyncWatchdogRepairsGapAndRequestsBlocks(t *testing.T) {
 	if genesisEntry == nil {
 		t.Fatal("missing genesis entry")
 	}
-	if err := svc.chainState.Store().RewriteActiveHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
-		t.Fatalf("RewriteActiveHeights: %v", err)
+	if err := svc.chainState.Store().RewriteActiveHeaderHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
+		t.Fatalf("RewriteActiveHeaderHeights: %v", err)
 	}
 
 	peer := newPeerConnForTests("127.0.0.1:18444")
@@ -3268,14 +4669,15 @@ func TestPreferredDownloadPeersExcludeCooledPeer(t *testing.T) {
 
 func newPeerConnForTests(addr string) *peerConn {
 	return &peerConn{
-		addr:        addr,
-		sendQ:       make(chan outboundMessage, 4),
-		closed:      make(chan struct{}),
-		queuedInv:   make(map[p2p.InvVector]int),
-		queuedTx:    make(map[[32]byte]int),
-		knownTx:     make(map[[32]byte]struct{}),
-		pendingThin: make(map[[32]byte]*pendingThinBlock),
-		version:     p2p.VersionMessage{Height: 0, UserAgent: "bpu/go"},
+		addr:          addr,
+		sendQ:         make(chan outboundMessage, 4),
+		closed:        make(chan struct{}),
+		queuedInv:     make(map[p2p.InvVector]int),
+		queuedTx:      make(map[[32]byte]int),
+		knownTx:       make(map[[32]byte]struct{}),
+		localRelayTxs: make(map[[32]byte]localRelayFallbackState),
+		pendingThin:   make(map[[32]byte]*pendingThinBlock),
+		version:       p2p.VersionMessage{Height: 0, UserAgent: "bpu/go"},
 	}
 }
 
@@ -3316,6 +4718,40 @@ func TestPeerConnCoalescesTxBatches(t *testing.T) {
 	}
 }
 
+func TestPeerConnPendingTxStoreMaterializesRelayBatchOnce(t *testing.T) {
+	peer := &peerConn{
+		queuedTx: make(map[[32]byte]int),
+		knownTx:  make(map[[32]byte]struct{}),
+	}
+	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
+	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2}})
+
+	ready, armFlush := peer.stagePendingTxs([]types.Transaction{first, second})
+	if len(ready) != 0 {
+		t.Fatalf("ready batches = %d, want 0", len(ready))
+	}
+	if !armFlush {
+		t.Fatal("expected flush timer to arm for partial relay batch")
+	}
+	if len(peer.pendingTxOrder) != 2 || len(peer.pendingTxByID) != 2 {
+		t.Fatalf("pending tx store = (%d order, %d payloads), want 2/2", len(peer.pendingTxOrder), len(peer.pendingTxByID))
+	}
+
+	batches := peer.takePendingTxs()
+	if len(batches) != 1 {
+		t.Fatalf("batch count = %d, want 1", len(batches))
+	}
+	if len(batches[0]) != 2 {
+		t.Fatalf("batch tx count = %d, want 2", len(batches[0]))
+	}
+	if consensus.TxID(&batches[0][0]) != consensus.TxID(&first) || consensus.TxID(&batches[0][1]) != consensus.TxID(&second) {
+		t.Fatal("materialized relay batch lost tx order")
+	}
+	if len(peer.pendingTxOrder) != 0 || len(peer.pendingTxByID) != 0 {
+		t.Fatal("expected pending tx store cleared after materialization")
+	}
+}
+
 func TestPeerConnCoalescesTxReconAnnouncements(t *testing.T) {
 	peer := &peerConn{
 		sendQ:    make(chan outboundMessage, 8),
@@ -3342,5 +4778,123 @@ func TestPeerConnCoalescesTxReconAnnouncements(t *testing.T) {
 		}
 	case <-time.After(50 * time.Millisecond):
 		t.Fatal("timed out waiting for coalesced recon message")
+	}
+}
+
+func TestEmitThroughputSummaryLogsExpectedFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "info"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	pool := mempool.NewWithConfig(mempool.PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	utxos := consensus.UtxoSet{
+		{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}
+	tx := spendTxForNodeTest(t, 1, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, 50, 2, 1)
+	if _, err := pool.AcceptTx(tx, utxos, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept tx: %v", err)
+	}
+
+	startedAt := time.Unix(1_700_000_000, 0).UTC()
+	peerA := newPeerConnForTests("127.0.0.1:18444")
+	peerA.sendQ <- outboundMessage{}
+	peerA.sendQ <- outboundMessage{}
+	peerA.telemetry.noteEnqueue(queueDepthSnapshot{total: 2, send: 2})
+	peerA.syncState.lastUsefulAt = startedAt.Add(30 * time.Second)
+	peerB := newPeerConnForTests("127.0.0.1:18445")
+	peerB.telemetry.noteEnqueue(queueDepthSnapshot{total: 1, send: 1})
+
+	svc := &Service{
+		cfg: ServiceConfig{
+			StallTimeout:              15 * time.Second,
+			ThroughputSummaryInterval: time.Minute,
+		},
+		logger:        logger,
+		pool:          pool,
+		peers:         map[string]*peerConn{peerA.addr: peerA, peerB.addr: peerB},
+		blockRequests: map[[32]byte]blockDownloadRequest{{1}: {}, {2}: {}},
+		txRequests:    map[[32]byte]blockDownloadRequest{{3}: {}, {4}: {}, {5}: {}},
+		pendingBlocks: map[[32]byte]pendingPeerBlock{{9}: {}},
+		startedAt:     startedAt,
+		stopCh:        make(chan struct{}),
+	}
+	peerA.svc = svc
+	peerB.svc = svc
+
+	svc.noteAcceptedAdmissions([]mempool.Admission{{
+		Accepted: []mempool.AcceptedTx{{TxID: [32]byte{6}}, {TxID: [32]byte{7}}},
+	}})
+	svc.noteRelaySent(relayMessageClass{txBatchItems: 6, blockInvItems: 1})
+	svc.noteBlockAccepted()
+	svc.noteTemplateRebuild()
+	svc.noteTemplateInterruption()
+
+	svc.emitThroughputSummary(startedAt.Add(time.Minute))
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
+		t.Fatalf("unmarshal summary log: %v", err)
+	}
+	if got := entry["msg"]; got != "throughput summary" {
+		t.Fatalf("msg = %v, want throughput summary", got)
+	}
+	if got := int(entry["admitted_txs"].(float64)); got != 2 {
+		t.Fatalf("admitted_txs = %d, want 2", got)
+	}
+	if got := entry["admitted_txs_per_sec"].(float64); got < 0.033 || got > 0.034 {
+		t.Fatalf("admitted_txs_per_sec = %.6f, want about 0.0333", got)
+	}
+	if got := int(entry["relayed_tx_items"].(float64)); got != 6 {
+		t.Fatalf("relayed_tx_items = %d, want 6", got)
+	}
+	if got := int(entry["relayed_block_items"].(float64)); got != 1 {
+		t.Fatalf("relayed_block_items = %d, want 1", got)
+	}
+	if got := int(entry["blocks_accepted"].(float64)); got != 1 {
+		t.Fatalf("blocks_accepted = %d, want 1", got)
+	}
+	if got := int(entry["template_rebuilds"].(float64)); got != 1 {
+		t.Fatalf("template_rebuilds = %d, want 1", got)
+	}
+	if got := int(entry["template_interruptions"].(float64)); got != 1 {
+		t.Fatalf("template_interruptions = %d, want 1", got)
+	}
+	if got := int(entry["orphan_promotions"].(float64)); got != 1 {
+		t.Fatalf("orphan_promotions = %d, want 1", got)
+	}
+	if got := int(entry["mempool_txs"].(float64)); got != 1 {
+		t.Fatalf("mempool_txs = %d, want 1", got)
+	}
+	if got := int(entry["candidate_frontier"].(float64)); got != 1 {
+		t.Fatalf("candidate_frontier = %d, want 1", got)
+	}
+	if got := int(entry["peer_count"].(float64)); got != 2 {
+		t.Fatalf("peer_count = %d, want 2", got)
+	}
+	if got := int(entry["useful_peers"].(float64)); got != 1 {
+		t.Fatalf("useful_peers = %d, want 1", got)
+	}
+	if got := int(entry["relay_queue_depth"].(float64)); got != 2 {
+		t.Fatalf("relay_queue_depth = %d, want 2", got)
+	}
+	if got := int(entry["relay_queue_depth_peak"].(float64)); got != 2 {
+		t.Fatalf("relay_queue_depth_peak = %d, want 2", got)
+	}
+	if got := int(entry["pending_peer_blocks"].(float64)); got != 1 {
+		t.Fatalf("pending_peer_blocks = %d, want 1", got)
+	}
+	if got := int(entry["inflight_block_requests"].(float64)); got != 2 {
+		t.Fatalf("inflight_block_requests = %d, want 2", got)
+	}
+	if got := int(entry["inflight_tx_requests"].(float64)); got != 3 {
+		t.Fatalf("inflight_tx_requests = %d, want 3", got)
 	}
 }

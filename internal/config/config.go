@@ -7,42 +7,47 @@ import (
 )
 
 type Config struct {
-	Profile            string   `json:"profile"`
-	DBPath             string   `json:"db_path"`
-	LogPath            string   `json:"log_path"`
-	LogLevel           string   `json:"log_level"`
-	RPCAddr            string   `json:"rpc_addr"`
-	RPCAuthToken       string   `json:"rpc_auth_token"`
-	RPCReadTimeoutMS   int      `json:"rpc_read_timeout_ms"`
-	RPCWriteTimeoutMS  int      `json:"rpc_write_timeout_ms"`
-	RPCHeaderTimeoutMS int      `json:"rpc_header_timeout_ms"`
-	RPCIdleTimeoutMS   int      `json:"rpc_idle_timeout_ms"`
-	RPCMaxHeaderBytes  int      `json:"rpc_max_header_bytes"`
-	RPCMaxBodyBytes    int      `json:"rpc_max_body_bytes"`
-	P2PAddr            string   `json:"p2p_addr"`
-	Peers              []string `json:"peers"`
-	MaxInboundPeers    int      `json:"max_inbound_peers"`
-	MaxOutboundPeers   int      `json:"max_outbound_peers"`
-	HandshakeTimeoutMS int      `json:"handshake_timeout_ms"`
-	StallTimeoutMS     int      `json:"stall_timeout_ms"`
-	MaxMessageBytes    int      `json:"max_message_bytes"`
-	MinRelayFeePerByte uint64   `json:"min_relay_fee_per_byte"`
-	MaxAncestors       int      `json:"max_ancestors"`
-	MaxDescendants     int      `json:"max_descendants"`
-	MaxOrphans         int      `json:"max_orphans"`
-	MinerEnabled       bool     `json:"miner_enabled"`
-	MinerWorkers       int      `json:"miner_workers"`
-	MinerKeyHashHex    string   `json:"miner_keyhash_hex"`
-	GenesisFixture     string   `json:"genesis_fixture"`
+	Profile                     string   `json:"profile"`
+	DBPath                      string   `json:"db_path"`
+	LogPath                     string   `json:"log_path"`
+	LogLevel                    string   `json:"log_level"`
+	LogFormat                   string   `json:"log_format"`
+	ThroughputSummaryIntervalMS int      `json:"throughput_summary_interval_ms"`
+	PprofAddr                   string   `json:"pprof_addr"`
+	RPCAddr                     string   `json:"rpc_addr"`
+	RPCAuthToken                string   `json:"rpc_auth_token"`
+	RPCReadTimeoutMS            int      `json:"rpc_read_timeout_ms"`
+	RPCWriteTimeoutMS           int      `json:"rpc_write_timeout_ms"`
+	RPCHeaderTimeoutMS          int      `json:"rpc_header_timeout_ms"`
+	RPCIdleTimeoutMS            int      `json:"rpc_idle_timeout_ms"`
+	RPCMaxHeaderBytes           int      `json:"rpc_max_header_bytes"`
+	RPCMaxBodyBytes             int      `json:"rpc_max_body_bytes"`
+	P2PAddr                     string   `json:"p2p_addr"`
+	Peers                       []string `json:"peers"`
+	MaxInboundPeers             int      `json:"max_inbound_peers"`
+	MaxOutboundPeers            int      `json:"max_outbound_peers"`
+	HandshakeTimeoutMS          int      `json:"handshake_timeout_ms"`
+	StallTimeoutMS              int      `json:"stall_timeout_ms"`
+	MaxMessageBytes             int      `json:"max_message_bytes"`
+	MinRelayFeePerByte          uint64   `json:"min_relay_fee_per_byte"`
+	MaxAncestors                int      `json:"max_ancestors"`
+	MaxDescendants              int      `json:"max_descendants"`
+	MaxOrphans                  int      `json:"max_orphans"`
+	MinerEnabled                bool     `json:"miner_enabled"`
+	MinerWorkers                int      `json:"miner_workers"`
+	MinerKeyHashHex             string   `json:"miner_keyhash_hex"`
+	GenesisFixture              string   `json:"genesis_fixture"`
 }
 
 func Default() Config {
 	return Config{
-		Profile:          "regtest",
-		DBPath:           "data/chain",
-		LogLevel:         "info",
-		RPCAddr:          "127.0.0.1:18443",
-		RPCReadTimeoutMS: 5000,
+		Profile:                     "regtest",
+		DBPath:                      "data/chain",
+		LogLevel:                    "info",
+		LogFormat:                   "text",
+		ThroughputSummaryIntervalMS: 60_000,
+		RPCAddr:                     "127.0.0.1:18443",
+		RPCReadTimeoutMS:            5000,
 		// Mining and some wallet/history RPCs can legitimately run for much
 		// longer than a few seconds on small nodes. Keep writes bounded, but
 		// high enough that long admin calls do not get cut off mid-response.

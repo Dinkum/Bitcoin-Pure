@@ -6,7 +6,7 @@
   "utxo_branch_tag": "BPU/UtxoBranchV1",
   "empty_utxo_root_hex": "5661a0245c35fb1fddfb49fd6b3a42327c1ceaecdf07b2c92da72569835b9d6f",
   "mainnet": {
-    "genesis_header_hash_hex": "8bc7ff3501b964dec7833036705a34540569e10951270930d8406fe75f655277",
+    "genesis_header_hash_hex": "00000006d003fe7c48fdc273ff89b832cc879ee0d550ae2149ab83587dcd9254",
     "genesis_txid_hex": "ac8e8c460defd637c2049fe58f946978e6958600033cab8fb733607777d7a104",
     "genesis_authid_hex": "1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a",
     "utxo_root_after_genesis_hex": "b0c9fc2b98acde1ff8a76f094c256ae725d679e80e50241e538102727e9b8134"

@@ -181,9 +181,20 @@ func TestWriteAndLoadKnownPeersRoundtrip(t *testing.T) {
 	defer store.Close()
 
 	base := time.Unix(1_700_000_000, 123).UTC()
-	peers := map[string]time.Time{
-		"127.0.0.1:18444": base,
-		"127.0.0.1:18445": base.Add(5 * time.Minute),
+	peers := map[string]KnownPeerRecord{
+		"127.0.0.1:18444": {
+			LastSeen:     base,
+			LastSuccess:  base,
+			LastAttempt:  base.Add(-time.Minute),
+			FailureCount: 1,
+			Manual:       true,
+		},
+		"127.0.0.1:18445": {
+			LastSeen:     base.Add(5 * time.Minute),
+			LastSuccess:  base.Add(4 * time.Minute),
+			LastAttempt:  base.Add(5 * time.Minute),
+			FailureCount: 3,
+		},
 	}
 	if err := store.WriteKnownPeers(peers); err != nil {
 		t.Fatalf("WriteKnownPeers: %v", err)
@@ -201,8 +212,8 @@ func TestWriteAndLoadKnownPeersRoundtrip(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing loaded peer %q", addr)
 		}
-		if !got.Equal(want) {
-			t.Fatalf("loaded peer %q time = %v, want %v", addr, got, want)
+		if got.LastSeen != want.LastSeen || got.LastSuccess != want.LastSuccess || got.LastAttempt != want.LastAttempt || got.FailureCount != want.FailureCount || got.Manual != want.Manual {
+			t.Fatalf("loaded peer %q = %+v, want %+v", addr, got, want)
 		}
 	}
 }
@@ -251,6 +262,110 @@ func TestPutValidatedBlockRoundtrip(t *testing.T) {
 	}
 	if len(gotUndo) != 1 || gotUndo[0] != undo[0] {
 		t.Fatal("undo roundtrip mismatch")
+	}
+}
+
+func TestPutHeaderDoesNotDowngradeValidatedEntry(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, _ := sampleBlockAndUTXOs()
+	work, err := consensus.BlockWork(block.Header.NBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &BlockIndexEntry{
+		Height:         0,
+		ParentHash:     block.Header.PrevBlockHash,
+		Header:         block.Header,
+		ChainWork:      work,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}
+	if err := store.PutValidatedBlock(&block, entry, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.PutHeader(0, &block.Header); err != nil {
+		t.Fatal(err)
+	}
+
+	hash := consensus.HeaderHash(&block.Header)
+	got, err := store.GetBlockIndex(&hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("expected block index entry")
+	}
+	if !got.Validated {
+		t.Fatal("validated entry was downgraded by PutHeader")
+	}
+	if got.BlockSizeState != entry.BlockSizeState {
+		t.Fatal("block size state was not preserved")
+	}
+}
+
+func TestCommitHeaderChainDoesNotDowngradeValidatedEntry(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, _ := sampleBlockAndUTXOs()
+	work, err := consensus.BlockWork(block.Header.NBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &BlockIndexEntry{
+		Height:         0,
+		ParentHash:     block.Header.PrevBlockHash,
+		Header:         block.Header,
+		ChainWork:      work,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}
+	if err := store.PutValidatedBlock(&block, entry, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteHeaderState(&StoredHeaderState{
+		Profile:   types.RegtestMedium,
+		Height:    0,
+		TipHeader: block.Header,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitHeaderChain(&StoredHeaderState{
+		Profile:   types.RegtestMedium,
+		Height:    0,
+		TipHeader: block.Header,
+	}, []HeaderBatchEntry{{
+		Height:    0,
+		Header:    block.Header,
+		ChainWork: work,
+	}}, 0, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	hash := consensus.HeaderHash(&block.Header)
+	got, err := store.GetBlockIndex(&hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("expected block index entry")
+	}
+	if !got.Validated {
+		t.Fatal("validated entry was downgraded by CommitHeaderChain")
+	}
+	if got.BlockSizeState != entry.BlockSizeState {
+		t.Fatal("block size state was not preserved")
 	}
 }
 
@@ -382,12 +497,19 @@ func TestCommitHeaderChainInactiveBatchDoesNotRewriteActiveHeightIndex(t *testin
 		t.Fatal(err)
 	}
 
-	hashAtHeight, err := store.GetBlockHashByHeight(1)
+	hashAtHeight, err := store.GetHeaderHashByHeight(1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hashAtHeight == nil || *hashAtHeight != mainHash {
-		t.Fatalf("active height hash = %x, want %x", hashAtHeight, mainHash)
+		t.Fatalf("active header hash = %x, want %x", hashAtHeight, mainHash)
+	}
+	blockHashAtHeight, err := store.GetBlockHashByHeight(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockHashAtHeight != nil {
+		t.Fatalf("validated block height hash = %x, want nil", blockHashAtHeight)
 	}
 }
 

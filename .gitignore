@@ -30,6 +30,7 @@
 /bpu-cli
 /.*-tmp/
 /benchmarks/reports/
+/node.test
 
 # cargo default target dir
 target/

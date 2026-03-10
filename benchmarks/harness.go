@@ -22,7 +22,9 @@ import (
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/crypto"
+	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/node"
+	"bitcoin-pure/internal/profiling"
 	"bitcoin-pure/internal/types"
 )
 
@@ -54,6 +56,7 @@ type RunOptions struct {
 	BatchSize    int
 	Timeout      time.Duration
 	DBRoot       string
+	ProfileDir   string
 	SuppressLogs bool
 }
 
@@ -64,7 +67,12 @@ type SuiteOptions struct {
 	BatchSize    int
 	Timeout      time.Duration
 	DBRoot       string
+	ProfileDir   string
 	SuppressLogs bool
+}
+
+type ProfilingReport struct {
+	Artifacts []profiling.Artifact `json:"artifacts,omitempty"`
 }
 
 type Report struct {
@@ -82,6 +90,7 @@ type Report struct {
 	EndToEndTPS           float64         `json:"end_to_end_tps"`
 	Phases                PhaseReport     `json:"phases"`
 	Metrics               ScenarioMetrics `json:"metrics,omitempty"`
+	Profiling             ProfilingReport `json:"profiling,omitempty"`
 	Environment           Environment     `json:"environment"`
 	Nodes                 []NodeReport    `json:"nodes"`
 	Notes                 []string        `json:"notes,omitempty"`
@@ -279,9 +288,28 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		return nil, err
 	}
 	started := time.Now()
-	outcome, err := executeScenario(runCtx, cluster, opts, started)
-	if err != nil {
-		return nil, err
+	var outcome workloadOutcome
+	var profilingReport ProfilingReport
+	if opts.ProfileDir != "" {
+		capture, err := profiling.StartCapture(profiling.DefaultCaptureConfig(opts.ProfileDir, slugify(string(opts.Scenario))+"-"))
+		if err != nil {
+			return nil, err
+		}
+		outcome, err = executeScenario(runCtx, cluster, opts, started)
+		if err != nil {
+			_, _ = capture.Stop()
+			return nil, err
+		}
+		artifacts, stopErr := capture.Stop()
+		if stopErr != nil {
+			return nil, stopErr
+		}
+		profilingReport.Artifacts = artifacts
+	} else {
+		outcome, err = executeScenario(runCtx, cluster, opts, started)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	report := &Report{
@@ -299,6 +327,7 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		EndToEndTPS:           ratePerSecond(opts.TxCount, outcome.completed.Sub(started)),
 		Phases:                outcome.phases,
 		Metrics:               outcome.metrics,
+		Profiling:             profilingReport,
 		Environment: Environment{
 			GoOS:      runtime.GOOS,
 			GoArch:    runtime.GOARCH,
@@ -361,6 +390,12 @@ func RenderMarkdown(report *Report) string {
 	b.WriteString(fmt.Sprintf("- Full convergence: `%.2f ms`\n", report.ConvergenceDurationMS))
 	b.WriteString(fmt.Sprintf("- Submit TPS: `%.2f`\n", report.SubmitTPS))
 	b.WriteString(fmt.Sprintf("- End-to-end TPS: `%.2f`\n", report.EndToEndTPS))
+	if len(report.Profiling.Artifacts) != 0 {
+		b.WriteString("\n## Profiles\n\n")
+		for _, artifact := range report.Profiling.Artifacts {
+			b.WriteString(fmt.Sprintf("- `%s`: `%s`\n", artifact.Kind, artifact.Path))
+		}
+	}
 	b.WriteString("\n## Phase Timings\n\n")
 	b.WriteString("| Decode | Validate / Admit | Relay Fanout | Convergence |\n")
 	b.WriteString("| ---: | ---: | ---: | ---: |\n")
@@ -467,6 +502,9 @@ func RenderASCIISummary(report *Report) string {
 			report.Phases.ConvergenceMS,
 		),
 	}
+	if len(report.Profiling.Artifacts) != 0 {
+		lines = append(lines, fmt.Sprintf("Profiles    %d artifacts in %s", len(report.Profiling.Artifacts), filepath.Dir(report.Profiling.Artifacts[0].Path)))
+	}
 	for _, row := range scenarioMetricRows(report.Metrics) {
 		lines = append(lines, fmt.Sprintf("Metric      %s: %s", row[0], row[1]))
 	}
@@ -528,7 +566,12 @@ func WriteSuiteReportFiles(report *SuiteReport, dir string) error {
 
 func suppressLogs() func() {
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger, err := logging.NewLogger(io.Discard, logging.Config{Format: "text"})
+	if err != nil {
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	} else {
+		slog.SetDefault(logger)
+	}
 	return func() {
 		slog.SetDefault(previous)
 	}
@@ -627,6 +670,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "direct-submit"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "direct-submit"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -640,6 +684,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "rpc-batch"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "rpc-batch"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -653,6 +698,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "user-mix"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "user-mix"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -666,6 +712,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "chained-packages"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "chained-packages"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -679,6 +726,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "orphan-storm"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "orphan-storm"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -692,6 +740,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "block-template-rebuild"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "block-template-rebuild"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -706,6 +755,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 				BatchSize:    opts.BatchSize,
 				Timeout:      opts.Timeout,
 				DBRoot:       suiteDBRoot(opts.DBRoot, "p2p-relay-2-line"),
+				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "p2p-relay-2-line"),
 				SuppressLogs: opts.SuppressLogs,
 			},
 		},
@@ -723,6 +773,7 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 					BatchSize:    opts.BatchSize,
 					Timeout:      opts.Timeout,
 					DBRoot:       suiteDBRoot(opts.DBRoot, "p2p-relay-line"),
+					ProfileDir:   suiteProfileRoot(opts.ProfileDir, "p2p-relay-line"),
 					SuppressLogs: opts.SuppressLogs,
 				},
 			},
@@ -737,12 +788,20 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 					BatchSize:    opts.BatchSize,
 					Timeout:      opts.Timeout,
 					DBRoot:       suiteDBRoot(opts.DBRoot, "p2p-relay-mesh"),
+					ProfileDir:   suiteProfileRoot(opts.ProfileDir, "p2p-relay-mesh"),
 					SuppressLogs: opts.SuppressLogs,
 				},
 			},
 		)
 	}
 	return cases
+}
+
+func suiteProfileRoot(root, name string) string {
+	if strings.TrimSpace(root) == "" {
+		return ""
+	}
+	return filepath.Join(root, slugify(name))
 }
 
 func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), error) {

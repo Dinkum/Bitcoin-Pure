@@ -2,6 +2,7 @@ package benchmarks
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,31 @@ func TestRunP2PRelaySmoke(t *testing.T) {
 		}
 		if node.FullPropagationMS == nil {
 			t.Fatalf("%s missing propagation time", node.Name)
+		}
+	}
+}
+
+func TestRunDirectSubmitCapturesProfiles(t *testing.T) {
+	profileDir := t.TempDir()
+	report, err := Run(context.Background(), RunOptions{
+		Scenario:     ScenarioDirectSubmit,
+		Profile:      types.Regtest,
+		NodeCount:    1,
+		TxCount:      8,
+		BatchSize:    4,
+		Timeout:      15 * time.Second,
+		ProfileDir:   profileDir,
+		SuppressLogs: true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(report.Profiling.Artifacts) != 4 {
+		t.Fatalf("artifact count = %d, want 4", len(report.Profiling.Artifacts))
+	}
+	for _, artifact := range report.Profiling.Artifacts {
+		if _, err := os.Stat(artifact.Path); err != nil {
+			t.Fatalf("missing profile artifact %s: %v", artifact.Path, err)
 		}
 	}
 }

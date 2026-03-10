@@ -15,6 +15,7 @@ const DefaultMaxSizeBytes int64 = 20 * 1024 * 1024
 type Config struct {
 	Path         string
 	Level        string
+	Format       string
 	MaxSizeBytes int64
 }
 
@@ -38,22 +39,52 @@ func Setup(cfg Config) (*slog.Logger, io.Closer, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	level, err := parseLevel(cfg.Level)
+	logger, err := NewLogger(io.MultiWriter(os.Stderr, writer), Config{
+		Level:  cfg.Level,
+		Format: cfg.Format,
+	})
 	if err != nil {
 		_ = writer.Close()
 		return nil, nil, err
 	}
-	handler := slog.NewTextHandler(io.MultiWriter(os.Stderr, writer), &slog.HandlerOptions{
-		Level:     level,
-		AddSource: true,
-	})
-	logger := slog.New(handler)
 	slog.SetDefault(logger)
 	return logger, writer, nil
 }
 
 func Component(name string) *slog.Logger {
 	return slog.Default().With("component", name)
+}
+
+func NewLogger(dst io.Writer, cfg Config) (*slog.Logger, error) {
+	handler, err := NewHandler(dst, Config{
+		Level:  cfg.Level,
+		Format: cfg.Format,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slog.New(handler), nil
+}
+
+func NewHandler(dst io.Writer, cfg Config) (slog.Handler, error) {
+	level, err := parseLevel(cfg.Level)
+	if err != nil {
+		return nil, err
+	}
+	format, err := parseFormat(cfg.Format)
+	if err != nil {
+		return nil, err
+	}
+	options := &slog.HandlerOptions{
+		Level:     level,
+		AddSource: true,
+	}
+	switch format {
+	case "json":
+		return slog.NewJSONHandler(dst, options), nil
+	default:
+		return slog.NewTextHandler(dst, options), nil
+	}
 }
 
 func parseLevel(raw string) (slog.Leveler, error) {
@@ -68,6 +99,17 @@ func parseLevel(raw string) (slog.Leveler, error) {
 		return slog.LevelError, nil
 	default:
 		return nil, errors.New("unsupported log level: " + raw)
+	}
+}
+
+func parseFormat(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "text":
+		return "text", nil
+	case "json":
+		return "json", nil
+	default:
+		return "", errors.New("unsupported log format: " + raw)
 	}
 }
 

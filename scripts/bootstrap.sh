@@ -31,7 +31,7 @@ DEPLOY_RESULT=""
 
 usage() {
 	cat <<'EOF'
-Usage: ./install [--update] [--repo-url URL] [--ref REF] [--mining on|off] [--profile regtest|regtest_hard|mainnet] [--peer host:port]
+Usage: ./install [--update] [--repo-url URL] [--ref REF] [--mining on|off] [--profile regtest|regtest_medium|regtest_hard|mainnet] [--peer host:port]
 
 No flags are required for a normal Ubuntu install from the current checkout.
 The installer keeps existing config where possible and uses sane defaults otherwise.
@@ -229,9 +229,18 @@ backup_live_state() {
 	if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
 		SERVICE_WAS_ACTIVE=1
 	fi
-	[[ -f "${CONFIG_PATH}" ]] && cp -a "${CONFIG_PATH}" "${BACKUP_DIR}/config.json"
-	[[ -f "${UNIT_PATH}" ]] && cp -a "${UNIT_PATH}" "${BACKUP_DIR}/unit.service"
-	[[ -e "${BIN_LINK}" ]] && cp -a "${BIN_LINK}" "${BACKUP_DIR}/bpu-cli"
+	# Fresh installs have no live state yet. Keep the backup step a no-op in
+	# that case so `set -e` does not abort the deployment before apply_release.
+	if [[ -f "${CONFIG_PATH}" ]]; then
+		cp -a "${CONFIG_PATH}" "${BACKUP_DIR}/config.json"
+	fi
+	if [[ -f "${UNIT_PATH}" ]]; then
+		cp -a "${UNIT_PATH}" "${BACKUP_DIR}/unit.service"
+	fi
+	if [[ -e "${BIN_LINK}" ]]; then
+		cp -a "${BIN_LINK}" "${BACKUP_DIR}/bpu-cli"
+	fi
+	return 0
 }
 
 switch_current_link() {
@@ -584,12 +593,12 @@ parse_args() {
 		--profile)
 			[[ $# -ge 2 ]] || fail "--profile requires a value"
 			case "$2" in
-			regtest|regtest_hard|mainnet)
+			regtest|regtest_medium|regtest_hard|mainnet)
 				PROFILE="$2"
 				shift 2
 				;;
 			*)
-				fail "--profile must be regtest, regtest_hard, or mainnet"
+				fail "--profile must be regtest, regtest_medium, regtest_hard, or mainnet"
 				;;
 			esac
 			;;
