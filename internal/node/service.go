@@ -18,11 +18,12 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,33 +40,41 @@ import (
 	"bitcoin-pure/internal/utreexo"
 )
 
+const (
+	localOriginRebroadcastInterval = 30 * time.Second
+	maxPendingPeerBlocks           = 512
+)
+
+var ErrBlockHeaderNotIndexed = errors.New("block header not indexed")
+
 type ServiceConfig struct {
-	Profile            types.ChainProfile
-	DBPath             string
-	RPCAddr            string
-	RPCAuthToken       string
-	RPCReadTimeout     time.Duration
-	RPCWriteTimeout    time.Duration
-	RPCHeaderTimeout   time.Duration
-	RPCIdleTimeout     time.Duration
-	RPCMaxHeaderBytes  int
-	RPCMaxBodyBytes    int
-	P2PAddr            string
-	Peers              []string
-	MaxInboundPeers    int
-	MaxOutboundPeers   int
-	HandshakeTimeout   time.Duration
-	StallTimeout       time.Duration
-	MaxMessageBytes    int
-	MinRelayFeePerByte uint64
-	MaxTxSize          int
-	MaxAncestors       int
-	MaxDescendants     int
-	MaxOrphans         int
-	MinerEnabled       bool
-	MinerWorkers       int
-	MinerKeyHash       [32]byte
-	GenesisFixture     string
+	Profile                   types.ChainProfile
+	DBPath                    string
+	ThroughputSummaryInterval time.Duration
+	RPCAddr                   string
+	RPCAuthToken              string
+	RPCReadTimeout            time.Duration
+	RPCWriteTimeout           time.Duration
+	RPCHeaderTimeout          time.Duration
+	RPCIdleTimeout            time.Duration
+	RPCMaxHeaderBytes         int
+	RPCMaxBodyBytes           int
+	P2PAddr                   string
+	Peers                     []string
+	MaxInboundPeers           int
+	MaxOutboundPeers          int
+	HandshakeTimeout          time.Duration
+	StallTimeout              time.Duration
+	MaxMessageBytes           int
+	MinRelayFeePerByte        uint64
+	MaxTxSize                 int
+	MaxAncestors              int
+	MaxDescendants            int
+	MaxOrphans                int
+	MinerEnabled              bool
+	MinerWorkers              int
+	MinerKeyHash              [32]byte
+	GenesisFixture            string
 }
 
 type ServiceInfo struct {
@@ -137,25 +146,49 @@ type WalletActivity struct {
 }
 
 type PeerRelayStats struct {
-	Addr          string  `json:"addr"`
-	Outbound      bool    `json:"outbound"`
-	QueueDepth    int     `json:"queue_depth"`
-	MaxQueueDepth int     `json:"max_queue_depth"`
-	SentMessages  int     `json:"sent_messages"`
-	TxInvItems    int     `json:"tx_inv_items"`
-	BlockInvItems int     `json:"block_inv_items"`
-	TxBatchMsgs   int     `json:"tx_batch_messages"`
-	TxBatchItems  int     `json:"tx_batch_items"`
-	TxReconMsgs   int     `json:"tx_recon_messages"`
-	TxReconItems  int     `json:"tx_recon_items"`
-	TxReqMsgs     int     `json:"tx_request_messages"`
-	TxReqItems    int     `json:"tx_request_items"`
-	DroppedInv    int     `json:"dropped_inv_items"`
-	DroppedTxs    int     `json:"dropped_tx_items"`
-	RelayEvents   int     `json:"relay_events"`
-	RelayAvgMS    float64 `json:"relay_avg_ms,omitempty"`
-	RelayP95MS    float64 `json:"relay_p95_ms,omitempty"`
-	RelayMaxMS    float64 `json:"relay_max_ms,omitempty"`
+	Addr                   string  `json:"addr"`
+	Outbound               bool    `json:"outbound"`
+	QueueDepth             int     `json:"queue_depth"`
+	MaxQueueDepth          int     `json:"max_queue_depth"`
+	ControlQueueDepth      int     `json:"control_queue_depth"`
+	PriorityQueueDepth     int     `json:"priority_queue_depth"`
+	SendQueueDepth         int     `json:"send_queue_depth"`
+	MaxControlQueueDepth   int     `json:"max_control_queue_depth"`
+	MaxPriorityQueueDepth  int     `json:"max_priority_queue_depth"`
+	MaxSendQueueDepth      int     `json:"max_send_queue_depth"`
+	PendingLocalRelayTxs   int     `json:"pending_local_relay_txs"`
+	SentMessages           int     `json:"sent_messages"`
+	TxInvItems             int     `json:"tx_inv_items"`
+	BlockInvItems          int     `json:"block_inv_items"`
+	BlockSendItems         int     `json:"block_send_items"`
+	BlockReqItems          int     `json:"block_request_items"`
+	TxBatchMsgs            int     `json:"tx_batch_messages"`
+	TxBatchItems           int     `json:"tx_batch_items"`
+	TxReconMsgs            int     `json:"tx_recon_messages"`
+	TxReconItems           int     `json:"tx_recon_items"`
+	TxReconRetries         int     `json:"tx_recon_retries"`
+	TxReqMsgs              int     `json:"tx_request_messages"`
+	TxReqItems             int     `json:"tx_request_items"`
+	TxReqRecvMsgs          int     `json:"tx_request_received_messages"`
+	TxReqRecvItems         int     `json:"tx_request_received_items"`
+	FallbackTxBatchMsgs    int     `json:"fallback_tx_batch_messages"`
+	FallbackTxBatchItems   int     `json:"fallback_tx_batch_items"`
+	TxNotFoundSent         int     `json:"tx_not_found_sent"`
+	TxNotFoundReceived     int     `json:"tx_not_found_received"`
+	KnownTxClears          int     `json:"known_tx_clears"`
+	DuplicateInvSuppressed int     `json:"duplicate_inv_suppressed"`
+	DuplicateTxSuppressed  int     `json:"duplicate_tx_suppressed"`
+	KnownTxSuppressed      int     `json:"known_tx_suppressed"`
+	CoalescedTxItems       int     `json:"coalesced_tx_items"`
+	CoalescedReconItems    int     `json:"coalesced_recon_items"`
+	DroppedInv             int     `json:"dropped_inv_items"`
+	DroppedTxs             int     `json:"dropped_tx_items"`
+	WriterStarvationEvents int     `json:"writer_starvation_events"`
+	LastRelayActivityUnix  int64   `json:"last_relay_activity_unix,omitempty"`
+	RelayEvents            int     `json:"relay_events"`
+	RelayAvgMS             float64 `json:"relay_avg_ms,omitempty"`
+	RelayP95MS             float64 `json:"relay_p95_ms,omitempty"`
+	RelayMaxMS             float64 `json:"relay_max_ms,omitempty"`
 }
 
 type BlockTemplateStats struct {
@@ -176,63 +209,75 @@ type Service struct {
 	pool        *mempool.Pool
 	genesis     *types.Block
 
-	stateMu            sync.RWMutex
-	templateMu         sync.Mutex
-	peerMu             sync.RWMutex
-	downloadMu         sync.Mutex
-	recentMu           sync.RWMutex
-	peers              map[string]*peerConn
-	outboundPeers      map[string]struct{}
-	knownPeers         map[string]time.Time
-	vettedPeers        map[string]time.Time
-	blockRequests      map[[32]byte]blockDownloadRequest
-	txRequests         map[[32]byte]blockDownloadRequest
-	templateGeneration uint64
-	template           *blockTemplateCache
-	recentHdrs         recentHeaderCache
-	recentBlks         recentBlockCache
-	templateStats      templateBuildTelemetry
-	peerMgr            *peerManager
-	syncMgr            *syncManager
-	relaySched         *relayScheduler
-	mineHeaderFn       func(types.BlockHeader, consensus.ChainParams, func(uint32) bool) (types.BlockHeader, bool, error)
-	nodeID             string
-	dashboard          dashboardCache
-	systemStats        dashboardSystemStats
-	startedAt          time.Time
-	publicPage         bool
-	listener           net.Listener
-	rpcSrv             *http.Server
-	stopCh             chan struct{}
-	stopOnce           sync.Once
-	closeOnce          sync.Once
-	closeErr           error
-	wg                 sync.WaitGroup
+	stateMu          sync.RWMutex
+	stressMu         sync.Mutex
+	peerMu           sync.RWMutex
+	downloadMu       sync.Mutex
+	recentMu         sync.RWMutex
+	rebroadcastMu    sync.Mutex
+	peers            map[string]*peerConn
+	outboundPeers    map[string]struct{}
+	knownPeers       map[string]storage.KnownPeerRecord
+	blockRequests    map[[32]byte]blockDownloadRequest
+	txRequests       map[[32]byte]blockDownloadRequest
+	pendingBlocks    map[[32]byte]pendingPeerBlock
+	pendingChildren  map[[32]byte]map[[32]byte]struct{}
+	pendingBlockFIFO [][32]byte
+	localRebroadcast map[[32]byte]time.Time
+	stressPending    map[[32]byte]stressLaneBatch
+	recentHdrs       recentHeaderCache
+	recentBlks       recentBlockCache
+	peerMgr          *peerManager
+	syncMgr          *syncManager
+	relaySched       *relayScheduler
+	minerMgr         *minerManager
+	mineHeaderFn     func(types.BlockHeader, consensus.ChainParams, func(uint32) bool) (types.BlockHeader, bool, error)
+	nodeID           string
+	dashboard        dashboardCache
+	systemStats      dashboardSystemStats
+	perf             performanceMetricsCollector
+	throughput       throughputSummaryTelemetry
+	startedAt        time.Time
+	publicPage       bool
+	listener         net.Listener
+	rpcSrv           *http.Server
+	stopCh           chan struct{}
+	stopOnce         sync.Once
+	closeOnce        sync.Once
+	closeErr         error
+	wg               sync.WaitGroup
 }
 
 type peerConn struct {
-	addr            string
-	targetAddr      string
-	outbound        bool
-	wire            *p2p.Conn
-	version         p2p.VersionMessage
-	lastProgress    atomic.Int64
-	bestHeight      atomic.Uint64
-	controlQ        chan outboundMessage
-	relayPriorityQ  chan outboundMessage
-	sendQ           chan outboundMessage
-	closed          chan struct{}
-	closeOnce       sync.Once
-	invMu           sync.Mutex
-	queuedInv       map[p2p.InvVector]int
-	txMu            sync.Mutex
-	queuedTx        map[[32]byte]int
-	knownTx         map[[32]byte]struct{}
-	knownTxOrder    [][32]byte
-	pendingTxs      []types.Transaction
+	svc            *Service
+	addr           string
+	targetAddr     string
+	outbound       bool
+	connectedAt    time.Time
+	traffic        *peerTrafficMeter
+	wire           *p2p.Conn
+	version        p2p.VersionMessage
+	lastProgress   atomic.Int64
+	bestHeight     atomic.Uint64
+	controlQ       chan outboundMessage
+	relayPriorityQ chan outboundMessage
+	sendQ          chan outboundMessage
+	closed         chan struct{}
+	closeOnce      sync.Once
+	invMu          sync.Mutex
+	queuedInv      map[p2p.InvVector]int
+	txMu           sync.Mutex
+	queuedTx       map[[32]byte]int
+	knownTx        map[[32]byte]struct{}
+	knownTxOrder   [][32]byte
+	// Keep buffered relay payloads keyed by txid so coalescing does not repeatedly copy
+	// whole transaction structs through intermediate queue slices on busy fanout paths.
+	pendingTxOrder  [][32]byte
+	pendingTxByID   map[[32]byte]types.Transaction
 	txFlushArmed    bool
 	pendingRecon    [][32]byte
 	reconFlushArmed bool
+	localRelayTxs   map[[32]byte]localRelayFallbackState
 	thinMu          sync.Mutex
 	pendingThin     map[[32]byte]*pendingThinBlock
 	telemetry       peerRelayTelemetry
@@ -255,51 +300,80 @@ type peerSyncState struct {
 type outboundMessage struct {
 	msg        p2p.Message
 	enqueuedAt time.Time
+	lane       relayQueueLane
 	class      relayMessageClass
 	invItems   []p2p.InvVector
 }
 
+type relayQueueLane uint8
+
+const (
+	relayQueueLaneControl relayQueueLane = iota + 1
+	relayQueueLanePriority
+	relayQueueLaneSend
+)
+
 type relayMessageClass struct {
-	txInvItems    int
-	blockInvItems int
-	txBatchMsgs   int
-	txBatchItems  int
-	txReconMsgs   int
-	txReconItems  int
-	txReqMsgs     int
-	txReqItems    int
+	txInvItems           int
+	blockInvItems        int
+	blockSendItems       int
+	blockReqItems        int
+	txBatchMsgs          int
+	txBatchItems         int
+	fallbackTxBatchMsgs  int
+	fallbackTxBatchItems int
+	txReconMsgs          int
+	txReconItems         int
+	txReqMsgs            int
+	txReqItems           int
 }
 
 type peerRelayTelemetry struct {
-	mu            sync.Mutex
-	maxQueueDepth int
-	sentMessages  int
-	txInvItems    int
-	blockInvItems int
-	txBatchMsgs   int
-	txBatchItems  int
-	txReconMsgs   int
-	txReconItems  int
-	txReqMsgs     int
-	txReqItems    int
-	droppedInv    int
-	droppedTxs    int
-	relaySamples  []float64
+	mu                    sync.Mutex
+	maxQueueDepth         int
+	maxControlQueueDepth  int
+	maxPriorityQueueDepth int
+	maxSendQueueDepth     int
+	sentMessages          int
+	txInvItems            int
+	blockInvItems         int
+	blockSendItems        int
+	blockReqItems         int
+	txBatchMsgs           int
+	txBatchItems          int
+	txReconMsgs           int
+	txReconItems          int
+	txReconRetries        int
+	txReqMsgs             int
+	txReqItems            int
+	txReqRecvMsgs         int
+	txReqRecvItems        int
+	fallbackTxBatchMsgs   int
+	fallbackTxBatchItems  int
+	txNotFoundSent        int
+	txNotFoundReceived    int
+	knownTxClears         int
+	duplicateInv          int
+	duplicateTx           int
+	knownTxSuppressed     int
+	coalescedTxItems      int
+	coalescedReconItems   int
+	droppedInv            int
+	droppedTxs            int
+	writerStarvation      int
+	lastRelayActivityUnix int64
+	relaySamples          []float64
 }
 
-type blockTemplateCache struct {
-	tipHash       [32]byte
-	mempoolEpoch  uint64
-	generation    uint64
-	builtAt       time.Time
-	block         types.Block
-	selected      []mempool.SnapshotEntry
-	totalFees     uint64
-	usedTxBytes   int
-	baseUtxos     consensus.UtxoSet
-	selectionView *consensus.UtxoOverlay
-	baseAcc       *utreexo.Accumulator
-	selectionAcc  *utreexo.Accumulator
+type queueDepthSnapshot struct {
+	total    int
+	control  int
+	priority int
+	send     int
+}
+
+type localRelayFallbackState struct {
+	announcedAt time.Time
 }
 
 type blockDownloadRequest struct {
@@ -308,31 +382,10 @@ type blockDownloadRequest struct {
 	attempts    int
 }
 
-type templateBuildTelemetry struct {
-	mu                 sync.Mutex
-	cacheHits          int
-	rebuilds           int
-	frontierCandidates int
-	invalidations      int
-	interruptions      int
-	lastBuildAt        time.Time
-	lastReason         string
-}
-
-type chainSelectionSnapshot struct {
-	tipHash        [32]byte
-	height         uint64
-	tipHeader      types.BlockHeader
-	blockSizeState consensus.BlockSizeState
-	utxos          consensus.UtxoSet
-	utxoAcc        *utreexo.Accumulator
-}
-
-type chainTemplateContext struct {
-	tipHash        [32]byte
-	height         uint64
-	tipHeader      types.BlockHeader
-	blockSizeState consensus.BlockSizeState
+type pendingPeerBlock struct {
+	block      types.Block
+	peerAddr   string
+	receivedAt time.Time
 }
 
 type recentHeaderCache struct {
@@ -364,15 +417,88 @@ type publicDashboardView struct {
 	info        ServiceInfo
 	health      string
 	system      dashboardSystemSummary
+	performance PerformanceMetrics
 	blocks      []dashboardBlockPage
 	peers       []PeerInfo
 	relay       []PeerRelayStats
+	peerHosts   []dashboardPeerHostPage
 	template    BlockTemplateStats
 	pow         dashboardPowSummary
 	fees        dashboardFeeSummary
 	mining      dashboardMiningSummary
 	mempool     dashboardMempoolSummary
 	tpsChart    dashboardTPSChart
+}
+
+type dashboardPeerSocketPage struct {
+	Addr           string
+	Port           string
+	Outbound       bool
+	Height         uint64
+	Lag            uint64
+	LastSeenUnix   int64
+	LastUsefulUnix int64
+	UsefulBlocks   int
+	SessionAge     time.Duration
+	QueueDepth     int
+	LatencyAvgS    float64
+	LatencyP95S    float64
+	TxSent         int
+	TxRequested    int
+	BlockSent      int
+	BlockRequested int
+	BytesIn        uint64
+	BytesOut       uint64
+}
+
+type dashboardPeerHostPage struct {
+	Host           string
+	Health         string
+	Direction      string
+	Reason         string
+	Sockets        int
+	LastSeenUnix   int64
+	SessionAge     time.Duration
+	BlocksBehind   uint64
+	BestHeight     uint64
+	TipHash        string
+	LastBlockUnix  int64
+	LatencyAvgS    float64
+	LatencyP95S    float64
+	OutboundQueue  int
+	TxSent         int
+	TxRequested    int
+	BlockSent      int
+	BlockRequested int
+	BytesIn        uint64
+	BytesOut       uint64
+	SocketPages    []dashboardPeerSocketPage
+}
+
+type peerTrafficMeter struct {
+	rxBytes atomic.Uint64
+	txBytes atomic.Uint64
+}
+
+type meteredNetConn struct {
+	net.Conn
+	meter *peerTrafficMeter
+}
+
+func (c *meteredNetConn) Read(buf []byte) (int, error) {
+	n, err := c.Conn.Read(buf)
+	if n > 0 && c.meter != nil {
+		c.meter.rxBytes.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (c *meteredNetConn) Write(buf []byte) (int, error) {
+	n, err := c.Conn.Write(buf)
+	if n > 0 && c.meter != nil {
+		c.meter.txBytes.Add(uint64(n))
+	}
+	return n, err
 }
 
 type dashboardBlockPage struct {
@@ -390,6 +516,11 @@ type dashboardBlockPage struct {
 	MedianFee     uint64
 	LowFee        uint64
 	HighFee       uint64
+	MedianFeeRate uint64
+	LowFeeRate    uint64
+	HighFeeRate   uint64
+	PaidTxs       int
+	TotalUserTxs  int
 	MinedByNode   bool
 	PreviewTxs    []dashboardTxPage
 	HiddenTxCount int
@@ -428,14 +559,27 @@ type dashboardPowSummary struct {
 	CurrentBits        uint32
 	NextBits           uint32
 	Difficulty         float64
+	NetworkHashrate    float64
 	AvgBlockInterval   time.Duration
+	RecentBlockGap     time.Duration
 	HasObservedGap     bool
 	LastBlockTimestamp time.Time
 }
 
 type dashboardFeeSummary struct {
-	Recent []dashboardBlockFeeLine
-	Clear  dashboardMempoolClearEstimate
+	Recent        []dashboardBlockFeeLine
+	CurrentMedian uint64
+	Median6       uint64
+	Median24      uint64
+	RecentMin     uint64
+	RecentMax     uint64
+	PaidBlocks    int
+	TotalBlocks   int
+	FeePayingTxs  int
+	TotalTxs      int
+	Candidate     dashboardCandidateFeeLine
+	Bands         dashboardMempoolFeeBands
+	Clear         dashboardMempoolClearEstimate
 }
 
 type dashboardBlockFeeLine struct {
@@ -443,6 +587,27 @@ type dashboardBlockFeeLine struct {
 	MedianFee uint64
 	LowFee    uint64
 	HighFee   uint64
+	PaidTxs   int
+	TotalTxs  int
+	Candidate bool
+}
+
+type dashboardCandidateFeeLine struct {
+	Height    uint64
+	MedianFee uint64
+	LowFee    uint64
+	HighFee   uint64
+	PaidTxs   int
+	TotalTxs  int
+	Available bool
+}
+
+type dashboardMempoolFeeBands struct {
+	Above1000 int
+	Band500   int
+	Band100   int
+	Band1     int
+	Zero      int
 }
 
 type dashboardMempoolClearEstimate struct {
@@ -451,14 +616,18 @@ type dashboardMempoolClearEstimate struct {
 }
 
 type dashboardMiningSummary struct {
-	Enabled       bool
-	Workers       int
-	RecentHeights []uint64
-	RecentHashes  [][32]byte
+	Enabled           bool
+	Workers           int
+	EstimatedHashrate float64
+	RecentWins        int
+	RecentWindow      int
+	RecentHeights     []uint64
+	RecentHashes      [][32]byte
 }
 
 type dashboardMempoolSummary struct {
 	Count         int
+	Bytes         int
 	Orphans       int
 	Top           []mempool.SnapshotEntry
 	MedianFee     uint64
@@ -468,10 +637,17 @@ type dashboardMempoolSummary struct {
 }
 
 type dashboardTPSChart struct {
-	Label     string
-	Buckets   []float64
-	BucketEnd []time.Time
-	MaxTPS    float64
+	Label       string
+	Blocks      []dashboardThroughputBlock
+	TotalTx     int
+	AvgTPS      float64
+	AvgTxPerBlk float64
+}
+
+type dashboardThroughputBlock struct {
+	TxCount   int
+	Candidate bool
+	BarWidth  int
 }
 
 type dashboardSystemStats struct {
@@ -521,6 +697,16 @@ type FundingOutput struct {
 	BlockHash [32]byte
 }
 
+type StressLaneInfo struct {
+	ReserveKeyHash  string `json:"reserve_keyhash"`
+	ReserveUTXOs    int    `json:"reserve_utxos"`
+	ReserveAtoms    uint64 `json:"reserve_atoms"`
+	PendingBatches  int    `json:"pending_batches"`
+	PendingOutputs  int    `json:"pending_outputs"`
+	ReadyOutputs    int    `json:"ready_outputs"`
+	LastPendingTxID string `json:"last_pending_txid,omitempty"`
+}
+
 const (
 	dashboardSystemSampleInterval = 10 * time.Second
 	dashboardSystemMinimumWindow  = 10 * time.Second
@@ -532,6 +718,7 @@ const (
 	blockRequestBatchSize         = 128
 	maxKnownPeerAddrs             = 256
 	defaultMaxMessageBytes        = 64_000_000
+	stressLaneConfirmTimeout      = 8 * time.Minute
 )
 
 type pendingThinBlock struct {
@@ -539,6 +726,12 @@ type pendingThinBlock struct {
 	header types.BlockHeader
 	txs    []types.Transaction
 	filled []bool
+}
+
+type stressLaneBatch struct {
+	TxID      [32]byte
+	Outputs   []FundingOutput
+	CreatedAt time.Time
 }
 
 type rpcRequest struct {
@@ -664,24 +857,28 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 			MaxDescendants:     cfg.MaxDescendants,
 			MaxOrphans:         cfg.MaxOrphans,
 		}),
-		genesis:       genesis,
-		peers:         make(map[string]*peerConn),
-		outboundPeers: make(map[string]struct{}),
-		knownPeers:    make(map[string]time.Time),
-		vettedPeers:   make(map[string]time.Time),
-		blockRequests: make(map[[32]byte]blockDownloadRequest),
-		txRequests:    make(map[[32]byte]blockDownloadRequest),
-		recentHdrs:    recentHeaderCache{items: make(map[[32]byte]types.BlockHeader)},
-		recentBlks:    recentBlockCache{items: make(map[[32]byte]types.Block)},
-		startedAt:     time.Now(),
-		nodeID:        deriveNodeID(cfg),
-		publicPage:    shouldServePublicDashboard(),
-		stopCh:        make(chan struct{}),
-		mineHeaderFn:  consensus.MineHeaderInterruptible,
+		genesis:          genesis,
+		peers:            make(map[string]*peerConn),
+		outboundPeers:    make(map[string]struct{}),
+		knownPeers:       make(map[string]storage.KnownPeerRecord),
+		blockRequests:    make(map[[32]byte]blockDownloadRequest),
+		txRequests:       make(map[[32]byte]blockDownloadRequest),
+		pendingBlocks:    make(map[[32]byte]pendingPeerBlock),
+		pendingChildren:  make(map[[32]byte]map[[32]byte]struct{}),
+		localRebroadcast: make(map[[32]byte]time.Time),
+		stressPending:    make(map[[32]byte]stressLaneBatch),
+		recentHdrs:       recentHeaderCache{items: make(map[[32]byte]types.BlockHeader)},
+		recentBlks:       recentBlockCache{items: make(map[[32]byte]types.Block)},
+		startedAt:        time.Now(),
+		nodeID:           deriveNodeID(cfg),
+		publicPage:       shouldServePublicDashboard(),
+		stopCh:           make(chan struct{}),
+		mineHeaderFn:     consensus.MineHeaderInterruptible,
 	}
 	svc.peerMgr = &peerManager{svc: svc}
 	svc.syncMgr = &syncManager{svc: svc}
 	svc.relaySched = &relayScheduler{svc: svc}
+	svc.minerMgr = &minerManager{svc: svc}
 	svc.rememberKnownPeers(cfg.Peers)
 	if persistedPeers, err := chainState.Store().LoadKnownPeers(); err != nil {
 		chainState.Close()
@@ -780,6 +977,13 @@ func (s *Service) Start(ctx context.Context) error {
 			s.dashboardSystemLoop()
 		}()
 	}
+	if s.cfg.ThroughputSummaryInterval > 0 {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.throughputSummaryLoop()
+		}()
+	}
 	if s.cfg.P2PAddr != "" || len(s.cfg.Peers) > 0 {
 		s.wg.Add(1)
 		go func() {
@@ -791,6 +995,11 @@ func (s *Service) Start(ctx context.Context) error {
 			defer s.wg.Done()
 			s.outboundRefillLoop()
 		}()
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.localRebroadcastLoop()
+		}()
 	}
 	if s.cfg.MinerEnabled {
 		s.logger.Info("continuous miner enabled", slog.Int("workers", s.cfg.MinerWorkers))
@@ -798,7 +1007,7 @@ func (s *Service) Start(ctx context.Context) error {
 			s.wg.Add(1)
 			go func(workerID int) {
 				defer s.wg.Done()
-				s.minerLoop(workerID)
+				s.minerManager().minerLoop(workerID)
 			}(workerID)
 		}
 	}
@@ -832,6 +1041,13 @@ func (s *Service) relayManager() *relayScheduler {
 	return s.relaySched
 }
 
+func (s *Service) minerManager() *minerManager {
+	if s.minerMgr == nil {
+		s.minerMgr = &minerManager{svc: s}
+	}
+	return s.minerMgr
+}
+
 func (s *Service) acceptLoop()                      { s.peerManager().acceptLoop() }
 func (s *Service) canAcceptInboundPeer() bool       { return s.peerManager().canAcceptInboundPeer() }
 func (s *Service) ConnectPeer(addr string) error    { return s.peerManager().ConnectPeer(addr) }
@@ -856,6 +1072,7 @@ func (p *peerConn) send(msg p2p.Message) error {
 	envelope := outboundMessage{
 		msg:        msg,
 		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneControl,
 		class:      classifyRelayMessage(msg),
 	}
 	return p.enqueueDirectMessage(envelope)
@@ -867,20 +1084,43 @@ func (p *peerConn) enqueueDirectMessage(envelope outboundMessage) error {
 	q := p.sendQ
 	if p.controlQ != nil {
 		q = p.controlQ
+		envelope.lane = relayQueueLaneControl
+	} else {
+		envelope.lane = relayQueueLaneSend
 	}
 	select {
 	case <-p.closed:
 		return io.EOF
 	case q <- envelope:
-		p.telemetry.noteEnqueue(p.queueDepth())
+		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	case <-timer.C:
+		p.telemetry.noteWriterStarvation()
+		if p.svc != nil {
+			p.svc.noteWriterStarvation(1)
+		}
 		return errors.New("peer send queue saturated")
 	}
 }
 
 func (p *peerConn) enqueueTxRecon(msg p2p.TxReconMessage) error {
-	filtered := p.filterQueuedTxIDs(msg.TxIDs)
+	return p.enqueueTxReconWithPolicy(msg, true)
+}
+
+// Rebroadcast retries intentionally bypass the known-tx cache so peers that
+// only saw a prior announcement get another chance to request the full tx.
+func (p *peerConn) enqueueTxReconRetry(msg p2p.TxReconMessage) error {
+	if len(msg.TxIDs) > 0 {
+		p.telemetry.noteTxReconRetry(len(msg.TxIDs))
+		if p.svc != nil {
+			p.svc.noteTxReconRetry(len(msg.TxIDs))
+		}
+	}
+	return p.enqueueTxReconWithPolicy(msg, false)
+}
+
+func (p *peerConn) enqueueTxReconWithPolicy(msg p2p.TxReconMessage, suppressKnown bool) error {
+	filtered := p.filterQueuedTxIDs(msg.TxIDs, suppressKnown)
 	if len(filtered) == 0 {
 		return nil
 	}
@@ -913,19 +1153,21 @@ func (p *peerConn) enqueueInvItems(items []p2p.InvVector, priority bool) error {
 	envelope := outboundMessage{
 		msg:        p2p.InvMessage{Items: items},
 		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneSend,
 		class:      classifyRelayMessage(p2p.InvMessage{Items: items}),
 		invItems:   items,
 	}
 	q := p.sendQ
 	if priority && p.relayPriorityQ != nil {
 		q = p.relayPriorityQ
+		envelope.lane = relayQueueLanePriority
 	}
 	select {
 	case <-p.closed:
 		p.releaseQueuedInv(items)
 		return io.EOF
 	case q <- envelope:
-		p.telemetry.noteEnqueue(p.queueDepth())
+		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	default:
 		p.releaseQueuedInv(items)
@@ -956,9 +1198,37 @@ func (p *peerConn) sendRequestedTxBatch(msg p2p.TxBatchMessage) error {
 	envelope := outboundMessage{
 		msg:        msg,
 		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneControl,
 		class:      classifyRelayMessage(msg),
 	}
 	return p.enqueueDirectMessage(envelope)
+}
+
+func (p *peerConn) enqueueFallbackTxBatch(msg p2p.TxBatchMessage) error {
+	if len(msg.Txs) == 0 {
+		return nil
+	}
+	envelope := outboundMessage{
+		msg:        msg,
+		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneSend,
+		class: relayMessageClass{
+			txBatchMsgs:          1,
+			txBatchItems:         len(msg.Txs),
+			fallbackTxBatchMsgs:  1,
+			fallbackTxBatchItems: len(msg.Txs),
+		},
+	}
+	select {
+	case <-p.closed:
+		return io.EOF
+	case p.sendQ <- envelope:
+		p.telemetry.noteEnqueue(p.queueDepths())
+		return nil
+	default:
+		p.telemetry.noteDroppedTxs(len(msg.Txs))
+		return nil
+	}
 }
 
 func (p *peerConn) close() {
@@ -1014,14 +1284,19 @@ func (p *peerConn) drainSendQueue() {
 }
 
 func (p *peerConn) queueDepth() int {
-	depth := len(p.sendQ)
+	return p.queueDepths().total
+}
+
+func (p *peerConn) queueDepths() queueDepthSnapshot {
+	depths := queueDepthSnapshot{send: len(p.sendQ)}
 	if p.relayPriorityQ != nil {
-		depth += len(p.relayPriorityQ)
+		depths.priority = len(p.relayPriorityQ)
 	}
 	if p.controlQ != nil {
-		depth += len(p.controlQ)
+		depths.control = len(p.controlQ)
 	}
-	return depth
+	depths.total = depths.control + depths.priority + depths.send
+	return depths
 }
 
 func (p *peerConn) clearRelayState() {
@@ -1033,8 +1308,10 @@ func (p *peerConn) clearRelayState() {
 	p.queuedTx = make(map[[32]byte]int)
 	p.knownTx = make(map[[32]byte]struct{})
 	p.knownTxOrder = nil
-	p.pendingTxs = nil
+	p.pendingTxOrder = nil
+	p.pendingTxByID = nil
 	p.pendingRecon = nil
+	p.localRelayTxs = nil
 	p.txFlushArmed = false
 	p.reconFlushArmed = false
 	p.txMu.Unlock()
@@ -1062,6 +1339,10 @@ func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bo
 	peer.releaseQueuedInv(envelope.invItems)
 	peer.releaseRelayBatch(envelope.msg)
 	peer.telemetry.noteSent(envelope, peer.queueDepth())
+	if budget := relayLaneBudget(envelope.lane); budget > 0 && time.Since(envelope.enqueuedAt) > budget {
+		s.noteWriterStarvation(1)
+	}
+	s.noteRelaySent(envelope.class)
 	return true
 }
 
@@ -1099,7 +1380,12 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 		}
 		peer.noteUsefulHeaders(applied, time.Now())
 		if applied > 0 {
-			s.logger.Info("applied peer headers", slog.String("addr", peer.addr), slog.Int("count", applied), slog.Uint64("header_height", s.headerHeight()))
+			s.logger.Info("applied peer headers",
+				slog.String("addr", peer.addr),
+				slog.Int("count", applied),
+				slog.Uint64("header_height", s.headerHeight()),
+				slog.String("headers", headersDebugSummary(m.Headers, 4)),
+			)
 		}
 		return s.requestBlocks(peer)
 	case p2p.GetBlocksMessage:
@@ -1204,23 +1490,18 @@ func (s *Service) ChainStateInfo() ChainStateInfo {
 }
 
 func (s *Service) MempoolInfo() MempoolInfo {
-	entries := s.pool.Snapshot()
+	stats := s.pool.Stats()
 	info := MempoolInfo{
-		Count:              len(entries),
-		Orphans:            s.pool.OrphanCount(),
+		Count:              stats.Count,
+		Orphans:            stats.Orphans,
+		Bytes:              stats.Bytes,
+		TotalFees:          stats.TotalFees,
+		MedianFee:          stats.MedianFee,
+		LowFee:             stats.LowFee,
+		HighFee:            stats.HighFee,
 		MinRelayFeePerByte: s.cfg.MinRelayFeePerByte,
 		CandidateFrontier:  s.pool.SelectionCandidateCount(),
 	}
-	if len(entries) == 0 {
-		return info
-	}
-	fees := make([]uint64, 0, len(entries))
-	for _, entry := range entries {
-		info.Bytes += entry.Size
-		info.TotalFees += entry.Fee
-		fees = append(fees, entry.Fee)
-	}
-	info.MedianFee, info.LowFee, info.HighFee = summarizeFeeSet(fees)
 	return info
 }
 
@@ -1251,9 +1532,13 @@ func (s *Service) MiningInfo() MiningInfo {
 }
 
 func (s *Service) SubmitTx(tx types.Transaction) (mempool.Admission, error) {
+	startedAt := time.Now()
 	admissions, errs, orphanCount, mempoolSize := s.submitDecodedTxs([]types.Transaction{tx})
 	if errs[0] != nil {
-		s.logger.Warn("transaction rejected", slog.Any("error", errs[0]))
+		s.logger.Warn("transaction rejected",
+			slog.Any("error", errs[0]),
+			slog.Duration("admit_duration", time.Since(startedAt)),
+		)
 		return mempool.Admission{}, errs[0]
 	}
 	admission := admissions[0]
@@ -1264,6 +1549,7 @@ func (s *Service) SubmitTx(tx types.Transaction) (mempool.Admission, error) {
 			slog.Int("outputs", len(tx.Base.Outputs)),
 			slog.Int("orphan_count", orphanCount),
 			slog.Int("evicted_orphans", admission.EvictedOrphans),
+			slog.Duration("admit_duration", time.Since(startedAt)),
 		)
 		return admission, nil
 	}
@@ -1274,6 +1560,7 @@ func (s *Service) SubmitTx(tx types.Transaction) (mempool.Admission, error) {
 		slog.Uint64("fee", admission.Summary.Fee),
 		slog.Int("accepted_txs", len(admission.Accepted)),
 		slog.Int("mempool_size", mempoolSize),
+		slog.Duration("admit_duration", time.Since(startedAt)),
 	)
 	return admission, nil
 }
@@ -1480,10 +1767,43 @@ func (s *Service) submitDecodedTxs(txs []types.Transaction) ([]mempool.Admission
 }
 
 func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn) ([]mempool.Admission, []error, int, int) {
+	startedAt := time.Now()
 	s.releaseTxRequestsForTransactions(txs)
 	admissions := make([]mempool.Admission, len(txs))
 	errs := make([]error, len(txs))
 	accepted := make([]mempool.AcceptedTx, 0, len(txs))
+	acceptedCount := 0
+	orphanCount := 0
+	mempoolSize := 0
+	defer func() {
+		if len(txs) == 0 {
+			return
+		}
+		s.perf.noteAdmissionDuration(time.Since(startedAt))
+		errorCount := 0
+		for _, err := range errs {
+			if err != nil {
+				errorCount++
+			}
+		}
+		for _, admission := range admissions {
+			acceptedCount += len(admission.Accepted)
+		}
+		attrs := []slog.Attr{
+			slog.Int("tx_count", len(txs)),
+			slog.Int("accepted_txs", acceptedCount),
+			slog.Int("error_count", errorCount),
+			slog.Int("orphan_count", orphanCount),
+			slog.Int("mempool_size", mempoolSize),
+			slog.Duration("admit_duration", time.Since(startedAt)),
+		}
+		if source != nil {
+			attrs = append(attrs, slog.String("source_addr", source.addr))
+		} else {
+			attrs = append(attrs, slog.String("source_addr", "local"))
+		}
+		s.logger.LogAttrs(context.Background(), slog.LevelDebug, "tx admission batch complete", attrs...)
+	}()
 	rules := consensus.DefaultConsensusRules()
 	if len(txs) == 1 {
 		admission, err := s.pool.AcceptTx(txs[0], s.chainUtxoSnapshot(), rules)
@@ -1493,27 +1813,32 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 			admissions[0] = admission
 			accepted = append(accepted, admission.Accepted...)
 		}
-		orphanCount := s.pool.OrphanCount()
-		mempoolSize := s.pool.Count()
+		orphanCount = s.pool.OrphanCount()
+		mempoolSize = s.pool.Count()
+		s.noteAcceptedAdmissions(admissions)
 		if len(accepted) > 0 {
 			s.invalidateBlockTemplate("tx_admission")
 		}
+		s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
 		s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
 		return admissions, errs, orphanCount, mempoolSize
 	}
 	if batchHasInternalDependencies(txs) {
 		admissions, errs, accepted = s.submitDependentDecodedTxs(txs, rules)
-		orphanCount := s.pool.OrphanCount()
-		mempoolSize := s.pool.Count()
+		orphanCount = s.pool.OrphanCount()
+		mempoolSize = s.pool.Count()
+		s.noteAcceptedAdmissions(admissions)
 		if len(accepted) > 0 {
 			s.invalidateBlockTemplate("tx_admission")
 		}
+		s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
 		s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
 		return admissions, errs, orphanCount, mempoolSize
 	}
 	tipHash, chainUtxos := s.chainUtxoSnapshotWithTip()
-	snapshot := s.pool.AdmissionSnapshot()
-	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, snapshot, chainUtxos, rules)
+	view := s.pool.AcquireSharedAdmissionView()
+	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, rules)
+	view.Release()
 	for i := range txs {
 		if prepareErrs[i] != nil {
 			errs[i] = prepareErrs[i]
@@ -1534,13 +1859,32 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 		admissions[i] = admission
 		accepted = append(accepted, admission.Accepted...)
 	}
-	orphanCount := s.pool.OrphanCount()
-	mempoolSize := s.pool.Count()
+	orphanCount = s.pool.OrphanCount()
+	mempoolSize = s.pool.Count()
+	s.noteAcceptedAdmissions(admissions)
 	if len(accepted) > 0 {
 		s.invalidateBlockTemplate("tx_admission")
 	}
+	s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
 	s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
 	return admissions, errs, orphanCount, mempoolSize
+}
+
+func (s *Service) noteLocalOriginAcceptedTxs(txs []types.Transaction, admissions []mempool.Admission, errs []error, source *peerConn) {
+	if source != nil || len(txs) == 0 {
+		return
+	}
+	now := time.Now()
+	s.rebroadcastMu.Lock()
+	defer s.rebroadcastMu.Unlock()
+	for i := range txs {
+		if errs[i] != nil || admissions[i].Orphaned {
+			continue
+		}
+		// Track only txs explicitly submitted by the local operator path, not
+		// extra txs that happened to get promoted alongside them.
+		s.localRebroadcast[consensus.TxID(&txs[i])] = now
+	}
 }
 
 func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules consensus.ConsensusRules) ([]mempool.Admission, []error, []mempool.AcceptedTx) {
@@ -1621,8 +1965,9 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 		return admissions, errs, accepted
 	}
 	tipHash, chainUtxos := s.chainUtxoSnapshotWithTip()
-	snapshot := s.pool.AdmissionSnapshot()
-	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, snapshot, chainUtxos, rules)
+	view := s.pool.AcquireSharedAdmissionView()
+	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, rules)
+	view.Release()
 	var fallbackTipHash [32]byte
 	var fallbackChainUtxos consensus.UtxoSet
 	for i, tx := range txs {
@@ -1686,7 +2031,7 @@ func decodePackedTransactions(encoded string) ([]types.Transaction, error) {
 	return txs, nil
 }
 
-func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, snapshot mempool.AdmissionSnapshot, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) ([]mempool.PreparedAdmission, []error) {
+func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempool.SharedAdmissionView, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) ([]mempool.PreparedAdmission, []error) {
 	prepared := make([]mempool.PreparedAdmission, len(txs))
 	errs := make([]error, len(txs))
 	if len(txs) == 0 {
@@ -1706,7 +2051,7 @@ func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, snapshot me
 		go func() {
 			defer wg.Done()
 			for idx := range indexCh {
-				item, err := s.pool.PrepareAdmission(txs[idx], snapshot, chainUtxos, rules)
+				item, err := s.pool.PrepareAdmissionShared(txs[idx], view, chainUtxos, rules)
 				if err != nil {
 					errs[idx] = err
 					continue
@@ -1736,45 +2081,15 @@ func (s *Service) MineBlocks(count int) ([]string, error) {
 }
 
 func (s *Service) currentTemplateGeneration() uint64 {
-	s.templateMu.Lock()
-	defer s.templateMu.Unlock()
-	return s.templateGeneration
+	return s.minerManager().currentTemplateGeneration()
 }
 
 func (s *Service) invalidateBlockTemplate(reason string) {
-	s.templateMu.Lock()
-	s.templateGeneration++
-	s.template = nil
-	s.templateMu.Unlock()
-	s.templateStats.noteInvalidation(reason)
+	s.minerManager().invalidateBlockTemplate(reason)
 }
 
 func (s *Service) mineOneBlock() ([32]byte, error) {
-	for {
-		block, generation, err := s.buildBlockTemplateWithGeneration()
-		if err != nil {
-			return [32]byte{}, err
-		}
-		block, fresh, err := s.mineBlockTemplate(block, generation)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		if !fresh {
-			s.templateStats.noteInterruption()
-			continue
-		}
-		hash, _, err := s.acceptMinedBlock(block)
-		if err == nil {
-			return hash, nil
-		}
-		if errors.Is(err, ErrNoTip) {
-			return [32]byte{}, err
-		}
-		if strings.Contains(err.Error(), "stale template") {
-			continue
-		}
-		return [32]byte{}, err
-	}
+	return s.minerManager().mineOneBlock()
 }
 
 func (s *Service) mineBlockTemplate(block types.Block, generation uint64) (types.Block, bool, error) {
@@ -1823,6 +2138,7 @@ func (s *Service) MineFundingOutputs(keyHashes [][32]byte) ([]FundingOutput, err
 }
 
 func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) {
+	startedAt := time.Now()
 	hash := consensus.HeaderHash(&block.Header)
 
 	s.stateMu.Lock()
@@ -1856,169 +2172,37 @@ func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) 
 	if tip := s.chainState.ChainState().TipHeight(); tip != nil {
 		height = *tip
 	}
+	if err := s.chainState.Store().SetHeaderHashByHeight(height, hash); err != nil {
+		s.stateMu.Unlock()
+		return [32]byte{}, 0, err
+	}
 	s.stateMu.Unlock()
 
 	s.pool.RemoveConfirmed(&block)
+	s.promoteReadyOrphansAfterBlock(&block)
+	s.removeLocalRebroadcastForBlock(&block)
 	s.invalidateBlockTemplate("tip_advanced")
 	s.cacheRecentBlock(block)
 	s.cacheRecentHeader(block.Header)
 	s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
+	s.noteBlockAccepted()
 	s.logger.Info("block accepted",
 		slog.Uint64("height", height),
 		slog.String("hash", hex.EncodeToString(hash[:])),
 		slog.Int("txs", len(block.Txs)),
 		slog.Int("mempool_size", s.pool.Count()),
+		slog.Duration("apply_duration", time.Since(startedAt)),
 	)
+	s.perf.noteBlockApplyDuration(time.Since(startedAt))
 	return hash, height, nil
 }
 
 func (s *Service) BuildBlockTemplate() (types.Block, error) {
-	block, _, err := s.buildBlockTemplateWithGeneration()
-	return block, err
-}
-
-func (s *Service) buildBlockTemplateWithGeneration() (types.Block, uint64, error) {
-	ctx, err := s.chainTemplateContext()
-	if err != nil {
-		return types.Block{}, 0, err
-	}
-	mempoolEpoch := s.pool.Epoch()
-	if cached, generation, ok := s.cachedBlockTemplate(ctx.tipHash, mempoolEpoch); ok {
-		s.templateStats.noteCacheHit(s.pool.SelectionCandidateCount())
-		return cloneBlock(cached), generation, nil
-	}
-	if block, generation, ok, err := s.extendBlockTemplate(ctx, mempoolEpoch); err != nil {
-		return types.Block{}, 0, err
-	} else if ok {
-		s.templateStats.noteRebuild(s.pool.SelectionCandidateCount())
-		return cloneBlock(block), generation, nil
-	}
-	snapshot, err := s.chainSelectionSnapshot()
-	if err != nil {
-		return types.Block{}, 0, err
-	}
-	block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, err := s.buildBlockCandidate(snapshot)
-	if err != nil {
-		return types.Block{}, 0, err
-	}
-	generation := s.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, snapshot.utxoAcc, selectionAcc)
-	s.templateStats.noteRebuild(s.pool.SelectionCandidateCount())
-	return cloneBlock(block), generation, nil
-}
-
-func (s *Service) minerLoop(workerID int) {
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		default:
-		}
-		hash, err := s.mineOneBlock()
-		if err != nil {
-			if errors.Is(err, ErrNoTip) {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			s.logger.Warn("continuous mining failed", slog.Int("worker", workerID), slog.Any("error", err))
-			select {
-			case <-s.stopCh:
-				return
-			case <-time.After(250 * time.Millisecond):
-			}
-			continue
-		}
-		s.logger.Debug("miner worker found block", slog.Int("worker", workerID), slog.String("hash", hex.EncodeToString(hash[:])))
-	}
-}
-
-func (s *Service) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, uint64, int, consensus.UtxoSet, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
-	baseUtxos := snapshot.utxos
-	maxTemplateBytes := int(consensus.NextBlockSizeLimit(snapshot.blockSizeState, consensus.ParamsForProfile(s.cfg.Profile)))
-	if maxTemplateBytes > 1024 {
-		maxTemplateBytes -= 1024
-	}
-	selectedEntries, totalFees, selectionView := s.pool.SelectForBlockOverlay(baseUtxos, consensus.DefaultConsensusRules(), maxTemplateBytes)
-	selectionAcc, err := snapshot.utxoAcc.Apply(selectedEntrySpends(selectedEntries), selectedEntryLeaves(selectedEntries))
-	if err != nil {
-		return types.Block{}, nil, 0, 0, nil, nil, nil, err
-	}
-	block, usedTxBytes, err := s.assembleBlockTemplate(chainTemplateContext{
-		tipHash:        snapshot.tipHash,
-		height:         snapshot.height,
-		tipHeader:      snapshot.tipHeader,
-		blockSizeState: snapshot.blockSizeState,
-	}, selectedEntries, totalFees, selectionAcc)
-	if err != nil {
-		return types.Block{}, nil, 0, 0, nil, nil, nil, err
-	}
-	s.logger.Debug("building block candidate",
-		slog.Uint64("next_height", snapshot.height+1),
-		slog.Int("selected_txs", len(selectedEntries)),
-		slog.Uint64("total_fees", totalFees),
-	)
-	return block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, nil
-}
-
-func (s *Service) assembleBlockTemplate(ctx chainTemplateContext, selectedEntries []mempool.SnapshotEntry, totalFees uint64, selectionAcc *utreexo.Accumulator) (types.Block, int, error) {
-	params := consensus.ParamsForProfile(s.cfg.Profile)
-	nextTimestamp := ctx.tipHeader.Timestamp + uint64(params.TargetSpacingSecs)
-	if nextTimestamp <= ctx.tipHeader.Timestamp {
-		nextTimestamp = ctx.tipHeader.Timestamp + 1
-	}
-	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: ctx.height, Header: ctx.tipHeader}, params)
-	if err != nil {
-		return types.Block{}, 0, err
-	}
-
-	orderedEntries := append([]mempool.SnapshotEntry(nil), selectedEntries...)
-	sort.Slice(orderedEntries, func(i, j int) bool {
-		return bytes.Compare(orderedEntries[i].TxID[:], orderedEntries[j].TxID[:]) < 0
-	})
-
-	selected := make([]types.Transaction, 0, len(orderedEntries))
-	usedTxBytes := 0
-	for _, entry := range orderedEntries {
-		selected = append(selected, entry.Tx)
-		usedTxBytes += entry.Size
-	}
-
-	coinbase := coinbaseTxForHeight(ctx.height+1, []types.TxOutput{{
-		ValueAtoms: consensus.SubsidyAtoms(ctx.height+1, params) + totalFees,
-		KeyHash:    s.cfg.MinerKeyHash,
-	}})
-	coinbaseTxID := consensus.TxID(&coinbase)
-
-	txs := make([]types.Transaction, 0, len(selected)+1)
-	txs = append(txs, coinbase)
-	txs = append(txs, selected...)
-	_, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
-	coinbaseLeaves := make([]utreexo.UtxoLeaf, 0, len(coinbase.Base.Outputs))
-	for vout, output := range coinbase.Base.Outputs {
-		outPoint := types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}
-		coinbaseLeaves = append(coinbaseLeaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
-		})
-	}
-	finalAcc, err := selectionAcc.Apply(nil, coinbaseLeaves)
-	if err != nil {
-		return types.Block{}, 0, err
-	}
-	header := types.BlockHeader{
-		Version:        1,
-		PrevBlockHash:  ctx.tipHash,
-		MerkleTxIDRoot: txRoot,
-		MerkleAuthRoot: authRoot,
-		UTXORoot:       finalAcc.Root(),
-		Timestamp:      nextTimestamp,
-		NBits:          nbits,
-	}
-	return types.Block{Header: header, Txs: txs}, usedTxBytes, nil
+	return s.minerManager().BuildBlockTemplate()
 }
 
 func (s *Service) buildFundingBlock(keyHashes [][32]byte) (types.Block, []FundingOutput, error) {
-	ctx, err := s.chainSelectionSnapshot()
+	ctx, err := s.minerManager().chainSelectionSnapshot()
 	if err != nil {
 		return types.Block{}, nil, err
 	}
@@ -2123,155 +2307,6 @@ func (s *Service) chainTipHash() [32]byte {
 		return view.TipHash
 	}
 	return [32]byte{}
-}
-
-func (s *Service) chainTemplateContext() (chainTemplateContext, error) {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.CommittedView()
-	if !ok {
-		return chainTemplateContext{}, ErrNoTip
-	}
-	return chainTemplateContext{
-		tipHash:        view.TipHash,
-		height:         view.Height,
-		tipHeader:      view.TipHeader,
-		blockSizeState: view.BlockSizeState,
-	}, nil
-}
-
-func (s *Service) chainSelectionSnapshot() (chainSelectionSnapshot, error) {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.CommittedView()
-	if !ok {
-		return chainSelectionSnapshot{}, ErrNoTip
-	}
-	return chainSelectionSnapshot{
-		tipHash:        view.TipHash,
-		height:         view.Height,
-		tipHeader:      view.TipHeader,
-		blockSizeState: view.BlockSizeState,
-		utxos:          view.UTXOs,
-		utxoAcc:        view.UTXOAcc,
-	}, nil
-}
-
-func (s *Service) cachedBlockTemplate(tipHash [32]byte, mempoolEpoch uint64) (types.Block, uint64, bool) {
-	s.templateMu.Lock()
-	defer s.templateMu.Unlock()
-	if s.template == nil || s.template.tipHash != tipHash || s.template.mempoolEpoch != mempoolEpoch {
-		return types.Block{}, 0, false
-	}
-	return cloneBlock(s.template.block), s.template.generation, true
-}
-
-func (s *Service) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoch uint64) (types.Block, uint64, bool, error) {
-	s.templateMu.Lock()
-	defer s.templateMu.Unlock()
-	if s.template == nil || s.template.tipHash != ctx.tipHash || s.template.mempoolEpoch >= mempoolEpoch {
-		return types.Block{}, 0, false, nil
-	}
-	maxTemplateBytes := int(consensus.NextBlockSizeLimit(ctx.blockSizeState, consensus.ParamsForProfile(s.cfg.Profile)))
-	if maxTemplateBytes > 1024 {
-		maxTemplateBytes -= 1024
-	}
-	if s.template.usedTxBytes >= maxTemplateBytes {
-		return types.Block{}, 0, false, nil
-	}
-	if !s.pool.ContainsAll(s.template.selected) {
-		return types.Block{}, 0, false, nil
-	}
-
-	added, addedFees := s.pool.AppendForBlockOverlay(s.template.baseUtxos, s.template.selectionView, consensus.DefaultConsensusRules(), maxTemplateBytes, s.template.selected)
-	if len(added) == 0 {
-		s.template.mempoolEpoch = mempoolEpoch
-		block, _, err := s.assembleBlockTemplate(ctx, s.template.selected, s.template.totalFees, s.template.selectionAcc)
-		if err != nil {
-			return types.Block{}, 0, false, err
-		}
-		s.template.block = cloneBlock(block)
-		s.template.builtAt = time.Now()
-		s.templateStats.noteBuildTime(s.template.builtAt)
-		return cloneBlock(s.template.block), s.template.generation, true, nil
-	}
-
-	s.template.selected = append(s.template.selected, added...)
-	s.template.totalFees += addedFees
-	for _, entry := range added {
-		s.template.usedTxBytes += entry.Size
-	}
-	nextAcc, err := s.template.selectionAcc.Apply(selectedEntrySpends(added), selectedEntryLeaves(added))
-	if err != nil {
-		return types.Block{}, 0, false, err
-	}
-	s.template.selectionAcc = nextAcc
-	block, _, err := s.assembleBlockTemplate(ctx, s.template.selected, s.template.totalFees, s.template.selectionAcc)
-	if err != nil {
-		return types.Block{}, 0, false, err
-	}
-	s.template.block = cloneBlock(block)
-	s.template.mempoolEpoch = mempoolEpoch
-	s.template.builtAt = time.Now()
-	s.templateStats.noteBuildTime(s.template.builtAt)
-	return cloneBlock(s.template.block), s.template.generation, true, nil
-}
-
-func (s *Service) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, totalFees uint64, usedTxBytes int, baseUtxos consensus.UtxoSet, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
-	s.templateMu.Lock()
-	defer s.templateMu.Unlock()
-	if s.templateGeneration == 0 {
-		s.templateGeneration = 1
-	}
-	generation := s.templateGeneration
-	s.template = &blockTemplateCache{
-		tipHash:       tipHash,
-		mempoolEpoch:  mempoolEpoch,
-		generation:    generation,
-		builtAt:       time.Now(),
-		block:         cloneBlock(block),
-		selected:      append([]mempool.SnapshotEntry(nil), selected...),
-		totalFees:     totalFees,
-		usedTxBytes:   usedTxBytes,
-		baseUtxos:     baseUtxos,
-		selectionView: selectionView,
-		baseAcc:       baseAcc,
-		selectionAcc:  selectionAcc,
-	}
-	s.templateStats.noteBuildTime(s.template.builtAt)
-	return generation
-}
-
-func cloneBlock(block types.Block) types.Block {
-	out := block
-	if len(block.Txs) != 0 {
-		out.Txs = append([]types.Transaction(nil), block.Txs...)
-	}
-	return out
-}
-
-func selectedEntrySpends(entries []mempool.SnapshotEntry) []types.OutPoint {
-	spent := make([]types.OutPoint, 0)
-	for _, entry := range entries {
-		for _, input := range entry.Tx.Base.Inputs {
-			spent = append(spent, input.PrevOut)
-		}
-	}
-	return spent
-}
-
-func selectedEntryLeaves(entries []mempool.SnapshotEntry) []utreexo.UtxoLeaf {
-	created := make([]utreexo.UtxoLeaf, 0)
-	for _, entry := range entries {
-		for vout, output := range entry.Tx.Base.Outputs {
-			created = append(created, utreexo.UtxoLeaf{
-				OutPoint:   types.OutPoint{TxID: entry.TxID, Vout: uint32(vout)},
-				ValueAtoms: output.ValueAtoms,
-				KeyHash:    output.KeyHash,
-			})
-		}
-	}
-	return created
 }
 
 func buildXThinBlockMessage(block types.Block) p2p.Message {
@@ -2563,7 +2598,7 @@ func (s *Service) blocksFromLocator(locator [][32]byte, stopHash [32]byte) ([]p2
 		return nil, err
 	}
 	for height := startHeight + 1; height <= *tip && len(out) < 500; height++ {
-		hash, err := s.chainState.Store().GetBlockHashByHeight(height)
+		hash, err := s.chainState.Store().GetHeaderHashByHeight(height)
 		if err != nil {
 			return nil, err
 		}
@@ -2588,6 +2623,8 @@ func (s *Service) applyPeerHeaders(headers []types.BlockHeader) (int, error) {
 		return 0, ErrNoTip
 	}
 	parentHash := headers[0].PrevBlockHash
+	firstHash := consensus.HeaderHash(&headers[0])
+	lastHash := consensus.HeaderHash(&headers[len(headers)-1])
 	parentEntry, err := s.chainState.Store().GetBlockIndex(&parentHash)
 	if err != nil {
 		return 0, err
@@ -2639,14 +2676,16 @@ func (s *Service) applyPeerHeaders(headers []types.BlockHeader) (int, error) {
 		return applied, err
 	}
 	oldTipHeight := currentTipEntry.Height
+	oldTipHash := currentTipHash
 	var activeEntries []storage.HeaderBatchEntry
 	var activeForkHeight uint64
+	promoted := false
 	if consensus.CompareChainWork(prevEntry.ChainWork, currentTipEntry.ChainWork) > 0 {
-		promoted := NewHeaderChain(s.headerChain.Profile())
-		if err := promoted.InitializeTip(prevEntry.Height, prevEntry.Header); err != nil {
+		promotedChain := NewHeaderChain(s.headerChain.Profile())
+		if err := promotedChain.InitializeTip(prevEntry.Height, prevEntry.Header); err != nil {
 			return applied, err
 		}
-		nextChain = promoted
+		nextChain = promotedChain
 		stored = &storage.StoredHeaderState{
 			Profile:   s.headerChain.Profile(),
 			Height:    prevEntry.Height,
@@ -2656,11 +2695,33 @@ func (s *Service) applyPeerHeaders(headers []types.BlockHeader) (int, error) {
 		if err != nil {
 			return applied, err
 		}
+		promoted = true
 	}
 	if err := s.chainState.Store().CommitHeaderChain(stored, batchEntries, activeForkHeight, oldTipHeight, activeEntries); err != nil {
 		return 0, err
 	}
 	s.headerChain = nextChain
+	if promoted {
+		s.logger.Info("promoted higher-work header branch",
+			slog.Uint64("fork_height", activeForkHeight),
+			slog.Uint64("old_header_height", oldTipHeight),
+			slog.Uint64("new_header_height", prevEntry.Height),
+			slog.String("old_tip", shortHexBytes(oldTipHash, 16)),
+			slog.String("new_tip", shortHexBytes(lastHash, 16)),
+			slog.Int("branch_headers", len(activeEntries)),
+			slog.String("batch_first", shortHexBytes(firstHash, 16)),
+			slog.String("batch_last", shortHexBytes(lastHash, 16)),
+		)
+	} else {
+		s.logger.Debug("stored non-winning peer header branch",
+			slog.Uint64("parent_height", parentEntry.Height),
+			slog.Uint64("branch_tip_height", prevEntry.Height),
+			slog.Uint64("active_header_height", oldTipHeight),
+			slog.String("parent", shortHexBytes(parentHash, 16)),
+			slog.String("batch_first", shortHexBytes(firstHash, 16)),
+			slog.String("batch_last", shortHexBytes(lastHash, 16)),
+		)
+	}
 	return applied, nil
 }
 
@@ -2668,7 +2729,7 @@ func (s *Service) headerBranchEntriesLocked(tip storage.BlockIndexEntry, batchEn
 	entries := make([]storage.HeaderBatchEntry, 0, 8)
 	cursor := tip
 	for {
-		activeHash, err := s.chainState.Store().GetBlockHashByHeight(cursor.Height)
+		activeHash, err := s.chainState.Store().GetHeaderHashByHeight(cursor.Height)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -2697,42 +2758,175 @@ func (s *Service) headerBranchEntriesLocked(tip storage.BlockIndexEntry, batchEn
 	}
 }
 
-func (s *Service) applyPeerBlock(block *types.Block) (bool, error) {
-	s.stateMu.Lock()
+func (s *Service) applyPeerBlock(block *types.Block) (bool, time.Duration, error) {
+	startedAt := time.Now()
 	hash := consensus.HeaderHash(&block.Header)
 	entry, err := s.chainState.Store().GetBlockIndex(&hash)
 	if err != nil {
-		s.stateMu.Unlock()
-		return false, err
+		return false, 0, err
+	}
+	lockWaitStarted := time.Now()
+	s.stateMu.Lock()
+	s.perf.noteBlockApplyLockWaitDuration(time.Since(lockWaitStarted))
+	// We already hold stateMu here, so read the committed tip fields directly
+	// instead of calling helpers like blockHeight() that would try to take it again.
+	beforeHeight := uint64(0)
+	if tipHeight := s.chainState.ChainState().TipHeight(); tipHeight != nil {
+		beforeHeight = *tipHeight
+	}
+	var beforeHash [32]byte
+	if tip := s.chainState.ChainState().TipHeader(); tip != nil {
+		beforeHash = consensus.HeaderHash(tip)
 	}
 	if entry == nil {
 		s.stateMu.Unlock()
-		return false, fmt.Errorf("cannot apply block %x without indexed header", hash)
+		return false, 0, fmt.Errorf("%w: %x", ErrBlockHeaderNotIndexed, hash)
 	}
 	if _, err := s.chainState.ApplyBlock(block); err != nil {
 		s.stateMu.Unlock()
-		return false, err
+		return false, 0, err
+	}
+	afterHeight := uint64(0)
+	if tipHeight := s.chainState.ChainState().TipHeight(); tipHeight != nil {
+		afterHeight = *tipHeight
+	}
+	var afterHash [32]byte
+	if tip := s.chainState.ChainState().TipHeader(); tip != nil {
+		afterHash = consensus.HeaderHash(tip)
 	}
 	s.stateMu.Unlock()
 	s.pool.RemoveConfirmed(block)
+	s.promoteReadyOrphansAfterBlock(block)
+	s.removeLocalRebroadcastForBlock(block)
 	s.cacheRecentBlock(*block)
-	return true, nil
+	return afterHeight != beforeHeight || afterHash != beforeHash, time.Since(startedAt), nil
+}
+
+func (s *Service) localRebroadcastLoop() {
+	ticker := time.NewTicker(localOriginRebroadcastInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.rebroadcastLocalTxs()
+		}
+	}
+}
+
+func (s *Service) rebroadcastLocalTxs() {
+	peers := s.peerSnapshot()
+	if len(peers) == 0 {
+		return
+	}
+	now := time.Now()
+	s.rebroadcastMu.Lock()
+	if len(s.localRebroadcast) == 0 {
+		s.rebroadcastMu.Unlock()
+		return
+	}
+	txids := make([][32]byte, 0, len(s.localRebroadcast))
+	for txid := range s.localRebroadcast {
+		if !s.pool.Contains(txid) {
+			delete(s.localRebroadcast, txid)
+			continue
+		}
+		s.localRebroadcast[txid] = now
+		txids = append(txids, txid)
+	}
+	s.rebroadcastMu.Unlock()
+	if len(txids) == 0 {
+		return
+	}
+	accepted := make([]mempool.AcceptedTx, 0, len(txids))
+	for _, txid := range txids {
+		accepted = append(accepted, mempool.AcceptedTx{TxID: txid})
+	}
+	s.broadcastAcceptedTxsToPeersRetry(peers, accepted)
+}
+
+func (s *Service) promoteReadyOrphansAfterBlock(block *types.Block) {
+	promoted := s.pool.PromoteReadyOrphansForBlock(block, s.chainUtxoSnapshot(), consensus.DefaultConsensusRules())
+	if len(promoted) == 0 {
+		return
+	}
+	s.notePromotedLocalRelayTxs(promoted)
+	s.invalidateBlockTemplate("orphan_promotion")
+	s.broadcastAcceptedTxsToPeers(s.peerSnapshot(), promoted)
+	if s.logger != nil {
+		s.logger.Debug("promoted ready orphans after block acceptance",
+			slog.Int("promoted", len(promoted)),
+			slog.Int("mempool_size", s.pool.Count()),
+			slog.Int("orphan_count", s.pool.OrphanCount()),
+			slog.String("txids", acceptedTxDebugSummary(promoted, 6)),
+		)
+	}
+}
+
+func (s *Service) notePromotedLocalRelayTxs(accepted []mempool.AcceptedTx) {
+	if len(accepted) == 0 {
+		return
+	}
+	now := time.Now()
+	s.rebroadcastMu.Lock()
+	defer s.rebroadcastMu.Unlock()
+	for _, item := range accepted {
+		s.localRebroadcast[item.TxID] = now
+	}
+}
+
+func (s *Service) removeLocalRebroadcastForBlock(block *types.Block) {
+	if block == nil || len(block.Txs) <= 1 {
+		return
+	}
+	s.rebroadcastMu.Lock()
+	defer s.rebroadcastMu.Unlock()
+	for i := 1; i < len(block.Txs); i++ {
+		delete(s.localRebroadcast, consensus.TxID(&block.Txs[i]))
+	}
 }
 
 func (s *Service) acceptPeerBlockMessage(peer *peerConn, block *types.Block) error {
 	hash := consensus.HeaderHash(&block.Header)
-	applied, err := s.applyPeerBlock(block)
+	applied, applyDuration, err := s.applyPeerBlock(block)
+	if errors.Is(err, ErrBlockHeaderNotIndexed) {
+		if _, seen := s.recentHeader(hash); seen {
+			if _, headerErr := s.applyPeerHeaders([]types.BlockHeader{block.Header}); headerErr == nil {
+				applied, applyDuration, err = s.applyPeerBlock(block)
+			}
+		}
+	}
 	if err != nil {
 		return s.handlePeerBlockAcceptanceError(peer, block, err)
 	}
 	s.releaseBlockRequest(hash)
+	s.removePendingPeerBlock(hash)
 	if applied {
 		peer.noteHeight(s.blockHeight())
 		peer.noteUsefulBlocks(1, time.Now())
 		s.invalidateBlockTemplate("peer_block")
-		s.logger.Info("applied peer block", slog.String("addr", peer.addr), slog.Uint64("block_height", s.blockHeight()))
+		s.noteBlockAccepted()
+		s.perf.noteBlockApplyDuration(applyDuration)
+		s.logger.Info("applied peer block",
+			slog.String("addr", peer.addr),
+			slog.String("hash", fmt.Sprintf("%x", hash)),
+			slog.Uint64("block_height", s.blockHeight()),
+			slog.Duration("apply_duration", applyDuration),
+		)
 		s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
+	} else {
+		s.perf.noteBlockApplyDuration(applyDuration)
+		s.logger.Debug("validated side-branch peer block",
+			slog.String("addr", peer.addr),
+			slog.String("hash", fmt.Sprintf("%x", hash)),
+			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
+			slog.Uint64("active_height", s.blockHeight()),
+			slog.Uint64("header_height", s.headerHeight()),
+			slog.Duration("apply_duration", applyDuration),
+		)
 	}
+	s.drainPendingPeerBlocks(hash)
 	return s.requestBlocks(peer)
 }
 
@@ -2775,30 +2969,283 @@ func (s *Service) handlePeerBlockAcceptanceError(peer *peerConn, block *types.Bl
 	switch {
 	case errors.Is(err, ErrBlockAlreadyKnown):
 		s.releaseBlockRequest(hash)
+		s.removePendingPeerBlock(hash)
 		s.logger.Debug("ignoring duplicate peer block",
 			slog.String("addr", peer.addr),
-			slog.String("hash", fmt.Sprintf("%x", hash)),
+			slog.String("hash", shortHexBytes(hash, 16)),
+			slog.Uint64("tip_height", s.blockHeight()),
+			slog.Uint64("header_height", s.headerHeight()),
 		)
+		s.drainPendingPeerBlocks(hash)
 		return s.requestBlocks(peer)
 	case errors.Is(err, ErrUnknownParent):
-		s.logger.Debug("peer block arrived before parent header",
+		added, pendingCount, evicted, evictedHash := s.storePendingPeerBlock(peer.addr, block)
+		s.releaseBlockRequest(hash)
+		s.logger.Warn("peer block arrived before parent header",
 			slog.String("addr", peer.addr),
-			slog.String("hash", fmt.Sprintf("%x", hash)),
-			slog.String("parent", fmt.Sprintf("%x", block.Header.PrevBlockHash)),
+			slog.String("hash", shortHexBytes(hash, 16)),
+			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
+			slog.Bool("queued", added),
+			slog.Int("pending_blocks", pendingCount),
+			slog.Uint64("tip_height", s.blockHeight()),
+			slog.Uint64("header_height", s.headerHeight()),
+			slog.String("peer_sync", s.peerSyncDebugSummary(4)),
+			slog.String("inflight_blocks", s.inflightBlockDebugSummary(6)),
+			slog.String("pending_detail", s.pendingPeerBlockDebugSummary(6)),
 		)
+		if evicted {
+			s.logger.Warn("evicted oldest queued peer block while retaining out-of-order block",
+				slog.String("hash", shortHexBytes(evictedHash, 16)),
+				slog.Int("limit", maxPendingPeerBlocks),
+			)
+		}
 		return s.requestHeaders(peer, hash)
-	case errors.Is(err, ErrParentStateUnavailable) || strings.Contains(err.Error(), "without indexed header"):
-		s.logger.Debug("peer block requires catch-up before apply",
+	case errors.Is(err, ErrParentStateUnavailable) || errors.Is(err, ErrBlockHeaderNotIndexed):
+		added, pendingCount, evicted, evictedHash := s.storePendingPeerBlock(peer.addr, block)
+		s.releaseBlockRequest(hash)
+		s.logger.Warn("peer block requires catch-up before apply",
 			slog.String("addr", peer.addr),
-			slog.String("hash", fmt.Sprintf("%x", hash)),
+			slog.String("hash", shortHexBytes(hash, 16)),
+			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
+			slog.Bool("queued", added),
+			slog.Int("pending_blocks", pendingCount),
 			slog.Any("error", err),
+			slog.Uint64("tip_height", s.blockHeight()),
+			slog.Uint64("header_height", s.headerHeight()),
+			slog.String("peer_sync", s.peerSyncDebugSummary(4)),
+			slog.String("inflight_blocks", s.inflightBlockDebugSummary(6)),
+			slog.String("pending_detail", s.pendingPeerBlockDebugSummary(6)),
 		)
+		if evicted {
+			s.logger.Warn("evicted oldest queued peer block while retaining competing-branch child",
+				slog.String("hash", shortHexBytes(evictedHash, 16)),
+				slog.Int("limit", maxPendingPeerBlocks),
+			)
+		}
 		if syncErr := s.requestHeaders(peer, hash); syncErr != nil {
 			return syncErr
 		}
 		return s.requestBlocks(peer)
 	default:
+		s.logger.Warn("peer block apply failed",
+			slog.String("addr", peer.addr),
+			slog.String("hash", shortHexBytes(hash, 16)),
+			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
+			slog.Any("error", err),
+			slog.Uint64("tip_height", s.blockHeight()),
+			slog.Uint64("header_height", s.headerHeight()),
+			slog.String("peer_sync", s.peerSyncDebugSummary(4)),
+			slog.String("inflight_blocks", s.inflightBlockDebugSummary(6)),
+		)
 		return err
+	}
+}
+
+func (s *Service) storePendingPeerBlock(peerAddr string, block *types.Block) (bool, int, bool, [32]byte) {
+	hash := consensus.HeaderHash(&block.Header)
+	parent := block.Header.PrevBlockHash
+	now := time.Now()
+
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+
+	if existing, ok := s.pendingBlocks[hash]; ok {
+		if existing.peerAddr == "" {
+			existing.peerAddr = peerAddr
+		}
+		existing.block = *block
+		existing.receivedAt = now
+		s.pendingBlocks[hash] = existing
+		return false, len(s.pendingBlocks), false, [32]byte{}
+	}
+
+	var evictedHash [32]byte
+	evicted := false
+	if len(s.pendingBlocks) >= maxPendingPeerBlocks {
+		evictedHash, evicted = s.evictOldestPendingPeerBlockLocked()
+	}
+
+	s.pendingBlocks[hash] = pendingPeerBlock{
+		block:      *block,
+		peerAddr:   peerAddr,
+		receivedAt: now,
+	}
+	if s.pendingChildren[parent] == nil {
+		s.pendingChildren[parent] = make(map[[32]byte]struct{})
+	}
+	s.pendingChildren[parent][hash] = struct{}{}
+	s.pendingBlockFIFO = append(s.pendingBlockFIFO, hash)
+	return true, len(s.pendingBlocks), evicted, evictedHash
+}
+
+func (s *Service) removePendingPeerBlock(hash [32]byte) {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	s.removePendingPeerBlockLocked(hash)
+}
+
+func (s *Service) removePendingPeerBlockLocked(hash [32]byte) {
+	entry, ok := s.pendingBlocks[hash]
+	if !ok {
+		return
+	}
+	delete(s.pendingBlocks, hash)
+	parent := entry.block.Header.PrevBlockHash
+	if children, ok := s.pendingChildren[parent]; ok {
+		delete(children, hash)
+		if len(children) == 0 {
+			delete(s.pendingChildren, parent)
+		}
+	}
+	for i, candidate := range s.pendingBlockFIFO {
+		if candidate == hash {
+			s.pendingBlockFIFO = append(s.pendingBlockFIFO[:i], s.pendingBlockFIFO[i+1:]...)
+			break
+		}
+	}
+}
+
+func (s *Service) evictOldestPendingPeerBlockLocked() ([32]byte, bool) {
+	for len(s.pendingBlockFIFO) > 0 {
+		hash := s.pendingBlockFIFO[0]
+		s.pendingBlockFIFO = s.pendingBlockFIFO[1:]
+		if _, ok := s.pendingBlocks[hash]; !ok {
+			continue
+		}
+		entry := s.pendingBlocks[hash]
+		delete(s.pendingBlocks, hash)
+		parent := entry.block.Header.PrevBlockHash
+		if children, ok := s.pendingChildren[parent]; ok {
+			delete(children, hash)
+			if len(children) == 0 {
+				delete(s.pendingChildren, parent)
+			}
+		}
+		return hash, true
+	}
+	return [32]byte{}, false
+}
+
+func (s *Service) pendingPeerBlockChildren(parent [32]byte) []pendingPeerBlock {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	children := s.pendingChildren[parent]
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]pendingPeerBlock, 0, len(children))
+	for hash := range children {
+		entry, ok := s.pendingBlocks[hash]
+		if !ok {
+			continue
+		}
+		out = append(out, entry)
+	}
+	slices.SortFunc(out, func(a, b pendingPeerBlock) int {
+		if !a.receivedAt.Equal(b.receivedAt) {
+			if a.receivedAt.Before(b.receivedAt) {
+				return -1
+			}
+			return 1
+		}
+		left := consensus.HeaderHash(&a.block.Header)
+		right := consensus.HeaderHash(&b.block.Header)
+		return bytes.Compare(left[:], right[:])
+	})
+	return out
+}
+
+func (s *Service) hasPendingPeerBlock(hash [32]byte) bool {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	_, ok := s.pendingBlocks[hash]
+	return ok
+}
+
+func (s *Service) pendingPeerBlockCount() int {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	return len(s.pendingBlocks)
+}
+
+func (s *Service) pendingPeerBlockDebugSummary(limit int) string {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	if len(s.pendingBlocks) == 0 {
+		return "none"
+	}
+	items := make([]string, 0, len(s.pendingBlocks))
+	for hash, entry := range s.pendingBlocks {
+		items = append(items, fmt.Sprintf("%s<- %s@%s", shortHexBytes(hash, 8), shortHexBytes(entry.block.Header.PrevBlockHash, 8), shortPeerAddr(entry.peerAddr)))
+	}
+	slices.Sort(items)
+	if limit > 0 && len(items) > limit {
+		extra := len(items) - limit
+		items = append(items[:limit], fmt.Sprintf("... +%d more", extra))
+	}
+	return strings.Join(items, ", ")
+}
+
+func (s *Service) drainPendingPeerBlocks(parentHash [32]byte) {
+	queue := [][32]byte{parentHash}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		children := s.pendingPeerBlockChildren(current)
+		for _, queued := range children {
+			hash := consensus.HeaderHash(&queued.block.Header)
+			applied, applyDuration, err := s.applyPeerBlock(&queued.block)
+			switch {
+			case err == nil:
+				s.releaseBlockRequest(hash)
+				s.removePendingPeerBlock(hash)
+				if applied {
+					s.invalidateBlockTemplate("peer_block")
+					s.noteBlockAccepted()
+					s.perf.noteBlockApplyDuration(applyDuration)
+					s.logger.Info("applied queued peer block",
+						slog.String("addr", queued.peerAddr),
+						slog.String("hash", fmt.Sprintf("%x", hash)),
+						slog.Uint64("block_height", s.blockHeight()),
+						slog.Duration("apply_duration", applyDuration),
+						slog.Int("pending_remaining", s.pendingPeerBlockCount()),
+					)
+					s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
+				} else {
+					s.perf.noteBlockApplyDuration(applyDuration)
+					s.logger.Debug("validated queued side-branch peer block",
+						slog.String("addr", queued.peerAddr),
+						slog.String("hash", fmt.Sprintf("%x", hash)),
+						slog.String("parent", shortHexBytes(queued.block.Header.PrevBlockHash, 16)),
+						slog.Uint64("active_height", s.blockHeight()),
+						slog.Uint64("header_height", s.headerHeight()),
+						slog.Duration("apply_duration", applyDuration),
+					)
+				}
+				queue = append(queue, hash)
+			case errors.Is(err, ErrBlockAlreadyKnown):
+				s.releaseBlockRequest(hash)
+				s.removePendingPeerBlock(hash)
+				queue = append(queue, hash)
+			case errors.Is(err, ErrUnknownParent), errors.Is(err, ErrParentStateUnavailable), strings.Contains(err.Error(), "without indexed header"):
+				s.logger.Debug("queued peer block still waiting on parent state",
+					slog.String("addr", queued.peerAddr),
+					slog.String("hash", shortHexBytes(hash, 16)),
+					slog.String("parent", shortHexBytes(queued.block.Header.PrevBlockHash, 16)),
+					slog.Any("error", err),
+					slog.Int("pending_blocks", s.pendingPeerBlockCount()),
+				)
+			default:
+				s.releaseBlockRequest(hash)
+				s.removePendingPeerBlock(hash)
+				s.logger.Warn("dropping queued peer block after apply failure",
+					slog.String("addr", queued.peerAddr),
+					slog.String("hash", shortHexBytes(hash, 16)),
+					slog.String("parent", shortHexBytes(queued.block.Header.PrevBlockHash, 16)),
+					slog.Any("error", err),
+				)
+			}
+		}
 	}
 }
 
@@ -2815,6 +3262,9 @@ func (s *Service) PeerCount() int {
 func (s *Service) blockHeight() uint64 {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
+	if s.chainState == nil {
+		return 0
+	}
 	if tip := s.chainState.ChainState().TipHeight(); tip != nil {
 		return *tip
 	}
@@ -2923,6 +3373,248 @@ func (s *Service) dashboardSystemLoop() {
 	}
 }
 
+func stressLaneSecretKey() [32]byte {
+	return bpcrypto.TaggedHash("bpu-stress-lane-seed", []byte("regtest"))
+}
+
+func stressLaneReserveKeyHash() [32]byte {
+	pubKey := bpcrypto.XOnlyPubKeyFromSecret(stressLaneSecretKey())
+	return bpcrypto.KeyHash(&pubKey)
+}
+
+func signStressLaneTx(tx types.Transaction, prevValue uint64) (types.Transaction, error) {
+	msg, err := consensus.Sighash(&tx, 0, []uint64{prevValue})
+	if err != nil {
+		return types.Transaction{}, err
+	}
+	pubKey, sig := bpcrypto.SignSchnorr(stressLaneSecretKey(), &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	return tx, nil
+}
+
+func buildStressLaneFanoutTx(prevOut types.OutPoint, prevValue uint64, keyHashes [][32]byte) (types.Transaction, []FundingOutput, error) {
+	if len(keyHashes) == 0 {
+		return types.Transaction{}, nil, errors.New("at least one key hash is required")
+	}
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: prevOut}},
+			Outputs: make([]types.TxOutput, len(keyHashes)),
+		},
+	}
+	for i, keyHash := range keyHashes {
+		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, KeyHash: keyHash}
+	}
+	tx, err := signStressLaneTx(tx, prevValue)
+	if err != nil {
+		return types.Transaction{}, nil, err
+	}
+	fee := uint64(len(tx.Encode()))
+	if prevValue <= fee || prevValue-fee < uint64(len(keyHashes)) {
+		return types.Transaction{}, nil, consensus.ErrInputsLessThanOutputs
+	}
+	perOutput := (prevValue - fee) / uint64(len(keyHashes))
+	remainder := (prevValue - fee) % uint64(len(keyHashes))
+	for i := range tx.Base.Outputs {
+		value := perOutput
+		if i == len(tx.Base.Outputs)-1 {
+			value += remainder
+		}
+		tx.Base.Outputs[i].ValueAtoms = value
+	}
+	tx, err = signStressLaneTx(tx, prevValue)
+	if err != nil {
+		return types.Transaction{}, nil, err
+	}
+	txid := consensus.TxID(&tx)
+	outputs := make([]FundingOutput, 0, len(tx.Base.Outputs))
+	for vout, output := range tx.Base.Outputs {
+		outputs = append(outputs, FundingOutput{
+			OutPoint: types.OutPoint{TxID: txid, Vout: uint32(vout)},
+			Value:    output.ValueAtoms,
+			KeyHash:  output.KeyHash,
+		})
+	}
+	return tx, outputs, nil
+}
+
+func stressLaneBatchConfirmed(utxos consensus.UtxoSet, outputs []FundingOutput) bool {
+	for _, output := range outputs {
+		entry, ok := utxos[output.OutPoint]
+		if !ok || entry.ValueAtoms != output.Value || entry.KeyHash != output.KeyHash {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) stressLaneInfo() StressLaneInfo {
+	confirmed := s.chainUtxoSnapshot()
+	reserveKey := stressLaneReserveKeyHash()
+	info := StressLaneInfo{ReserveKeyHash: hex.EncodeToString(reserveKey[:])}
+	for _, utxo := range s.UTXOsByKeyHashes([][32]byte{reserveKey}) {
+		info.ReserveUTXOs++
+		info.ReserveAtoms += utxo.Value
+	}
+	s.stressMu.Lock()
+	defer s.stressMu.Unlock()
+	lastPending := time.Time{}
+	for txid, batch := range s.stressPending {
+		if stressLaneBatchConfirmed(confirmed, batch.Outputs) {
+			delete(s.stressPending, txid)
+			continue
+		}
+		info.PendingBatches++
+		info.PendingOutputs += len(batch.Outputs)
+		if batch.CreatedAt.After(lastPending) {
+			lastPending = batch.CreatedAt
+			info.LastPendingTxID = hex.EncodeToString(txid[:])
+		}
+	}
+	return info
+}
+
+func (s *Service) ensureStressLaneReserve() error {
+	if s.stressLaneInfo().ReserveUTXOs > 0 {
+		return nil
+	}
+	// Seed a confirmed reserve output once so live stress funding can fan out a
+	// normal signed transaction and let any network miner confirm it.
+	_, err := s.MineFundingOutputs([][32]byte{stressLaneReserveKeyHash()})
+	return err
+}
+
+func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool) (stressLaneBatch, StressLaneInfo, error) {
+	if reserveTopUp {
+		if err := s.ensureStressLaneReserve(); err != nil {
+			return stressLaneBatch{}, StressLaneInfo{}, err
+		}
+	}
+	reserveUTXOs := s.UTXOsByKeyHashes([][32]byte{stressLaneReserveKeyHash()})
+	if len(reserveUTXOs) == 0 {
+		return stressLaneBatch{}, s.stressLaneInfo(), errors.New("no confirmed stress reserve is available")
+	}
+	best := reserveUTXOs[0]
+	for _, utxo := range reserveUTXOs[1:] {
+		if utxo.Value > best.Value {
+			best = utxo
+		}
+	}
+	tx, outputs, err := buildStressLaneFanoutTx(best.OutPoint, best.Value, keyHashes)
+	if err != nil && reserveTopUp && errors.Is(err, consensus.ErrInputsLessThanOutputs) {
+		if _, topUpErr := s.MineFundingOutputs([][32]byte{stressLaneReserveKeyHash()}); topUpErr != nil {
+			return stressLaneBatch{}, StressLaneInfo{}, topUpErr
+		}
+		reserveUTXOs = s.UTXOsByKeyHashes([][32]byte{stressLaneReserveKeyHash()})
+		if len(reserveUTXOs) == 0 {
+			return stressLaneBatch{}, StressLaneInfo{}, errors.New("stress reserve top-up did not publish a spendable output")
+		}
+		best = reserveUTXOs[0]
+		for _, utxo := range reserveUTXOs[1:] {
+			if utxo.Value > best.Value {
+				best = utxo
+			}
+		}
+		tx, outputs, err = buildStressLaneFanoutTx(best.OutPoint, best.Value, keyHashes)
+	}
+	if err != nil {
+		return stressLaneBatch{}, s.stressLaneInfo(), err
+	}
+	if _, err := s.SubmitTx(tx); err != nil {
+		return stressLaneBatch{}, s.stressLaneInfo(), err
+	}
+	batch := stressLaneBatch{
+		TxID:      consensus.TxID(&tx),
+		Outputs:   outputs,
+		CreatedAt: time.Now(),
+	}
+	s.stressMu.Lock()
+	s.stressPending[batch.TxID] = batch
+	s.stressMu.Unlock()
+	return batch, s.stressLaneInfo(), nil
+}
+
+func (s *Service) findActiveTxBlockHash(txid [32]byte) ([32]byte, bool, error) {
+	var zero [32]byte
+	s.stateMu.RLock()
+	tip := s.chainState.ChainState().TipHeight()
+	s.stateMu.RUnlock()
+	if tip == nil {
+		return zero, false, nil
+	}
+	for height := *tip + 1; height > 0; height-- {
+		blockHeight := height - 1
+		hash, err := s.chainState.Store().GetBlockHashByHeight(blockHeight)
+		if err != nil {
+			return zero, false, err
+		}
+		if hash == nil {
+			continue
+		}
+		block, err := s.chainState.Store().GetBlock(hash)
+		if err != nil {
+			return zero, false, err
+		}
+		if block == nil {
+			continue
+		}
+		for _, tx := range block.Txs {
+			if consensus.TxID(&tx) == txid {
+				return *hash, true, nil
+			}
+		}
+	}
+	return zero, false, nil
+}
+
+func (s *Service) waitForStressLaneBatch(batch stressLaneBatch, timeout time.Duration) ([]FundingOutput, StressLaneInfo, error) {
+	if timeout <= 0 {
+		timeout = stressLaneConfirmTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		confirmed := s.chainUtxoSnapshot()
+		if stressLaneBatchConfirmed(confirmed, batch.Outputs) {
+			outputs := append([]FundingOutput(nil), batch.Outputs...)
+			if hash, ok, err := s.findActiveTxBlockHash(batch.TxID); err != nil {
+				return nil, s.stressLaneInfo(), err
+			} else if ok {
+				for i := range outputs {
+					outputs[i].BlockHash = hash
+				}
+			}
+			s.stressMu.Lock()
+			delete(s.stressPending, batch.TxID)
+			s.stressMu.Unlock()
+			info := s.stressLaneInfo()
+			info.ReadyOutputs = len(outputs)
+			return outputs, info, nil
+		}
+		select {
+		case <-s.stopCh:
+			return nil, s.stressLaneInfo(), io.EOF
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return nil, s.stressLaneInfo(), fmt.Errorf("timed out waiting for stress funding tx %x to confirm", batch.TxID)
+}
+
+func (s *Service) SeedStressLanes(keyHashes [][32]byte, reserveTopUp bool, waitForConfirmation bool) ([]FundingOutput, StressLaneInfo, [32]byte, error) {
+	if !s.cfg.Profile.IsRegtestLike() {
+		return nil, StressLaneInfo{}, [32]byte{}, errors.New("stress lanes are only available on regtest-style profiles")
+	}
+	batch, info, err := s.createStressLaneBatch(keyHashes, reserveTopUp)
+	if err != nil {
+		return nil, info, [32]byte{}, err
+	}
+	if !waitForConfirmation {
+		return append([]FundingOutput(nil), batch.Outputs...), info, batch.TxID, nil
+	}
+	outputs, info, err := s.waitForStressLaneBatch(batch, stressLaneConfirmTimeout)
+	return outputs, info, batch.TxID, err
+}
+
 func (s *Service) recordDashboardSystemSample() error {
 	sample, err := readDashboardSystemSample(time.Now())
 	if err != nil {
@@ -2948,12 +3640,16 @@ func (s *Service) buildPublicDashboardView() (*publicDashboardView, error) {
 	if len(blocks) > 5 {
 		blocks = blocks[:5]
 	}
+	mempoolInfo := s.MempoolInfo()
 	mempoolEntries := s.pool.Snapshot()
+	mempoolTop := s.pool.TopByFee(8)
+	performance := s.PerformanceMetrics()
 	pow := s.dashboardPowSummary(blockWindow.recent)
-	fees := s.dashboardFeeSummary(blockWindow.recent, mempoolEntries, pow)
-	mining := s.dashboardMiningSummary(blocks)
-	tpsChart := s.dashboardTPSChartFromBlocks(now, blockWindow.chart)
-	mempool := s.dashboardMempoolSummary(mempoolEntries, fees.Clear.Time)
+	fees := s.dashboardFeeSummary(blockWindow.chart, mempoolInfo.Count, pow, s.cachedCandidateFeeLine(), mempoolEntries)
+	mining := s.dashboardMiningSummary(blocks, pow)
+	tpsChart := s.dashboardTPSChartFromBlocks(blockWindow.recent, pow, s.cachedCandidateBlockTxCount())
+	mempool := s.dashboardMempoolSummary(mempoolInfo, mempoolEntries, mempoolTop, fees.Clear.Time)
+	peerHosts := s.dashboardPeerHosts(now, info)
 	return &publicDashboardView{
 		generatedAt: now,
 		nodeID:      s.nodeID,
@@ -2961,9 +3657,11 @@ func (s *Service) buildPublicDashboardView() (*publicDashboardView, error) {
 		info:        info,
 		health:      health,
 		system:      system,
+		performance: performance,
 		blocks:      blocks,
 		peers:       peers,
 		relay:       relay,
+		peerHosts:   peerHosts,
 		template:    template,
 		pow:         pow,
 		fees:        fees,
@@ -3051,6 +3749,7 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 		MinedByNode: blockMinedByKeyHash(block, s.cfg.MinerKeyHash),
 	}
 	fees := make([]uint64, 0, len(block.Txs))
+	feeRates := make([]uint64, 0, len(block.Txs))
 	undoIndex := 0
 	for i, tx := range block.Txs {
 		txPage := dashboardTxPage{
@@ -3074,6 +3773,7 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 			})
 		}
 		if !txPage.Coinbase {
+			page.TotalUserTxs++
 			txPage.Inputs = make([]dashboardTxInput, 0, len(tx.Base.Inputs))
 			for _, input := range tx.Base.Inputs {
 				if undoIndex >= len(undo) {
@@ -3090,9 +3790,15 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 			txPage.Fee = txPage.InputSum - txPage.OutputSum
 			if txPage.Size > 0 {
 				txPage.FeeRate = txPage.Fee / uint64(txPage.Size)
+				feeRates = append(feeRates, (txPage.Fee*1000)/uint64(txPage.Size))
+			} else {
+				feeRates = append(feeRates, 0)
 			}
 			page.TotalFees += txPage.Fee
 			fees = append(fees, txPage.Fee)
+			if txPage.Fee > 0 {
+				page.PaidTxs++
+			}
 		}
 		if len(page.PreviewTxs) < previewLimit {
 			page.PreviewTxs = append(page.PreviewTxs, txPage)
@@ -3102,6 +3808,7 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 		page.HiddenTxCount = len(block.Txs) - len(page.PreviewTxs)
 	}
 	page.MedianFee, page.LowFee, page.HighFee = summarizeFeeSet(fees)
+	page.MedianFeeRate, page.LowFeeRate, page.HighFeeRate = summarizeFeeSet(feeRates)
 	return page, nil
 }
 
@@ -3126,6 +3833,10 @@ func (s *Service) dashboardPowSummary(blocks []dashboardBlockPage) dashboardPowS
 	summary.Difficulty = dashboardDifficulty(header.NBits, params.PowLimitBits)
 	summary.LastBlockTimestamp = time.Unix(int64(header.Timestamp), 0).UTC()
 	if len(blocks) >= 2 {
+		firstGap := blocks[0].Timestamp.Sub(blocks[1].Timestamp)
+		if firstGap > 0 {
+			summary.RecentBlockGap = firstGap
+		}
 		var total time.Duration
 		var count int
 		for i := 0; i < len(blocks)-1; i++ {
@@ -3143,27 +3854,75 @@ func (s *Service) dashboardPowSummary(blocks []dashboardBlockPage) dashboardPowS
 	if summary.AvgBlockInterval <= 0 {
 		summary.AvgBlockInterval = summary.TargetSpacing
 	}
+	if summary.RecentBlockGap <= 0 {
+		summary.RecentBlockGap = summary.AvgBlockInterval
+	}
+	hashrateSpacing := summary.TargetSpacing.Seconds()
+	if summary.HasObservedGap && summary.RecentBlockGap > 0 {
+		hashrateSpacing = summary.RecentBlockGap.Seconds()
+	}
+	if hashrateSpacing > 0 {
+		summary.NetworkHashrate = summary.Difficulty * float64(uint64(1)<<32) / hashrateSpacing
+	}
 	return summary
 }
 
-func (s *Service) dashboardFeeSummary(blocks []dashboardBlockPage, entries []mempool.SnapshotEntry, pow dashboardPowSummary) dashboardFeeSummary {
+func (s *Service) dashboardFeeSummary(blocks []dashboardBlockPage, mempoolCount int, pow dashboardPowSummary, candidate dashboardCandidateFeeLine, mempoolEntries []mempool.SnapshotEntry) dashboardFeeSummary {
 	out := dashboardFeeSummary{
-		Recent: make([]dashboardBlockFeeLine, 0, len(blocks)),
+		Recent:    make([]dashboardBlockFeeLine, 0, minInt(len(blocks), 24)),
+		Candidate: candidate,
 	}
 	var avgTxs float64
 	var txBlocks int
-	for _, block := range blocks {
-		out.Recent = append(out.Recent, dashboardBlockFeeLine{
-			Height:    block.Height,
-			MedianFee: block.MedianFee,
-			LowFee:    block.LowFee,
-			HighFee:   block.HighFee,
-		})
+	median6 := make([]uint64, 0, minInt(len(blocks), 6))
+	median24 := make([]uint64, 0, minInt(len(blocks), 24))
+	for i, block := range blocks {
+		if i < 6 {
+			median6 = append(median6, block.MedianFeeRate)
+		}
+		if i < 24 {
+			out.Recent = append(out.Recent, dashboardBlockFeeLine{
+				Height:    block.Height,
+				MedianFee: block.MedianFeeRate,
+				LowFee:    block.LowFeeRate,
+				HighFee:   block.HighFeeRate,
+				PaidTxs:   block.PaidTxs,
+				TotalTxs:  block.TotalUserTxs,
+			})
+			median24 = append(median24, block.MedianFeeRate)
+			if block.PaidTxs > 0 {
+				out.PaidBlocks++
+			}
+			out.FeePayingTxs += block.PaidTxs
+			out.TotalTxs += block.TotalUserTxs
+			if len(out.Recent) == 1 || block.LowFeeRate < out.RecentMin {
+				out.RecentMin = block.LowFeeRate
+			}
+			if block.HighFeeRate > out.RecentMax {
+				out.RecentMax = block.HighFeeRate
+			}
+		}
 		if block.TxCount > 1 {
 			avgTxs += float64(block.TxCount - 1)
 			txBlocks++
 		}
 	}
+	slices.Reverse(out.Recent)
+	out.TotalBlocks = len(out.Recent)
+	if candidate.Available {
+		out.CurrentMedian = candidate.MedianFee
+	} else if len(out.Recent) != 0 {
+		out.CurrentMedian = out.Recent[len(out.Recent)-1].MedianFee
+	}
+	if len(median6) != 0 {
+		median, _, _ := summarizeFeeSet(median6)
+		out.Median6 = median
+	}
+	if len(median24) != 0 {
+		median, _, _ := summarizeFeeSet(median24)
+		out.Median24 = median
+	}
+	out.Bands = summarizeMempoolFeeBands(mempoolEntries)
 	if txBlocks == 0 {
 		out.Clear.Blocks = 1
 		out.Clear.Time = pow.TargetSpacing
@@ -3171,8 +3930,8 @@ func (s *Service) dashboardFeeSummary(blocks []dashboardBlockPage, entries []mem
 	}
 	avgPerBlock := avgTxs / float64(txBlocks)
 	neededBlocks := 1
-	if len(entries) > 0 {
-		neededBlocks = int(math.Ceil(float64(len(entries)) / avgPerBlock))
+	if mempoolCount > 0 {
+		neededBlocks = int(math.Ceil(float64(mempoolCount) / avgPerBlock))
 		if neededBlocks < 1 {
 			neededBlocks = 1
 		}
@@ -3182,7 +3941,7 @@ func (s *Service) dashboardFeeSummary(blocks []dashboardBlockPage, entries []mem
 	return out
 }
 
-func (s *Service) dashboardMiningSummary(blocks []dashboardBlockPage) dashboardMiningSummary {
+func (s *Service) dashboardMiningSummary(blocks []dashboardBlockPage, pow dashboardPowSummary) dashboardMiningSummary {
 	out := dashboardMiningSummary{
 		Enabled: s.cfg.MinerEnabled,
 		Workers: s.cfg.MinerWorkers,
@@ -3191,87 +3950,95 @@ func (s *Service) dashboardMiningSummary(blocks []dashboardBlockPage) dashboardM
 		return out
 	}
 	for _, block := range blocks {
+		out.RecentWindow++
 		if !block.MinedByNode {
 			continue
 		}
+		out.RecentWins++
 		out.RecentHeights = append(out.RecentHeights, block.Height)
 		out.RecentHashes = append(out.RecentHashes, block.Hash)
+	}
+	if out.RecentWindow > 0 && pow.NetworkHashrate > 0 {
+		out.EstimatedHashrate = pow.NetworkHashrate * (float64(out.RecentWins) / float64(out.RecentWindow))
 	}
 	return out
 }
 
-func (s *Service) dashboardMempoolSummary(entries []mempool.SnapshotEntry, clearEstimate time.Duration) dashboardMempoolSummary {
+func (s *Service) dashboardMempoolSummary(info MempoolInfo, entries []mempool.SnapshotEntry, top []mempool.SnapshotEntry, clearEstimate time.Duration) dashboardMempoolSummary {
 	out := dashboardMempoolSummary{
-		Count:         len(entries),
-		Orphans:       s.OrphanCount(),
+		Count:         info.Count,
+		Bytes:         info.Bytes,
+		Orphans:       info.Orphans,
 		EstimatedNext: clearEstimate,
 	}
-	if len(entries) == 0 {
+	feeRates := make([]uint64, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Size <= 0 {
+			feeRates = append(feeRates, 0)
+			continue
+		}
+		feeRates = append(feeRates, (entry.Fee*1000)/uint64(entry.Size))
+	}
+	out.MedianFee, out.LowFee, out.HighFee = summarizeFeeSet(feeRates)
+	if len(top) == 0 {
 		return out
 	}
-	slices.SortFunc(entries, func(a, b mempool.SnapshotEntry) int {
+	out.Top = append([]mempool.SnapshotEntry(nil), top...)
+	return out
+}
+
+func (s *Service) dashboardTPSChartFromBlocks(blocks []dashboardBlockPage, pow dashboardPowSummary, candidateTxCount int) dashboardTPSChart {
+	chart := dashboardTPSChart{
+		Label: "THROUGHPUT (BY BLOCK)",
+	}
+	ordered := append([]dashboardBlockPage(nil), blocks...)
+	slices.SortFunc(ordered, func(a, b dashboardBlockPage) int {
 		switch {
-		case a.Fee > b.Fee:
+		case a.Height < b.Height:
 			return -1
-		case a.Fee < b.Fee:
+		case a.Height > b.Height:
 			return 1
 		default:
 			return 0
 		}
 	})
-	out.HighFee = entries[0].Fee
-	out.LowFee = entries[len(entries)-1].Fee
-	fees := make([]uint64, 0, len(entries))
-	for _, entry := range entries {
-		fees = append(fees, entry.Fee)
+	if len(ordered) > 5 {
+		ordered = ordered[len(ordered)-5:]
 	}
-	out.MedianFee, _, _ = summarizeFeeSet(fees)
-	out.Top = append([]mempool.SnapshotEntry(nil), entries...)
-	if len(out.Top) > 8 {
-		out.Top = out.Top[:8]
+	chart.Blocks = make([]dashboardThroughputBlock, 0, len(ordered)+1)
+	maxTx := 0
+	for _, block := range ordered {
+		txCount := maxInt(block.TxCount-1, 0)
+		chart.Blocks = append(chart.Blocks, dashboardThroughputBlock{TxCount: txCount})
+		chart.TotalTx += txCount
+		if txCount > maxTx {
+			maxTx = txCount
+		}
 	}
-	return out
-}
-
-func (s *Service) dashboardTPSChartFromBlocks(now time.Time, blocks []dashboardBlockPage) dashboardTPSChart {
-	cutoff := now.Add(-time.Hour)
-	start := cutoff
-	if len(blocks) != 0 && blocks[len(blocks)-1].Timestamp.After(start) {
-		start = blocks[len(blocks)-1].Timestamp
+	if candidateTxCount >= 0 {
+		chart.Blocks = append(chart.Blocks, dashboardThroughputBlock{TxCount: candidateTxCount, Candidate: true})
+		chart.TotalTx += maxInt(candidateTxCount, 0)
+		if candidateTxCount > maxTx {
+			maxTx = candidateTxCount
+		}
 	}
-	span := now.Sub(start)
-	if span < time.Minute {
-		span = time.Minute
+	if len(chart.Blocks) == 0 {
+		return chart
 	}
-	bucketCount := 12
-	bucketWidth := span / time.Duration(bucketCount)
-	if bucketWidth <= 0 {
-		bucketWidth = time.Minute
-	}
-	chart := dashboardTPSChart{
-		Label:     fmt.Sprintf("TPS last %s", formatDashboardWindow(span)),
-		Buckets:   make([]float64, bucketCount),
-		BucketEnd: make([]time.Time, bucketCount),
-	}
-	for i := range chart.BucketEnd {
-		chart.BucketEnd[i] = start.Add(bucketWidth * time.Duration(i+1))
-	}
-	for _, block := range blocks {
-		if block.Timestamp.Before(start) {
+	const maxBarWidth = 24
+	for i := range chart.Blocks {
+		if chart.Blocks[i].TxCount <= 0 || maxTx <= 0 {
 			continue
 		}
-		idx := int(block.Timestamp.Sub(start) / bucketWidth)
-		if idx >= bucketCount {
-			idx = bucketCount - 1
+		width := int(math.Round((float64(chart.Blocks[i].TxCount) / float64(maxTx)) * maxBarWidth))
+		if width <= 0 {
+			width = 1
 		}
-		if idx < 0 {
-			idx = 0
-		}
-		txs := float64(maxInt(block.TxCount-1, 0))
-		chart.Buckets[idx] += txs / bucketWidth.Seconds()
-		if chart.Buckets[idx] > chart.MaxTPS {
-			chart.MaxTPS = chart.Buckets[idx]
-		}
+		chart.Blocks[i].BarWidth = width
+	}
+	chart.AvgTxPerBlk = float64(chart.TotalTx) / float64(len(chart.Blocks))
+	if pow.TargetSpacing > 0 {
+		chart.AvgTPS = float64(chart.TotalTx) / (pow.TargetSpacing.Seconds() * float64(len(chart.Blocks)))
 	}
 	return chart
 }
@@ -3332,6 +4099,8 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		return s.MiningInfo(), nil
 	case "getpeerinfo":
 		return s.PeerInfo(), nil
+	case "getmetrics":
+		return s.PerformanceMetrics(), nil
 	case "getheader":
 		var params struct {
 			Hash string `json:"hash"`
@@ -3414,6 +4183,11 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			})
 		}
 		return map[string]any{"utxos": out, "count": len(out)}, nil
+	case "getstresslaneinfo":
+		if !s.cfg.Profile.IsRegtestLike() {
+			return nil, errors.New("stress lane info is only available on regtest-style profiles")
+		}
+		return s.stressLaneInfo(), nil
 	case "getwalletactivitybykeyhashes":
 		var params struct {
 			KeyHashes []string `json:"keyhashes"`
@@ -3614,7 +4388,9 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			return nil, errors.New("seedstresslanes is only available on regtest-style profiles")
 		}
 		var params struct {
-			KeyHashes []string `json:"keyhashes"`
+			KeyHashes           []string `json:"keyhashes"`
+			ReserveTopUp        *bool    `json:"reserve_top_up,omitempty"`
+			WaitForConfirmation *bool    `json:"wait_for_confirmation,omitempty"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, err
@@ -3630,7 +4406,15 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			}
 			keyHashes = append(keyHashes, keyHash)
 		}
-		outputs, err := s.MineFundingOutputs(keyHashes)
+		reserveTopUp := true
+		if params.ReserveTopUp != nil {
+			reserveTopUp = *params.ReserveTopUp
+		}
+		waitForConfirmation := true
+		if params.WaitForConfirmation != nil {
+			waitForConfirmation = *params.WaitForConfirmation
+		}
+		outputs, info, pendingTxID, err := s.SeedStressLanes(keyHashes, reserveTopUp, waitForConfirmation)
 		if err != nil {
 			return nil, err
 		}
@@ -3644,7 +4428,14 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 				"block_hash": hex.EncodeToString(output.BlockHash[:]),
 			})
 		}
-		return map[string]any{"outputs": result, "count": len(result)}, nil
+		return map[string]any{
+			"outputs":       result,
+			"count":         len(result),
+			"confirmed":     waitForConfirmation,
+			"pending_txid":  hex.EncodeToString(pendingTxID[:]),
+			"reserve_topup": reserveTopUp,
+			"status":        info,
+		}, nil
 	case "submitblock":
 		var params struct {
 			Hex string `json:"hex"`
@@ -3656,7 +4447,7 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		applied, err := s.applyPeerBlock(&block)
+		applied, _, err := s.applyPeerBlock(&block)
 		if err != nil {
 			return nil, err
 		}
@@ -3692,25 +4483,48 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 }
 
 type PeerInfo struct {
-	Addr               string `json:"addr"`
-	Outbound           bool   `json:"outbound"`
-	Height             uint64 `json:"height"`
-	UserAgent          string `json:"user_agent"`
-	LastProgress       int64  `json:"last_progress_unix"`
-	LastUseful         int64  `json:"last_useful_unix,omitempty"`
-	PreferredDownload  bool   `json:"preferred_download,omitempty"`
-	DownloadScore      int    `json:"download_score,omitempty"`
-	HeaderStalls       int    `json:"header_stalls,omitempty"`
-	BlockStalls        int    `json:"block_stalls,omitempty"`
-	TxStalls           int    `json:"tx_stalls,omitempty"`
-	DownloadCooldownMS int64  `json:"download_cooldown_ms,omitempty"`
+	Addr                  string `json:"addr"`
+	Outbound              bool   `json:"outbound"`
+	Height                uint64 `json:"height"`
+	UserAgent             string `json:"user_agent"`
+	LastProgress          int64  `json:"last_progress_unix"`
+	LastUseful            int64  `json:"last_useful_unix,omitempty"`
+	PreferredDownload     bool   `json:"preferred_download,omitempty"`
+	DownloadScore         int    `json:"download_score,omitempty"`
+	HeaderStalls          int    `json:"header_stalls,omitempty"`
+	BlockStalls           int    `json:"block_stalls,omitempty"`
+	TxStalls              int    `json:"tx_stalls,omitempty"`
+	DownloadCooldownMS    int64  `json:"download_cooldown_ms,omitempty"`
+	RelayQueueDepth       int    `json:"relay_queue_depth,omitempty"`
+	ControlQueueDepth     int    `json:"control_queue_depth,omitempty"`
+	PriorityQueueDepth    int    `json:"priority_queue_depth,omitempty"`
+	SendQueueDepth        int    `json:"send_queue_depth,omitempty"`
+	PendingLocalRelayTxs  int    `json:"pending_local_relay_txs,omitempty"`
+	LastRelayActivityUnix int64  `json:"last_relay_activity_unix,omitempty"`
+	TxReqRecvItems        int    `json:"tx_request_received_items,omitempty"`
+	TxNotFoundReceived    int    `json:"tx_not_found_received,omitempty"`
+	KnownTxClears         int    `json:"known_tx_clears,omitempty"`
+	WriterStarvation      int    `json:"writer_starvation_events,omitempty"`
 }
 
 func (s *Service) PeerInfo() []PeerInfo             { return s.peerManager().PeerInfo() }
 func (s *Service) RelayPeerStats() []PeerRelayStats { return s.relayManager().RelayPeerStats() }
 
 func (s *Service) BlockTemplateStats() BlockTemplateStats {
-	return s.templateStats.snapshot()
+	return s.minerManager().BlockTemplateStats()
+}
+
+func (s *Service) cachedCandidateBlockTxCount() int {
+	return s.minerManager().cachedTemplateTxCount()
+}
+
+func (s *Service) cachedCandidateFeeLine() dashboardCandidateFeeLine {
+	line := s.minerManager().cachedTemplateFeeLine()
+	if !line.Available {
+		return line
+	}
+	line.Height = s.Info().TipHeight + 1
+	return line
 }
 
 func (s *Service) requestSync(peer *peerConn) { s.syncManager().requestSync(peer) }
@@ -3836,6 +4650,20 @@ func (p *peerConn) snapshotProgressUnix() int64 {
 	return 0
 }
 
+func (p *peerConn) bytesIn() uint64 {
+	if p.traffic == nil {
+		return 0
+	}
+	return p.traffic.rxBytes.Load()
+}
+
+func (p *peerConn) bytesOut() uint64 {
+	if p.traffic == nil {
+		return 0
+	}
+	return p.traffic.txBytes.Load()
+}
+
 func unixTimeOrZero(unix int64) time.Time {
 	if unix <= 0 {
 		return time.Time{}
@@ -3900,7 +4728,7 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 		if end > len(txs) {
 			end = len(txs)
 		}
-		send = append(send, p2p.TxBatchMessage{Txs: append([]types.Transaction(nil), txs[start:end]...)})
+		send = append(send, p2p.TxBatchMessage{Txs: txs[start:end]})
 	}
 	for _, msg := range send {
 		if err := peer.send(msg); err != nil {
@@ -3910,10 +4738,20 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 	if len(notFound) == 0 {
 		return nil
 	}
+	txNotFound := len(txIDsFromInvItems(notFound))
+	if txNotFound > 0 {
+		peer.telemetry.noteTxNotFoundSent(txNotFound)
+		s.noteTxNotFoundSent(txNotFound)
+	}
 	return peer.send(p2p.NotFoundMessage{Items: notFound})
 }
 
 func (s *Service) onNotFoundMessage(peer *peerConn, msg p2p.NotFoundMessage) error {
+	if txids := txIDsFromInvItems(msg.Items); len(txids) > 0 {
+		peer.telemetry.noteTxNotFoundReceived(len(txids))
+		s.noteTxNotFoundReceived(len(txids))
+		peer.forgetKnownTxIDs(txids)
+	}
 	return s.syncManager().onNotFoundMessage(peer, msg)
 }
 
@@ -4090,6 +4928,14 @@ func (s *Service) onTxReconMessage(peer *peerConn, msg p2p.TxReconMessage) error
 		return nil
 	}
 	missing := s.pool.MissingTxIDs(msg.TxIDs)
+	if s.logger != nil {
+		s.logger.Debug("processed tx reconciliation announcement",
+			slog.String("addr", peer.addr),
+			slog.Int("announced", len(msg.TxIDs)),
+			slog.Int("missing", len(missing)),
+			slog.String("txids", hashesDebugSummary(msg.TxIDs, 6)),
+		)
+	}
 	if len(missing) == 0 {
 		return nil
 	}
@@ -4100,13 +4946,42 @@ func (s *Service) onTxRequestMessage(peer *peerConn, msg p2p.TxRequestMessage) e
 	if len(msg.TxIDs) == 0 {
 		return nil
 	}
+	peer.noteTxRequestReceived(msg.TxIDs)
+	s.noteTxRequestsReceived(len(msg.TxIDs))
 	txs := s.pool.TransactionsByID(msg.TxIDs)
+	found := make(map[[32]byte]struct{}, len(txs))
+	for _, tx := range txs {
+		found[consensus.TxID(&tx)] = struct{}{}
+	}
+	missingItems := make([]p2p.InvVector, 0)
+	for _, txid := range msg.TxIDs {
+		if _, ok := found[txid]; ok {
+			continue
+		}
+		missingItems = append(missingItems, p2p.InvVector{Type: p2p.InvTypeTx, Hash: txid})
+	}
+	if s.logger != nil {
+		s.logger.Debug("serving tx reconciliation request",
+			slog.String("addr", peer.addr),
+			slog.Int("requested", len(msg.TxIDs)),
+			slog.Int("found", len(txs)),
+			slog.Int("missing", len(missingItems)),
+			slog.String("txids", hashesDebugSummary(msg.TxIDs, 6)),
+		)
+	}
 	for start := 0; start < len(txs); start += 64 {
 		end := start + 64
 		if end > len(txs) {
 			end = len(txs)
 		}
-		if err := peer.sendRequestedTxBatch(p2p.TxBatchMessage{Txs: append([]types.Transaction(nil), txs[start:end]...)}); err != nil {
+		if err := peer.sendRequestedTxBatch(p2p.TxBatchMessage{Txs: txs[start:end]}); err != nil {
+			return err
+		}
+	}
+	if len(missingItems) > 0 {
+		peer.telemetry.noteTxNotFoundSent(len(missingItems))
+		s.noteTxNotFoundSent(len(missingItems))
+		if err := peer.send(p2p.NotFoundMessage{Items: missingItems}); err != nil {
 			return err
 		}
 	}
@@ -4119,6 +4994,104 @@ func (s *Service) broadcastInvToPeers(peers []*peerConn, items []p2p.InvVector) 
 }
 func (s *Service) broadcastAcceptedTxsToPeers(peers []*peerConn, accepted []mempool.AcceptedTx) {
 	s.relayManager().broadcastAcceptedTxsToPeers(peers, accepted)
+	s.scheduleLocalRelayFallbacks(peers, accepted)
+}
+
+func (s *Service) broadcastAcceptedTxsToPeersRetry(peers []*peerConn, accepted []mempool.AcceptedTx) {
+	if len(peers) == 0 || len(accepted) == 0 {
+		return
+	}
+	txids := make([][32]byte, 0, len(accepted))
+	for _, item := range accepted {
+		txids = append(txids, item.TxID)
+	}
+	for _, batch := range planTxRelayRecon(peers, txids) {
+		if err := batch.peer.enqueueTxReconRetry(p2p.TxReconMessage{TxIDs: batch.txids}); err != nil {
+			if s.logger != nil {
+				s.logger.Debug("relay retry txrecon enqueue failed",
+					slog.String("addr", batch.peer.addr),
+					slog.Int("count", len(batch.txids)),
+					slog.Any("error", err),
+				)
+			}
+		}
+	}
+}
+
+const localRelayFallbackGrace = 750 * time.Millisecond
+
+func (s *Service) scheduleLocalRelayFallbacks(peers []*peerConn, accepted []mempool.AcceptedTx) {
+	if len(peers) == 0 || len(accepted) == 0 {
+		return
+	}
+	txids := s.localOriginRelayTxIDs(accepted)
+	if len(txids) == 0 {
+		return
+	}
+	announcedAt := time.Now()
+	for _, peer := range peers {
+		armed := peer.armLocalRelayFallback(txids, announcedAt)
+		if armed == 0 {
+			continue
+		}
+		go s.runLocalRelayFallback(peer, append([][32]byte(nil), txids...))
+	}
+}
+
+func (s *Service) localOriginRelayTxIDs(accepted []mempool.AcceptedTx) [][32]byte {
+	if len(accepted) == 0 {
+		return nil
+	}
+	s.rebroadcastMu.Lock()
+	defer s.rebroadcastMu.Unlock()
+	txids := make([][32]byte, 0, len(accepted))
+	for _, item := range accepted {
+		if _, ok := s.localRebroadcast[item.TxID]; !ok {
+			continue
+		}
+		txids = append(txids, item.TxID)
+	}
+	return txids
+}
+
+func (s *Service) runLocalRelayFallback(peer *peerConn, txids [][32]byte) {
+	timer := time.NewTimer(localRelayFallbackGrace)
+	defer timer.Stop()
+	select {
+	case <-s.stopCh:
+		return
+	case <-peer.closed:
+		return
+	case <-timer.C:
+	}
+	due := peer.collectDueLocalRelayFallback(time.Now(), localRelayFallbackGrace, txids)
+	if len(due) == 0 {
+		return
+	}
+	txs := s.pool.TransactionsByID(due)
+	if len(txs) == 0 {
+		return
+	}
+	// Send fallback batches directly rather than waiting for another TxRecon
+	// round so local-origin funding txs can recover from a missed request path.
+	for start := 0; start < len(txs); start += 64 {
+		end := start + 64
+		if end > len(txs) {
+			end = len(txs)
+		}
+		batch := p2p.TxBatchMessage{Txs: txs[start:end]}
+		if err := peer.enqueueFallbackTxBatch(batch); err != nil {
+			return
+		}
+		s.noteDirectFallback(1, len(batch.Txs))
+		if s.logger != nil {
+			s.logger.Debug("sent direct fallback tx batch",
+				slog.String("addr", peer.addr),
+				slog.Int("txs", len(batch.Txs)),
+				slog.String("txids", txDebugSummary(batch.Txs, 6)),
+			)
+		}
+	}
 }
 
 type txRelayReconBatch struct {
@@ -4249,6 +5222,16 @@ func classifyRelayMessage(msg p2p.Message) relayMessageClass {
 	case p2p.TxRequestMessage:
 		class.txReqMsgs = 1
 		class.txReqItems = len(m.TxIDs)
+	case p2p.GetDataMessage:
+		for _, item := range m.Items {
+			if item.Type == p2p.InvTypeBlock || item.Type == p2p.InvTypeBlockFull {
+				class.blockReqItems++
+			}
+		}
+	case p2p.GetBlockTxMessage, p2p.GetXBlockTxMessage:
+		class.blockReqItems = 1
+	case p2p.BlockMessage, p2p.CompactBlockMessage, p2p.XThinBlockMessage, p2p.BlockTxMessage, p2p.XBlockTxMessage:
+		class.blockSendItems = 1
 	}
 	return class
 }
@@ -4273,12 +5256,20 @@ func (p *peerConn) filterQueuedInv(items []p2p.InvVector) []p2p.InvVector {
 	p.invMu.Lock()
 	defer p.invMu.Unlock()
 	filtered := make([]p2p.InvVector, 0, len(items))
+	duplicates := 0
 	for _, item := range items {
 		if p.queuedInv[item] > 0 {
+			duplicates++
 			continue
 		}
 		p.queuedInv[item]++
 		filtered = append(filtered, item)
+	}
+	if duplicates > 0 {
+		p.telemetry.noteDuplicateInv(duplicates)
+		if p.svc != nil {
+			p.svc.noteDuplicateSuppression(duplicates)
+		}
 	}
 	return filtered
 }
@@ -4302,33 +5293,67 @@ func (p *peerConn) filterQueuedTxs(txs []types.Transaction) []types.Transaction 
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
 	filtered := make([]types.Transaction, 0, len(txs))
+	duplicateQueued := 0
+	suppressedKnown := 0
 	for _, tx := range txs {
 		txid := consensus.TxID(&tx)
 		if p.queuedTx[txid] > 0 {
+			duplicateQueued++
 			continue
 		}
 		if _, ok := p.knownTx[txid]; ok {
+			suppressedKnown++
 			continue
 		}
 		p.queuedTx[txid]++
 		filtered = append(filtered, tx)
 	}
+	if duplicateQueued > 0 {
+		p.telemetry.noteDuplicateTx(duplicateQueued)
+		if p.svc != nil {
+			p.svc.noteDuplicateSuppression(duplicateQueued)
+		}
+	}
+	if suppressedKnown > 0 {
+		p.telemetry.noteKnownTxSuppressed(suppressedKnown)
+		if p.svc != nil {
+			p.svc.noteDuplicateSuppression(suppressedKnown)
+		}
+	}
 	return filtered
 }
 
-func (p *peerConn) filterQueuedTxIDs(txids [][32]byte) [][32]byte {
+func (p *peerConn) filterQueuedTxIDs(txids [][32]byte, suppressKnown bool) [][32]byte {
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
 	filtered := make([][32]byte, 0, len(txids))
+	duplicateQueued := 0
+	suppressedKnownCount := 0
 	for _, txid := range txids {
 		if p.queuedTx[txid] > 0 {
+			duplicateQueued++
 			continue
 		}
-		if _, ok := p.knownTx[txid]; ok {
-			continue
+		if suppressKnown {
+			if _, ok := p.knownTx[txid]; ok {
+				suppressedKnownCount++
+				continue
+			}
 		}
 		p.queuedTx[txid]++
 		filtered = append(filtered, txid)
+	}
+	if duplicateQueued > 0 {
+		p.telemetry.noteDuplicateTx(duplicateQueued)
+		if p.svc != nil {
+			p.svc.noteDuplicateSuppression(duplicateQueued)
+		}
+	}
+	if suppressedKnownCount > 0 {
+		p.telemetry.noteKnownTxSuppressed(suppressedKnownCount)
+		if p.svc != nil {
+			p.svc.noteDuplicateSuppression(suppressedKnownCount)
+		}
 	}
 	return filtered
 }
@@ -4368,15 +5393,21 @@ func (p *peerConn) stagePendingTxs(txs []types.Transaction) ([][]types.Transacti
 	const maxBatch = 64
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
-	p.pendingTxs = append(p.pendingTxs, txs...)
-	ready := make([][]types.Transaction, 0, len(p.pendingTxs)/maxBatch+1)
-	for len(p.pendingTxs) >= maxBatch {
-		batch := append([]types.Transaction(nil), p.pendingTxs[:maxBatch]...)
-		ready = append(ready, batch)
-		p.pendingTxs = p.pendingTxs[maxBatch:]
+	if p.pendingTxByID == nil {
+		p.pendingTxByID = make(map[[32]byte]types.Transaction, len(txs))
+	}
+	for _, tx := range txs {
+		txid := consensus.TxID(&tx)
+		p.pendingTxOrder = append(p.pendingTxOrder, txid)
+		p.pendingTxByID[txid] = tx
+	}
+	p.telemetry.noteCoalescedTxs(len(txs))
+	ready := make([][]types.Transaction, 0, len(p.pendingTxOrder)/maxBatch+1)
+	for len(p.pendingTxOrder) >= maxBatch {
+		ready = append(ready, p.takePendingTxBatchLocked(maxBatch))
 	}
 	armFlush := false
-	if len(p.pendingTxs) != 0 && !p.txFlushArmed {
+	if len(p.pendingTxOrder) != 0 && !p.txFlushArmed {
 		p.txFlushArmed = true
 		armFlush = true
 	}
@@ -4388,6 +5419,7 @@ func (p *peerConn) stagePendingRecon(txids [][32]byte) ([][][32]byte, bool) {
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
 	p.pendingRecon = append(p.pendingRecon, txids...)
+	p.telemetry.noteCoalescedRecon(len(txids))
 	ready := make([][][32]byte, 0, len(p.pendingRecon)/maxBatch+1)
 	for len(p.pendingRecon) >= maxBatch {
 		batch := append([][32]byte(nil), p.pendingRecon[:maxBatch]...)
@@ -4403,6 +5435,7 @@ func (p *peerConn) stagePendingRecon(txids [][32]byte) ([][][32]byte, bool) {
 }
 
 func (p *peerConn) flushPendingTxsAfterDelay() {
+	startedAt := time.Now()
 	timer := time.NewTimer(2 * time.Millisecond)
 	defer timer.Stop()
 	select {
@@ -4410,12 +5443,25 @@ func (p *peerConn) flushPendingTxsAfterDelay() {
 		return
 	case <-timer.C:
 	}
-	for _, batch := range p.takePendingTxs() {
+	batches := p.takePendingTxs()
+	txCount := 0
+	for _, batch := range batches {
+		txCount += len(batch)
 		p.enqueueRelayTxs(batch)
+	}
+	if p.svc != nil && len(batches) > 0 {
+		p.svc.perf.noteRelayFlushDuration(time.Since(startedAt))
+		p.svc.logger.Debug("flushed pending tx relay",
+			slog.String("addr", p.addr),
+			slog.Int("batches", len(batches)),
+			slog.Int("tx_count", txCount),
+			slog.Duration("flush_duration", time.Since(startedAt)),
+		)
 	}
 }
 
 func (p *peerConn) flushPendingReconAfterDelay() {
+	startedAt := time.Now()
 	timer := time.NewTimer(2 * time.Millisecond)
 	defer timer.Stop()
 	select {
@@ -4423,8 +5469,20 @@ func (p *peerConn) flushPendingReconAfterDelay() {
 		return
 	case <-timer.C:
 	}
-	for _, batch := range p.takePendingRecon() {
+	batches := p.takePendingRecon()
+	txidCount := 0
+	for _, batch := range batches {
+		txidCount += len(batch)
 		p.enqueueRelayRecon(batch)
+	}
+	if p.svc != nil && len(batches) > 0 {
+		p.svc.perf.noteRelayFlushDuration(time.Since(startedAt))
+		p.svc.logger.Debug("flushed pending tx reconciliation",
+			slog.String("addr", p.addr),
+			slog.Int("batches", len(batches)),
+			slog.Int("txid_count", txidCount),
+			slog.Duration("flush_duration", time.Since(startedAt)),
+		)
 	}
 }
 
@@ -4434,21 +5492,37 @@ func (p *peerConn) takePendingTxs() [][]types.Transaction {
 	defer func() {
 		p.txFlushArmed = false
 	}()
-	if len(p.pendingTxs) == 0 {
+	if len(p.pendingTxOrder) == 0 {
 		return nil
 	}
 	const maxBatch = 64
-	batches := make([][]types.Transaction, 0, (len(p.pendingTxs)+maxBatch-1)/maxBatch)
-	for len(p.pendingTxs) != 0 {
+	batches := make([][]types.Transaction, 0, (len(p.pendingTxOrder)+maxBatch-1)/maxBatch)
+	for len(p.pendingTxOrder) != 0 {
 		end := maxBatch
-		if end > len(p.pendingTxs) {
-			end = len(p.pendingTxs)
+		if end > len(p.pendingTxOrder) {
+			end = len(p.pendingTxOrder)
 		}
-		batch := append([]types.Transaction(nil), p.pendingTxs[:end]...)
-		batches = append(batches, batch)
-		p.pendingTxs = p.pendingTxs[end:]
+		batches = append(batches, p.takePendingTxBatchLocked(end))
 	}
 	return batches
+}
+
+func (p *peerConn) takePendingTxBatchLocked(size int) []types.Transaction {
+	batch := make([]types.Transaction, 0, size)
+	for _, txid := range p.pendingTxOrder[:size] {
+		tx, ok := p.pendingTxByID[txid]
+		if !ok {
+			continue
+		}
+		batch = append(batch, tx)
+		delete(p.pendingTxByID, txid)
+	}
+	p.pendingTxOrder = p.pendingTxOrder[size:]
+	if len(p.pendingTxOrder) == 0 {
+		p.pendingTxOrder = nil
+		p.pendingTxByID = nil
+	}
+	return batch
 }
 
 func (p *peerConn) takePendingRecon() [][][32]byte {
@@ -4481,6 +5555,7 @@ func (p *peerConn) enqueueRelayTxs(txs []types.Transaction) error {
 	envelope := outboundMessage{
 		msg:        p2p.TxBatchMessage{Txs: txs},
 		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneSend,
 		class:      classifyRelayMessage(p2p.TxBatchMessage{Txs: txs}),
 	}
 	select {
@@ -4488,7 +5563,7 @@ func (p *peerConn) enqueueRelayTxs(txs []types.Transaction) error {
 		p.releaseQueuedTxs(txs)
 		return io.EOF
 	case p.sendQ <- envelope:
-		p.telemetry.noteEnqueue(p.queueDepth())
+		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	default:
 		p.releaseQueuedTxs(txs)
@@ -4504,6 +5579,7 @@ func (p *peerConn) enqueueRelayRecon(txids [][32]byte) error {
 	envelope := outboundMessage{
 		msg:        p2p.TxReconMessage{TxIDs: txids},
 		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneSend,
 		class:      classifyRelayMessage(p2p.TxReconMessage{TxIDs: txids}),
 	}
 	select {
@@ -4511,7 +5587,7 @@ func (p *peerConn) enqueueRelayRecon(txids [][32]byte) error {
 		p.releaseQueuedTxIDs(txids)
 		return io.EOF
 	case p.sendQ <- envelope:
-		p.telemetry.noteEnqueue(p.queueDepth())
+		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	default:
 		p.releaseQueuedTxIDs(txids)
@@ -4545,6 +5621,88 @@ func (p *peerConn) noteKnownTxIDs(txids [][32]byte) {
 	}
 }
 
+func (p *peerConn) forgetKnownTxIDs(txids [][32]byte) {
+	if len(txids) == 0 {
+		return
+	}
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	cleared := 0
+	for _, txid := range txids {
+		if _, ok := p.knownTx[txid]; ok {
+			delete(p.knownTx, txid)
+			cleared++
+		}
+	}
+	if cleared > 0 {
+		p.telemetry.noteKnownTxClears(cleared)
+		if p.svc != nil {
+			p.svc.noteKnownTxClears(cleared)
+		}
+	}
+}
+
+func (p *peerConn) armLocalRelayFallback(txids [][32]byte, announcedAt time.Time) int {
+	if len(txids) == 0 {
+		return 0
+	}
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	if p.localRelayTxs == nil {
+		p.localRelayTxs = make(map[[32]byte]localRelayFallbackState, len(txids))
+	}
+	armed := 0
+	for _, txid := range txids {
+		if _, ok := p.localRelayTxs[txid]; ok {
+			continue
+		}
+		p.localRelayTxs[txid] = localRelayFallbackState{announcedAt: announcedAt}
+		armed++
+	}
+	return armed
+}
+
+func (p *peerConn) collectDueLocalRelayFallback(now time.Time, grace time.Duration, txids [][32]byte) [][32]byte {
+	if len(txids) == 0 {
+		return nil
+	}
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	due := make([][32]byte, 0, len(txids))
+	for _, txid := range txids {
+		state, ok := p.localRelayTxs[txid]
+		if !ok {
+			continue
+		}
+		if grace > 0 && now.Sub(state.announcedAt) < grace {
+			continue
+		}
+		due = append(due, txid)
+		delete(p.localRelayTxs, txid)
+	}
+	return due
+}
+
+func (p *peerConn) noteTxRequestReceived(txids [][32]byte) {
+	if len(txids) == 0 {
+		return
+	}
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	if p.localRelayTxs != nil {
+		for _, txid := range txids {
+			delete(p.localRelayTxs, txid)
+		}
+	}
+	p.telemetry.noteTxRequestReceived(len(txids))
+}
+
+func (p *peerConn) pendingLocalRelayCount() int {
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	return len(p.localRelayTxs)
+}
+
 func (p *peerConn) rememberKnownTxLocked(txid [32]byte) {
 	if _, ok := p.knownTx[txid]; ok {
 		return
@@ -4557,6 +5715,20 @@ func (p *peerConn) rememberKnownTxLocked(txid [32]byte) {
 		p.knownTxOrder = p.knownTxOrder[1:]
 		delete(p.knownTx, evict)
 	}
+}
+
+func txIDsFromInvItems(items []p2p.InvVector) [][32]byte {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([][32]byte, 0, len(items))
+	for _, item := range items {
+		if item.Type != p2p.InvTypeTx {
+			continue
+		}
+		out = append(out, item.Hash)
+	}
+	return out
 }
 
 func (p *peerConn) releaseRelayBatch(msg p2p.Message) {
@@ -4589,12 +5761,95 @@ func (p *peerConn) deletePendingThin(hash [32]byte) {
 	delete(p.pendingThin, hash)
 }
 
-func (t *peerRelayTelemetry) noteEnqueue(depth int) {
+func (t *peerRelayTelemetry) noteEnqueue(depth queueDepthSnapshot) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if depth > t.maxQueueDepth {
-		t.maxQueueDepth = depth
+	if depth.total > t.maxQueueDepth {
+		t.maxQueueDepth = depth.total
 	}
+	if depth.control > t.maxControlQueueDepth {
+		t.maxControlQueueDepth = depth.control
+	}
+	if depth.priority > t.maxPriorityQueueDepth {
+		t.maxPriorityQueueDepth = depth.priority
+	}
+	if depth.send > t.maxSendQueueDepth {
+		t.maxSendQueueDepth = depth.send
+	}
+}
+
+func (t *peerRelayTelemetry) noteDuplicateInv(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.duplicateInv += count
+}
+
+func (t *peerRelayTelemetry) noteDuplicateTx(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.duplicateTx += count
+}
+
+func (t *peerRelayTelemetry) noteKnownTxSuppressed(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.knownTxSuppressed += count
+}
+
+func (t *peerRelayTelemetry) noteCoalescedTxs(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.coalescedTxItems += count
+}
+
+func (t *peerRelayTelemetry) noteCoalescedRecon(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.coalescedReconItems += count
+}
+
+func (t *peerRelayTelemetry) noteTxReconRetry(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.txReconRetries += count
+}
+
+func (t *peerRelayTelemetry) noteTxRequestReceived(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.txReqRecvMsgs++
+	t.txReqRecvItems += count
+}
+
+func (t *peerRelayTelemetry) noteFallbackBatch(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fallbackTxBatchMsgs++
+	t.fallbackTxBatchItems += count
+}
+
+func (t *peerRelayTelemetry) noteTxNotFoundSent(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.txNotFoundSent += count
+}
+
+func (t *peerRelayTelemetry) noteTxNotFoundReceived(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.txNotFoundReceived += count
+}
+
+func (t *peerRelayTelemetry) noteKnownTxClears(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.knownTxClears += count
+}
+
+func (t *peerRelayTelemetry) noteWriterStarvation() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.writerStarvation++
 }
 
 func (t *peerRelayTelemetry) noteDroppedInv(count int) {
@@ -4615,37 +5870,85 @@ func (t *peerRelayTelemetry) noteSent(envelope outboundMessage, _ int) {
 	t.sentMessages++
 	t.txInvItems += envelope.class.txInvItems
 	t.blockInvItems += envelope.class.blockInvItems
+	t.blockSendItems += envelope.class.blockSendItems
+	t.blockReqItems += envelope.class.blockReqItems
 	t.txBatchMsgs += envelope.class.txBatchMsgs
 	t.txBatchItems += envelope.class.txBatchItems
+	t.fallbackTxBatchMsgs += envelope.class.fallbackTxBatchMsgs
+	t.fallbackTxBatchItems += envelope.class.fallbackTxBatchItems
 	t.txReconMsgs += envelope.class.txReconMsgs
 	t.txReconItems += envelope.class.txReconItems
 	t.txReqMsgs += envelope.class.txReqMsgs
 	t.txReqItems += envelope.class.txReqItems
+	if !envelope.enqueuedAt.IsZero() {
+		t.lastRelayActivityUnix = time.Now().Unix()
+	}
 	if envelope.class.txInvItems != 0 || envelope.class.blockInvItems != 0 || envelope.class.txBatchItems != 0 || envelope.class.txReconItems != 0 || envelope.class.txReqItems != 0 {
-		t.relaySamples = append(t.relaySamples, float64(time.Since(envelope.enqueuedAt).Microseconds())/1000)
+		delay := time.Since(envelope.enqueuedAt)
+		t.relaySamples = append(t.relaySamples, float64(delay.Microseconds())/1000)
+		if relayLaneBudget(envelope.lane) > 0 && delay > relayLaneBudget(envelope.lane) {
+			t.writerStarvation++
+		}
 	}
 }
 
-func (t *peerRelayTelemetry) snapshot(addr string, outbound bool, queueDepth int) PeerRelayStats {
+func relayLaneBudget(lane relayQueueLane) time.Duration {
+	switch lane {
+	case relayQueueLaneControl:
+		return 100 * time.Millisecond
+	case relayQueueLanePriority:
+		return 200 * time.Millisecond
+	case relayQueueLaneSend:
+		return 500 * time.Millisecond
+	default:
+		return 0
+	}
+}
+
+func (t *peerRelayTelemetry) snapshot(addr string, outbound bool, queueDepth queueDepthSnapshot, pendingLocalRelay int) PeerRelayStats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	stats := PeerRelayStats{
-		Addr:          addr,
-		Outbound:      outbound,
-		QueueDepth:    queueDepth,
-		MaxQueueDepth: t.maxQueueDepth,
-		SentMessages:  t.sentMessages,
-		TxInvItems:    t.txInvItems,
-		BlockInvItems: t.blockInvItems,
-		TxBatchMsgs:   t.txBatchMsgs,
-		TxBatchItems:  t.txBatchItems,
-		TxReconMsgs:   t.txReconMsgs,
-		TxReconItems:  t.txReconItems,
-		TxReqMsgs:     t.txReqMsgs,
-		TxReqItems:    t.txReqItems,
-		DroppedInv:    t.droppedInv,
-		DroppedTxs:    t.droppedTxs,
-		RelayEvents:   len(t.relaySamples),
+		Addr:                   addr,
+		Outbound:               outbound,
+		QueueDepth:             queueDepth.total,
+		MaxQueueDepth:          t.maxQueueDepth,
+		ControlQueueDepth:      queueDepth.control,
+		PriorityQueueDepth:     queueDepth.priority,
+		SendQueueDepth:         queueDepth.send,
+		MaxControlQueueDepth:   t.maxControlQueueDepth,
+		MaxPriorityQueueDepth:  t.maxPriorityQueueDepth,
+		MaxSendQueueDepth:      t.maxSendQueueDepth,
+		PendingLocalRelayTxs:   pendingLocalRelay,
+		SentMessages:           t.sentMessages,
+		TxInvItems:             t.txInvItems,
+		BlockInvItems:          t.blockInvItems,
+		BlockSendItems:         t.blockSendItems,
+		BlockReqItems:          t.blockReqItems,
+		TxBatchMsgs:            t.txBatchMsgs,
+		TxBatchItems:           t.txBatchItems,
+		TxReconMsgs:            t.txReconMsgs,
+		TxReconItems:           t.txReconItems,
+		TxReconRetries:         t.txReconRetries,
+		TxReqMsgs:              t.txReqMsgs,
+		TxReqItems:             t.txReqItems,
+		TxReqRecvMsgs:          t.txReqRecvMsgs,
+		TxReqRecvItems:         t.txReqRecvItems,
+		FallbackTxBatchMsgs:    t.fallbackTxBatchMsgs,
+		FallbackTxBatchItems:   t.fallbackTxBatchItems,
+		TxNotFoundSent:         t.txNotFoundSent,
+		TxNotFoundReceived:     t.txNotFoundReceived,
+		KnownTxClears:          t.knownTxClears,
+		DuplicateInvSuppressed: t.duplicateInv,
+		DuplicateTxSuppressed:  t.duplicateTx,
+		KnownTxSuppressed:      t.knownTxSuppressed,
+		CoalescedTxItems:       t.coalescedTxItems,
+		CoalescedReconItems:    t.coalescedReconItems,
+		DroppedInv:             t.droppedInv,
+		DroppedTxs:             t.droppedTxs,
+		WriterStarvationEvents: t.writerStarvation,
+		LastRelayActivityUnix:  t.lastRelayActivityUnix,
+		RelayEvents:            len(t.relaySamples),
 	}
 	if len(t.relaySamples) == 0 {
 		return stats
@@ -4660,62 +5963,6 @@ func (t *peerRelayTelemetry) snapshot(addr string, outbound bool, queueDepth int
 	stats.RelayP95MS = samples[(len(samples)-1)*95/100]
 	stats.RelayMaxMS = samples[len(samples)-1]
 	return stats
-}
-
-func (t *templateBuildTelemetry) noteCacheHit(frontierCandidates int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.cacheHits++
-	if frontierCandidates > t.frontierCandidates {
-		t.frontierCandidates = frontierCandidates
-	}
-}
-
-func (t *templateBuildTelemetry) noteRebuild(frontierCandidates int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.rebuilds++
-	if frontierCandidates > t.frontierCandidates {
-		t.frontierCandidates = frontierCandidates
-	}
-}
-
-func (t *templateBuildTelemetry) noteInvalidation(reason string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.invalidations++
-	t.lastReason = reason
-}
-
-func (t *templateBuildTelemetry) noteInterruption() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.interruptions++
-	t.lastReason = "interrupted"
-}
-
-func (t *templateBuildTelemetry) noteBuildTime(at time.Time) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.lastBuildAt = at
-}
-
-func (t *templateBuildTelemetry) snapshot() BlockTemplateStats {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	lastBuildAgeMS := 0
-	if !t.lastBuildAt.IsZero() {
-		lastBuildAgeMS = int(time.Since(t.lastBuildAt) / time.Millisecond)
-	}
-	return BlockTemplateStats{
-		CacheHits:          t.cacheHits,
-		Rebuilds:           t.rebuilds,
-		FrontierCandidates: t.frontierCandidates,
-		Invalidations:      t.invalidations,
-		Interruptions:      t.interruptions,
-		LastBuildAgeMS:     lastBuildAgeMS,
-		LastReason:         t.lastReason,
-	}
 }
 
 func (s *Service) activePeerAddrs() []string {
@@ -4785,24 +6032,73 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 	if blockTip == nil || headerTip == nil {
 		return out, false, nil
 	}
-	for height := *blockTip + 1; height <= *headerTip && len(out) < limit; height++ {
-		entry, err := s.chainState.Store().GetBlockIndexByHeight(height)
+	startHeight := *blockTip + 1
+	if tipHeader := s.chainState.ChainState().TipHeader(); tipHeader != nil {
+		tipHash := consensus.HeaderHash(tipHeader)
+		activeTipHash, err := s.chainState.Store().GetHeaderHashByHeight(*blockTip)
 		if err != nil {
 			return nil, false, err
 		}
-		if entry == nil {
+		if activeTipHash == nil {
 			return out, true, nil
 		}
-		hash := consensus.HeaderHash(&entry.Header)
-		block, err := s.chainState.Store().GetBlock(&hash)
+		if *activeTipHash != tipHash {
+			forkHeight, err := s.firstMissingActiveBlockHeightLocked(*blockTip, tipHash)
+			if err != nil {
+				return nil, false, err
+			}
+			startHeight = forkHeight
+		}
+	}
+	for height := startHeight; height <= *headerTip && len(out) < limit; height++ {
+		hash, err := s.chainState.Store().GetHeaderHashByHeight(height)
+		if err != nil {
+			return nil, false, err
+		}
+		if hash == nil {
+			return out, true, nil
+		}
+		block, err := s.chainState.Store().GetBlock(hash)
 		if err != nil {
 			return nil, false, err
 		}
 		if block == nil {
-			out = append(out, hash)
+			if s.hasPendingPeerBlock(*hash) {
+				continue
+			}
+			out = append(out, *hash)
 		}
 	}
 	return out, false, nil
+}
+
+func (s *Service) firstMissingActiveBlockHeightLocked(blockTipHeight uint64, blockTipHash [32]byte) (uint64, error) {
+	cursorHeight := blockTipHeight
+	cursorHash := blockTipHash
+	for {
+		activeHash, err := s.chainState.Store().GetHeaderHashByHeight(cursorHeight)
+		if err != nil {
+			return 0, err
+		}
+		if activeHash == nil {
+			return 0, fmt.Errorf("missing active header hash at height %d while locating fork point", cursorHeight)
+		}
+		if *activeHash == cursorHash {
+			return cursorHeight + 1, nil
+		}
+		if cursorHeight == 0 {
+			return 1, nil
+		}
+		entry, err := s.chainState.Store().GetBlockIndex(&cursorHash)
+		if err != nil {
+			return 0, err
+		}
+		if entry == nil {
+			return 0, fmt.Errorf("missing block index for active tip ancestor %x", cursorHash)
+		}
+		cursorHash = entry.ParentHash
+		cursorHeight--
+	}
 }
 
 func (s *Service) repairActiveHeightIndex() (int, error) {
@@ -4817,7 +6113,7 @@ func (s *Service) restartOutboundPeer(addr string)  { s.peerManager().restartOut
 func (s *Service) knownPeerAddrs() []string         { return s.peerManager().knownPeerAddrs() }
 func (s *Service) hasPeer(addr string) bool         { return s.peerManager().hasPeer(addr) }
 func (s *Service) hasOutboundPeer(addr string) bool { return s.peerManager().hasOutboundPeer(addr) }
-func (s *Service) loadPersistedKnownPeers(peers map[string]time.Time) {
+func (s *Service) loadPersistedKnownPeers(peers map[string]storage.KnownPeerRecord) {
 	s.peerManager().loadPersistedKnownPeers(peers)
 }
 func (s *Service) recordKnownPeerSuccess(addr string, at time.Time) {
@@ -4868,7 +6164,7 @@ func (s *Service) findLocatorHeightLocked(locator [][32]byte) (uint64, error) {
 		if entry == nil {
 			continue
 		}
-		activeHash, err := s.chainState.Store().GetBlockHashByHeight(entry.Height)
+		activeHash, err := s.chainState.Store().GetHeaderHashByHeight(entry.Height)
 		if err != nil {
 			return 0, err
 		}
@@ -4942,6 +6238,8 @@ func renderPublicDashboardPage(view *publicDashboardView, path string) (string, 
 	switch {
 	case path == "/":
 		return renderPublicDashboardHome(view), http.StatusOK
+	case path == "/fees":
+		return renderPublicFeePage(view), http.StatusOK
 	case strings.HasPrefix(path, "/block/"):
 		hash := strings.TrimPrefix(path, "/block/")
 		for _, block := range view.blocks {
@@ -4961,8 +6259,44 @@ func renderPublicDashboardPage(view *publicDashboardView, path string) (string, 
 				}
 			}
 		}
+	case strings.HasPrefix(path, "/peer/"):
+		host, err := url.PathUnescape(strings.TrimPrefix(path, "/peer/"))
+		if err == nil {
+			for _, peerHost := range view.peerHosts {
+				if peerHost.Host == host {
+					return renderPublicPeerPage(view, peerHost), http.StatusOK
+				}
+			}
+		}
 	}
 	return renderPublicNotFoundPage(view), http.StatusNotFound
+}
+
+type dashboardKeyValueRow struct {
+	Key   string
+	Value string
+}
+
+// Render dashboard metadata with a per-section label width so each value
+// starts at a stable column without hand-maintained spacing.
+func renderDashboardKeyValues(rows ...dashboardKeyValueRow) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	width := 0
+	for _, row := range rows {
+		if len(row.Key) > width {
+			width = len(row.Key)
+		}
+	}
+	var out strings.Builder
+	for _, row := range rows {
+		if row.Key == "" {
+			continue
+		}
+		out.WriteString(fmt.Sprintf(" %-*s : %s\n", width, row.Key, row.Value))
+	}
+	return out.String()
 }
 
 func renderPublicDashboardHome(view *publicDashboardView) string {
@@ -4972,24 +6306,22 @@ func renderPublicDashboardHome(view *publicDashboardView) string {
 	body.WriteString(renderDashboardBanner())
 	body.WriteString("\n")
 	body.WriteString(renderSectionHeader("CHAIN OVERVIEW"))
-	body.WriteString(fmt.Sprintf(" Node ID      : %s\n", view.nodeID))
-	body.WriteString(fmt.Sprintf(" Created      : %s UTC\n", view.createdAt.UTC().Format("2006-01-02 15:04:05")))
-	body.WriteString(fmt.Sprintf(" Refreshed    : %s UTC\n", view.generatedAt.UTC().Format("2006-01-02 15:04:05")))
-	body.WriteString(fmt.Sprintf(" Health       : %s\n", view.health))
-	body.WriteString(fmt.Sprintf(" Tip          : height %-8d  hash %s\n", view.info.TipHeight, linkHash("/block/", view.info.TipHeaderHash, 14)))
-	body.WriteString(fmt.Sprintf(" UTXO Root    : %s\n", shortHexString(view.info.UTXORoot, 20)))
-	body.WriteString(fmt.Sprintf(" Peers        : %-4d  mempool %-6d  orphans %-4d\n", len(view.peers), view.mempool.Count, view.mempool.Orphans))
-	body.WriteString(fmt.Sprintf(" Tx Relay     : reconciled batches\n"))
-	body.WriteString(fmt.Sprintf(" Block Relay  : short-id blocks\n"))
-	body.WriteString(fmt.Sprintf(" Template     : cache %-4d  rebuilds %-4d  frontier %-4d  invalid %-4d  interrupt %-4d  age_ms %-6d  reason %s\n",
-		view.template.CacheHits,
-		view.template.Rebuilds,
-		view.template.FrontierCandidates,
-		view.template.Invalidations,
-		view.template.Interruptions,
-		view.template.LastBuildAgeMS,
-		defaultDashboardValue(view.template.LastReason, "-"),
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "Health", Value: view.health},
+		dashboardKeyValueRow{Key: "Tip Height", Value: fmt.Sprintf("%d", view.info.TipHeight)},
+		dashboardKeyValueRow{Key: "Tip Hash", Value: linkHash("/block/", view.info.TipHeaderHash, 14)},
+		dashboardKeyValueRow{Key: "Last Block", Value: formatDashboardAgeFromTime(view.generatedAt, view.pow.LastBlockTimestamp)},
+		dashboardKeyValueRow{Key: "Network Hashrate", Value: formatHumanHashRate(view.pow.NetworkHashrate)},
+		dashboardKeyValueRow{Key: "Peers", Value: fmt.Sprintf("%d", len(view.peers))},
+		dashboardKeyValueRow{Key: "Mempool", Value: fmt.Sprintf("%d tx", view.mempool.Count)},
+		dashboardKeyValueRow{Key: "Current Orphan Blocks", Value: fmt.Sprintf("%d", view.performance.Gauges.PendingPeerBlocks)},
+		dashboardKeyValueRow{Key: "Tx Relay Mode", Value: "reconciled batches"},
+		dashboardKeyValueRow{Key: "Block Relay Mode", Value: "short-id blocks"},
 	))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader("CANDIDATE BLOCK"))
+	body.WriteString(renderCandidateBlockSection(view.template))
 	body.WriteString("\n")
 
 	body.WriteString(renderSectionHeader("BLOCK FLOW"))
@@ -5000,7 +6332,7 @@ func renderPublicDashboardHome(view *publicDashboardView) string {
 	body.WriteString(renderTPSChart(view.tpsChart))
 	body.WriteString("\n")
 
-	body.WriteString(renderSectionHeader("FEE WINDOW"))
+	body.WriteString(renderSectionHeader("FEE MARKET"))
 	body.WriteString(renderFeeSection(view.fees))
 	body.WriteString("\n")
 
@@ -5010,7 +6342,7 @@ func renderPublicDashboardHome(view *publicDashboardView) string {
 
 	if view.mining.Enabled {
 		body.WriteString(renderSectionHeader("MINING"))
-		body.WriteString(renderMiningSection(view.mining, view.pow))
+		body.WriteString(renderMiningSection(view.mining))
 		body.WriteString("\n")
 	}
 
@@ -5019,7 +6351,11 @@ func renderPublicDashboardHome(view *publicDashboardView) string {
 	body.WriteString("\n")
 
 	body.WriteString(renderSectionHeader("PEER MESH"))
-	body.WriteString(renderPeerMesh(view.peers, view.relay, view.info.TipHeight))
+	body.WriteString(renderPeerMesh(view.peerHosts))
+	body.WriteString("\n")
+
+	body.WriteString(renderSectionHeader("PERFORMANCE"))
+	body.WriteString(renderPerformanceSection(view.performance))
 	body.WriteString("\n")
 
 	body.WriteString(renderDashboardSystemSection(view.system))
@@ -5038,18 +6374,20 @@ func renderPublicBlockPage(view *publicDashboardView, block dashboardBlockPage) 
 	body.WriteString(renderBlockVisual(block))
 	body.WriteString("\n")
 	body.WriteString(renderSectionHeader("BLOCK META"))
-	body.WriteString(fmt.Sprintf(" Hash         : %s\n", fullHashString(block.Hash)))
-	body.WriteString(fmt.Sprintf(" Prev         : %s\n", shortHexBytes(block.PrevHash, 24)))
-	body.WriteString(fmt.Sprintf(" Time         : %s UTC\n", block.Timestamp.Format("2006-01-02 15:04:05")))
-	body.WriteString(fmt.Sprintf(" Size         : %s bytes\n", formatWithCommas(block.Size)))
-	body.WriteString(fmt.Sprintf(" Tx Count     : %d\n", block.TxCount))
-	body.WriteString(fmt.Sprintf(" Fees         : median %s  low %s  high %s  total %s\n",
-		formatAtoms(block.MedianFee), formatAtoms(block.LowFee), formatAtoms(block.HighFee), formatAtoms(block.TotalFees)))
-	body.WriteString(fmt.Sprintf(" Pow Bits     : 0x%08x\n", block.NBits))
-	body.WriteString(fmt.Sprintf(" Tx Root      : %s\n", shortHexBytes(block.TxRoot, 24)))
-	body.WriteString(fmt.Sprintf(" Auth Root    : %s\n", shortHexBytes(block.AuthRoot, 24)))
-	body.WriteString(fmt.Sprintf(" UTXO Root    : %s\n", shortHexBytes(block.UTXORoot, 24)))
-	body.WriteString(fmt.Sprintf(" Mined Here   : %t\n", block.MinedByNode))
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "Hash", Value: fullHashString(block.Hash)},
+		dashboardKeyValueRow{Key: "Prev", Value: shortHexBytes(block.PrevHash, 24)},
+		dashboardKeyValueRow{Key: "Time", Value: block.Timestamp.Format("2006-01-02 15:04:05") + " UTC"},
+		dashboardKeyValueRow{Key: "Size", Value: fmt.Sprintf("%s bytes", formatWithCommas(block.Size))},
+		dashboardKeyValueRow{Key: "Tx Count", Value: fmt.Sprintf("%d", block.TxCount)},
+		dashboardKeyValueRow{Key: "Fees", Value: fmt.Sprintf("median %s  low %s  high %s  total %s",
+			formatAtoms(block.MedianFee), formatAtoms(block.LowFee), formatAtoms(block.HighFee), formatAtoms(block.TotalFees))},
+		dashboardKeyValueRow{Key: "Pow Bits", Value: fmt.Sprintf("0x%08x", block.NBits)},
+		dashboardKeyValueRow{Key: "Tx Root", Value: shortHexBytes(block.TxRoot, 24)},
+		dashboardKeyValueRow{Key: "Auth Root", Value: shortHexBytes(block.AuthRoot, 24)},
+		dashboardKeyValueRow{Key: "UTXO Root", Value: shortHexBytes(block.UTXORoot, 24)},
+		dashboardKeyValueRow{Key: "Mined Here", Value: fmt.Sprintf("%t", block.MinedByNode)},
+	))
 	body.WriteString("\n")
 	body.WriteString(renderSectionHeader("TX PREVIEW"))
 	body.WriteString(renderBlockTxPreview(block))
@@ -5069,21 +6407,85 @@ func renderPublicTxPage(_ *publicDashboardView, block dashboardBlockPage, tx das
 	body.WriteString(renderTxVisual(tx))
 	body.WriteString("\n")
 	body.WriteString(renderSectionHeader("TX META"))
-	body.WriteString(fmt.Sprintf(" TxID         : %s\n", fullHashString(tx.TxID)))
-	body.WriteString(fmt.Sprintf(" Block        : %d / %s\n", block.Height, shortHexBytes(block.Hash, 20)))
-	body.WriteString(fmt.Sprintf(" Time         : %s UTC\n", tx.Timestamp.Format("2006-01-02 15:04:05")))
-	body.WriteString(fmt.Sprintf(" Coinbase     : %t\n", tx.Coinbase))
-	body.WriteString(fmt.Sprintf(" Size         : %s bytes\n", formatWithCommas(tx.Size)))
-	body.WriteString(fmt.Sprintf(" Auth Entries : %d\n", tx.AuthCount))
-	body.WriteString(fmt.Sprintf(" Inputs       : %d (%s)\n", len(tx.Inputs), formatAtoms(tx.InputSum)))
-	body.WriteString(fmt.Sprintf(" Outputs      : %d (%s)\n", len(tx.Outputs), formatAtoms(tx.OutputSum)))
-	body.WriteString(fmt.Sprintf(" Fee          : %s (%s/byte)\n", formatAtoms(tx.Fee), formatAtoms(tx.FeeRate)))
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "TxID", Value: fullHashString(tx.TxID)},
+		dashboardKeyValueRow{Key: "Block", Value: fmt.Sprintf("%d / %s", block.Height, shortHexBytes(block.Hash, 20))},
+		dashboardKeyValueRow{Key: "Time", Value: tx.Timestamp.Format("2006-01-02 15:04:05") + " UTC"},
+		dashboardKeyValueRow{Key: "Coinbase", Value: fmt.Sprintf("%t", tx.Coinbase)},
+		dashboardKeyValueRow{Key: "Size", Value: fmt.Sprintf("%s bytes", formatWithCommas(tx.Size))},
+		dashboardKeyValueRow{Key: "Auth Entries", Value: fmt.Sprintf("%d", tx.AuthCount)},
+		dashboardKeyValueRow{Key: "Inputs", Value: fmt.Sprintf("%d (%s)", len(tx.Inputs), formatAtoms(tx.InputSum))},
+		dashboardKeyValueRow{Key: "Outputs", Value: fmt.Sprintf("%d (%s)", len(tx.Outputs), formatAtoms(tx.OutputSum))},
+		dashboardKeyValueRow{Key: "Fee", Value: fmt.Sprintf("%s (%s/byte)", formatAtoms(tx.Fee), formatAtoms(tx.FeeRate))},
+	))
 	body.WriteString("\n")
 	body.WriteString(renderSectionHeader("INPUTS"))
 	body.WriteString(renderTxInputs(tx))
 	body.WriteString("\n")
 	body.WriteString(renderSectionHeader("OUTPUTS"))
 	body.WriteString(renderTxOutputs(tx))
+	body.WriteString(renderHTMLEpilogue())
+	return body.String()
+}
+
+func renderPublicPeerPage(view *publicDashboardView, host dashboardPeerHostPage) string {
+	var body strings.Builder
+	body.Grow(12288)
+	body.WriteString(renderHTMLPrologue(fmt.Sprintf("Peer %s", host.Host)))
+	body.WriteString(renderDashboardBannerCompact())
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("PEER DETAIL"))
+	body.WriteString(" <a href=\"/\">[home]</a>\n")
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "peer", Value: host.Host},
+		dashboardKeyValueRow{Key: "health", Value: host.Health},
+		dashboardKeyValueRow{Key: "direction", Value: host.Direction},
+		dashboardKeyValueRow{Key: "sockets", Value: fmt.Sprintf("%d", host.Sockets)},
+		dashboardKeyValueRow{Key: "last seen", Value: formatDashboardAgeCompact(host.LastSeenUnix)},
+		dashboardKeyValueRow{Key: "session age", Value: formatDashboardDuration(host.SessionAge)},
+	))
+	body.WriteString("\n")
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "blocks behind", Value: fmt.Sprintf("%d", host.BlocksBehind)},
+		dashboardKeyValueRow{Key: "best height", Value: fmt.Sprintf("%d", host.BestHeight)},
+		dashboardKeyValueRow{Key: "tip hash", Value: host.TipHash},
+		dashboardKeyValueRow{Key: "last block", Value: formatDashboardAgeCompact(host.LastBlockUnix)},
+	))
+	body.WriteString("\n")
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "latency avg", Value: fmt.Sprintf("%.2f s", host.LatencyAvgS)},
+		dashboardKeyValueRow{Key: "latency p95", Value: fmt.Sprintf("%.2f s", host.LatencyP95S)},
+		dashboardKeyValueRow{Key: "outbound queue", Value: fmt.Sprintf("%d", host.OutboundQueue)},
+	))
+	body.WriteString("\n")
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "tx sent", Value: fmt.Sprintf("%d", host.TxSent)},
+		dashboardKeyValueRow{Key: "tx requested", Value: fmt.Sprintf("%d", host.TxRequested)},
+		dashboardKeyValueRow{Key: "blk sent", Value: fmt.Sprintf("%d", host.BlockSent)},
+		dashboardKeyValueRow{Key: "blk requested", Value: fmt.Sprintf("%d", host.BlockRequested)},
+	))
+	body.WriteString("\n")
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "bytes in", Value: formatHumanBytes(host.BytesIn)},
+		dashboardKeyValueRow{Key: "bytes out", Value: formatHumanBytes(host.BytesOut)},
+	))
+	body.WriteString("\n")
+	body.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "reason", Value: host.Reason},
+	))
+	body.WriteString(renderHTMLEpilogue())
+	return body.String()
+}
+
+func renderPublicFeePage(view *publicDashboardView) string {
+	var body strings.Builder
+	body.Grow(12288)
+	body.WriteString(renderHTMLPrologue("Fee Market Details"))
+	body.WriteString(renderDashboardBannerCompact())
+	body.WriteString("\n")
+	body.WriteString(renderSectionHeader("FEE MARKET DETAILS"))
+	body.WriteString(" <a href=\"/\">[home]</a>\n")
+	body.WriteString(renderFeeChartPage(view.fees))
 	body.WriteString(renderHTMLEpilogue())
 	return body.String()
 }
@@ -5156,13 +6558,15 @@ func renderSectionHeader(title string) string {
 func renderDashboardSystemSection(summary dashboardSystemSummary) string {
 	var out strings.Builder
 	out.WriteString(renderSectionHeader(fmt.Sprintf("NODE SYSTEM (AVG %s)", formatDashboardWindow(summary.Window))))
-	out.WriteString(fmt.Sprintf(" CPU Avg      : %s\n", formatDashboardCPU(summary)))
-	out.WriteString(fmt.Sprintf(" Network Avg  : up %-12s down %-12s\n",
-		formatDashboardNetworkRate(summary.TxBytesPerSec, summary.HasNetwork), formatDashboardNetworkRate(summary.RxBytesPerSec, summary.HasNetwork)))
-	out.WriteString(fmt.Sprintf(" RAM Avg      : %s\n", formatDashboardMemory(summary)))
-	out.WriteString(fmt.Sprintf(" Load Avg     : %s\n", formatDashboardLoad(summary)))
-	out.WriteString(fmt.Sprintf(" Processes    : %s\n", formatDashboardProcesses(summary)))
-	out.WriteString(fmt.Sprintf(" CPU Cores    : %s\n", formatDashboardCores(summary)))
+	out.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "CPU Avg", Value: formatDashboardCPU(summary)},
+		dashboardKeyValueRow{Key: "Network Up", Value: formatDashboardNetworkRate(summary.TxBytesPerSec, summary.HasNetwork)},
+		dashboardKeyValueRow{Key: "Network Down", Value: formatDashboardNetworkRate(summary.RxBytesPerSec, summary.HasNetwork)},
+		dashboardKeyValueRow{Key: "RAM Avg", Value: formatDashboardMemory(summary)},
+		dashboardKeyValueRow{Key: "Load Avg", Value: formatDashboardLoad(summary)},
+		dashboardKeyValueRow{Key: "Processes", Value: formatDashboardProcesses(summary)},
+		dashboardKeyValueRow{Key: "CPU Cores", Value: formatDashboardCores(summary)},
+	))
 	return out.String()
 }
 
@@ -5181,160 +6585,563 @@ func renderBlockFlow(blocks []dashboardBlockPage) string {
 			return 0
 		}
 	})
+	const cardWidth = 17
 	top := make([]string, 0, len(ordered))
 	mid := make([]string, 0, len(ordered))
-	bot := make([]string, 0, len(ordered))
+	hashes := make([]string, 0, len(ordered))
 	cap := make([]string, 0, len(ordered))
 	for i, block := range ordered {
-		label := fmt.Sprintf("h:%d", block.Height)
+		label := fmt.Sprintf("height %d", block.Height)
 		if i == len(ordered)-1 {
-			label = fmt.Sprintf("tip:%d", block.Height)
+			label = fmt.Sprintf("tip %d", block.Height)
 		}
-		hash := linkHashPadded("/block/", hex.EncodeToString(block.Hash[:]), 12, 12)
-		top = append(top, ".--------------.")
-		mid = append(mid, fmt.Sprintf("| %-12s |", label))
-		bot = append(bot, fmt.Sprintf("| %s |", hash))
-		cap = append(cap, "'--------------'")
+		hash := linkHashPadded("/block/", hex.EncodeToString(block.Hash[:]), 12, cardWidth)
+		top = append(top, "."+strings.Repeat("-", cardWidth+2)+".")
+		mid = append(mid, fmt.Sprintf("| %-*s |", cardWidth, label))
+		hashes = append(hashes, fmt.Sprintf("| %s |", hash))
+		cap = append(cap, "'"+strings.Repeat("-", cardWidth+2)+"'")
 	}
 	gap := "   "
 	arrow := " ---> "
+	if len(arrow) > len(gap) {
+		gap = strings.Repeat(" ", len(arrow))
+	}
+	// Keep every row on the same column grid so hash-row arrows do not skew the cards.
 	return " " + strings.Join(top, gap) + "\n" +
 		" " + strings.Join(mid, gap) + "\n" +
-		" " + strings.Join(bot, arrow) + "\n" +
+		" " + strings.Join(hashes, arrow) + "\n" +
 		" " + strings.Join(cap, gap) + "\n"
 }
 
 func renderTPSChart(chart dashboardTPSChart) string {
-	if len(chart.Buckets) == 0 || chart.MaxTPS == 0 {
+	if len(chart.Blocks) == 0 {
 		return " no recent block throughput yet\n"
 	}
-	const rows = 8
 	var out strings.Builder
-	for row := rows; row >= 1; row-- {
-		threshold := chart.MaxTPS * float64(row) / float64(rows)
-		out.WriteString(fmt.Sprintf(" %7.1f |", threshold))
-		for _, bucket := range chart.Buckets {
-			if bucket >= threshold {
-				out.WriteByte('#')
-			} else {
-				out.WriteByte(' ')
-			}
+	for _, block := range chart.Blocks {
+		marker := " "
+		if block.Candidate {
+			marker = "*"
 		}
-		out.WriteString("\n")
-	}
-	out.WriteString("     0.0 +")
-	out.WriteString(strings.Repeat("-", len(chart.Buckets)))
-	out.WriteString("\n")
-	out.WriteString("         ")
-	for _, end := range chart.BucketEnd {
-		out.WriteString(string(end.Format("15:04")[3]))
+		out.WriteString(fmt.Sprintf(" %3d tx%s |%s\n", block.TxCount, marker, strings.Repeat("█", block.BarWidth)))
 	}
 	out.WriteString("\n")
-	out.WriteString(fmt.Sprintf(" max %.1f tx/s\n", chart.MaxTPS))
+	out.WriteString(fmt.Sprintf(" %d tx total over last %d blocks (%.2f avg TPS)\n", chart.TotalTx, len(chart.Blocks), chart.AvgTPS))
+	out.WriteString(fmt.Sprintf(" %.1f tx avg/block\n", chart.AvgTxPerBlk))
+	for _, block := range chart.Blocks {
+		if block.Candidate {
+			out.WriteString(" * candidate block\n")
+			break
+		}
+	}
 	return out.String()
 }
 
 func renderFeeSection(summary dashboardFeeSummary) string {
 	var out strings.Builder
 	if len(summary.Recent) == 0 {
-		out.WriteString(" no recent block fees yet\n")
-	} else {
-		for _, line := range summary.Recent {
-			out.WriteString(fmt.Sprintf(" h%-6d median %-10s low %-10s high %-10s\n",
-				line.Height, formatAtoms(line.MedianFee), formatAtoms(line.LowFee), formatAtoms(line.HighFee)))
-		}
+		return " no recent block fees yet\n"
 	}
-	out.WriteString(fmt.Sprintf(" mempool clear estimate : ~%d block(s) / %s\n", summary.Clear.Blocks, formatDashboardDuration(summary.Clear.Time)))
+	out.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: fmt.Sprintf("%d-block medians", summary.TotalBlocks), Value: renderFeeSparkline(summary.Recent)},
+		dashboardKeyValueRow{Key: "current / 6-block median", Value: fmt.Sprintf("%s / %s", formatAtomsPerKB(summary.CurrentMedian), formatAtomsPerKB(summary.Median6))},
+		dashboardKeyValueRow{Key: "paid blocks", Value: fmt.Sprintf("%d / %d", summary.PaidBlocks, summary.TotalBlocks)},
+	))
+	out.WriteString("\n")
+	out.WriteString(" <a href=\"/fees\">Full fee chart →</a>\n")
+	return out.String()
+}
+
+func renderFeeChartPage(summary dashboardFeeSummary) string {
+	var out strings.Builder
+	if len(summary.Recent) == 0 {
+		out.WriteString(" no recent block fees yet\n")
+		return out.String()
+	}
+	out.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "6-block median", Value: formatAtomsPerKB(summary.Median6)},
+		dashboardKeyValueRow{Key: "24-block median", Value: formatAtomsPerKB(summary.Median24)},
+		dashboardKeyValueRow{Key: "recent min / max", Value: fmt.Sprintf("%s / %s atoms/kB", formatAtoms(summary.RecentMin), formatAtoms(summary.RecentMax))},
+		dashboardKeyValueRow{Key: "paid blocks", Value: fmt.Sprintf("%d / %d", summary.PaidBlocks, summary.TotalBlocks)},
+		dashboardKeyValueRow{Key: "fee-paying tx ratio", Value: formatDashboardPercent(summary.FeePayingTxs, summary.TotalTxs)},
+		dashboardKeyValueRow{Key: "candidate block fee", Value: formatAtomsPerKB(summary.CurrentMedian)},
+	))
+	out.WriteString("\n")
+	out.WriteString(fmt.Sprintf(" median fee by block, last %d (atoms/kB)\n\n", summary.TotalBlocks))
+	out.WriteString(renderFeeHistogram(summary))
+	out.WriteString("\n")
+	out.WriteString(" recent blocks\n")
+	out.WriteString(" height   median fee   paid tx   range\n")
+	if summary.Candidate.Available {
+		out.WriteString(fmt.Sprintf(" %-7s  %-11s  %-7d  %s -> %s\n",
+			fmt.Sprintf("%d*", summary.Candidate.Height),
+			formatAtoms(summary.Candidate.MedianFee),
+			summary.Candidate.PaidTxs,
+			formatAtoms(summary.Candidate.LowFee),
+			formatAtoms(summary.Candidate.HighFee),
+		))
+	}
+	remaining := 8
+	if summary.Candidate.Available {
+		remaining = 7
+	}
+	for i := len(summary.Recent) - 1; i >= 0 && remaining > 0; i-- {
+		line := summary.Recent[i]
+		out.WriteString(fmt.Sprintf(" %-7d  %-11s  %-7d  %s -> %s\n",
+			line.Height,
+			formatAtoms(line.MedianFee),
+			line.PaidTxs,
+			formatAtoms(line.LowFee),
+			formatAtoms(line.HighFee),
+		))
+		remaining--
+	}
+	out.WriteString("\n")
+	out.WriteString(" mempool by fee band\n")
+	out.WriteString(fmt.Sprintf(" 1000+    : %d tx\n", summary.Bands.Above1000))
+	out.WriteString(fmt.Sprintf(" 500-999  : %d tx\n", summary.Bands.Band500))
+	out.WriteString(fmt.Sprintf(" 100-499  : %d tx\n", summary.Bands.Band100))
+	out.WriteString(fmt.Sprintf(" 1-99     : %d tx\n", summary.Bands.Band1))
+	out.WriteString(fmt.Sprintf(" 0        : %d tx\n", summary.Bands.Zero))
+	if summary.Candidate.Available {
+		out.WriteString("\n * current candidate block\n")
+	}
 	return out.String()
 }
 
 func renderPowSection(summary dashboardPowSummary) string {
-	var out strings.Builder
-	out.WriteString(fmt.Sprintf(" Algo         : %s\n", summary.Algorithm))
-	out.WriteString(fmt.Sprintf(" Target Space : %s\n", formatDashboardDuration(summary.TargetSpacing)))
-	out.WriteString(fmt.Sprintf(" Current Bits : 0x%08x\n", summary.CurrentBits))
-	out.WriteString(fmt.Sprintf(" Next Bits    : 0x%08x\n", summary.NextBits))
-	out.WriteString(fmt.Sprintf(" Difficulty   : %.4fx\n", summary.Difficulty))
+	rows := []dashboardKeyValueRow{
+		{Key: "Algo", Value: summary.Algorithm},
+		{Key: "Target Space", Value: formatDashboardDuration(summary.TargetSpacing)},
+		{Key: "Recent Gap", Value: "warming up"},
+		{Key: "Difficulty", Value: fmt.Sprintf("%.4fx", summary.Difficulty)},
+		{Key: "Net Hashrate", Value: formatHumanHashRate(summary.NetworkHashrate)},
+		{Key: "Current Bits", Value: fmt.Sprintf("0x%08x", summary.CurrentBits)},
+		{Key: "Next Bits", Value: fmt.Sprintf("0x%08x", summary.NextBits)},
+	}
 	if summary.HasObservedGap {
-		out.WriteString(fmt.Sprintf(" Recent Gap   : %s\n", formatDashboardDuration(summary.AvgBlockInterval)))
-	} else {
-		out.WriteString(" Recent Gap   : warming up\n")
+		rows[2].Value = formatDashboardDuration(summary.RecentBlockGap)
 	}
 	if !summary.LastBlockTimestamp.IsZero() {
-		out.WriteString(fmt.Sprintf(" Last Block   : %s UTC\n", summary.LastBlockTimestamp.Format("2006-01-02 15:04:05")))
+		rows = append(rows, dashboardKeyValueRow{Key: "Last Block", Value: summary.LastBlockTimestamp.Format("2006-01-02 15:04:05") + " UTC"})
 	}
-	return out.String()
+	return renderDashboardKeyValues(rows...)
 }
 
-func renderMiningSection(summary dashboardMiningSummary, pow dashboardPowSummary) string {
+func renderMiningSection(summary dashboardMiningSummary) string {
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf(" Status       : enabled\n"))
-	out.WriteString(fmt.Sprintf(" Workers      : %d\n", summary.Workers))
-	out.WriteString(" Hashrate     : not sampled yet\n")
-	out.WriteString(fmt.Sprintf(" Target Space : %s\n", formatDashboardDuration(pow.TargetSpacing)))
+	winShare := "warming up"
+	if summary.RecentWindow > 0 {
+		winShare = fmt.Sprintf("%d / %d recent blocks", summary.RecentWins, summary.RecentWindow)
+	}
+	out.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "Status", Value: "enabled"},
+		dashboardKeyValueRow{Key: "Workers", Value: fmt.Sprintf("%d", summary.Workers)},
+		dashboardKeyValueRow{Key: "Local Est", Value: formatHumanHashRate(summary.EstimatedHashrate)},
+		dashboardKeyValueRow{Key: "Win Share", Value: winShare},
+	))
 	if len(summary.RecentHeights) == 0 {
 		out.WriteString(" Recent Wins  : none in current on-screen block window\n")
 		return out.String()
 	}
 	out.WriteString(" Recent Wins  :")
 	for i := range summary.RecentHeights {
-		out.WriteString(fmt.Sprintf(" h%d", summary.RecentHeights[i]))
+		out.WriteString(fmt.Sprintf(" %d", summary.RecentHeights[i]))
 	}
 	out.WriteString("\n")
 	return out.String()
 }
 
-func renderMempoolSection(summary dashboardMempoolSummary) string {
+func renderPerformanceSection(summary PerformanceMetrics) string {
 	var out strings.Builder
-	out.WriteString(fmt.Sprintf(" Tx Count     : %d\n", summary.Count))
-	out.WriteString(fmt.Sprintf(" Orphans      : %d\n", summary.Orphans))
-	out.WriteString(fmt.Sprintf(" Median Fee   : %s\n", formatAtoms(summary.MedianFee)))
-	out.WriteString(fmt.Sprintf(" Fee Low / Hi : %s / %s\n", formatAtoms(summary.LowFee), formatAtoms(summary.HighFee)))
-	out.WriteString(fmt.Sprintf(" Next Block   : est %s\n", formatDashboardDuration(summary.EstimatedNext)))
-	if len(summary.Top) == 0 {
-		out.WriteString(" Queue        : empty\n")
-		return out.String()
-	}
-	out.WriteString(" Queue Top    :\n")
-	maxFee := uint64(1)
-	for _, entry := range summary.Top {
-		if entry.Fee > maxFee {
-			maxFee = entry.Fee
-		}
-	}
-	for _, entry := range summary.Top {
-		width := int((entry.Fee * 20) / maxFee)
-		if width == 0 && entry.Fee > 0 {
-			width = 1
-		}
-		bar := strings.Repeat("#", width) + strings.Repeat(".", 20-width)
-		out.WriteString(fmt.Sprintf("   %s  fee %-10s  size %-6s  [%s]\n",
-			shortHexBytes(entry.TxID, 10), formatAtoms(entry.Fee), formatWithCommas(entry.Size), bar))
-	}
-	if summary.Count > len(summary.Top) {
-		out.WriteString(fmt.Sprintf("   ... %d more waiting\n", summary.Count-len(summary.Top)))
+	out.WriteString(fmt.Sprintf(" Generated    : %s UTC\n", summary.GeneratedAt.UTC().Format("2006-01-02 15:04:05")))
+	out.WriteString(formatDashboardColumns("Throughput", [][2]string{
+		{"admitted tx", formatWithCommas(summary.Counters.AdmittedTxs)},
+		{"blocks", formatWithCommas(summary.Counters.BlocksAccepted)},
+		{"orphans", formatWithCommas(summary.Counters.OrphanPromotions)},
+	}))
+	out.WriteString(formatDashboardColumns("Relay", [][2]string{
+		{"tx items", formatWithCommas(summary.Counters.RelayedTxItems)},
+		{"block items", formatWithCommas(summary.Counters.RelayedBlockItems)},
+		{"stalls", formatWithCommas(summary.Counters.PeerStallEvents)},
+	}))
+	out.WriteString(formatDashboardColumns("Template", [][2]string{
+		{"rebuilds", formatWithCommas(summary.Counters.TemplateRebuilds)},
+		{"interrupts", formatWithCommas(summary.Counters.TemplateInterruptions)},
+		{"frontier", formatWithCommas(summary.Gauges.CandidateFrontier)},
+	}))
+	out.WriteString(formatDashboardColumns("Peers", [][2]string{
+		{"connected", formatWithCommas(summary.Gauges.PeerCount)},
+		{"useful", formatWithCommas(summary.Gauges.UsefulPeers)},
+		{"mempool", formatWithCommas(summary.Gauges.MempoolTxs)},
+	}))
+	out.WriteString(formatDashboardColumns("Queues", [][2]string{
+		{"relay now", formatWithCommas(summary.Gauges.RelayQueueDepth)},
+		{"relay peak", formatWithCommas(summary.Gauges.RelayQueueDepthPeak)},
+		{"orphans", formatWithCommas(summary.Gauges.MempoolOrphans)},
+	}))
+	out.WriteString(formatDashboardColumns("Download", [][2]string{
+		{"pending blk", formatWithCommas(summary.Gauges.PendingPeerBlocks)},
+		{"inflight blk", formatWithCommas(summary.Gauges.InflightBlockReqs)},
+		{"inflight tx", formatWithCommas(summary.Gauges.InflightTxReqs)},
+	}))
+	for _, line := range []struct {
+		label string
+		stats DurationHistogramSummary
+	}{
+		{label: " Admission", stats: summary.Latency.Admission},
+		{label: " Template ", stats: summary.Latency.Template},
+		{label: " Apply    ", stats: summary.Latency.BlockApply},
+		{label: " Relay    ", stats: summary.Latency.RelayFlush},
+		{label: " Sync     ", stats: summary.Latency.SyncReq},
+	} {
+		out.WriteString(fmt.Sprintf(" %s : %s\n", line.label, formatLatencySummary(line.stats)))
 	}
 	return out.String()
 }
 
-func renderPeerMesh(peers []PeerInfo, relay []PeerRelayStats, tipHeight uint64) string {
+func renderMempoolSection(summary dashboardMempoolSummary) string {
+	var out strings.Builder
+	out.WriteString(renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "Tx Count", Value: fmt.Sprintf("%d", summary.Count)},
+		dashboardKeyValueRow{Key: "Total Size", Value: fmt.Sprintf("%s bytes", formatWithCommas(summary.Bytes))},
+		dashboardKeyValueRow{Key: "Orphan Tx Count", Value: fmt.Sprintf("%d", summary.Orphans)},
+		dashboardKeyValueRow{Key: "Fee Min / Median / Max (atoms/kB)", Value: fmt.Sprintf("%s / %s / %s",
+			formatAtoms(summary.LowFee), formatAtoms(summary.MedianFee), formatAtoms(summary.HighFee))},
+	))
+	if len(summary.Top) == 0 {
+		out.WriteString("\n")
+		out.WriteString(" top queued tx by fee\n")
+		out.WriteString(" empty\n")
+		return out.String()
+	}
+	out.WriteString("\n")
+	out.WriteString(" top queued tx by fee\n")
+	for _, entry := range summary.Top {
+		feeRate := uint64(0)
+		if entry.Size > 0 {
+			feeRate = (entry.Fee * 1000) / uint64(entry.Size)
+		}
+		out.WriteString(fmt.Sprintf(" %s   %s atoms/kB   %s\n",
+			shortHexBytes(entry.TxID, 10), formatAtoms(feeRate), formatByteCountShort(entry.Size)))
+	}
+	if summary.Count > len(summary.Top) {
+		out.WriteString(fmt.Sprintf(" ... %d more\n", summary.Count-len(summary.Top)))
+	}
+	return out.String()
+}
+
+func formatLatencySummary(summary DurationHistogramSummary) string {
+	if summary.Count == 0 {
+		return "no samples"
+	}
+	return fmt.Sprintf("count %-4d avg %6.2fms p50 %6.2fms p95 %6.2fms max %6.2fms",
+		summary.Count,
+		summary.AvgMS,
+		summary.P50MS,
+		summary.P95MS,
+		summary.MaxMS,
+	)
+}
+
+func formatDashboardColumns(label string, cols [][2]string) string {
+	if len(cols) == 0 {
+		return ""
+	}
+	label = strings.TrimSpace(label)
+	parts := make([]string, 0, len(cols))
+	for _, col := range cols {
+		parts = append(parts, fmt.Sprintf("%-11s %8s", col[0], col[1]))
+	}
+	return fmt.Sprintf(" %-12s : %s\n", label, strings.Join(parts, "  "))
+}
+
+func renderCandidateBlockSection(stats BlockTemplateStats) string {
+	return renderDashboardKeyValues(
+		dashboardKeyValueRow{Key: "Status", Value: candidateBlockStatus(stats)},
+		dashboardKeyValueRow{Key: "Age", Value: formatDashboardCompactDuration(time.Duration(stats.LastBuildAgeMS) * time.Millisecond)},
+		dashboardKeyValueRow{Key: "Tx Candidate Txs", Value: formatWithCommas(stats.FrontierCandidates)},
+		dashboardKeyValueRow{Key: "Rebuilds (1h)", Value: formatWithCommas(stats.Rebuilds)},
+		dashboardKeyValueRow{Key: "Interrupts (1h)", Value: formatWithCommas(stats.Interruptions)},
+		dashboardKeyValueRow{Key: "Invalidations (1h)", Value: formatWithCommas(stats.Invalidations)},
+		dashboardKeyValueRow{Key: "Last Reason", Value: defaultDashboardValue(stats.LastReason, "-")},
+	)
+}
+
+func candidateBlockStatus(stats BlockTemplateStats) string {
+	switch strings.TrimSpace(strings.ToLower(stats.LastReason)) {
+	case "interrupted":
+		return "rebuilding"
+	case "":
+		if stats.Rebuilds == 0 && stats.CacheHits == 0 {
+			return "warming up"
+		}
+	}
+	return "ready"
+}
+
+func (s *Service) dashboardPeerHosts(now time.Time, info ServiceInfo) []dashboardPeerHostPage {
+	peers := s.peerSnapshot()
 	if len(peers) == 0 {
+		return nil
+	}
+	hostSockets := make(map[string][]dashboardPeerSocketPage)
+	for _, peer := range peers {
+		relay := peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepths(), peer.pendingLocalRelayCount())
+		sync := peer.syncSnapshot()
+		host := peerHostName(peer.addr)
+		lag := uint64(0)
+		if peerHeight := peer.snapshotHeight(); peerHeight < info.TipHeight {
+			lag = info.TipHeight - peerHeight
+		}
+		socket := dashboardPeerSocketPage{
+			Addr:           peer.addr,
+			Port:           peerPort(peer.addr),
+			Outbound:       peer.outbound,
+			Height:         peer.snapshotHeight(),
+			Lag:            lag,
+			LastSeenUnix:   peer.snapshotProgressUnix(),
+			LastUsefulUnix: sync.lastUsefulUnix(),
+			UsefulBlocks:   sync.UsefulBlocks,
+			SessionAge:     now.Sub(peer.connectedAt),
+			QueueDepth:     relay.QueueDepth,
+			LatencyAvgS:    relay.RelayAvgMS / 1000,
+			LatencyP95S:    relay.RelayP95MS / 1000,
+			TxSent:         relay.TxReconItems,
+			TxRequested:    relay.TxReqItems,
+			BlockSent:      relay.BlockSendItems,
+			BlockRequested: relay.BlockReqItems,
+			BytesIn:        peer.bytesIn(),
+			BytesOut:       peer.bytesOut(),
+		}
+		hostSockets[host] = append(hostSockets[host], socket)
+	}
+
+	hosts := make([]dashboardPeerHostPage, 0, len(hostSockets))
+	for host, sockets := range hostSockets {
+		slices.SortFunc(sockets, func(a, b dashboardPeerSocketPage) int {
+			if a.Outbound != b.Outbound {
+				if a.Outbound {
+					return -1
+				}
+				return 1
+			}
+			if a.Lag != b.Lag {
+				if a.Lag < b.Lag {
+					return -1
+				}
+				return 1
+			}
+			return strings.Compare(a.Addr, b.Addr)
+		})
+		hosts = append(hosts, summarizeDashboardPeerHost(now, host, info, sockets))
+	}
+	slices.SortFunc(hosts, func(a, b dashboardPeerHostPage) int {
+		return strings.Compare(a.Host, b.Host)
+	})
+	return hosts
+}
+
+func summarizeDashboardPeerHost(now time.Time, host string, info ServiceInfo, sockets []dashboardPeerSocketPage) dashboardPeerHostPage {
+	out := dashboardPeerHostPage{
+		Host:        host,
+		Sockets:     len(sockets),
+		TipHash:     shortHexString(info.TipHeaderHash, 13),
+		SocketPages: append([]dashboardPeerSocketPage(nil), sockets...),
+	}
+	hasInbound := false
+	hasOutbound := false
+	bestLag := ^uint64(0)
+	worstLag := uint64(0)
+	bestHeight := uint64(0)
+	latestSeen := int64(0)
+	latestBlock := int64(0)
+	maxQueue := 0
+	maxP95 := 0.0
+	totalAvg := 0.0
+	avgCount := 0
+	txSentPrimary := pickDashboardPeerSocket(sockets, true)
+	txReqPrimary := pickDashboardPeerSocket(sockets, false)
+	for _, socket := range sockets {
+		if socket.Outbound {
+			hasOutbound = true
+		} else {
+			hasInbound = true
+		}
+		if socket.Lag < bestLag {
+			bestLag = socket.Lag
+		}
+		if socket.Lag > worstLag {
+			worstLag = socket.Lag
+		}
+		if socket.Height > bestHeight {
+			bestHeight = socket.Height
+		}
+		if socket.LastSeenUnix > latestSeen {
+			latestSeen = socket.LastSeenUnix
+		}
+		if socket.UsefulBlocks > 0 && socket.LastUsefulUnix > latestBlock {
+			latestBlock = socket.LastUsefulUnix
+		}
+		if socket.SessionAge > out.SessionAge {
+			out.SessionAge = socket.SessionAge
+		}
+		if socket.QueueDepth > maxQueue {
+			maxQueue = socket.QueueDepth
+		}
+		if socket.LatencyP95S > maxP95 {
+			maxP95 = socket.LatencyP95S
+		}
+		if socket.LatencyAvgS > 0 {
+			totalAvg += socket.LatencyAvgS
+			avgCount++
+		}
+		out.BytesIn += socket.BytesIn
+		out.BytesOut += socket.BytesOut
+	}
+	if bestLag == ^uint64(0) {
+		bestLag = 0
+	}
+	if avgCount > 0 {
+		out.LatencyAvgS = totalAvg / float64(avgCount)
+	}
+	out.LatencyP95S = maxP95
+	out.LastSeenUnix = latestSeen
+	out.LastBlockUnix = latestBlock
+	out.BestHeight = bestHeight
+	out.BlocksBehind = bestLag
+	out.OutboundQueue = maxQueue
+	if hasInbound && hasOutbound {
+		out.Direction = "in/out"
+	} else if hasOutbound {
+		out.Direction = "out"
+	} else {
+		out.Direction = "in"
+	}
+	if txSentPrimary != nil {
+		out.TxSent = txSentPrimary.TxSent
+		out.BlockSent = txSentPrimary.BlockSent
+	}
+	if txReqPrimary != nil {
+		out.TxRequested = txReqPrimary.TxRequested
+		out.BlockRequested = txReqPrimary.BlockRequested
+	}
+	if out.TxSent == 0 {
+		for _, socket := range sockets {
+			if socket.TxSent > out.TxSent {
+				out.TxSent = socket.TxSent
+			}
+			if socket.BlockSent > out.BlockSent {
+				out.BlockSent = socket.BlockSent
+			}
+		}
+	}
+	if out.TxRequested == 0 {
+		for _, socket := range sockets {
+			if socket.TxRequested > out.TxRequested {
+				out.TxRequested = socket.TxRequested
+			}
+			if socket.BlockRequested > out.BlockRequested {
+				out.BlockRequested = socket.BlockRequested
+			}
+		}
+	}
+	out.Health, out.Reason = classifyDashboardPeerHealth(now, latestSeen, bestLag, worstLag, maxQueue)
+	return out
+}
+
+func classifyDashboardPeerHealth(now time.Time, lastSeenUnix int64, bestLag uint64, worstLag uint64, maxQueue int) (string, string) {
+	const (
+		busyQueueDepth = 16
+		staleAfter     = 45 * time.Second
+		warnAfter      = 10 * time.Second
+		nearTipLag     = 2
+		warnLag        = 32
+		lagThreshold   = 128
+	)
+	if maxQueue >= busyQueueDepth {
+		return "BUSY", "relay queue is overloaded"
+	}
+	if lastSeenUnix <= 0 || now.Sub(time.Unix(lastSeenUnix, 0)) > staleAfter {
+		return "STALE", "recent peer activity is stale"
+	}
+	if bestLag <= nearTipLag && worstLag >= lagThreshold {
+		return "MIXED", "one socket is current while another lags"
+	}
+	if bestLag >= lagThreshold {
+		return "LAG", "materially behind tip"
+	}
+	if bestLag >= warnLag || worstLag >= lagThreshold || now.Sub(time.Unix(lastSeenUnix, 0)) > warnAfter {
+		return "WARN", "slightly behind but active"
+	}
+	return "OK", "healthy and current"
+}
+
+func pickDashboardPeerSocket(sockets []dashboardPeerSocketPage, outbound bool) *dashboardPeerSocketPage {
+	var best *dashboardPeerSocketPage
+	for i := range sockets {
+		socket := &sockets[i]
+		if socket.Outbound != outbound {
+			continue
+		}
+		if best == nil || socket.Lag < best.Lag || (socket.Lag == best.Lag && socket.LastSeenUnix > best.LastSeenUnix) {
+			best = socket
+		}
+	}
+	if best != nil {
+		return best
+	}
+	for i := range sockets {
+		socket := &sockets[i]
+		if best == nil || socket.Lag < best.Lag || (socket.Lag == best.Lag && socket.LastSeenUnix > best.LastSeenUnix) {
+			best = socket
+		}
+	}
+	return best
+}
+
+func peerHostName(addr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		host = strings.TrimSpace(addr)
+	}
+	if parsed, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		return parsed.String()
+	}
+	return strings.Trim(host, "[]")
+}
+
+func peerPort(addr string) string {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return "-"
+	}
+	return port
+}
+
+func renderPeerMesh(hosts []dashboardPeerHostPage) string {
+	if len(hosts) == 0 {
 		return " no live peers\n"
 	}
-	relayByAddr := make(map[string]PeerRelayStats, len(relay))
-	for _, stat := range relay {
-		relayByAddr[stat.Addr] = stat
-	}
 	var out strings.Builder
-	for _, peer := range peers {
-		stat := relayByAddr[peer.Addr]
-		lag := int64(tipHeight) - int64(peer.Height)
-		if lag < 0 {
-			lag = 0
-		}
-		out.WriteString(fmt.Sprintf(" %s\n", dashboardPeerLabel(peer.Addr)))
-		out.WriteString(fmt.Sprintf("    out=%-5t lag=%-3d q=%-3d p95=%-7.2fms avg=%-7.2fms batches=%-5d recon=%-5d req=%-5d last=%s\n",
-			peer.Outbound, lag, stat.QueueDepth, stat.RelayP95MS, stat.RelayAvgMS, stat.TxBatchItems, stat.TxReconItems, stat.TxReqItems, formatAgeUnix(peer.LastProgress)))
+	socketCount := 0
+	for _, host := range hosts {
+		socketCount += host.Sockets
+	}
+	out.WriteString(fmt.Sprintf(" hosts=%d  sockets=%d\n\n", len(hosts), socketCount))
+	out.WriteString(" peer            health  direction  latency (s) avg/p95  tx sent  tx requested  last seen\n")
+	for _, host := range hosts {
+		label := linkPathPadded("/peer/"+url.PathEscape(host.Host), host.Host, 15)
+		out.WriteString(fmt.Sprintf(" %s  %-6s  %-9s  %5.2f / %-5.2f  %7d  %12d  %s\n",
+			label,
+			host.Health,
+			host.Direction,
+			host.LatencyAvgS,
+			host.LatencyP95S,
+			host.TxSent,
+			host.TxRequested,
+			formatDashboardAgeCompact(host.LastSeenUnix),
+		))
 	}
 	return out.String()
 }
@@ -5434,6 +7241,13 @@ func linkHashPadded(prefix string, hash string, shortWidth int, cellWidth int) s
 	return fmt.Sprintf("<a href=\"%s%s\">%s</a>", prefix, hash, label)
 }
 
+func linkPathPadded(path string, label string, width int) string {
+	if width > len(label) {
+		label = label + strings.Repeat(" ", width-len(label))
+	}
+	return fmt.Sprintf("<a href=\"%s\">%s</a>", path, label)
+}
+
 func deriveNodeID(cfg ServiceConfig) string {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -5502,8 +7316,198 @@ func fullHashString(hash [32]byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
+func shortUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return "-"
+	}
+	if len(ua) <= 20 {
+		return ua
+	}
+	return ua[:17] + "..."
+}
+
+func shortPeerAddr(addr string) string {
+	addr = normalizePeerAddr(addr)
+	if addr == "" {
+		return "-"
+	}
+	if len(addr) <= 24 {
+		return addr
+	}
+	return addr[:21] + "..."
+}
+
+func formatMaybeTimeAgo(unix int64, now time.Time) string {
+	if unix <= 0 {
+		return "never"
+	}
+	return now.Sub(time.Unix(unix, 0)).Round(time.Second).String()
+}
+
+func (s *Service) peerSyncDebugSummary(limit int) string {
+	peers := s.snapshotPeers()
+	if len(peers) == 0 {
+		return "none"
+	}
+	now := time.Now()
+	slices.SortFunc(peers, func(a, b *peerConn) int {
+		return comparePeerAddrs(a.addr, b.addr)
+	})
+	var out strings.Builder
+	for i, peer := range peers {
+		if i >= limit {
+			if out.Len() > 0 {
+				out.WriteString(" | ")
+			}
+			out.WriteString(fmt.Sprintf("+%d more", len(peers)-limit))
+			break
+		}
+		stats := peer.syncSnapshot()
+		if i > 0 {
+			out.WriteString(" | ")
+		}
+		out.WriteString(fmt.Sprintf("%s(out=%t h=%d last=%s hs=%d bs=%d txs=%d cool=%dms ua=%s)",
+			shortPeerAddr(peer.addr),
+			peer.outbound,
+			peer.snapshotHeight(),
+			formatMaybeTimeAgo(peer.snapshotProgressUnix(), now),
+			stats.HeaderStalls,
+			stats.BlockStalls,
+			stats.TxStalls,
+			stats.cooldownRemainingMS(now),
+			shortUserAgent(peer.version.UserAgent),
+		))
+	}
+	return out.String()
+}
+
+func headersDebugSummary(headers []types.BlockHeader, limit int) string {
+	if len(headers) == 0 {
+		return "none"
+	}
+	hashes := make([][32]byte, 0, len(headers))
+	for _, header := range headers {
+		hashes = append(hashes, consensus.HeaderHash(&header))
+	}
+	return hashesDebugSummary(hashes, limit)
+}
+
+func hashesDebugSummary(hashes [][32]byte, limit int) string {
+	if len(hashes) == 0 {
+		return "none"
+	}
+	if limit <= 0 || limit > len(hashes) {
+		limit = len(hashes)
+	}
+	parts := make([]string, 0, limit+1)
+	for _, hash := range hashes[:limit] {
+		parts = append(parts, shortHexBytes(hash, 16))
+	}
+	if len(hashes) > limit {
+		parts = append(parts, fmt.Sprintf("+%d more", len(hashes)-limit))
+	}
+	return strings.Join(parts, ",")
+}
+
+func acceptedTxDebugSummary(accepted []mempool.AcceptedTx, limit int) string {
+	if len(accepted) == 0 {
+		return "none"
+	}
+	hashes := make([][32]byte, 0, len(accepted))
+	for _, item := range accepted {
+		hashes = append(hashes, item.TxID)
+	}
+	return hashesDebugSummary(hashes, limit)
+}
+
+func txDebugSummary(txs []types.Transaction, limit int) string {
+	if len(txs) == 0 {
+		return "none"
+	}
+	hashes := make([][32]byte, 0, len(txs))
+	for _, tx := range txs {
+		hashes = append(hashes, consensus.TxID(&tx))
+	}
+	return hashesDebugSummary(hashes, limit)
+}
+
+func invItemsDebugSummary(items []p2p.InvVector, filterType p2p.InvType, limit int) string {
+	hashes := make([][32]byte, 0, len(items))
+	for _, item := range items {
+		if item.Type == filterType || (filterType == p2p.InvTypeBlockFull && item.Type == p2p.InvTypeBlock) {
+			hashes = append(hashes, item.Hash)
+		}
+	}
+	return hashesDebugSummary(hashes, limit)
+}
+
+func (s *Service) inflightBlockDebugSummary(limit int) string {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	if len(s.blockRequests) == 0 {
+		return "none"
+	}
+	type item struct {
+		hash [32]byte
+		req  blockDownloadRequest
+	}
+	items := make([]item, 0, len(s.blockRequests))
+	for hash, req := range s.blockRequests {
+		items = append(items, item{hash: hash, req: req})
+	}
+	slices.SortFunc(items, func(a, b item) int {
+		if a.req.requestedAt.Equal(b.req.requestedAt) {
+			return bytes.Compare(a.hash[:], b.hash[:])
+		}
+		if a.req.requestedAt.Before(b.req.requestedAt) {
+			return -1
+		}
+		return 1
+	})
+	now := time.Now()
+	if limit <= 0 || limit > len(items) {
+		limit = len(items)
+	}
+	parts := make([]string, 0, limit+1)
+	for _, item := range items[:limit] {
+		age := "pending"
+		if !item.req.requestedAt.IsZero() {
+			age = now.Sub(item.req.requestedAt).Round(time.Second).String()
+		}
+		parts = append(parts, fmt.Sprintf("%s->%s@%s(a=%d)",
+			shortHexBytes(item.hash, 16),
+			shortPeerAddr(item.req.peerAddr),
+			age,
+			item.req.attempts,
+		))
+	}
+	if len(items) > limit {
+		parts = append(parts, fmt.Sprintf("+%d more", len(items)-limit))
+	}
+	return strings.Join(parts, " | ")
+}
+
 func formatAtoms(value uint64) string {
 	return formatUintWithCommas(value)
+}
+
+func formatAtomsPerKB(value uint64) string {
+	return formatAtoms(value) + " atoms/kB"
+}
+
+func formatDashboardPercent(numerator, denominator int) string {
+	if denominator <= 0 {
+		return "0%"
+	}
+	return fmt.Sprintf("%d%%", int(math.Round((float64(numerator)/float64(denominator))*100)))
+}
+
+func formatByteCountShort(bytes int) string {
+	if bytes < 0 {
+		bytes = 0
+	}
+	return fmt.Sprintf("%s B", formatWithCommas(bytes))
 }
 
 func formatWithCommas[T ~int | ~int64 | ~uint64](value T) string {
@@ -5532,15 +7536,131 @@ func maxInt(left, right int) int {
 	return right
 }
 
-func formatAgeUnix(unix int64) string {
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func formatDashboardAgeCompact(unix int64) string {
 	if unix <= 0 {
 		return "n/a"
 	}
-	return formatDashboardDuration(time.Since(time.Unix(unix, 0)))
+	return formatDashboardCompactDuration(time.Since(time.Unix(unix, 0))) + " ago"
 }
 
-func dashboardPeerLabel(addr string) string {
-	return fmt.Sprintf("peer %-28s", addr)
+func renderFeeSparkline(lines []dashboardBlockFeeLine) string {
+	if len(lines) == 0 {
+		return "n/a"
+	}
+	levels := []rune("▁▂▃▄▅▆▇█")
+	maxMedian := uint64(0)
+	for _, line := range lines {
+		if line.MedianFee > maxMedian {
+			maxMedian = line.MedianFee
+		}
+	}
+	if maxMedian == 0 {
+		return strings.Repeat(string(levels[0]), len(lines))
+	}
+	var out strings.Builder
+	out.Grow(len(lines) * 3)
+	// Compress recent fee medians into a fixed eight-level sparkline so the
+	// home page keeps directional fee pressure without dumping a full table.
+	for _, line := range lines {
+		level := int(math.Round((float64(line.MedianFee) / float64(maxMedian)) * float64(len(levels)-1)))
+		if level < 0 {
+			level = 0
+		}
+		if level >= len(levels) {
+			level = len(levels) - 1
+		}
+		out.WriteRune(levels[level])
+	}
+	return out.String()
+}
+
+func renderFeeHistogram(summary dashboardFeeSummary) string {
+	if len(summary.Recent) == 0 {
+		return ""
+	}
+	chartTop := roundUpFeeAxis(summary.RecentMax)
+	cols := buildFeeHistogramColumns(summary.Recent, 0)
+	var out strings.Builder
+	// Keep the histogram on a strict fixed-width grid so each fee window reads
+	// like an actual chart rather than a wrapped list of bars.
+	for level := chartTop; level >= 0; level -= 100 {
+		out.WriteString(fmt.Sprintf("%4d |%s\n", level, buildFeeHistogramColumns(summary.Recent, uint64(level))))
+	}
+	out.WriteString(fmt.Sprintf("     +%s\n", strings.Repeat("-", len(cols))))
+	out.WriteString("      -24      -20      -16      -12      -8       -4 now\n")
+	if summary.Candidate.Available {
+		out.WriteString(fmt.Sprintf("      %s*\n", strings.Repeat(" ", maxInt(len(cols)-1, 0))))
+	}
+	return out.String()
+}
+
+func buildFeeHistogramColumns(lines []dashboardBlockFeeLine, level uint64) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	cols := make([]string, 0, len(lines))
+	for _, line := range lines {
+		cell := " "
+		if level == 0 || line.MedianFee >= level {
+			cell = "█"
+		}
+		cols = append(cols, cell)
+	}
+	return strings.Join(cols, " ")
+}
+
+func roundUpFeeAxis(value uint64) int {
+	if value <= 100 {
+		return 100
+	}
+	rounded := int(((value + 99) / 100) * 100)
+	if rounded < 100 {
+		return 100
+	}
+	return rounded
+}
+
+func summarizeMempoolFeeBands(entries []mempool.SnapshotEntry) dashboardMempoolFeeBands {
+	var bands dashboardMempoolFeeBands
+	for _, entry := range entries {
+		rate := uint64(0)
+		if entry.Size > 0 {
+			rate = (entry.Fee * 1000) / uint64(entry.Size)
+		}
+		switch {
+		case rate >= 1000:
+			bands.Above1000++
+		case rate >= 500:
+			bands.Band500++
+		case rate >= 100:
+			bands.Band100++
+		case rate >= 1:
+			bands.Band1++
+		default:
+			bands.Zero++
+		}
+	}
+	return bands
+}
+
+func formatDashboardAgeFromTime(now time.Time, at time.Time) string {
+	if at.IsZero() {
+		return "n/a"
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if at.After(now) {
+		at = now
+	}
+	return formatDashboardCompactDuration(now.Sub(at)) + " ago"
 }
 
 func (stats *dashboardSystemStats) record(sample dashboardSystemSample) {
@@ -5670,6 +7790,20 @@ func formatDashboardDuration(d time.Duration) string {
 	return fmt.Sprintf("%02dh %02dm %02ds", hours, minutes, seconds)
 }
 
+func formatDashboardCompactDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d/time.Minute), int(d/time.Second)%60)
+	}
+	return fmt.Sprintf("%dh%02dm", int(d/time.Hour), int(d/time.Minute)%60)
+}
+
 func formatDashboardWindow(d time.Duration) string {
 	if d <= 0 {
 		return "warming up"
@@ -5768,6 +7902,23 @@ func formatHumanRate(bytesPerSecond float64) string {
 		unit = units[i]
 	}
 	if unit == "B/s" {
+		return fmt.Sprintf("%.0f %s", value, unit)
+	}
+	return fmt.Sprintf("%.1f %s", value, unit)
+}
+
+func formatHumanHashRate(hashesPerSecond float64) string {
+	if hashesPerSecond <= 0 {
+		return "warming up"
+	}
+	units := []string{"H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s"}
+	value := hashesPerSecond
+	unit := units[0]
+	for i := 1; i < len(units) && value >= 1000; i++ {
+		value /= 1000
+		unit = units[i]
+	}
+	if unit == "H/s" {
 		return fmt.Sprintf("%.0f %s", value, unit)
 	}
 	return fmt.Sprintf("%.1f %s", value, unit)
@@ -5915,7 +8066,10 @@ func shortHexString(raw string, chars int) string {
 	if len(raw) <= chars {
 		return raw
 	}
-	return raw[:chars]
+	if chars <= 3 {
+		return raw[:chars]
+	}
+	return raw[:chars-3] + "..."
 }
 
 func shouldServePublicDashboard() bool {

@@ -2,6 +2,7 @@ package mempool
 
 import (
 	"bytes"
+	"container/heap"
 	"errors"
 	"sort"
 	"sync"
@@ -85,6 +86,14 @@ type AdmissionSnapshot struct {
 	Orphans map[[32]byte]struct{}
 }
 
+// SharedAdmissionView exposes a read-locked view of live mempool admission
+// state so parallel batch preparation can share one base view without cloning
+// the full pool up front. Callers must Release the view when finished.
+type SharedAdmissionView struct {
+	pool  *Pool
+	Epoch uint64
+}
+
 type PreparedAdmission struct {
 	Tx            types.Transaction
 	TxID          [32]byte
@@ -104,16 +113,29 @@ type Admission struct {
 	EvictedOrphans int
 }
 
+type Stats struct {
+	Count     int
+	Orphans   int
+	Bytes     int
+	TotalFees uint64
+	MedianFee uint64
+	LowFee    uint64
+	HighFee   uint64
+}
+
 type Pool struct {
 	mu         sync.RWMutex
 	cfg        PoolConfig
 	entries    map[[32]byte]*Entry
 	spent      map[types.OutPoint][32]byte
 	orphans    map[[32]byte]*orphanEntry
-	orphanDeps map[types.OutPoint]map[[32]byte]struct{}
+	orphanDeps map[types.OutPoint][][32]byte
 	sequence   uint64
 	epoch      uint64
 	selection  *selectionCache
+	stats      poolStats
+	topByFee   []SnapshotEntry
+	topDirty   bool
 }
 
 type orphanEntry struct {
@@ -122,6 +144,10 @@ type orphanEntry struct {
 	Size    int
 	AddedAt uint64
 	Missing map[types.OutPoint]struct{}
+	// MissingCount lets orphan promotion become dependency-driven: newly
+	// created outputs decrement unresolved inputs directly instead of forcing a
+	// full missing-set rescan on every waiting orphan.
+	MissingCount int
 }
 
 type admissionEntry struct {
@@ -139,10 +165,26 @@ type packageCandidate struct {
 }
 
 type selectionCache struct {
-	epoch   uint64
-	ordered []packageCandidate
+	epoch    uint64
+	frontier candidateHeap
+}
+
+// candidateHeap keeps the package frontier incrementally ordered without
+// reindexing the full tail on every insert or removal. Block assembly still
+// materializes an ordered snapshot when it needs to walk the frontier end to
+// end, but churn-heavy admission updates now stay O(log n).
+type candidateHeap struct {
+	items   []packageCandidate
 	indexes map[[32]byte]int
 }
+
+type poolStats struct {
+	bytes     int
+	totalFees uint64
+	feeCounts map[uint64]int
+}
+
+const topFeeCacheLimit = 8
 
 func New() *Pool {
 	return NewWithConfig(DefaultConfig())
@@ -154,7 +196,8 @@ func NewWithConfig(cfg PoolConfig) *Pool {
 		entries:    make(map[[32]byte]*Entry),
 		spent:      make(map[types.OutPoint][32]byte),
 		orphans:    make(map[[32]byte]*orphanEntry),
-		orphanDeps: make(map[types.OutPoint]map[[32]byte]struct{}),
+		orphanDeps: make(map[types.OutPoint][][32]byte),
+		stats:      poolStats{feeCounts: make(map[uint64]int)},
 	}
 }
 
@@ -247,6 +290,50 @@ func (p *Pool) Snapshot() []SnapshotEntry {
 	return entries
 }
 
+func (p *Pool) Stats() Stats {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := Stats{
+		Count:     len(p.entries),
+		Orphans:   len(p.orphans),
+		Bytes:     p.stats.bytes,
+		TotalFees: p.stats.totalFees,
+	}
+	if out.Count == 0 {
+		return out
+	}
+	fees := make([]uint64, 0, len(p.stats.feeCounts))
+	for fee := range p.stats.feeCounts {
+		fees = append(fees, fee)
+	}
+	sort.Slice(fees, func(i, j int) bool { return fees[i] < fees[j] })
+	out.LowFee = fees[0]
+	out.HighFee = fees[len(fees)-1]
+	target := out.Count / 2
+	seen := 0
+	for _, fee := range fees {
+		seen += p.stats.feeCounts[fee]
+		if seen > target {
+			out.MedianFee = fee
+			break
+		}
+	}
+	return out
+}
+
+func (p *Pool) TopByFee(limit int) []SnapshotEntry {
+	if limit <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ensureTopByFeeLocked(limit)
+	if len(p.topByFee) < limit {
+		limit = len(p.topByFee)
+	}
+	return append([]SnapshotEntry(nil), p.topByFee[:limit]...)
+}
+
 func (p *Pool) ShortIDMatches(shortIDFn func([32]byte) uint64, wanted map[uint64]struct{}) map[uint64][]types.Transaction {
 	if len(wanted) == 0 {
 		return nil
@@ -324,12 +411,33 @@ func AdvanceAdmissionSnapshot(snapshot *AdmissionSnapshot, chainUtxos consensus.
 	return nil
 }
 
+func (p *Pool) AcquireSharedAdmissionView() SharedAdmissionView {
+	p.mu.RLock()
+	return SharedAdmissionView{
+		pool:  p,
+		Epoch: p.epoch,
+	}
+}
+
+func (v SharedAdmissionView) Release() {
+	if v.pool != nil {
+		v.pool.mu.RUnlock()
+	}
+}
+
 func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.prepareAdmission(tx, snapshot.Epoch, snapshot.Entries, snapshot.Spent, snapshot.Orphans, chainUtxos, rules)
+}
+
+func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmissionView, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	if view.pool != p {
+		return PreparedAdmission{}, errors.New("shared admission view belongs to different mempool")
+	}
 	txid := consensus.TxID(&tx)
-	if _, ok := snapshot.Entries[txid]; ok {
+	if _, ok := p.entries[txid]; ok {
 		return PreparedAdmission{}, ErrTxAlreadyExists
 	}
-	if _, ok := snapshot.Orphans[txid]; ok {
+	if _, ok := p.orphans[txid]; ok {
 		return PreparedAdmission{}, ErrTxAlreadyExists
 	}
 	if len(tx.Base.Inputs) == 0 {
@@ -341,7 +449,66 @@ func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot
 		return PreparedAdmission{}, ErrTxTooLarge
 	}
 
-	view, parents, missing, err := resolveInputsWithView(tx, consensus.LookupFromSet(chainUtxos), snapshot.Entries, snapshot.Spent)
+	liveView, parents, missing, err := p.resolveInputsAgainstLiveView(tx, consensus.LookupFromSet(chainUtxos))
+	if err != nil {
+		return PreparedAdmission{}, err
+	}
+	prepared := PreparedAdmission{
+		Tx:            tx,
+		TxID:          txid,
+		Size:          size,
+		Parents:       parents,
+		Missing:       missing,
+		View:          liveView,
+		SnapshotEpoch: view.Epoch,
+	}
+	if len(missing) != 0 {
+		return prepared, nil
+	}
+
+	summary, err := consensus.ValidateTx(&tx, liveView, rules)
+	if err != nil {
+		return PreparedAdmission{}, err
+	}
+	if !p.meetsRelayFloor(summary.Fee, size) {
+		return PreparedAdmission{}, ErrRelayFeeTooLow
+	}
+
+	ancestorIDs := p.gatherAncestorsLiveView(parents)
+	if p.cfg.MaxAncestors > 0 && len(ancestorIDs)+1 > p.cfg.MaxAncestors {
+		return PreparedAdmission{}, ErrTooManyAncestors
+	}
+	if p.cfg.MaxDescendants > 0 {
+		for ancestorID := range ancestorIDs {
+			ancestor := p.entries[ancestorID]
+			if ancestor != nil && ancestor.DescendantCount+1 > p.cfg.MaxDescendants {
+				return PreparedAdmission{}, ErrTooManyDescendants
+			}
+		}
+	}
+
+	prepared.Summary = summary
+	return prepared, nil
+}
+
+func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte, orphans map[[32]byte]struct{}, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	txid := consensus.TxID(&tx)
+	if _, ok := entries[txid]; ok {
+		return PreparedAdmission{}, ErrTxAlreadyExists
+	}
+	if _, ok := orphans[txid]; ok {
+		return PreparedAdmission{}, ErrTxAlreadyExists
+	}
+	if len(tx.Base.Inputs) == 0 {
+		return PreparedAdmission{}, ErrCoinbaseTx
+	}
+
+	size := len(tx.Encode())
+	if p.cfg.MaxTxSize > 0 && size > p.cfg.MaxTxSize {
+		return PreparedAdmission{}, ErrTxTooLarge
+	}
+
+	view, parents, missing, err := resolveInputsWithView(tx, consensus.LookupFromSet(chainUtxos), entries, spent)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -352,7 +519,7 @@ func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot
 		Parents:       parents,
 		Missing:       missing,
 		View:          view,
-		SnapshotEpoch: snapshot.Epoch,
+		SnapshotEpoch: epoch,
 	}
 	if len(missing) != 0 {
 		return prepared, nil
@@ -366,13 +533,13 @@ func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot
 		return PreparedAdmission{}, ErrRelayFeeTooLow
 	}
 
-	ancestorIDs := gatherAncestorsForView(snapshot.Entries, parents)
+	ancestorIDs := gatherAncestorsForView(entries, parents)
 	if p.cfg.MaxAncestors > 0 && len(ancestorIDs)+1 > p.cfg.MaxAncestors {
 		return PreparedAdmission{}, ErrTooManyAncestors
 	}
 	if p.cfg.MaxDescendants > 0 {
 		for ancestorID := range ancestorIDs {
-			ancestor := snapshot.Entries[ancestorID]
+			ancestor := entries[ancestorID]
 			if ancestor.DescendantCount+1 > p.cfg.MaxDescendants {
 				return PreparedAdmission{}, ErrTooManyDescendants
 			}
@@ -667,6 +834,29 @@ func (p *Pool) RemoveConfirmed(block *types.Block) {
 	p.bumpEpochLocked()
 }
 
+// PromoteReadyOrphansForBlock rechecks orphan transactions that were waiting on
+// outputs created by the newly accepted block.
+func (p *Pool) PromoteReadyOrphansForBlock(block *types.Block, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) []AcceptedTx {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if block == nil {
+		return nil
+	}
+	outputs := make([]types.OutPoint, 0)
+	for _, tx := range block.Txs {
+		txid := consensus.TxID(&tx)
+		outputs = append(outputs, outputsForTx(txid, tx)...)
+	}
+	if len(outputs) == 0 {
+		return nil
+	}
+	promoted := p.promoteReadyOrphans(outputs, consensus.LookupFromSet(chainUtxos), rules)
+	if len(promoted) > 0 {
+		p.bumpEpochLocked()
+	}
+	return promoted
+}
+
 func (p *Pool) insertResolved(tx types.Transaction, txid [32]byte, size int, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, rules consensus.ConsensusRules) (AcceptedTx, error) {
 	summary, err := consensus.ValidateTx(&tx, utxos, rules)
 	if err != nil {
@@ -734,6 +924,7 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 		DescendantFees:  summary.Fee,
 	}
 	p.entries[txid] = entry
+	p.noteEntryAddedLocked(entry)
 	for _, input := range tx.Base.Inputs {
 		p.spent[input.PrevOut] = txid
 	}
@@ -765,44 +956,59 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 
 func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) []AcceptedTx {
 	promoted := make([]AcceptedTx, 0)
-	queued := append([]types.OutPoint(nil), outputs...)
-	seen := make(map[[32]byte]struct{})
+	ready := make([][32]byte, 0)
+	ready = p.enqueueReadyOrphansForOutputs(ready, outputs)
+	for i := 0; i < len(ready); i++ {
+		txid := ready[i]
+		orphan := p.orphans[txid]
+		if orphan == nil || orphan.MissingCount != 0 {
+			continue
+		}
+		view, parents, missing, err := p.resolveInputs(orphan.Tx, chainLookup)
+		if err != nil {
+			p.deleteOrphan(txid)
+			continue
+		}
+		if len(missing) != 0 {
+			p.updateOrphanMissing(txid, missing)
+			continue
+		}
 
-	for len(queued) != 0 {
-		out := queued[0]
-		queued = queued[1:]
-		waiting := p.orphansForOutPoint(out)
+		p.deleteOrphan(txid)
+		accepted, err := p.insertResolved(orphan.Tx, txid, orphan.Size, view, parents, rules)
+		if err != nil {
+			continue
+		}
+		promoted = append(promoted, accepted)
+		ready = p.enqueueReadyOrphansForOutputs(ready, outputsForTx(txid, orphan.Tx))
+	}
+
+	return promoted
+}
+
+func (p *Pool) enqueueReadyOrphansForOutputs(ready [][32]byte, outputs []types.OutPoint) [][32]byte {
+	for _, out := range outputs {
+		waiting := p.orphanDeps[out]
+		if len(waiting) == 0 {
+			continue
+		}
+		delete(p.orphanDeps, out)
 		for _, txid := range waiting {
-			if _, ok := seen[txid]; ok {
-				continue
-			}
-			seen[txid] = struct{}{}
-
 			orphan := p.orphans[txid]
 			if orphan == nil {
 				continue
 			}
-			view, parents, missing, err := p.resolveInputs(orphan.Tx, chainLookup)
-			if err != nil {
-				p.deleteOrphan(txid)
+			if _, ok := orphan.Missing[out]; !ok {
 				continue
 			}
-			if len(missing) != 0 {
-				p.updateOrphanMissing(txid, missing)
-				continue
+			delete(orphan.Missing, out)
+			orphan.MissingCount--
+			if orphan.MissingCount == 0 {
+				ready = append(ready, txid)
 			}
-
-			p.deleteOrphan(txid)
-			accepted, err := p.insertResolved(orphan.Tx, txid, orphan.Size, view, parents, rules)
-			if err != nil {
-				continue
-			}
-			promoted = append(promoted, accepted)
-			queued = append(queued, outputsForTx(txid, orphan.Tx)...)
 		}
 	}
-
-	return promoted
+	return ready
 }
 
 func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLookup) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
@@ -875,20 +1081,53 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 	return view, parents, missing, nil
 }
 
+func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup consensus.UtxoLookup) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
+	view := make(consensus.UtxoSet, len(tx.Base.Inputs))
+	parents := make(map[[32]byte]struct{})
+	missing := make(map[types.OutPoint]struct{})
+
+	for _, input := range tx.Base.Inputs {
+		if _, ok := p.spent[input.PrevOut]; ok {
+			return nil, nil, nil, ErrInputAlreadySpent
+		}
+		if utxo, ok := chainLookup(input.PrevOut); ok {
+			view[input.PrevOut] = utxo
+			continue
+		}
+
+		parent := p.entries[input.PrevOut.TxID]
+		if parent == nil {
+			missing[input.PrevOut] = struct{}{}
+			continue
+		}
+		if input.PrevOut.Vout >= uint32(len(parent.Tx.Base.Outputs)) {
+			missing[input.PrevOut] = struct{}{}
+			continue
+		}
+
+		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
+		view[input.PrevOut] = consensus.UtxoEntry{
+			ValueAtoms: output.ValueAtoms,
+			KeyHash:    output.KeyHash,
+		}
+		parents[parent.TxID] = struct{}{}
+	}
+
+	return view, parents, missing, nil
+}
+
 func (p *Pool) storeOrphan(tx types.Transaction, txid [32]byte, size int, missing map[types.OutPoint]struct{}) int {
 	p.sequence++
 	p.orphans[txid] = &orphanEntry{
-		Tx:      tx,
-		TxID:    txid,
-		Size:    size,
-		AddedAt: p.sequence,
-		Missing: copyOutPointSet(missing),
+		Tx:           tx,
+		TxID:         txid,
+		Size:         size,
+		AddedAt:      p.sequence,
+		Missing:      copyOutPointSet(missing),
+		MissingCount: len(missing),
 	}
 	for out := range missing {
-		if p.orphanDeps[out] == nil {
-			p.orphanDeps[out] = make(map[[32]byte]struct{})
-		}
-		p.orphanDeps[out][txid] = struct{}{}
+		p.orphanDeps[out] = append(p.orphanDeps[out], txid)
 	}
 	return p.trimOrphans()
 }
@@ -918,17 +1157,6 @@ func (p *Pool) trimOrphans() int {
 }
 
 func (p *Pool) deleteOrphan(txid [32]byte) {
-	orphan := p.orphans[txid]
-	if orphan == nil {
-		return
-	}
-	for out := range orphan.Missing {
-		waiting := p.orphanDeps[out]
-		delete(waiting, txid)
-		if len(waiting) == 0 {
-			delete(p.orphanDeps, out)
-		}
-	}
 	delete(p.orphans, txid)
 }
 
@@ -937,35 +1165,11 @@ func (p *Pool) updateOrphanMissing(txid [32]byte, missing map[types.OutPoint]str
 	if orphan == nil {
 		return
 	}
-	for out := range orphan.Missing {
-		waiting := p.orphanDeps[out]
-		delete(waiting, txid)
-		if len(waiting) == 0 {
-			delete(p.orphanDeps, out)
-		}
-	}
 	orphan.Missing = copyOutPointSet(missing)
+	orphan.MissingCount = len(missing)
 	for out := range orphan.Missing {
-		if p.orphanDeps[out] == nil {
-			p.orphanDeps[out] = make(map[[32]byte]struct{})
-		}
-		p.orphanDeps[out][txid] = struct{}{}
+		p.orphanDeps[out] = append(p.orphanDeps[out], txid)
 	}
-}
-
-func (p *Pool) orphansForOutPoint(out types.OutPoint) [][32]byte {
-	waiting := p.orphanDeps[out]
-	if len(waiting) == 0 {
-		return nil
-	}
-	txids := make([][32]byte, 0, len(waiting))
-	for txid := range waiting {
-		txids = append(txids, txid)
-	}
-	sort.Slice(txids, func(i, j int) bool {
-		return bytes.Compare(txids[i][:], txids[j][:]) < 0
-	})
-	return txids
 }
 
 func (p *Pool) removeRecursive(roots map[[32]byte]struct{}) {
@@ -1025,6 +1229,9 @@ func (p *Pool) removeRecursive(roots map[[32]byte]struct{}) {
 		}
 	}
 	for txid := range remove {
+		if entry := p.entries[txid]; entry != nil {
+			p.noteEntryRemovedLocked(entry)
+		}
 		delete(p.entries, txid)
 	}
 	p.removeSelectionCandidatesLocked(remove)
@@ -1040,14 +1247,14 @@ func (p *Pool) SelectionCandidateCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.selection != nil {
-		return len(p.selection.ordered)
+		return p.selection.frontier.Len()
 	}
 	return len(p.entries)
 }
 
 func (p *Pool) cachedPackageCandidatesLocked() []packageCandidate {
 	p.ensureSelectionLocked()
-	return p.selection.ordered
+	return p.selection.frontier.ordered()
 }
 
 func (p *Pool) packageForSelection(txid [32]byte) []*Entry {
@@ -1089,25 +1296,81 @@ func (p *Pool) ensureSelectionLocked() {
 }
 
 func (p *Pool) rebuildSelectionLocked() {
-	candidates := make([]packageCandidate, 0, len(p.entries))
+	frontier := candidateHeap{indexes: make(map[[32]byte]int, len(p.entries))}
 	for _, entry := range p.entries {
 		candidate := p.candidateForTxLocked(entry.TxID)
 		if len(candidate.Entries) == 0 {
 			continue
 		}
-		candidates = append(candidates, candidate)
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidateLess(candidates[i], candidates[j])
-	})
-	indexes := make(map[[32]byte]int, len(candidates))
-	for i, candidate := range candidates {
-		indexes[candidate.TxID] = i
+		heap.Push(&frontier, candidate)
 	}
 	p.selection = &selectionCache{
-		epoch:   p.epoch,
-		ordered: candidates,
-		indexes: indexes,
+		epoch:    p.epoch,
+		frontier: frontier,
+	}
+}
+
+func (p *Pool) ensureTopByFeeLocked(limit int) {
+	if !p.topDirty && len(p.topByFee) >= minInt(limit, len(p.entries)) {
+		return
+	}
+	top := make([]SnapshotEntry, 0, minInt(limit, len(p.entries)))
+	for _, entry := range p.entries {
+		snapshot := snapshotForEntry(entry)
+		insertAt := sort.Search(len(top), func(i int) bool {
+			return topByFeeLess(snapshot, top[i])
+		})
+		if insertAt >= limit {
+			continue
+		}
+		top = append(top, SnapshotEntry{})
+		copy(top[insertAt+1:], top[insertAt:])
+		top[insertAt] = snapshot
+		if len(top) > limit {
+			top = top[:limit]
+		}
+	}
+	p.topByFee = top
+	p.topDirty = false
+}
+
+func (p *Pool) noteEntryAddedLocked(entry *Entry) {
+	p.stats.bytes += entry.Size
+	p.stats.totalFees += entry.Fee
+	p.stats.feeCounts[entry.Fee]++
+	if p.topDirty {
+		return
+	}
+	snapshot := snapshotForEntry(entry)
+	insertAt := sort.Search(len(p.topByFee), func(i int) bool {
+		return topByFeeLess(snapshot, p.topByFee[i])
+	})
+	if len(p.topByFee) >= topFeeCacheLimit && insertAt >= topFeeCacheLimit {
+		return
+	}
+	p.topByFee = append(p.topByFee, SnapshotEntry{})
+	copy(p.topByFee[insertAt+1:], p.topByFee[insertAt:])
+	p.topByFee[insertAt] = snapshot
+	if len(p.topByFee) > topFeeCacheLimit {
+		p.topByFee = p.topByFee[:topFeeCacheLimit]
+	}
+}
+
+func (p *Pool) noteEntryRemovedLocked(entry *Entry) {
+	p.stats.bytes -= entry.Size
+	p.stats.totalFees -= entry.Fee
+	if count := p.stats.feeCounts[entry.Fee] - 1; count > 0 {
+		p.stats.feeCounts[entry.Fee] = count
+	} else {
+		delete(p.stats.feeCounts, entry.Fee)
+	}
+	for i := range p.topByFee {
+		if p.topByFee[i].TxID != entry.TxID {
+			continue
+		}
+		p.topByFee = append(p.topByFee[:i], p.topByFee[i+1:]...)
+		p.topDirty = true
+		return
 	}
 }
 
@@ -1115,41 +1378,18 @@ func (p *Pool) upsertSelectionCandidateLocked(txid [32]byte) {
 	p.ensureSelectionLocked()
 	candidate := p.candidateForTxLocked(txid)
 	if len(candidate.Entries) == 0 {
+		p.selection.frontier.remove(txid)
 		return
 	}
-	if idx, ok := p.selection.indexes[txid]; ok {
-		p.selection.ordered = append(p.selection.ordered[:idx], p.selection.ordered[idx+1:]...)
-		delete(p.selection.indexes, txid)
-		for i := idx; i < len(p.selection.ordered); i++ {
-			p.selection.indexes[p.selection.ordered[i].TxID] = i
-		}
-	}
-	insertAt := sort.Search(len(p.selection.ordered), func(i int) bool {
-		return candidateLess(candidate, p.selection.ordered[i])
-	})
-	p.selection.ordered = append(p.selection.ordered, packageCandidate{})
-	copy(p.selection.ordered[insertAt+1:], p.selection.ordered[insertAt:])
-	p.selection.ordered[insertAt] = candidate
-	for i := insertAt; i < len(p.selection.ordered); i++ {
-		p.selection.indexes[p.selection.ordered[i].TxID] = i
-	}
+	p.selection.frontier.upsert(candidate)
 }
 
 func (p *Pool) removeSelectionCandidatesLocked(remove map[[32]byte]struct{}) {
 	if p.selection == nil || len(remove) == 0 {
 		return
 	}
-	filtered := p.selection.ordered[:0]
-	for _, candidate := range p.selection.ordered {
-		if _, ok := remove[candidate.TxID]; ok {
-			continue
-		}
-		filtered = append(filtered, candidate)
-	}
-	p.selection.ordered = filtered
-	p.selection.indexes = make(map[[32]byte]int, len(p.selection.ordered))
-	for i, candidate := range p.selection.ordered {
-		p.selection.indexes[candidate.TxID] = i
+	for txid := range remove {
+		p.selection.frontier.remove(txid)
 	}
 }
 
@@ -1277,6 +1517,27 @@ func (p *Pool) gatherAncestors(parents map[[32]byte]struct{}) map[[32]byte]struc
 		ancestors[txid] = struct{}{}
 		for parent := range entry.Parents {
 			stack = append(stack, parent)
+		}
+	}
+	return ancestors
+}
+
+func (p *Pool) gatherAncestorsLiveView(parents map[[32]byte]struct{}) map[[32]byte]struct{} {
+	ancestors := make(map[[32]byte]struct{})
+	stack := txidSetKeys(parents)
+	for len(stack) != 0 {
+		txid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := ancestors[txid]; ok {
+			continue
+		}
+		entry := p.entries[txid]
+		if entry == nil {
+			continue
+		}
+		ancestors[txid] = struct{}{}
+		for parentID := range entry.Parents {
+			stack = append(stack, parentID)
 		}
 	}
 	return ancestors
@@ -1434,6 +1695,62 @@ func candidateLess(left, right packageCandidate) bool {
 	return bytes.Compare(left.TxID[:], right.TxID[:]) < 0
 }
 
+func (h candidateHeap) Len() int {
+	return len(h.items)
+}
+
+func (h candidateHeap) Less(i, j int) bool {
+	return candidateLess(h.items[i], h.items[j])
+}
+
+func (h candidateHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+	h.indexes[h.items[i].TxID] = i
+	h.indexes[h.items[j].TxID] = j
+}
+
+func (h *candidateHeap) Push(x any) {
+	candidate := x.(packageCandidate)
+	h.items = append(h.items, candidate)
+	h.indexes[candidate.TxID] = len(h.items) - 1
+}
+
+func (h *candidateHeap) Pop() any {
+	last := len(h.items) - 1
+	candidate := h.items[last]
+	h.items = h.items[:last]
+	delete(h.indexes, candidate.TxID)
+	return candidate
+}
+
+func (h *candidateHeap) ordered() []packageCandidate {
+	ordered := append([]packageCandidate(nil), h.items...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return candidateLess(ordered[i], ordered[j])
+	})
+	return ordered
+}
+
+func (h *candidateHeap) remove(txid [32]byte) {
+	idx, ok := h.indexes[txid]
+	if !ok {
+		return
+	}
+	heap.Remove(h, idx)
+}
+
+func (h *candidateHeap) upsert(candidate packageCandidate) {
+	if idx, ok := h.indexes[candidate.TxID]; ok {
+		prev := h.items[idx]
+		h.items[idx] = candidate
+		if candidateLess(candidate, prev) || candidateLess(prev, candidate) {
+			heap.Fix(h, idx)
+		}
+		return
+	}
+	heap.Push(h, candidate)
+}
+
 func outputsForTx(txid [32]byte, tx types.Transaction) []types.OutPoint {
 	outputs := make([]types.OutPoint, 0, len(tx.Base.Outputs))
 	for vout := range tx.Base.Outputs {
@@ -1531,4 +1848,26 @@ func sortTxIDs(ids [][32]byte) {
 	sort.Slice(ids, func(i, j int) bool {
 		return bytes.Compare(ids[i][:], ids[j][:]) < 0
 	})
+}
+
+func topByFeeLess(left, right SnapshotEntry) bool {
+	switch {
+	case left.Fee > right.Fee:
+		return true
+	case left.Fee < right.Fee:
+		return false
+	case left.Size < right.Size:
+		return true
+	case left.Size > right.Size:
+		return false
+	default:
+		return bytes.Compare(left.TxID[:], right.TxID[:]) < 0
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

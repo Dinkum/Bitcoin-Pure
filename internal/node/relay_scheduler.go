@@ -19,7 +19,7 @@ func (r *relayScheduler) RelayPeerStats() []PeerRelayStats {
 	defer r.svc.peerMu.RUnlock()
 	out := make([]PeerRelayStats, 0, len(r.svc.peers))
 	for _, peer := range r.svc.peers {
-		out = append(out, peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepth()))
+		out = append(out, peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepths(), peer.pendingLocalRelayCount()))
 	}
 	slices.SortFunc(out, func(a, b PeerRelayStats) int {
 		return strings.Compare(a.Addr, b.Addr)

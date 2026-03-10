@@ -2,90 +2,61 @@ package logging
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestRotatingFileRotatesAtCap(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "node.log")
-	writer, err := openRotatingFile(path, 64)
+func TestNewLoggerJSONAndTextShareFields(t *testing.T) {
+	var textBuf bytes.Buffer
+	textLogger, err := NewLogger(&textBuf, Config{Format: "text", Level: "info"})
 	if err != nil {
-		t.Fatalf("openRotatingFile() error = %v", err)
+		t.Fatalf("NewLogger(text): %v", err)
 	}
-	t.Cleanup(func() {
-		_ = writer.Close()
-	})
+	textLogger.With("component", "service").Info("event", slog.String("foo", "bar"), slog.Int("count", 2))
 
-	first := bytes.Repeat([]byte("a"), 40)
-	second := bytes.Repeat([]byte("b"), 40)
-	if _, err := writer.Write(first); err != nil {
-		t.Fatalf("writer.Write(first) error = %v", err)
+	var jsonBuf bytes.Buffer
+	jsonLogger, err := NewLogger(&jsonBuf, Config{Format: "json", Level: "info"})
+	if err != nil {
+		t.Fatalf("NewLogger(json): %v", err)
 	}
-	if _, err := writer.Write(second); err != nil {
-		t.Fatalf("writer.Write(second) error = %v", err)
+	jsonLogger.With("component", "service").Info("event", slog.String("foo", "bar"), slog.Int("count", 2))
+
+	textOutput := textBuf.String()
+	for _, want := range []string{"level=INFO", "msg=event", "component=service", "foo=bar", "count=2", "source="} {
+		if !strings.Contains(textOutput, want) {
+			t.Fatalf("text output missing %q: %q", want, textOutput)
+		}
 	}
 
-	current, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(current) error = %v", err)
+	var payload map[string]any
+	line := strings.TrimSpace(jsonBuf.String())
+	if err := json.Unmarshal([]byte(line), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", line, err)
 	}
-	backup, err := os.ReadFile(path + ".1")
-	if err != nil {
-		t.Fatalf("ReadFile(backup) error = %v", err)
+	if got := payload["level"]; got != "INFO" {
+		t.Fatalf("json level = %v, want INFO", got)
 	}
-	if got, want := string(current), string(second); got != want {
-		t.Fatalf("current log mismatch: got %q want %q", got, want)
+	if got := payload["msg"]; got != "event" {
+		t.Fatalf("json msg = %v, want event", got)
 	}
-	if got, want := string(backup), string(first); got != want {
-		t.Fatalf("backup log mismatch: got %q want %q", got, want)
+	if got := payload["component"]; got != "service" {
+		t.Fatalf("json component = %v, want service", got)
+	}
+	if got := payload["foo"]; got != "bar" {
+		t.Fatalf("json foo = %v, want bar", got)
+	}
+	if got := payload["count"]; got != float64(2) {
+		t.Fatalf("json count = %v, want 2", got)
+	}
+	if _, ok := payload["source"]; !ok {
+		t.Fatalf("json output missing source: %v", payload)
 	}
 }
 
-func TestParseLevel(t *testing.T) {
-	t.Parallel()
-
-	level, err := parseLevel("debug")
-	if err != nil {
-		t.Fatalf("parseLevel(debug) error = %v", err)
-	}
-	if got, want := level.Level(), slog.LevelDebug; got != want {
-		t.Fatalf("level = %v want %v", got, want)
-	}
-	if _, err := parseLevel("bogus"); err == nil {
-		t.Fatal("parseLevel(bogus) unexpectedly succeeded")
-	}
-}
-
-func TestSetupWritesLogLine(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "node.log")
-	logger, closer, err := Setup(Config{Path: path, Level: "info", MaxSizeBytes: 1024})
-	if err != nil {
-		t.Fatalf("Setup() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = closer.Close()
-	})
-
-	logger.Info("hello", "component", "test")
-
-	buf, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	text := string(buf)
-	if !strings.Contains(text, "hello") {
-		t.Fatalf("log line missing message: %q", text)
-	}
-	if !strings.Contains(text, "component=test") {
-		t.Fatalf("log line missing component: %q", text)
+func TestNewHandlerRejectsUnsupportedFormat(t *testing.T) {
+	if _, err := NewHandler(&bytes.Buffer{}, Config{Format: "yaml"}); err == nil {
+		t.Fatal("expected unsupported format error")
 	}
 }

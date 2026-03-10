@@ -60,9 +60,10 @@ type Block struct {
 type ChainProfile string
 
 const (
-	Mainnet     ChainProfile = "mainnet"
-	Regtest     ChainProfile = "regtest"
-	RegtestHard ChainProfile = "regtest_hard"
+	Mainnet       ChainProfile = "mainnet"
+	Regtest       ChainProfile = "regtest"
+	RegtestMedium ChainProfile = "regtest_medium"
+	RegtestHard   ChainProfile = "regtest_hard"
 )
 
 func ParseChainProfile(raw string) (ChainProfile, error) {
@@ -71,6 +72,8 @@ func ParseChainProfile(raw string) (ChainProfile, error) {
 		return Mainnet, nil
 	case Regtest:
 		return Regtest, nil
+	case RegtestMedium:
+		return RegtestMedium, nil
 	case RegtestHard:
 		return RegtestHard, nil
 	default:
@@ -83,7 +86,7 @@ func (p ChainProfile) String() string {
 }
 
 func (p ChainProfile) IsRegtestLike() bool {
-	return p == Regtest || p == RegtestHard
+	return p == Regtest || p == RegtestMedium || p == RegtestHard
 }
 
 type CodecLimits struct {
@@ -475,7 +478,7 @@ func decodeTransactionFromReader(r *reader, limits CodecLimits) (Transaction, er
 			return Transaction{}, InvalidFormatError{Reason: "non-coinbase tx must not include coinbase_height"}
 		}
 		if len(auth.Entries) != len(base.Inputs) {
-		return Transaction{}, InvalidFormatError{Reason: "auth entry count must equal input count"}
+			return Transaction{}, InvalidFormatError{Reason: "auth entry count must equal input count"}
 		}
 	}
 	return Transaction{Base: base, Auth: auth}, nil

@@ -45,9 +45,21 @@ func VerifySchnorrXOnly(pubKey *[32]byte, sig *[64]byte, msg *[32]byte) bool {
 	return parsedSig.Verify(msg[:], parsedPubKey)
 }
 
-func SignSchnorrForTest(secretKey [32]byte, msg *[32]byte) ([32]byte, [64]byte) {
+func XOnlyPubKeyFromSecret(secretKey [32]byte) [32]byte {
+	privKey, _ := btcec.PrivKeyFromBytes(secretKey[:])
+	pubKey := schnorr.SerializePubKey(privKey.PubKey())
+	var xonly [32]byte
+	copy(xonly[:], pubKey)
+	return xonly
+}
+
+func SignSchnorr(secretKey [32]byte, msg *[32]byte) ([32]byte, [64]byte) {
 	privKey, _ := btcec.PrivKeyFromBytes(secretKey[:])
 	return signWithPrivKey(privKey, msg)
+}
+
+func SignSchnorrForTest(secretKey [32]byte, msg *[32]byte) ([32]byte, [64]byte) {
+	return SignSchnorr(secretKey, msg)
 }
 
 func RandomSignSchnorrForTest(msg *[32]byte) ([32]byte, [64]byte) {

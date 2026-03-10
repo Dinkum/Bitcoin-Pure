@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"path/filepath"
 	"testing"
 
@@ -121,19 +122,30 @@ func TestEnsureMiningWalletProvisionedNoopsWhenMiningDisabled(t *testing.T) {
 	}
 }
 
-func TestDefaultGenesisFixtureSupportsRegtestHard(t *testing.T) {
+func TestDefaultGenesisFixtureSupportsRegtestMediumAndHard(t *testing.T) {
+	if got := defaultGenesisFixture(types.RegtestMedium); got != "fixtures/genesis/regtest_medium.json" {
+		t.Fatalf("default medium genesis fixture = %q", got)
+	}
 	if got := defaultGenesisFixture(types.RegtestHard); got != "fixtures/genesis/regtest_hard.json" {
-		t.Fatalf("default genesis fixture = %q", got)
+		t.Fatalf("default hard genesis fixture = %q", got)
 	}
 }
 
-func TestLoadGenesisFixtureSupportsRegtestHard(t *testing.T) {
-	loaded, err := loadGenesisFixtureFromPath(filepath.Join("..", "..", "fixtures", "genesis", "regtest_hard.json"))
+func TestLoadGenesisFixtureSupportsRegtestMediumAndHard(t *testing.T) {
+	loaded, err := loadGenesisFixtureFromPath(filepath.Join("..", "..", "fixtures", "genesis", "regtest_medium.json"))
 	if err != nil {
-		t.Fatalf("loadGenesisFixture: %v", err)
+		t.Fatalf("loadGenesisFixture(regtest_medium): %v", err)
 	}
-	if loaded.Fixture.Profile != string(types.RegtestHard) {
-		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.RegtestHard)
+	if loaded.Fixture.Profile != string(types.RegtestMedium) {
+		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.RegtestMedium)
+	}
+
+	loadedHard, err := loadGenesisFixtureFromPath(filepath.Join("..", "..", "fixtures", "genesis", "regtest_hard.json"))
+	if err != nil {
+		t.Fatalf("loadGenesisFixture(regtest_hard): %v", err)
+	}
+	if loadedHard.Fixture.Profile != string(types.RegtestHard) {
+		t.Fatalf("fixture profile = %q, want %q", loadedHard.Fixture.Profile, types.RegtestHard)
 	}
 }
 
@@ -144,5 +156,37 @@ func TestLoadGenesisFixtureSupportsMainnet(t *testing.T) {
 	}
 	if loaded.Fixture.Profile != string(types.Mainnet) {
 		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.Mainnet)
+	}
+}
+
+func TestValidateLoopbackListenAddr(t *testing.T) {
+	if err := validateLoopbackListenAddr("127.0.0.1:6060"); err != nil {
+		t.Fatalf("validate loopback ipv4: %v", err)
+	}
+	if err := validateLoopbackListenAddr("[::1]:6060"); err != nil {
+		t.Fatalf("validate loopback ipv6: %v", err)
+	}
+	if err := validateLoopbackListenAddr("localhost:6060"); err != nil {
+		t.Fatalf("validate localhost: %v", err)
+	}
+	if err := validateLoopbackListenAddr("0.0.0.0:6060"); err == nil {
+		t.Fatal("expected non-loopback addr rejection")
+	}
+}
+
+func TestMaybeStartPprofServerServesLoopbackEndpoint(t *testing.T) {
+	server, err := maybeStartPprofServer("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("maybeStartPprofServer: %v", err)
+	}
+	defer server.Close()
+
+	resp, err := http.Get("http://" + server.ln.Addr().String() + "/debug/pprof/")
+	if err != nil {
+		t.Fatalf("GET /debug/pprof/: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }
