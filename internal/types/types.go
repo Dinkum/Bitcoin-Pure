@@ -26,10 +26,11 @@ type TxAuthEntry struct {
 }
 
 type TxBase struct {
-	Version        uint32
-	CoinbaseHeight *uint64
-	Inputs         []TxInput
-	Outputs        []TxOutput
+	Version            uint32
+	CoinbaseHeight     *uint64
+	CoinbaseExtraNonce *[CoinbaseExtraNonceLen]byte
+	Inputs             []TxInput
+	Outputs            []TxOutput
 }
 
 type TxAuth struct {
@@ -49,7 +50,7 @@ type BlockHeader struct {
 	UTXORoot       [32]byte
 	Timestamp      uint64
 	NBits          uint32
-	Nonce          uint32
+	Nonce          uint64
 }
 
 type Block struct {
@@ -64,6 +65,11 @@ const (
 	Regtest       ChainProfile = "regtest"
 	RegtestMedium ChainProfile = "regtest_medium"
 	RegtestHard   ChainProfile = "regtest_hard"
+)
+
+const (
+	CoinbaseExtraNonceLen = 16
+	BlockHeaderEncodedLen = 152
 )
 
 func ParseChainProfile(raw string) (ChainProfile, error) {
@@ -193,6 +199,16 @@ func (r *reader) readU64LE() (uint64, error) {
 func (r *reader) readArray32() ([32]byte, error) {
 	var out [32]byte
 	buf, err := r.take(32)
+	if err != nil {
+		return out, err
+	}
+	copy(out[:], buf)
+	return out, nil
+}
+
+func (r *reader) readArray16() ([CoinbaseExtraNonceLen]byte, error) {
+	var out [CoinbaseExtraNonceLen]byte
+	buf, err := r.take(CoinbaseExtraNonceLen)
 	if err != nil {
 		return out, err
 	}
@@ -358,9 +374,10 @@ func (b TxBase) Encode(out *[]byte) {
 	writeVarInt(out, uint64(len(b.Inputs)))
 	if len(b.Inputs) == 0 {
 		// Coinbase transactions structurally commit the block height inside the
-		// base encoding so the txid changes across heights without overloading
-		// unrelated fields.
+		// base encoding. The fixed-width extra nonce extends miner search space
+		// without introducing an unbounded arbitrary script region.
 		writeVarInt(out, *b.CoinbaseHeight)
+		*out = append(*out, (*b.CoinbaseExtraNonce)[:]...)
 	}
 	for _, input := range b.Inputs {
 		input.Encode(out)
@@ -381,6 +398,7 @@ func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
 		return TxBase{}, err
 	}
 	var coinbaseHeight *uint64
+	var coinbaseExtraNonce *[CoinbaseExtraNonceLen]byte
 	if inputCount == 0 {
 		height, err := r.readVarInt()
 		if err != nil {
@@ -388,6 +406,12 @@ func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
 		}
 		coinbaseHeight = new(uint64)
 		*coinbaseHeight = height
+		extraNonce, err := r.readArray16()
+		if err != nil {
+			return TxBase{}, err
+		}
+		coinbaseExtraNonce = new([CoinbaseExtraNonceLen]byte)
+		*coinbaseExtraNonce = extraNonce
 	}
 	inputs := make([]TxInput, 0, inputCount)
 	for range inputCount {
@@ -409,7 +433,13 @@ func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
 		}
 		outputs = append(outputs, output)
 	}
-	return TxBase{Version: version, CoinbaseHeight: coinbaseHeight, Inputs: inputs, Outputs: outputs}, nil
+	return TxBase{
+		Version:            version,
+		CoinbaseHeight:     coinbaseHeight,
+		CoinbaseExtraNonce: coinbaseExtraNonce,
+		Inputs:             inputs,
+		Outputs:            outputs,
+	}, nil
 }
 
 func (a TxAuth) Encode(out *[]byte) {
@@ -436,7 +466,7 @@ func decodeTxAuth(r *reader, maxEntries int) (TxAuth, error) {
 }
 
 func (t Transaction) IsCoinbase() bool {
-	return len(t.Base.Inputs) == 0 && t.Base.CoinbaseHeight != nil
+	return len(t.Base.Inputs) == 0 && t.Base.CoinbaseHeight != nil && t.Base.CoinbaseExtraNonce != nil
 }
 
 func (t Transaction) EncodeBase() []byte {
@@ -470,12 +500,18 @@ func decodeTransactionFromReader(r *reader, limits CodecLimits) (Transaction, er
 		if base.CoinbaseHeight == nil {
 			return Transaction{}, InvalidFormatError{Reason: "coinbase tx must include coinbase_height"}
 		}
+		if base.CoinbaseExtraNonce == nil {
+			return Transaction{}, InvalidFormatError{Reason: "coinbase tx must include coinbase_extra_nonce"}
+		}
 		if len(auth.Entries) != 0 {
 			return Transaction{}, InvalidFormatError{Reason: "coinbase tx must have empty auth"}
 		}
 	} else {
 		if base.CoinbaseHeight != nil {
 			return Transaction{}, InvalidFormatError{Reason: "non-coinbase tx must not include coinbase_height"}
+		}
+		if base.CoinbaseExtraNonce != nil {
+			return Transaction{}, InvalidFormatError{Reason: "non-coinbase tx must not include coinbase_extra_nonce"}
 		}
 		if len(auth.Entries) != len(base.Inputs) {
 			return Transaction{}, InvalidFormatError{Reason: "auth entry count must equal input count"}
@@ -505,7 +541,7 @@ func DecodeTransactionHex(raw string, limits CodecLimits) (Transaction, error) {
 }
 
 func (h BlockHeader) Encode() []byte {
-	out := make([]byte, 0, 148)
+	out := make([]byte, 0, BlockHeaderEncodedLen)
 	writeU32LE(&out, h.Version)
 	out = append(out, h.PrevBlockHash[:]...)
 	out = append(out, h.MerkleTxIDRoot[:]...)
@@ -513,7 +549,7 @@ func (h BlockHeader) Encode() []byte {
 	out = append(out, h.UTXORoot[:]...)
 	writeU64LE(&out, h.Timestamp)
 	writeU32LE(&out, h.NBits)
-	writeU32LE(&out, h.Nonce)
+	writeU64LE(&out, h.Nonce)
 	return out
 }
 
@@ -546,7 +582,7 @@ func decodeBlockHeader(r *reader) (BlockHeader, error) {
 	if err != nil {
 		return BlockHeader{}, err
 	}
-	nonce, err := r.readU32LE()
+	nonce, err := r.readU64LE()
 	if err != nil {
 		return BlockHeader{}, err
 	}

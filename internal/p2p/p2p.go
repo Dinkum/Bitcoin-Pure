@@ -613,7 +613,7 @@ func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Messa
 		}
 		return TxRequestMessage{TxIDs: txids}, nil
 	case CmdCompactBlock:
-		headerBytes, err := r.take(148)
+		headerBytes, err := r.take(types.BlockHeaderEncodedLen)
 		if err != nil {
 			return nil, err
 		}
@@ -663,7 +663,7 @@ func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Messa
 		}
 		return BlockTxMessage{BlockHash: blockHash, Indexes: indexes, Txs: txs}, nil
 	case CmdXThinBlock:
-		headerBytes, err := r.take(148)
+		headerBytes, err := r.take(types.BlockHeaderEncodedLen)
 		if err != nil {
 			return nil, err
 		}
@@ -1098,7 +1098,7 @@ func (r *reader) readHeaders() ([]types.BlockHeader, error) {
 	}
 	headers := make([]types.BlockHeader, 0, count)
 	for i := uint32(0); i < count; i++ {
-		buf, err := r.take(148)
+		buf, err := r.take(types.BlockHeaderEncodedLen)
 		if err != nil {
 			return nil, err
 		}

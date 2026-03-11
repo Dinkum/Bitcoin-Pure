@@ -11,6 +11,12 @@ func testCoinbaseHeight(height uint64) *uint64 {
 	return &height
 }
 
+func testCoinbaseExtraNonce(seed byte) *[CoinbaseExtraNonceLen]byte {
+	var extra [CoinbaseExtraNonceLen]byte
+	extra[0] = seed
+	return &extra
+}
+
 func sampleTx() Transaction {
 	return Transaction{
 		Base: TxBase{
@@ -55,11 +61,13 @@ func TestBlockRoundtrip(t *testing.T) {
 			UTXORoot:       [32]byte{7},
 			Timestamp:      1,
 			NBits:          0x1d00ffff,
+			Nonce:          1<<40 + 7,
 		},
 		Txs: []Transaction{{
 			Base: TxBase{
-				Version:        1,
-				CoinbaseHeight: testCoinbaseHeight(0),
+				Version:            1,
+				CoinbaseHeight:     testCoinbaseHeight(0),
+				CoinbaseExtraNonce: testCoinbaseExtraNonce(1),
 				Outputs: []TxOutput{{
 					ValueAtoms: 50,
 					KeyHash:    [32]byte{5},
@@ -79,9 +87,10 @@ func TestBlockRoundtrip(t *testing.T) {
 func TestCoinbaseTransactionRoundtripPreservesHeight(t *testing.T) {
 	tx := Transaction{
 		Base: TxBase{
-			Version:        7,
-			CoinbaseHeight: testCoinbaseHeight(123),
-			Inputs:         []TxInput{},
+			Version:            7,
+			CoinbaseHeight:     testCoinbaseHeight(123),
+			CoinbaseExtraNonce: testCoinbaseExtraNonce(9),
+			Inputs:             []TxInput{},
 			Outputs: []TxOutput{{
 				ValueAtoms: 50,
 				KeyHash:    [32]byte{9},
@@ -95,6 +104,43 @@ func TestCoinbaseTransactionRoundtripPreservesHeight(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, tx) {
 		t.Fatalf("coinbase transaction mismatch")
+	}
+}
+
+func TestBlockHeaderRoundtripPreservesUint64Nonce(t *testing.T) {
+	header := BlockHeader{
+		Version:        1,
+		PrevBlockHash:  [32]byte{1},
+		MerkleTxIDRoot: [32]byte{2},
+		MerkleAuthRoot: [32]byte{3},
+		UTXORoot:       [32]byte{4},
+		Timestamp:      5,
+		NBits:          0x1d00ffff,
+		Nonce:          1<<48 + 9,
+	}
+	got, err := DecodeBlockHeader(header.Encode())
+	if err != nil {
+		t.Fatalf("decode header: %v", err)
+	}
+	if !reflect.DeepEqual(got, header) {
+		t.Fatalf("header mismatch")
+	}
+	if len(header.Encode()) != BlockHeaderEncodedLen {
+		t.Fatalf("header length = %d, want %d", len(header.Encode()), BlockHeaderEncodedLen)
+	}
+}
+
+func TestDecodeTransactionRejectsCoinbaseMissingExtraNonce(t *testing.T) {
+	raw := []byte{
+		0x01, 0x00, 0x00, 0x00, // version
+		0x00, // input_count
+		0x01, // coinbase_height
+		0x01, // output_count
+	}
+	raw = append(raw, make([]byte, 40)...)
+	raw = append(raw, 0x00) // auth_count
+	if _, err := DecodeTransactionWithLimits(raw, DefaultCodecLimits()); err == nil {
+		t.Fatal("expected missing coinbase extra nonce to fail decoding")
 	}
 }
 

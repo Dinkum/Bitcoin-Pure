@@ -24,7 +24,6 @@
 /releases
 /works
 /Works
-/specs
 /REFERENCE_NODES
 /CI/
 /bpu-cli
@@ -46,3 +45,4 @@ target/
 # Root-level markdown notes are local unless explicitly published.
 /*.md
 !/README.md
+!/SPEC.md

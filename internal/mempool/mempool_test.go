@@ -17,11 +17,13 @@ func signerKeyHash(seed byte) [32]byte {
 }
 
 func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
+	var extraNonce [types.CoinbaseExtraNonceLen]byte
 	return types.Transaction{
 		Base: types.TxBase{
-			Version:        1,
-			CoinbaseHeight: &height,
-			Outputs:        outputs,
+			Version:            1,
+			CoinbaseHeight:     &height,
+			CoinbaseExtraNonce: &extraNonce,
+			Outputs:            outputs,
 		},
 	}
 }

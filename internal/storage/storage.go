@@ -39,6 +39,15 @@ var (
 	utxoPrefixEnd      = prefixUpperBound(utxoPrefix)
 )
 
+var (
+	// Canonical chain/header state must cross a durable sync boundary before the
+	// store acknowledges progress to higher layers.
+	consensusCriticalWriteOptions = pebble.Sync
+	// Non-consensus metadata can remain best-effort and rely on Pebble's normal
+	// flush cadence.
+	bestEffortWriteOptions = pebble.NoSync
+)
+
 type StoredChainState struct {
 	Profile        types.ChainProfile
 	Height         uint64
@@ -332,7 +341,7 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 			return err
 		}
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(bestEffortWriteOptions); err != nil {
 		return err
 	}
 	logging.Component("storage").Info("wrote known peers", slog.Int("count", len(peers)))
@@ -366,7 +375,7 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 			return err
 		}
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -422,7 +431,7 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 		}
 		written++
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -448,7 +457,7 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 	}); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -491,7 +500,7 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 			return err
 		}
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -518,7 +527,7 @@ func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 	}); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -551,7 +560,7 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 	}); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -605,7 +614,7 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 	); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -628,7 +637,7 @@ func (s *ChainStore) PutValidatedBlock(block *types.Block, entry *BlockIndexEntr
 	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
 		return err
 	}
-	return batch.Commit(pebble.NoSync)
+	return batch.Commit(consensusCriticalWriteOptions)
 }
 
 func (s *ChainStore) preserveValidatedBlockIndex(entry BlockIndexEntry) (BlockIndexEntry, error) {
@@ -663,7 +672,7 @@ func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64
 	}); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -686,7 +695,7 @@ func (s *ChainStore) RewriteActiveHeaderHeights(forkHeight uint64, oldTipHeight 
 	}); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -702,7 +711,7 @@ func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
 	}); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
@@ -765,6 +774,26 @@ func (s *ChainStore) GetHeaderHashByHeight(height uint64) (*[32]byte, error) {
 	var hash [32]byte
 	copy(hash[:], buf)
 	return &hash, nil
+}
+
+func (s *ChainStore) GetIndexedHeaderHashByHeight(height uint64) (*[32]byte, error) {
+	buf, err := s.get(headerHeightIndexKey(height))
+	if err != nil {
+		return nil, err
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	if len(buf) != 32 {
+		return nil, errors.New("invalid header height index encoding")
+	}
+	var hash [32]byte
+	copy(hash[:], buf)
+	return &hash, nil
+}
+
+func (s *ChainStore) GetCanonicalHeaderHashByHeight(height uint64) (*[32]byte, error) {
+	return s.derivedHashByHeight(height, true)
 }
 
 func (s *ChainStore) GetBlockIndex(blockHash *[32]byte) (*BlockIndexEntry, error) {
@@ -1259,7 +1288,7 @@ func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {
 
 func encodeBlockIndexEntry(entry BlockIndexEntry) []byte {
 	blockSizeState := encodeBlockSizeState(entry.BlockSizeState)
-	buf := make([]byte, 8, 8+32+148+32+1+4+len(blockSizeState))
+	buf := make([]byte, 8, 8+32+types.BlockHeaderEncodedLen+32+1+4+len(blockSizeState))
 	binary.LittleEndian.PutUint64(buf, entry.Height)
 	buf = append(buf, entry.ParentHash[:]...)
 	buf = append(buf, entry.Header.Encode()...)
@@ -1274,20 +1303,22 @@ func encodeBlockIndexEntry(entry BlockIndexEntry) []byte {
 }
 
 func decodeBlockIndexEntry(buf []byte) (*BlockIndexEntry, error) {
-	if len(buf) < 8+32+148+32+1+4 {
+	if len(buf) < 8+32+types.BlockHeaderEncodedLen+32+1+4 {
 		return nil, errors.New("invalid block index entry encoding")
 	}
 	height := binary.LittleEndian.Uint64(buf[:8])
 	var parentHash [32]byte
 	copy(parentHash[:], buf[8:40])
-	header, err := types.DecodeBlockHeader(buf[40 : 40+148])
+	header, err := types.DecodeBlockHeader(buf[40 : 40+types.BlockHeaderEncodedLen])
 	if err != nil {
 		return nil, err
 	}
 	var chainWork [32]byte
-	copy(chainWork[:], buf[188:220])
-	validated := buf[220] != 0
-	stateBytes, remaining, err := consensus.DecodeLenPrefixed(buf[221:])
+	chainWorkOffset := 40 + types.BlockHeaderEncodedLen
+	copy(chainWork[:], buf[chainWorkOffset:chainWorkOffset+32])
+	validatedOffset := chainWorkOffset + 32
+	validated := buf[validatedOffset] != 0
+	stateBytes, remaining, err := consensus.DecodeLenPrefixed(buf[validatedOffset+1:])
 	if err != nil {
 		return nil, err
 	}

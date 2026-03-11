@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/big"
 	"net"
 	"regexp"
@@ -42,11 +43,14 @@ func compactTargetForTest(compact uint32) *big.Int {
 
 func mineHeaderForNodeTest(header types.BlockHeader) types.BlockHeader {
 	target := compactTargetForTest(header.NBits)
-	for nonce := uint32(0); nonce < ^uint32(0); nonce++ {
+	for nonce := uint64(0); ; nonce++ {
 		header.Nonce = nonce
 		hash := consensus.HeaderHash(&header)
 		if new(big.Int).SetBytes(hash[:]).Cmp(target) <= 0 {
 			return header
+		}
+		if nonce == math.MaxUint64 {
+			break
 		}
 	}
 	panic("unable to mine header")
@@ -55,6 +59,52 @@ func mineHeaderForNodeTest(header types.BlockHeader) types.BlockHeader {
 func nodeSignerKeyHash(seed byte) [32]byte {
 	pubKey, _ := crypto.SignSchnorrForTest([32]byte{seed}, &[32]byte{})
 	return crypto.KeyHash(&pubKey)
+}
+
+func merkleLeafForNodeTest(item [32]byte) [32]byte {
+	var buf [33]byte
+	buf[0] = 0x00
+	copy(buf[1:], item[:])
+	return crypto.Sha256d(buf[:])
+}
+
+func merkleNodeForNodeTest(left, right [32]byte) [32]byte {
+	var buf [65]byte
+	buf[0] = 0x01
+	copy(buf[1:33], left[:])
+	copy(buf[33:], right[:])
+	return crypto.Sha256d(buf[:])
+}
+
+func merkleSoloForNodeTest(item [32]byte) [32]byte {
+	var buf [33]byte
+	buf[0] = 0x02
+	copy(buf[1:], item[:])
+	return crypto.Sha256d(buf[:])
+}
+
+// merkleRootForNodeTest keeps header fixtures anchored to the spec-tagged
+// tree rules instead of reusing the production consensus.MerkleRoot path.
+func merkleRootForNodeTest(items [][32]byte) [32]byte {
+	if len(items) == 0 {
+		panic("merkleRootForNodeTest requires at least one item")
+	}
+	level := make([][32]byte, len(items))
+	for i, item := range items {
+		level[i] = merkleLeafForNodeTest(item)
+	}
+	for len(level) > 1 {
+		next := make([][32]byte, 0, (len(level)+1)/2)
+		for i := 0; i < len(level); i += 2 {
+			if i+1 == len(level) {
+				next = append(next, merkleSoloForNodeTest(level[i]))
+				continue
+			}
+			next = append(next, merkleNodeForNodeTest(level[i], level[i+1]))
+		}
+		level = next
+	}
+	return level[0]
 }
 
 func spendTxForNodeTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint64, recipientSeed byte, fee uint64) types.Transaction {
@@ -89,8 +139,8 @@ func genesisBlock() types.Block {
 	return types.Block{
 		Header: types.BlockHeader{
 			Version:        1,
-			MerkleTxIDRoot: consensus.MerkleRoot(txids),
-			MerkleAuthRoot: consensus.MerkleRoot(authids),
+			MerkleTxIDRoot: merkleRootForNodeTest(txids),
+			MerkleAuthRoot: merkleRootForNodeTest(authids),
 			UTXORoot:       consensus.ComputedUTXORoot(utxos),
 			Timestamp:      params.GenesisTimestamp,
 			NBits:          params.GenesisBits,
@@ -110,8 +160,8 @@ func genesisBlockForKeyHash(keyHash [32]byte) types.Block {
 	return types.Block{
 		Header: types.BlockHeader{
 			Version:        1,
-			MerkleTxIDRoot: consensus.MerkleRoot(txids),
-			MerkleAuthRoot: consensus.MerkleRoot(authids),
+			MerkleTxIDRoot: merkleRootForNodeTest(txids),
+			MerkleAuthRoot: merkleRootForNodeTest(authids),
 			UTXORoot:       consensus.ComputedUTXORoot(utxos),
 			Timestamp:      params.GenesisTimestamp,
 			NBits:          params.GenesisBits,
@@ -134,8 +184,8 @@ func nextCoinbaseBlock(prevHeight uint64, prev types.BlockHeader, currentUTXOs c
 	header := types.BlockHeader{
 		Version:        1,
 		PrevBlockHash:  consensus.HeaderHash(&prev),
-		MerkleTxIDRoot: consensus.MerkleRoot(txids),
-		MerkleAuthRoot: consensus.MerkleRoot(authids),
+		MerkleTxIDRoot: merkleRootForNodeTest(txids),
+		MerkleAuthRoot: merkleRootForNodeTest(authids),
 		UTXORoot:       consensus.ComputedUTXORoot(nextUTXOs),
 		Timestamp:      timestamp,
 		NBits:          nbits,
@@ -216,8 +266,8 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 	header := types.BlockHeader{
 		Version:        1,
 		PrevBlockHash:  consensus.HeaderHash(&prev),
-		MerkleTxIDRoot: consensus.MerkleRoot(txids),
-		MerkleAuthRoot: consensus.MerkleRoot(authids),
+		MerkleTxIDRoot: merkleRootForNodeTest(txids),
+		MerkleAuthRoot: merkleRootForNodeTest(authids),
 		UTXORoot:       consensus.ComputedUTXORoot(tempUtxos),
 		Timestamp:      timestamp,
 		NBits:          nbits,
@@ -305,7 +355,7 @@ func TestRejectBadGenesisUTXORoot(t *testing.T) {
 	}
 }
 
-func TestCommittedViewReusesPublishedChainState(t *testing.T) {
+func TestCommittedViewReturnsDefensiveSnapshot(t *testing.T) {
 	state := NewChainState(types.Regtest)
 	block := genesisBlock()
 	if _, err := state.InitializeFromGenesisBlock(&block); err != nil {
@@ -326,6 +376,70 @@ func TestCommittedViewReusesPublishedChainState(t *testing.T) {
 	}
 	if view.UTXOAcc == nil {
 		t.Fatal("expected maintained accumulator")
+	}
+	if view.UTXOAcc == state.utxoAcc {
+		t.Fatal("committed view exposed live accumulator handle")
+	}
+
+	for outPoint := range view.UTXOs {
+		delete(view.UTXOs, outPoint)
+	}
+	view.UTXOAcc = nil
+
+	refreshed, ok := state.CommittedView()
+	if !ok {
+		t.Fatal("expected committed view after snapshot mutation")
+	}
+	if got := len(refreshed.UTXOs); got != 1 {
+		t.Fatalf("refreshed utxo count = %d, want 1", got)
+	}
+	if refreshed.UTXOAcc == nil {
+		t.Fatal("snapshot mutation cleared live accumulator")
+	}
+}
+
+func TestChainStateAccessorsReturnCopies(t *testing.T) {
+	state := NewChainState(types.Regtest)
+	block := genesisBlock()
+	if _, err := state.InitializeFromGenesisBlock(&block); err != nil {
+		t.Fatal(err)
+	}
+
+	height := state.TipHeight()
+	if height == nil {
+		t.Fatal("expected tip height")
+	}
+	*height = 99
+	if got := *state.TipHeight(); got != 0 {
+		t.Fatalf("live tip height = %d, want 0", got)
+	}
+
+	header := state.TipHeader()
+	if header == nil {
+		t.Fatal("expected tip header")
+	}
+	header.Timestamp++
+	if got := state.TipHeader().Timestamp; got != block.Header.Timestamp {
+		t.Fatalf("live tip timestamp = %d, want %d", got, block.Header.Timestamp)
+	}
+
+	utxos := state.UTXOs()
+	for outPoint := range utxos {
+		delete(utxos, outPoint)
+	}
+	if got := len(state.UTXOs()); got != 1 {
+		t.Fatalf("live utxo count = %d, want 1", got)
+	}
+
+	acc := state.UTXOAccumulator()
+	if acc == nil {
+		t.Fatal("expected accumulator snapshot")
+	}
+	if acc == state.utxoAcc {
+		t.Fatal("utxo accumulator accessor exposed live handle")
+	}
+	if got, want := acc.Root(), state.utxoAcc.Root(); got != want {
+		t.Fatalf("snapshot accumulator root = %x, want %x", got, want)
 	}
 }
 
@@ -589,7 +703,7 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	}
 }
 
-func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
+func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	path := t.TempDir()
 	persistent, err := OpenPersistentChainState(path, types.Regtest)
 	if err != nil {
@@ -607,8 +721,8 @@ func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
 	genesis := types.Block{
 		Header: types.BlockHeader{
 			Version:        1,
-			MerkleTxIDRoot: consensus.MerkleRoot([][32]byte{genesisTxID}),
-			MerkleAuthRoot: consensus.MerkleRoot([][32]byte{genesisAuthID}),
+			MerkleTxIDRoot: merkleRootForNodeTest([][32]byte{genesisTxID}),
+			MerkleAuthRoot: merkleRootForNodeTest([][32]byte{genesisAuthID}),
 			UTXORoot:       consensus.ComputedUTXORoot(genesisUTXOs),
 			Timestamp:      params.GenesisTimestamp,
 			NBits:          params.GenesisBits,
@@ -646,9 +760,11 @@ func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
 	nextUTXOs := cloneUtxos(persistent.ChainState().UTXOs())
 	delete(nextUTXOs, genesisOut)
 	parentTxID := txids[1]
-	nextUTXOs[types.OutPoint{TxID: parentTxID, Vout: 0}] = consensus.UtxoEntry{
-		ValueAtoms: parent.Base.Outputs[0].ValueAtoms,
-		KeyHash:    parent.Base.Outputs[0].KeyHash,
+	delete(nextUTXOs, types.OutPoint{TxID: parentTxID, Vout: 0})
+	childTxID := txids[2]
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = consensus.UtxoEntry{
+		ValueAtoms: child.Base.Outputs[0].ValueAtoms,
+		KeyHash:    child.Base.Outputs[0].KeyHash,
 	}
 	coinbaseTxID := txids[0]
 	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
@@ -673,14 +789,24 @@ func TestPersistentChainStateRejectsBlockWithIntraBlockSpend(t *testing.T) {
 	}
 	block.Header = mineHeaderForNodeTest(block.Header)
 
-	if _, err := persistent.ApplyBlock(&block); !errors.Is(err, consensus.ErrMissingUTXO) {
-		t.Fatalf("apply block with intra-block spend error = %v, want %v", err, consensus.ErrMissingUTXO)
+	summary, err := persistent.ApplyBlock(&block)
+	if err != nil {
+		t.Fatalf("apply block with intra-block spend: %v", err)
 	}
-	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != 0 {
-		t.Fatalf("unexpected tip after rejected block: %v", persistent.ChainState().TipHeight())
+	if got, want := summary.TotalFees, uint64(2); got != want {
+		t.Fatalf("total fees = %d, want %d", got, want)
 	}
-	if _, ok := persistent.ChainState().UTXOs()[genesisOut]; !ok {
-		t.Fatal("expected genesis outpoint to remain after rejection")
+	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != 1 {
+		t.Fatalf("unexpected tip after accepted block: %v", persistent.ChainState().TipHeight())
+	}
+	if _, ok := persistent.ChainState().UTXOs()[genesisOut]; ok {
+		t.Fatal("expected genesis outpoint to be spent")
+	}
+	if _, ok := persistent.ChainState().UTXOs()[types.OutPoint{TxID: parentTxID, Vout: 0}]; ok {
+		t.Fatal("expected parent outpoint to be spent by same-block child")
+	}
+	if got, want := persistent.ChainState().UTXORoot(), consensus.ComputedUTXORoot(nextUTXOs); got != want {
+		t.Fatalf("utxo root after accepted block = %x, want %x", got, want)
 	}
 }
 
@@ -1152,8 +1278,8 @@ func TestSubmitPackedTxBatchRPC(t *testing.T) {
 	genesis := genesisBlock()
 	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
-	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
 	})
@@ -1197,8 +1323,8 @@ func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
 		{ValueAtoms: 20, KeyHash: nodeSignerKeyHash(8)},
 	}
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
-	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 30, KeyHash: nodeSignerKeyHash(7)},
 		types.OutPoint{TxID: genesisTxID, Vout: 1}: {ValueAtoms: 20, KeyHash: nodeSignerKeyHash(8)},
@@ -1339,8 +1465,8 @@ func TestGetMempoolInfoRPC(t *testing.T) {
 	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
-	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, KeyHash: nodeSignerKeyHash(7)},
 	})
@@ -1418,8 +1544,8 @@ func TestGetMetricsRPC(t *testing.T) {
 	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
-	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, KeyHash: nodeSignerKeyHash(7)},
 	})
@@ -1607,8 +1733,8 @@ func TestEstimateFeeRPC(t *testing.T) {
 	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 5_000
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
-	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 5_000, KeyHash: nodeSignerKeyHash(7)},
 	})
@@ -1650,8 +1776,8 @@ func TestSubmitDecodedTxsAcceptsDependentChainBatch(t *testing.T) {
 	genesis := genesisBlock()
 	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	genesis.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{genesisTxID})
-	genesis.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
 	})
@@ -1903,6 +2029,79 @@ func TestMineBlocksProducesDistinctCoinbaseOutpoints(t *testing.T) {
 	}
 }
 
+func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerKeyHash: nodeSignerKeyHash(9),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	view, ok := svc.chainState.CommittedView()
+	if !ok {
+		t.Fatal("missing committed chain view")
+	}
+	block := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 9, view.TipHeader.Timestamp+600)
+	block.Header.Nonce = 0
+
+	originalTxID := consensus.TxID(&block.Txs[0])
+	originalTxRoot := block.Header.MerkleTxIDRoot
+	originalUTXORoot := block.Header.UTXORoot
+	if block.Txs[0].Base.CoinbaseExtraNonce == nil {
+		t.Fatal("coinbase extra nonce missing from template")
+	}
+	if *block.Txs[0].Base.CoinbaseExtraNonce != ([types.CoinbaseExtraNonceLen]byte{}) {
+		t.Fatal("expected initial coinbase extra nonce to start at zero")
+	}
+
+	calls := 0
+	svc.mineHeaderFn = func(header types.BlockHeader, params consensus.ChainParams, shouldContinue func(uint64) bool) (types.BlockHeader, bool, error) {
+		calls++
+		switch calls {
+		case 1:
+			return types.BlockHeader{}, false, consensus.ErrMiningNonceExhausted
+		case 2:
+			if header.Nonce != 0 {
+				t.Fatalf("rolled header nonce = %d, want 0", header.Nonce)
+			}
+			return mineHeaderForNodeTest(header), true, nil
+		default:
+			t.Fatalf("unexpected mineHeaderFn call %d", calls)
+			return types.BlockHeader{}, false, nil
+		}
+	}
+
+	mined, fresh, err := svc.mineBlockSearchSpace(block, consensus.RegtestParams(), view.UTXOAcc, nil)
+	if err != nil {
+		t.Fatalf("mineBlockSearchSpace: %v", err)
+	}
+	if !fresh {
+		t.Fatal("expected mining to continue after extra nonce rollover")
+	}
+	if calls != 2 {
+		t.Fatalf("mineHeaderFn calls = %d, want 2", calls)
+	}
+	if mined.Txs[0].Base.CoinbaseExtraNonce == nil {
+		t.Fatal("mined coinbase extra nonce missing")
+	}
+	if *mined.Txs[0].Base.CoinbaseExtraNonce == ([types.CoinbaseExtraNonceLen]byte{}) {
+		t.Fatal("expected coinbase extra nonce to roll after nonce exhaustion")
+	}
+	if got := consensus.TxID(&mined.Txs[0]); got == originalTxID {
+		t.Fatal("expected rolled extra nonce to change coinbase txid")
+	}
+	if mined.Header.MerkleTxIDRoot == originalTxRoot {
+		t.Fatal("expected tx root to change after extra nonce rollover")
+	}
+	if mined.Header.UTXORoot == originalUTXORoot {
+		t.Fatal("expected utxo root to change after extra nonce rollover")
+	}
+}
+
 func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
 	minerKey := nodeSignerKeyHash(9)
 	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
@@ -2058,7 +2257,7 @@ func TestMineOneBlockRefreshesInterruptedTemplate(t *testing.T) {
 
 	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
 	var calls int
-	svc.mineHeaderFn = func(header types.BlockHeader, params consensus.ChainParams, shouldContinue func(uint32) bool) (types.BlockHeader, bool, error) {
+	svc.mineHeaderFn = func(header types.BlockHeader, params consensus.ChainParams, shouldContinue func(uint64) bool) (types.BlockHeader, bool, error) {
 		calls++
 		switch calls {
 		case 1:
@@ -4194,11 +4393,11 @@ func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T
 	}
 	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 9, genesis.Header.Timestamp+600)
 	block.Txs = append(block.Txs, tx)
-	block.Header.MerkleTxIDRoot = consensus.MerkleRoot([][32]byte{
+	block.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{
 		consensus.TxID(&block.Txs[0]),
 		txid,
 	})
-	block.Header.MerkleAuthRoot = consensus.MerkleRoot([][32]byte{
+	block.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{
 		consensus.AuthID(&block.Txs[0]),
 		consensus.AuthID(&tx),
 	})
@@ -4632,6 +4831,9 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	if err := svc.chainState.Store().RewriteActiveHeaderHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
 		t.Fatalf("RewriteActiveHeaderHeights: %v", err)
 	}
+	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes: %v", err)
+	}
 
 	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
 	if err != nil {
@@ -4650,6 +4852,9 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	}
 	if repaired == 0 {
 		t.Fatal("expected repaired entries")
+	}
+	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes after repair: %v", err)
 	}
 
 	hashes, gapDetected, err = svc.missingBlockHashesDetailed(8)
@@ -4761,6 +4966,9 @@ func TestSyncWatchdogRepairsGapAndRequestsBlocks(t *testing.T) {
 	}
 	if err := svc.chainState.Store().RewriteActiveHeaderHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
 		t.Fatalf("RewriteActiveHeaderHeights: %v", err)
+	}
+	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes: %v", err)
 	}
 
 	peer := newPeerConnForTests("127.0.0.1:18444")

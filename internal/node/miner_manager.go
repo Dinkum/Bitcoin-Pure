@@ -254,16 +254,7 @@ func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedE
 	txs = append(txs, coinbase)
 	txs = append(txs, selected...)
 	_, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
-	coinbaseLeaves := make([]utreexo.UtxoLeaf, 0, len(coinbase.Base.Outputs))
-	for vout, output := range coinbase.Base.Outputs {
-		outPoint := types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}
-		coinbaseLeaves = append(coinbaseLeaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
-		})
-	}
-	finalAcc, err := selectionAcc.Apply(nil, coinbaseLeaves)
+	finalAcc, err := selectionAcc.Apply(nil, coinbaseLeaves(coinbaseTxID, coinbase.Base.Outputs))
 	if err != nil {
 		return types.Block{}, 0, err
 	}

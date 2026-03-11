@@ -109,6 +109,19 @@ func (a *Accumulator) Count() int {
 	return a.count
 }
 
+// Clone returns a distinct accumulator handle for callers that need snapshot
+// semantics. The trie itself is structurally persistent, so sharing the root is
+// safe and avoids rebuilding the committed state.
+func (a *Accumulator) Clone() *Accumulator {
+	if a == nil {
+		return nil
+	}
+	return &Accumulator{
+		root:  a.root,
+		count: a.count,
+	}
+}
+
 func (a *Accumulator) Add(leaf UtxoLeaf) (*Accumulator, error) {
 	if a == nil {
 		a = NewAccumulator()
