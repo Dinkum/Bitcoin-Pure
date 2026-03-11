@@ -3,6 +3,7 @@ package consensus
 import (
 	"bytes"
 	"errors"
+	"math"
 	"math/big"
 	"runtime"
 	"testing"
@@ -17,11 +18,13 @@ func consensusTestKeyHash(seed byte) [32]byte {
 }
 
 func coinbaseTxForConsensusTest(height uint64, outputs []types.TxOutput) types.Transaction {
+	var extraNonce [types.CoinbaseExtraNonceLen]byte
 	return types.Transaction{
 		Base: types.TxBase{
-			Version:        1,
-			CoinbaseHeight: &height,
-			Outputs:        outputs,
+			Version:            1,
+			CoinbaseHeight:     &height,
+			CoinbaseExtraNonce: &extraNonce,
+			Outputs:            outputs,
 		},
 	}
 }
@@ -77,13 +80,110 @@ func TestTxIDAndAuthIDAreStable(t *testing.T) {
 	}
 }
 
+func taggedMerkleLeafForTest(item [32]byte) [32]byte {
+	var buf [33]byte
+	buf[0] = 0x00
+	copy(buf[1:], item[:])
+	return crypto.Sha256d(buf[:])
+}
+
+func taggedMerkleNodeForTest(left, right [32]byte) [32]byte {
+	var buf [65]byte
+	buf[0] = 0x01
+	copy(buf[1:33], left[:])
+	copy(buf[33:], right[:])
+	return crypto.Sha256d(buf[:])
+}
+
+func taggedMerkleSoloForTest(item [32]byte) [32]byte {
+	var buf [33]byte
+	buf[0] = 0x02
+	copy(buf[1:], item[:])
+	return crypto.Sha256d(buf[:])
+}
+
+// specMerkleRootForTest mirrors the spec's leaf/node/solo rules so these
+// tests don't derive their expectations from the production MerkleRoot code.
+func specMerkleRootForTest(items [][32]byte) [32]byte {
+	if len(items) == 0 {
+		panic("specMerkleRootForTest requires at least one item")
+	}
+	level := make([][32]byte, len(items))
+	for i, item := range items {
+		level[i] = taggedMerkleLeafForTest(item)
+	}
+	for len(level) > 1 {
+		next := make([][32]byte, 0, (len(level)+1)/2)
+		for i := 0; i < len(level); i += 2 {
+			if i+1 == len(level) {
+				next = append(next, taggedMerkleSoloForTest(level[i]))
+				continue
+			}
+			next = append(next, taggedMerkleNodeForTest(level[i], level[i+1]))
+		}
+		level = next
+	}
+	return level[0]
+}
+
+func equalUtxoSets(left, right UtxoSet) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for outPoint, entry := range left {
+		if other, ok := right[outPoint]; !ok || other != entry {
+			return false
+		}
+	}
+	return true
+}
+
+func TestMerkleRootRequiresNonEmptyLeafSet(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected merkle root to panic on empty input")
+		}
+	}()
+	MerkleRoot(nil)
+}
+
+func TestMerkleRootUsesTaggedLeafNodeAndSoloHashes(t *testing.T) {
+	items := [][32]byte{
+		{0x11},
+		{0x22},
+		{0x33},
+	}
+
+	leaf0 := taggedMerkleLeafForTest(items[0])
+	leaf1 := taggedMerkleLeafForTest(items[1])
+	leaf2 := taggedMerkleLeafForTest(items[2])
+
+	if got, want := MerkleRoot(items[:1]), leaf0; got != want {
+		t.Fatalf("single-leaf merkle root = %x, want %x", got, want)
+	}
+
+	pairRoot := taggedMerkleNodeForTest(leaf0, leaf1)
+	if got, want := MerkleRoot(items[:2]), pairRoot; got != want {
+		t.Fatalf("pair merkle root = %x, want %x", got, want)
+	}
+
+	oddRoot := taggedMerkleNodeForTest(pairRoot, taggedMerkleSoloForTest(leaf2))
+	if got, want := MerkleRoot(items), oddRoot; got != want {
+		t.Fatalf("odd-leaf merkle root = %x, want %x", got, want)
+	}
+}
+
 func TestMerkleRootParallelMatchesSequential(t *testing.T) {
 	items := make([][32]byte, 513)
 	for i := range items {
 		items[i][0] = byte(i)
 		items[i][1] = byte(i >> 8)
 	}
-	if got, want := MerkleRootParallel(items), MerkleRoot(items); got != want {
+	want := specMerkleRootForTest(items)
+	if got := MerkleRoot(items); got != want {
+		t.Fatalf("sequential merkle root = %x, want %x", got, want)
+	}
+	if got := MerkleRootParallel(items); got != want {
 		t.Fatalf("parallel merkle root = %x, want %x", got, want)
 	}
 }
@@ -133,10 +233,10 @@ func TestBuildBlockRootsMatchesDirectComputation(t *testing.T) {
 			t.Fatalf("authid %d mismatch", i)
 		}
 	}
-	if txRoot != MerkleRoot(directTxIDs) {
+	if txRoot != specMerkleRootForTest(directTxIDs) {
 		t.Fatalf("tx root mismatch")
 	}
-	if authRoot != MerkleRoot(directAuthIDs) {
+	if authRoot != specMerkleRootForTest(directAuthIDs) {
 		t.Fatalf("auth root mismatch")
 	}
 }
@@ -199,7 +299,7 @@ func TestSubsidyAtomsMatchesSpecSchedule(t *testing.T) {
 func TestMineHeaderInterruptibleStopsWhenTemplateTurnsStale(t *testing.T) {
 	params := RegtestParams()
 	header := types.BlockHeader{NBits: params.GenesisBits}
-	mined, ok, err := MineHeaderInterruptible(header, params, func(uint32) bool { return false })
+	mined, ok, err := MineHeaderInterruptible(header, params, func(uint64) bool { return false })
 	if err != nil {
 		t.Fatalf("MineHeaderInterruptible: %v", err)
 	}
@@ -309,11 +409,14 @@ func referenceAsertBits(t *testing.T, anchor AsertAnchor, prev PrevBlockContext,
 
 func mineHeaderForTest(header types.BlockHeader) types.BlockHeader {
 	target := compactTargetForTest(header.NBits)
-	for nonce := uint32(0); nonce < ^uint32(0); nonce++ {
+	for nonce := uint64(0); ; nonce++ {
 		header.Nonce = nonce
 		hash := HeaderHash(&header)
 		if new(big.Int).SetBytes(hash[:]).Cmp(target) <= 0 {
 			return header
+		}
+		if nonce == math.MaxUint64 {
+			break
 		}
 	}
 	panic("unable to mine header")
@@ -330,8 +433,8 @@ func TestCoinbaseOnlyBlockValidatesOnRegtest(t *testing.T) {
 	}
 	genesisHeader := types.BlockHeader{
 		Version:        1,
-		MerkleTxIDRoot: MerkleRoot([][32]byte{genesisTxID}),
-		MerkleAuthRoot: MerkleRoot([][32]byte{AuthID(&genesisTx)}),
+		MerkleTxIDRoot: specMerkleRootForTest([][32]byte{genesisTxID}),
+		MerkleAuthRoot: specMerkleRootForTest([][32]byte{AuthID(&genesisTx)}),
 		UTXORoot:       ComputedUTXORoot(genesisUTXOs),
 		Timestamp:      params.GenesisTimestamp,
 		NBits:          params.GenesisBits,
@@ -351,8 +454,8 @@ func TestCoinbaseOnlyBlockValidatesOnRegtest(t *testing.T) {
 		Header: types.BlockHeader{
 			Version:        1,
 			PrevBlockHash:  HeaderHash(&genesisHeader),
-			MerkleTxIDRoot: MerkleRoot([][32]byte{blockTxID}),
-			MerkleAuthRoot: MerkleRoot([][32]byte{AuthID(&blockTx)}),
+			MerkleTxIDRoot: specMerkleRootForTest([][32]byte{blockTxID}),
+			MerkleAuthRoot: specMerkleRootForTest([][32]byte{AuthID(&blockTx)}),
 			UTXORoot:       ComputedUTXORoot(nextUTXOs),
 			Timestamp:      genesisHeader.Timestamp + 600,
 			NBits:          nbits,
@@ -381,8 +484,8 @@ func TestUTXORootMismatchRejects(t *testing.T) {
 		}},
 	}
 	txid := TxID(&block.Txs[0])
-	block.Header.MerkleTxIDRoot = MerkleRoot([][32]byte{txid})
-	block.Header.MerkleAuthRoot = MerkleRoot([][32]byte{AuthID(&block.Txs[0])})
+	block.Header.MerkleTxIDRoot = specMerkleRootForTest([][32]byte{txid})
+	block.Header.MerkleAuthRoot = specMerkleRootForTest([][32]byte{AuthID(&block.Txs[0])})
 	block.Header = mineHeaderForTest(block.Header)
 	_, err := ValidateAndApplyBlock(&block, PrevBlockContext{Height: 0, Header: genesis}, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
 	if !errors.Is(err, ErrUTXORootMismatch) {
@@ -455,7 +558,7 @@ func TestValidateAndApplyBlockRejectsNonLTOROrder(t *testing.T) {
 	}
 }
 
-func TestValidateAndApplyBlockRejectsSameBlockSpend(t *testing.T) {
+func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	params := RegtestParams()
 	prevOut := types.OutPoint{TxID: [32]byte{5}, Vout: 0}
 	utxos := UtxoSet{
@@ -491,15 +594,17 @@ func TestValidateAndApplyBlockRejectsSameBlockSpend(t *testing.T) {
 	}
 	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{8}}})
 	txs := []types.Transaction{coinbase, parent, child}
-	_, _, txRoot, authRoot := BuildBlockRoots(txs)
+	txids, _, txRoot, authRoot := BuildBlockRoots(txs)
 
 	nextUTXOs := cloneUtxos(utxos)
 	delete(nextUTXOs, prevOut)
-	nextUTXOs[types.OutPoint{TxID: parentTxID, Vout: 0}] = UtxoEntry{
-		ValueAtoms: parent.Base.Outputs[0].ValueAtoms,
-		KeyHash:    parent.Base.Outputs[0].KeyHash,
+	delete(nextUTXOs, types.OutPoint{TxID: parentTxID, Vout: 0})
+	childTxID := txids[2]
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntry{
+		ValueAtoms: child.Base.Outputs[0].ValueAtoms,
+		KeyHash:    child.Base.Outputs[0].KeyHash,
 	}
-	coinbaseTxID := TxID(&coinbase)
+	coinbaseTxID := txids[0]
 	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntry{
 		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
 		KeyHash:    coinbase.Base.Outputs[0].KeyHash,
@@ -522,9 +627,19 @@ func TestValidateAndApplyBlockRejectsSameBlockSpend(t *testing.T) {
 	}
 	block.Header = mineHeaderForTest(block.Header)
 
-	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), cloneUtxos(utxos), params, DefaultConsensusRules())
-	if !errors.Is(err, ErrMissingUTXO) {
-		t.Fatalf("expected missing utxo error, got %v", err)
+	applied := cloneUtxos(utxos)
+	summary, err := ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), applied, params, DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("validate block: %v", err)
+	}
+	if got, want := summary.TotalFees, uint64(2); got != want {
+		t.Fatalf("total fees = %d, want %d", got, want)
+	}
+	if _, ok := applied[types.OutPoint{TxID: parentTxID, Vout: 0}]; ok {
+		t.Fatal("parent output should be spent by same-block child")
+	}
+	if got, want := applied, nextUTXOs; !equalUtxoSets(got, want) {
+		t.Fatalf("post-block utxos mismatch: got %v want %v", got, want)
 	}
 }
 
@@ -549,8 +664,8 @@ func TestValidateAndApplyBlockRejectsCoinbaseHeightMismatch(t *testing.T) {
 		Header: types.BlockHeader{
 			Version:        1,
 			PrevBlockHash:  HeaderHash(&prevHeader),
-			MerkleTxIDRoot: MerkleRoot([][32]byte{blockTxID}),
-			MerkleAuthRoot: MerkleRoot([][32]byte{AuthID(&blockTx)}),
+			MerkleTxIDRoot: specMerkleRootForTest([][32]byte{blockTxID}),
+			MerkleAuthRoot: specMerkleRootForTest([][32]byte{AuthID(&blockTx)}),
 			UTXORoot:       ComputedUTXORoot(nextUTXOs),
 			Timestamp:      prevHeader.Timestamp + 600,
 			NBits:          nbits,

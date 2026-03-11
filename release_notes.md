@@ -1,0 +1,115 @@
+# Release Notes
+
+## v0.1.13
+Major
+- Fixed full-block validation so later non-coinbase transactions can spend outputs created earlier in the same block, matching the spec's atomic block-apply rule.
+- Switched transaction and authorization Merkle commitments to the tagged leaf / node / solo construction defined in the published block spec, and regenerated the shipped genesis and bootstrap fixtures under those corrected roots.
+- Expanded mining search space with a 64-bit header nonce plus a fixed-width coinbase extra nonce, so miners can keep rolling search state without discarding a useful template after the old nonce window is exhausted.
+- Hardened active-chain repair and persistence around competing branches: consensus-critical Pebble writes now sync before success is reported, and missing-block recovery now follows the canonical active header chain even when rebuildable height indexes lag behind.
+
+Minor
+- `getheaders`, locator matching, and missing-block request generation now distinguish canonical active-header state from the asynchronously rebuilt height indexes, which removes a fork-point blind spot after higher-work header promotion.
+- Chainstate read APIs and committed views now return defensive snapshots instead of exposing live mutable tip metadata, UTXO maps, or accumulator handles to callers.
+- Consensus and node coverage now anchor Merkle expectations to independent spec-side helpers and assert same-block spend acceptance directly, so a green test run is a stronger signal of actual spec conformance.
+- Published the checked-in root protocol spec and `specs/` reference documents with the repo, and refreshed fixture/benchmark tooling for the widened mining nonce model.
+
+## v0.1.9
+Major
+- Expanded the built-in wallet surface in `bpu-cli`. Wallets can now report confirmed and available balances, show recent on-chain history, and query fee estimates in addition to the earlier create/list/receive/send flow. The node RPC surface was extended so wallet tooling can scan confirmed chain activity and estimate spend rates directly from the running node.
+- Hardened the live node around peer sync and large-network behavior. The service now tracks stalled download peers, rotates preferred sync peers when headers, blocks, or transaction fetches stop making progress, and keeps richer peer lifecycle state through the dedicated peer, sync, and relay manager split. This materially improves long-running sync resilience and makes `getpeerinfo` much more useful for diagnosing network health.
+- Added a deterministic network-scale simulation harness under `bpu-cli bench sim`. It can model seeded topologies, asymmetric link latency, bounded link backlogs, and scheduled churn so relay and sync behavior can be exercised cheaply without spinning up a large live cluster.
+- Reworked hot-path UTXO handling around overlay / copy-on-write views instead of repeated whole-map cloning. Block validation, mempool admission, template assembly, and reorg evaluation now validate against shared immutable chain views and only materialize fresh UTXO maps when the next committed state is finalized, which removes one of the biggest remaining single-node efficiency cliffs.
+
+Minor
+- Added structured operator RPCs `getchainstate`, `getmempoolinfo`, and `getmininginfo` so external tooling can poll committed chainstate, mempool summary, and miner/template telemetry directly.
+- Finished the incremental canonical `utxo_root` pipeline with committed-view reuse and parallelized bulk commitment construction, so UTXO commitment maintenance now scales better across cores and avoids rebuilding state ad hoc in reporting and template-adjacent paths.
+- Improved live sync robustness around competing headers, duplicate relay, out-of-order blocks, sparse height-index repair, in-flight request reassignment, and watchdog-driven catch-up.
+- Refined the public text-mode node explorer with cleaner block flow rendering, link styling, mempool/system layout, and clearer timing labels for observed block gaps versus target spacing.
+- Added a dedicated `regtest_hard` profile for slower live multi-node VPS testing and updated fixtures, installer wiring, and tests accordingly.
+
+## v0.1.8
+Major
+- Added a dedicated `regtest_hard` network profile for slower, more realistic multi-node testing on small VPS hardware. The harder profile has its own chain parameters, network magic, genesis fixture, installer support, and regtest-style funding/stress RPC compatibility so live mining, relay, and sync tests no longer collapse into instant empty-block races.
+- Fixed the most important live peer/sync instability paths. Duplicate transaction relay and duplicate block delivery are now non-fatal, out-of-order block delivery triggers catch-up instead of disconnecting the peer, and header persistence no longer lets inactive side branches overwrite the active height map used by locator-based sync.
+- Tightened the public text-mode node explorer into a cleaner live monitor. The block flow renderer now uses single connectors with stable box borders, dashboard links render as plain underlined text, PoW timing labels distinguish target spacing from observed recent block gaps, and the page warms host metrics after a real sampling window instead of showing misleading placeholder timing.
+
+Minor
+- Extended node and storage test coverage for competing-header persistence, active-chain locator matching, duplicate relay handling, out-of-order block catch-up, and the new `regtest_hard` profile wiring.
+- Updated the Ubuntu install/bootstrap profile handling to accept the harder test profile cleanly and refreshed the local architecture notes to reflect the shipped sync and dashboard behavior.
+- The repository now carries the checked-in benchmark harness and the regenerated `regtest_hard` genesis fixture needed by the public build and live VPS testing flow.
+
+## v0.1.7
+Major
+- Added a first-class wallet surface to `bpu-cli`. The node now ships `wallet create`, `wallet list`, `wallet receive`, and `wallet send`, backed by a local file-based wallet store that can generate receive addresses, track pending spends, build and sign transactions, and broadcast them over the authenticated RPC interface.
+- Rebuilt the public node monitor into a richer text-only explorer served directly from the node. `GET /` now presents a larger ASCII layout with recent block flow, fee and PoW/DAA context, a last-hour TPS chart, mining and peer health sections, and cached drilldown pages for recent blocks and transactions at `/block/<hash>` and `/tx/<txid>`.
+- Upgraded the high-throughput path across validation, relay, and block assembly. The node now maintains the canonical `utxo_root` through an incremental Merklix-style accumulator, persists normal best-tip growth with block-local chainstate deltas, batches header persistence, uses compact blocks as the default optimized block relay path, and spreads dense transaction reconciliation across a bounded fanout set instead of pushing every batch down the same peers.
+
+Minor
+- Hardened long-running node behavior with outbound peer reconnect/backoff, learned peer retention from `addr`, bounded control-vs-relay peer queues, and better cleanup of buffered peer relay state during disconnects and shutdown.
+- Improved transaction ingress and package-heavy traffic handling. Regtest stress traffic now has a packed batch submission RPC, batch admission retries a drifted suffix from a fresh snapshot, same-batch parent/child chains advance against an evolving admission snapshot, and the default mempool package policy is raised to `256 / 256`.
+- Tightened block-template performance by reusing mutable selection UTXO views, incremental candidate frontiers, in-place package selection, and parallel transaction/auth root construction for larger blocks.
+- Refined the Ubuntu deployment path so `./install` and `./install --update` are more idempotent, stage releases more cleanly, and finish with a clearer ASCII summary of service state, paths, endpoints, and next-step commands.
+- Refreshed the public repository surface with a cleaner protocol-first `README.md`, updated fixture vectors for the shipped consensus/runtime behavior, and new wallet, node, storage, relay, and UTXO-commitment test coverage.
+
+## v0.1.5
+Major
+- Rewrote the public `README.md` around the Bitcoin Pure protocol itself instead of a generic node feature dump. The top-level page now leads with protocol identity, calls out the core consensus differentiators, and presents the project as the reference implementation in a cleaner, more public-facing format.
+- Restructured installation and operator guidance for faster scanning. The Ubuntu-only install path, important `./install` flags, staged `--update` behavior, operator surface, and top-level project structure are now presented with higher signal and much less internal noise.
+
+Minor
+- Tightened the protocol highlight section around the strongest public-facing claims already reflected in the code and spec surface, including the scriptless spend model, split transaction/auth commitments, live UTXO state commitments, ASERT, and adaptive blocksize.
+- Reworded the reference implementation section so it describes the runtime in plain English instead of protocol-family jargon, covering sync, reconciliation, relay, RPC, and the public ASCII node monitor.
+
+## v0.1.4
+Major
+- Hardened the live node based on real two-VPS testing: the chainstate undo path now handles valid same-block dependency chains correctly, peer height reporting reflects the highest observed sync progress instead of stale handshake values, and the public monitor now includes smoothed host stats for CPU, network traffic, RAM usage, and server load.
+- Reworked Ubuntu deployment around a staged installer pipeline. `./install` is now a thin entrypoint, `scripts/bootstrap.sh` performs locked atomic cutovers with health checks and rollback, and `scripts/update.sh` prepares staged releases so `./install --update` can safely fetch from Git and upgrade a running node.
+- Upgraded node operations for long-running hosts: mining defaults are wired through worker counts rather than interval ticks, the public dashboard now exposes more useful live status, and the shipped installer can preserve config while replacing the release underneath a systemd-managed service.
+
+Minor
+- Added dashboard tests for the new human-readable host stats section and peer-height reporting, plus a persistent-chain regression test that exercises a block with an intra-block spend and verifies disconnect/undo behavior.
+- Refined `.gitignore` for local scratch paths and operational artifacts so working copies stay cleaner during deployment and benchmarking.
+- Updated the public README install instructions to cover the new `./install` flow and the staged `./install --update` path.
+
+## v0.1.3
+Major
+- Expanded the node into a much more complete live runtime: binary P2P now has transaction reconciliation, coalesced tx batch relay, Xthinner-style preferred block relay with graceful full-block fallback, and Ubuntu deployments now expose a public ASCII dashboard on `GET /` so you can watch tip, peers, mempool, and relay health directly from the node IP.
+- Shipped a serious performance and benchmarking upgrade across the stack, including phase-timed benchmark reports, chained-package/orphan-storm/template-rebuild scenarios, per-peer queue and latency telemetry, incremental block-template reuse, split prepare/commit mempool admission, and a relay pipeline built around bounded per-peer queues instead of synchronous fanout.
+- Upgraded the mempool and mining path for higher throughput under load: admission now supports parallel prevalidation against stable snapshots, package-aware template selection is maintained incrementally, and template rebuilds reuse prior selection state instead of redoing full-pool work on every rebuild.
+
+Minor
+- Added richer benchmark outputs under `benchmarks/` with JSON, Markdown, and ASCII summaries that surface decode, validate/admit, relay fanout, and convergence timing as well as peer-level relay pressure.
+- Added new relay protocol coverage and node tests for tx reconciliation, Xthin block reconstruction, missing-tx recovery, and full-block fallback behavior.
+- Updated the public README and internal architecture/roadmap docs to reflect the current node capabilities, shipped relay modes, and future consensus/runtime priorities, while `.gitignore` now treats root-level scratch markdown as local-only except for `README.md`.
+
+## v0.1.2
+Major
+- Added block-tree-aware persistent chainstate with best-chain selection, branch evaluation, undo records, and restart-safe reorg handling so the node no longer assumes a single straight active chain.
+- Upgraded persisted block metadata to track parent links, cumulative chainwork, validation state, and per-block block-size state, laying the core storage needed for a real public full node.
+
+Minor
+- Added explicit reorg coverage that builds competing branches, confirms higher-work takeover, and verifies the winning chain survives reopen without chainstate drift.
+- Expanded storage roundtrip tests to cover validated block metadata and undo persistence.
+- Updated the public README with Ubuntu install commands and refreshed the roadmap and architecture docs to reflect the new reorg-capable chain core.
+
+## v0.1.1
+Major
+- Added a long-running `bpu-cli serve` node runtime with operator config, HTTP JSON-RPC, live peer sync, mempool-backed block assembly, and on-demand or interval mining on regtest-style deployments.
+- Split header validation from full block replay and added a headers-first sync path, giving the node a real persisted header chain, indexed block gating, and fixture-driven IBD flows that survive restarts.
+- Replaced the temporary bootstrap difficulty path with integer-only genesis-anchored ASERT while keeping the legacy Bitcoin retarget helper in code for reference and future compatibility work.
+
+Minor
+- Added `internal/config`, `internal/mempool`, `internal/node/service.go`, `internal/node/headers.go`, and `internal/node/ibd.go` to round out node orchestration, peer messaging, and transaction admission.
+- Expanded storage and chainstate handling with persisted header metadata, height indexes, block lookups by height, and richer reopen behavior on Pebble-backed databases.
+- Added rotating `node.log` runtime logging with source-tagged service, storage, chain, header, RPC, peer, mempool, and mining events, capped at 20 MB with backup rollover.
+- Updated `README.md`, `ARCHITECTURE.md`, and `ROADMAP.md` to reflect the current Go node layout and shipped operator/runtime surfaces.
+- Added `secaudit.md` and `perfaudit.md` with P0/P1 security and performance review findings for the current Go node.
+
+## v0.1.0
+Major
+- Hard-cut the node and tooling from the Rust workspace to a Go module with strict consensus codec, hashing, validation, and CLI flows.
+- Added Pebble-backed persisted chainstate and block index replay with fixture-backed genesis bootstrap and strict `utxo_root` enforcement.
+
+Minor
+- Preserved `bpu-cli` tx, block, chain init, and fixture replay commands across in-memory and persisted paths.
+- Added Go test coverage for codec roundtrips, Schnorr validation, block application, storage reopen checks, and deterministic fixture replay.

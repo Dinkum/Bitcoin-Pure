@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"runtime"
 	"sync"
@@ -271,6 +272,7 @@ var (
 	ErrTxOrderInvalid        = errors.New("non-coinbase transactions must be in ascending txid order")
 	ErrCoinbaseHasAuth       = errors.New("coinbase must not have auth entries")
 	ErrCoinbaseHeightInvalid = errors.New("coinbase height does not match block height")
+	ErrCoinbaseExtraNonce    = errors.New("coinbase extra nonce is missing")
 	ErrCoinbaseNoOutputs     = errors.New("coinbase has no outputs")
 	ErrEmptyInputs           = errors.New("non-coinbase transaction has zero inputs")
 	ErrEmptyOutputs          = errors.New("transaction has zero outputs")
@@ -288,6 +290,7 @@ var (
 	ErrInvalidNBits          = errors.New("unexpected nbits")
 	ErrInvalidCompactTarget  = errors.New("invalid compact target")
 	ErrInvalidPow            = errors.New("pow check failed")
+	ErrMiningNonceExhausted  = errors.New("mining header nonce space exhausted")
 	ErrBlockTooLarge         = errors.New("block too large")
 	ErrUTXORootMismatch      = errors.New("utxo root mismatch")
 )
@@ -315,11 +318,19 @@ func MerkleRootParallel(items [][32]byte) [32]byte {
 	return merkleRoot(items, true)
 }
 
+// Merkle commitments follow the BLOCK.md tagged construction:
+// leaves are hashed as Leaf(x), interior pairs as Node(l, r), and odd carries
+// as Solo(x). This avoids raw-leaf roots and duplicate-last ambiguity.
 func merkleRoot(items [][32]byte, allowParallel bool) [32]byte {
 	if len(items) == 0 {
-		return [32]byte{}
+		panic("merkle root requires a non-empty leaf set")
 	}
-	layer := append([][32]byte(nil), items...)
+	layer := make([][32]byte, len(items))
+	if allowParallel && shouldParallelMerkleLayer(len(items)) {
+		hashMerkleLeavesParallel(layer, items)
+	} else {
+		hashMerkleLeaves(layer, items)
+	}
 	for len(layer) > 1 {
 		next := make([][32]byte, (len(layer)+1)/2)
 		if allowParallel && shouldParallelMerkleLayer(len(layer)) {
@@ -330,6 +341,36 @@ func merkleRoot(items [][32]byte, allowParallel bool) [32]byte {
 		layer = next
 	}
 	return layer[0]
+}
+
+func hashMerkleLeaves(next, items [][32]byte) {
+	for i := range items {
+		next[i] = hashMerkleLeaf(items[i])
+	}
+}
+
+func hashMerkleLeavesParallel(next, items [][32]byte) {
+	workers := parallelWorkers(len(next))
+	if workers <= 1 {
+		hashMerkleLeaves(next, items)
+		return
+	}
+	chunk := (len(next) + workers - 1) / workers
+	var wg sync.WaitGroup
+	for start := 0; start < len(next); start += chunk {
+		end := start + chunk
+		if end > len(next) {
+			end = len(next)
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				next[i] = hashMerkleLeaf(items[i])
+			}
+		}(start, end)
+	}
+	wg.Wait()
 }
 
 func hashMerkleLayer(next, layer [][32]byte) {
@@ -364,13 +405,24 @@ func hashMerkleLayerParallel(next, layer [][32]byte) {
 
 func hashMerklePair(layer [][32]byte, leftIndex int) [32]byte {
 	left := layer[leftIndex]
-	right := left
-	if leftIndex+1 < len(layer) {
-		right = layer[leftIndex+1]
+	if leftIndex+1 >= len(layer) {
+		var buf [33]byte
+		buf[0] = 0x02
+		copy(buf[1:], left[:])
+		return crypto.Sha256d(buf[:])
 	}
-	var buf [64]byte
-	copy(buf[:32], left[:])
-	copy(buf[32:], right[:])
+	right := layer[leftIndex+1]
+	var buf [65]byte
+	buf[0] = 0x01
+	copy(buf[1:33], left[:])
+	copy(buf[33:], right[:])
+	return crypto.Sha256d(buf[:])
+}
+
+func hashMerkleLeaf(item [32]byte) [32]byte {
+	var buf [33]byte
+	buf[0] = 0x00
+	copy(buf[1:], item[:])
 	return crypto.Sha256d(buf[:])
 }
 
@@ -971,7 +1023,7 @@ func ValidateHeader(header *types.BlockHeader, prev PrevBlockContext, params Cha
 }
 
 func MineHeader(header types.BlockHeader, params ChainParams) (types.BlockHeader, error) {
-	mined, ok, err := MineHeaderInterruptible(header, params, func(uint32) bool { return true })
+	mined, ok, err := MineHeaderInterruptible(header, params, func(uint64) bool { return true })
 	if err != nil {
 		return types.BlockHeader{}, err
 	}
@@ -981,7 +1033,7 @@ func MineHeader(header types.BlockHeader, params ChainParams) (types.BlockHeader
 	return mined, nil
 }
 
-func MineHeaderInterruptible(header types.BlockHeader, params ChainParams, shouldContinue func(uint32) bool) (types.BlockHeader, bool, error) {
+func MineHeaderInterruptible(header types.BlockHeader, params ChainParams, shouldContinue func(uint64) bool) (types.BlockHeader, bool, error) {
 	target, err := compactToTarget(header.NBits)
 	if err != nil {
 		return types.BlockHeader{}, false, err
@@ -993,7 +1045,7 @@ func MineHeaderInterruptible(header types.BlockHeader, params ChainParams, shoul
 	if target.Cmp(powLimit) > 0 {
 		return types.BlockHeader{}, false, ErrInvalidPow
 	}
-	for nonce := uint32(0); nonce < ^uint32(0); nonce++ {
+	for nonce := header.Nonce; ; nonce++ {
 		if shouldContinue != nil && nonce&0x0fff == 0 && !shouldContinue(nonce) {
 			return types.BlockHeader{}, false, nil
 		}
@@ -1002,8 +1054,11 @@ func MineHeaderInterruptible(header types.BlockHeader, params ChainParams, shoul
 		if new(big.Int).SetBytes(hash[:]).Cmp(target) <= 0 {
 			return header, true, nil
 		}
+		if nonce == math.MaxUint64 {
+			break
+		}
 	}
-	return types.BlockHeader{}, false, ErrInvalidPow
+	return types.BlockHeader{}, false, ErrMiningNonceExhausted
 }
 
 func sumCoinbaseOutputs(tx *types.Transaction) (uint64, error) {
@@ -1028,29 +1083,46 @@ func cloneUtxos(utxos UtxoSet) UtxoSet {
 
 func blockUtxoDelta(block *types.Block) ([]types.OutPoint, []utreexo.UtxoLeaf) {
 	spent := make([]types.OutPoint, 0)
-	created := make([]utreexo.UtxoLeaf, 0)
+	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf)
+	createdOrder := make([]types.OutPoint, 0)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		txid := TxID(tx)
 		for _, input := range tx.Base.Inputs {
+			// Outputs created and spent within the same block never exist in the
+			// pre-block accumulator, so they cancel out of the accumulator delta.
+			if _, ok := createdByOutPoint[input.PrevOut]; ok {
+				delete(createdByOutPoint, input.PrevOut)
+				continue
+			}
 			spent = append(spent, input.PrevOut)
 		}
 		for vout, output := range tx.Base.Outputs {
-			created = append(created, utreexo.UtxoLeaf{
-				OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
+			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+			createdByOutPoint[outPoint] = utreexo.UtxoLeaf{
+				OutPoint:   outPoint,
 				ValueAtoms: output.ValueAtoms,
 				KeyHash:    output.KeyHash,
-			})
+			}
+			createdOrder = append(createdOrder, outPoint)
 		}
 	}
 	coinbase := &block.Txs[0]
 	coinbaseTxID := TxID(coinbase)
 	for vout, output := range coinbase.Base.Outputs {
-		created = append(created, utreexo.UtxoLeaf{
-			OutPoint:   types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)},
+		outPoint := types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}
+		createdByOutPoint[outPoint] = utreexo.UtxoLeaf{
+			OutPoint:   outPoint,
 			ValueAtoms: output.ValueAtoms,
 			KeyHash:    output.KeyHash,
-		})
+		}
+		createdOrder = append(createdOrder, outPoint)
+	}
+	created := make([]utreexo.UtxoLeaf, 0, len(createdByOutPoint))
+	for _, outPoint := range createdOrder {
+		if leaf, ok := createdByOutPoint[outPoint]; ok {
+			created = append(created, leaf)
+		}
 	}
 	return spent, created
 }
@@ -1104,6 +1176,9 @@ func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 	if coinbase.Base.CoinbaseHeight == nil || *coinbase.Base.CoinbaseHeight != prev.Height+1 {
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseHeightInvalid
 	}
+	if coinbase.Base.CoinbaseExtraNonce == nil {
+		return BlockValidationSummary{}, nil, nil, ErrCoinbaseExtraNonce
+	}
 	if len(coinbase.Auth.Entries) != 0 {
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseHasAuth
 	}
@@ -1111,7 +1186,6 @@ func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseNoOutputs
 	}
 
-	baseLookup := LookupFromSet(utxos)
 	tempUtxos := NewUtxoOverlay(utxos)
 	claimedInputs := make(map[types.OutPoint]struct{})
 	var totalFees uint64
@@ -1126,7 +1200,10 @@ func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 			}
 			claimedInputs[input.PrevOut] = struct{}{}
 		}
-		txSummary, err := ValidateTxWithLookup(tx, baseLookup, rules)
+		// Blocks are validated as an atomic patch to the pre-block UTXO set, so
+		// later transactions must see outputs created by earlier non-coinbase
+		// transactions in the same block.
+		txSummary, err := ValidateTxWithLookup(tx, tempUtxos.Lookup, rules)
 		if err != nil {
 			return BlockValidationSummary{}, nil, nil, err
 		}
@@ -1135,21 +1212,7 @@ func validateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 			return BlockValidationSummary{}, nil, nil, ErrAmountOverflow
 		}
 		totalFees = nextFees
-
-	}
-
-	for spent := range claimedInputs {
-		tempUtxos.Spend(spent)
-	}
-	for i := 1; i < len(block.Txs); i++ {
-		tx := &block.Txs[i]
-		txHash := TxID(tx)
-		for vout, output := range tx.Base.Outputs {
-			tempUtxos.Set(types.OutPoint{TxID: txHash, Vout: uint32(vout)}, UtxoEntry{
-				ValueAtoms: output.ValueAtoms,
-				KeyHash:    output.KeyHash,
-			})
-		}
+		tempUtxos.ApplyTx(*tx, txids[i])
 	}
 
 	coinbaseValue, err := sumCoinbaseOutputs(coinbase)

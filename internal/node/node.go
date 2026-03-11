@@ -118,6 +118,9 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 	if coinbase.Base.CoinbaseHeight == nil || *coinbase.Base.CoinbaseHeight != 0 {
 		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: coinbase height must be 0")
 	}
+	if coinbase.Base.CoinbaseExtraNonce == nil {
+		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: coinbase extra nonce must be present")
+	}
 	if len(coinbase.Base.Outputs) == 0 {
 		return GenesisBootstrapSummary{}, errors.New("invalid genesis block: coinbase has no outputs")
 	}
@@ -227,7 +230,7 @@ func (c *ChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySummary, err
 }
 
 func (c *ChainState) TipHeight() *uint64 {
-	return c.height
+	return cloneUint64Ptr(c.height)
 }
 
 func (c *ChainState) Profile() types.ChainProfile {
@@ -235,7 +238,7 @@ func (c *ChainState) Profile() types.ChainProfile {
 }
 
 func (c *ChainState) TipHeader() *types.BlockHeader {
-	return c.tipHeader
+	return cloneBlockHeaderPtr(c.tipHeader)
 }
 
 func (c *ChainState) BlockSizeState() consensus.BlockSizeState {
@@ -243,7 +246,7 @@ func (c *ChainState) BlockSizeState() consensus.BlockSizeState {
 }
 
 func (c *ChainState) UTXOs() consensus.UtxoSet {
-	return c.utxos
+	return cloneUtxos(c.utxos)
 }
 
 func (c *ChainState) UTXORoot() [32]byte {
@@ -262,15 +265,15 @@ func (c *ChainState) CommittedView() (CommittedChainView, bool) {
 		TipHeader:      *c.tipHeader,
 		TipHash:        consensus.HeaderHash(c.tipHeader),
 		BlockSizeState: c.blockSizeState,
-		UTXOs:          c.utxos,
-		UTXOAcc:        c.utxoAcc,
+		UTXOs:          cloneUtxos(c.utxos),
+		UTXOAcc:        c.utxoAcc.Clone(),
 		UTXORoot:       c.UTXORoot(),
 	}
 	return view, true
 }
 
 func (c *ChainState) UTXOAccumulator() *utreexo.Accumulator {
-	return c.utxoAcc
+	return c.utxoAcc.Clone()
 }
 
 func (c *ChainState) StoredState() (*storage.StoredChainState, error) {
@@ -447,4 +450,20 @@ func cloneUtxos(utxos consensus.UtxoSet) consensus.UtxoSet {
 		out[k] = v
 	}
 	return out
+}
+
+func cloneUint64Ptr(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	return &out
+}
+
+func cloneBlockHeaderPtr(header *types.BlockHeader) *types.BlockHeader {
+	if header == nil {
+		return nil
+	}
+	out := *header
+	return &out
 }

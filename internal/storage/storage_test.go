@@ -11,11 +11,13 @@ import (
 )
 
 func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
+	var extraNonce [types.CoinbaseExtraNonceLen]byte
 	return types.Transaction{
 		Base: types.TxBase{
-			Version:        1,
-			CoinbaseHeight: &height,
-			Outputs:        outputs,
+			Version:            1,
+			CoinbaseHeight:     &height,
+			CoinbaseExtraNonce: &extraNonce,
+			Outputs:            outputs,
 		},
 	}
 }
@@ -42,9 +44,21 @@ func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {
 
 func sampleBlockSizeState() consensus.BlockSizeState {
 	return consensus.BlockSizeState{
-		BlockSize: 148,
+		BlockSize: types.BlockHeaderEncodedLen,
 		Epsilon:   16_000_000,
 		Beta:      16_000_000,
+	}
+}
+
+func TestStorageWritePoliciesMatchDurabilityIntent(t *testing.T) {
+	if consensusCriticalWriteOptions == nil || !consensusCriticalWriteOptions.Sync {
+		t.Fatal("consensus-critical storage writes must be synced")
+	}
+	if bestEffortWriteOptions == nil {
+		t.Fatal("best-effort write options must be configured")
+	}
+	if bestEffortWriteOptions.Sync {
+		t.Fatal("best-effort storage writes should remain unsynced")
 	}
 }
 
@@ -628,6 +642,91 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	}
 	if len(rawHeightIndex) != 32 {
 		t.Fatalf("raw height index len = %d, want 32", len(rawHeightIndex))
+	}
+}
+
+func TestHeaderHeightLookupsSeparateIndexedAndCanonicalViews(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	genesis, _ := sampleBlockAndUTXOs()
+	if err := store.WriteHeaderState(&StoredHeaderState{
+		Profile:   types.Regtest,
+		Height:    0,
+		TipHeader: genesis.Header,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutHeader(0, &genesis.Header); err != nil {
+		t.Fatal(err)
+	}
+
+	first := genesis.Header
+	first.PrevBlockHash = consensus.HeaderHash(&genesis.Header)
+	first.Timestamp = genesis.Header.Timestamp + 1
+	firstHash := consensus.HeaderHash(&first)
+	if err := store.CommitHeaderChain(&StoredHeaderState{
+		Profile:   types.Regtest,
+		Height:    1,
+		TipHeader: first,
+	}, []HeaderBatchEntry{{
+		Height:    1,
+		Header:    first,
+		ChainWork: [32]byte{1},
+	}}, 0, 0, []HeaderBatchEntry{{
+		Height:    1,
+		Header:    first,
+		ChainWork: [32]byte{1},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := first
+	second.PrevBlockHash = firstHash
+	second.Timestamp = first.Timestamp + 1
+	secondHash := consensus.HeaderHash(&second)
+	if err := store.CommitHeaderChain(&StoredHeaderState{
+		Profile:   types.Regtest,
+		Height:    2,
+		TipHeader: second,
+	}, []HeaderBatchEntry{{
+		Height:    2,
+		Header:    second,
+		ChainWork: [32]byte{2},
+	}}, 1, 1, []HeaderBatchEntry{{
+		Height:    2,
+		Header:    second,
+		ChainWork: [32]byte{2},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes: %v", err)
+	}
+
+	// Simulate the derived index lagging behind the canonical header tip.
+	if err := store.db.Delete(headerHeightIndexKey(2), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+
+	indexedHash, err := store.GetIndexedHeaderHashByHeight(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indexedHash != nil {
+		t.Fatalf("indexed header hash at height 2 = %x, want nil", indexedHash)
+	}
+
+	canonicalHash, err := store.GetCanonicalHeaderHashByHeight(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalHash == nil || *canonicalHash != secondHash {
+		t.Fatalf("canonical header hash at height 2 = %x, want %x", canonicalHash, secondHash)
 	}
 }
 

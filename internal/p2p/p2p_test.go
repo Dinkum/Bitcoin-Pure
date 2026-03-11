@@ -10,11 +10,13 @@ import (
 )
 
 func testCoinbaseTx(height uint64, value uint64) types.Transaction {
+	var extraNonce [types.CoinbaseExtraNonceLen]byte
 	return types.Transaction{
 		Base: types.TxBase{
-			Version:        1,
-			CoinbaseHeight: &height,
-			Outputs:        []types.TxOutput{{ValueAtoms: value}},
+			Version:            1,
+			CoinbaseHeight:     &height,
+			CoinbaseExtraNonce: &extraNonce,
+			Outputs:            []types.TxOutput{{ValueAtoms: value}},
 		},
 	}
 }

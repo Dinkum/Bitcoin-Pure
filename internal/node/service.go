@@ -249,7 +249,7 @@ type Service struct {
 	relaySched       *relayScheduler
 	minerMgr         *minerManager
 	avaMgr           *avalancheManager
-	mineHeaderFn     func(types.BlockHeader, consensus.ChainParams, func(uint32) bool) (types.BlockHeader, bool, error)
+	mineHeaderFn     func(types.BlockHeader, consensus.ChainParams, func(uint64) bool) (types.BlockHeader, bool, error)
 	nodeID           string
 	dashboard        dashboardCache
 	systemStats      dashboardSystemStats
@@ -2314,21 +2314,16 @@ func (s *Service) mineOneBlock() ([32]byte, error) {
 
 func (s *Service) mineBlockTemplate(block types.Block, generation uint64) (types.Block, bool, error) {
 	params := consensus.ParamsForProfile(s.cfg.Profile)
-	mineHeader := s.mineHeaderFn
-	if mineHeader == nil {
-		mineHeader = consensus.MineHeaderInterruptible
-	}
-	minedHeader, ok, err := mineHeader(block.Header, params, func(uint32) bool {
-		return s.currentTemplateGeneration() == generation
-	})
+	selectionAcc, fresh, err := s.miningSelectionAccumulator(block)
 	if err != nil {
 		return types.Block{}, false, err
 	}
-	if !ok {
-		return types.Block{}, ok, err
+	if !fresh {
+		return types.Block{}, false, nil
 	}
-	block.Header = minedHeader
-	return block, true, nil
+	return s.mineBlockSearchSpace(block, params, selectionAcc, func(uint64) bool {
+		return s.currentTemplateGeneration() == generation
+	})
 }
 
 func (s *Service) MineFundingOutputs(keyHashes [][32]byte) ([]FundingOutput, error) {
@@ -2483,11 +2478,15 @@ func (s *Service) buildFundingBlock(keyHashes [][32]byte) (types.Block, []Fundin
 		Timestamp:      nextTimestamp,
 		NBits:          nbits,
 	}
-	mined, err := consensus.MineHeader(header, params)
+	block := types.Block{Header: header, Txs: []types.Transaction{coinbase}}
+	minedBlock, ok, err := s.mineBlockSearchSpace(block, params, ctx.utxoAcc, nil)
 	if err != nil {
 		return types.Block{}, nil, err
 	}
-	return types.Block{Header: mined, Txs: []types.Transaction{coinbase}}, funding, nil
+	if !ok {
+		return types.Block{}, nil, consensus.ErrInvalidPow
+	}
+	return minedBlock, funding, nil
 }
 
 func (s *Service) chainUtxoSnapshot() consensus.UtxoSet {
@@ -2501,13 +2500,132 @@ func (s *Service) chainUtxoSnapshot() consensus.UtxoSet {
 }
 
 func coinbaseTxForHeight(height uint64, outputs []types.TxOutput) types.Transaction {
+	var extraNonce [types.CoinbaseExtraNonceLen]byte
 	return types.Transaction{
 		Base: types.TxBase{
-			Version:        1,
-			CoinbaseHeight: &height,
-			Outputs:        outputs,
+			Version:            1,
+			CoinbaseHeight:     &height,
+			CoinbaseExtraNonce: &extraNonce,
+			Outputs:            outputs,
 		},
 	}
+}
+
+func (s *Service) miningSelectionAccumulator(block types.Block) (*utreexo.Accumulator, bool, error) {
+	s.stateMu.RLock()
+	view, ok := s.chainState.CommittedView()
+	s.stateMu.RUnlock()
+	if !ok {
+		return nil, false, ErrNoTip
+	}
+	if block.Header.PrevBlockHash != view.TipHash {
+		return nil, false, nil
+	}
+	if len(block.Txs) <= 1 {
+		return view.UTXOAcc, true, nil
+	}
+	nextAcc, err := view.UTXOAcc.Apply(blockSpendOutPoints(block.Txs[1:]), blockCreatedLeaves(block.Txs[1:]))
+	if err != nil {
+		return nil, false, err
+	}
+	return nextAcc, true, nil
+}
+
+func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.ChainParams, selectionAcc *utreexo.Accumulator, shouldContinue func(uint64) bool) (types.Block, bool, error) {
+	mineHeader := s.mineHeaderFn
+	if mineHeader == nil {
+		mineHeader = consensus.MineHeaderInterruptible
+	}
+	if len(block.Txs) == 0 || !block.Txs[0].IsCoinbase() {
+		return types.Block{}, false, errors.New("mining requires coinbase-first block")
+	}
+	for {
+		minedHeader, ok, err := mineHeader(block.Header, params, shouldContinue)
+		if err == nil && ok {
+			block.Header = minedHeader
+			return block, true, nil
+		}
+		if err != nil && !errors.Is(err, consensus.ErrMiningNonceExhausted) {
+			return types.Block{}, false, err
+		}
+		if !ok && err == nil {
+			return types.Block{}, false, nil
+		}
+		nextExtraNonce, wrapped := incrementCoinbaseExtraNonce(*block.Txs[0].Base.CoinbaseExtraNonce)
+		if wrapped {
+			return types.Block{}, false, consensus.ErrInvalidPow
+		}
+		block.Txs[0].Base.CoinbaseExtraNonce = &nextExtraNonce
+		block.Header.Nonce = 0
+		if err := rebuildCoinbaseSearchCommitments(&block, selectionAcc); err != nil {
+			return types.Block{}, false, err
+		}
+		s.logger.Debug("mining rolled coinbase extra nonce",
+			slog.String("extra_nonce", hex.EncodeToString(nextExtraNonce[:])),
+			slog.Uint64("timestamp", block.Header.Timestamp),
+		)
+	}
+}
+
+func rebuildCoinbaseSearchCommitments(block *types.Block, selectionAcc *utreexo.Accumulator) error {
+	coinbaseTxID := consensus.TxID(&block.Txs[0])
+	_, _, txRoot, authRoot := consensus.BuildBlockRoots(block.Txs)
+	block.Header.MerkleTxIDRoot = txRoot
+	block.Header.MerkleAuthRoot = authRoot
+	finalAcc, err := selectionAcc.Apply(nil, coinbaseLeaves(coinbaseTxID, block.Txs[0].Base.Outputs))
+	if err != nil {
+		return err
+	}
+	block.Header.UTXORoot = finalAcc.Root()
+	return nil
+}
+
+func incrementCoinbaseExtraNonce(current [types.CoinbaseExtraNonceLen]byte) ([types.CoinbaseExtraNonceLen]byte, bool) {
+	next := current
+	for i := 0; i < len(next); i++ {
+		next[i]++
+		if next[i] != 0 {
+			return next, false
+		}
+	}
+	return next, true
+}
+
+func coinbaseLeaves(txid [32]byte, outputs []types.TxOutput) []utreexo.UtxoLeaf {
+	leaves := make([]utreexo.UtxoLeaf, 0, len(outputs))
+	for vout, output := range outputs {
+		leaves = append(leaves, utreexo.UtxoLeaf{
+			OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
+			ValueAtoms: output.ValueAtoms,
+			KeyHash:    output.KeyHash,
+		})
+	}
+	return leaves
+}
+
+func blockSpendOutPoints(txs []types.Transaction) []types.OutPoint {
+	spent := make([]types.OutPoint, 0)
+	for _, tx := range txs {
+		for _, input := range tx.Base.Inputs {
+			spent = append(spent, input.PrevOut)
+		}
+	}
+	return spent
+}
+
+func blockCreatedLeaves(txs []types.Transaction) []utreexo.UtxoLeaf {
+	created := make([]utreexo.UtxoLeaf, 0)
+	for _, tx := range txs {
+		txid := consensus.TxID(&tx)
+		for vout, output := range tx.Base.Outputs {
+			created = append(created, utreexo.UtxoLeaf{
+				OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
+				ValueAtoms: output.ValueAtoms,
+				KeyHash:    output.KeyHash,
+			})
+		}
+	}
+	return created
 }
 
 func (s *Service) chainUtxoSnapshotWithTip() ([32]byte, consensus.UtxoSet) {
@@ -2862,7 +2980,7 @@ func (s *Service) blocksFromLocator(locator [][32]byte, stopHash [32]byte) ([]p2
 		return nil, err
 	}
 	for height := startHeight + 1; height <= *tip && len(out) < 500; height++ {
-		hash, err := s.chainState.Store().GetHeaderHashByHeight(height)
+		hash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(height)
 		if err != nil {
 			return nil, err
 		}
@@ -2993,7 +3111,7 @@ func (s *Service) headerBranchEntriesLocked(tip storage.BlockIndexEntry, batchEn
 	entries := make([]storage.HeaderBatchEntry, 0, 8)
 	cursor := tip
 	for {
-		activeHash, err := s.chainState.Store().GetHeaderHashByHeight(cursor.Height)
+		activeHash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(cursor.Height)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -6578,7 +6696,7 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 	startHeight := *blockTip + 1
 	if tipHeader := s.chainState.ChainState().TipHeader(); tipHeader != nil {
 		tipHash := consensus.HeaderHash(tipHeader)
-		activeTipHash, err := s.chainState.Store().GetHeaderHashByHeight(*blockTip)
+		activeTipHash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(*blockTip)
 		if err != nil {
 			return nil, false, err
 		}
@@ -6594,7 +6712,17 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 		}
 	}
 	for height := startHeight; height <= *headerTip && len(out) < limit; height++ {
-		hash, err := s.chainState.Store().GetHeaderHashByHeight(height)
+		// Missing index entries indicate the derived height map has a real gap.
+		// Missing-block requests should stop and let the repair path rebuild the
+		// index before we ask peers for blocks from an ambiguous active branch.
+		indexedHash, err := s.chainState.Store().GetIndexedHeaderHashByHeight(height)
+		if err != nil {
+			return nil, false, err
+		}
+		if indexedHash == nil {
+			return out, true, nil
+		}
+		hash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(height)
 		if err != nil {
 			return nil, false, err
 		}
@@ -6619,7 +6747,7 @@ func (s *Service) firstMissingActiveBlockHeightLocked(blockTipHeight uint64, blo
 	cursorHeight := blockTipHeight
 	cursorHash := blockTipHash
 	for {
-		activeHash, err := s.chainState.Store().GetHeaderHashByHeight(cursorHeight)
+		activeHash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(cursorHeight)
 		if err != nil {
 			return 0, err
 		}
@@ -6707,7 +6835,7 @@ func (s *Service) findLocatorHeightLocked(locator [][32]byte) (uint64, error) {
 		if entry == nil {
 			continue
 		}
-		activeHash, err := s.chainState.Store().GetHeaderHashByHeight(entry.Height)
+		activeHash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(entry.Height)
 		if err != nil {
 			return 0, err
 		}
