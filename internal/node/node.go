@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
@@ -55,6 +56,7 @@ type ChainState struct {
 }
 
 type PersistentChainState struct {
+	mu    sync.RWMutex
 	state *ChainState
 	store *storage.ChainStore
 }
@@ -345,6 +347,8 @@ func (p *PersistentChainState) Close() error {
 }
 
 func (p *PersistentChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBootstrapSummary, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	summary, err := p.state.InitializeFromGenesisBlock(genesis)
 	if err != nil {
 		return GenesisBootstrapSummary{}, err
@@ -392,10 +396,17 @@ func (p *PersistentChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySu
 }
 
 func (p *PersistentChainState) ChainState() *ChainState {
-	return p.state
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.state == nil {
+		return nil
+	}
+	return p.state.Clone()
 }
 
 func (p *PersistentChainState) CommittedView() (CommittedChainView, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p == nil || p.state == nil {
 		return CommittedChainView{}, false
 	}

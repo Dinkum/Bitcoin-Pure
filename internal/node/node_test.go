@@ -963,6 +963,46 @@ func TestOnCompactBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 	if !ok {
 		t.Fatalf("queued message type = %T, want GetDataMessage", envelope.msg)
 	}
+	if len(req.Items) != 1 || req.Items[0].Type != p2p.InvTypeBlockExtended {
+		t.Fatalf("unexpected fallback request: %+v", req.Items)
+	}
+}
+
+func TestOnCompactBlockFallsBackToFullBlockWithoutExtendedSupport(t *testing.T) {
+	svc := &Service{pool: mempool.New()}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, 4),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+		version: p2p.VersionMessage{
+			Services: p2p.ServiceNodeNetwork | p2p.ServiceGrapheneBlockRelay,
+		},
+	}
+	block := types.Block{
+		Header: types.BlockHeader{Version: 1, Timestamp: 202},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
+	}
+	for i := 0; i < 8; i++ {
+		block.Txs = append(block.Txs, types.Transaction{
+			Base: types.TxBase{
+				Version: 1,
+				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 21)}, Vout: 0}}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+			},
+		})
+	}
+	compact := buildCompactBlockMessage(block).(p2p.CompactBlockMessage)
+	if err := svc.onCompactBlockMessage(peer, compact); err != nil {
+		t.Fatalf("onCompactBlockMessage: %v", err)
+	}
+	envelope := <-peer.sendQ
+	req, ok := envelope.msg.(p2p.GetDataMessage)
+	if !ok {
+		t.Fatalf("queued message type = %T, want GetDataMessage", envelope.msg)
+	}
 	if len(req.Items) != 1 || req.Items[0].Type != p2p.InvTypeBlockFull {
 		t.Fatalf("unexpected fallback request: %+v", req.Items)
 	}
@@ -2634,6 +2674,83 @@ func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
 	<-done
 }
 
+func TestPeerWriteLoopPrefersControlThenPriorityThenSend(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+
+	svc := &Service{
+		cfg:    ServiceConfig{Profile: types.Regtest, StallTimeout: time.Second},
+		stopCh: make(chan struct{}),
+	}
+	peer := &peerConn{
+		wire:           p2p.NewConn(local, p2p.MagicForProfile(types.Regtest), 1_000_000),
+		controlQ:       make(chan outboundMessage, 2),
+		relayPriorityQ: make(chan outboundMessage, 2),
+		sendQ:          make(chan outboundMessage, 2),
+		closed:         make(chan struct{}),
+		queuedInv:      make(map[p2p.InvVector]int),
+		queuedTx:       make(map[[32]byte]int),
+		knownTx:        make(map[[32]byte]struct{}),
+		pendingThin:    make(map[[32]byte]*pendingThinBlock),
+	}
+	remoteWire := p2p.NewConn(remote, p2p.MagicForProfile(types.Regtest), 1_000_000)
+
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
+	peer.sendQ <- outboundMessage{
+		msg:        p2p.TxBatchMessage{Txs: []types.Transaction{tx}},
+		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneSend,
+		class:      classifyRelayMessage(p2p.TxBatchMessage{Txs: []types.Transaction{tx}}),
+	}
+	priorityItems := []p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: [32]byte{9}}}
+	peer.relayPriorityQ <- outboundMessage{
+		msg:        p2p.InvMessage{Items: priorityItems},
+		enqueuedAt: time.Now(),
+		lane:       relayQueueLanePriority,
+		class:      classifyRelayMessage(p2p.InvMessage{Items: priorityItems}),
+		invItems:   priorityItems,
+	}
+	peer.controlQ <- outboundMessage{
+		msg:        p2p.PingMessage{Nonce: 7},
+		enqueuedAt: time.Now(),
+		lane:       relayQueueLaneControl,
+		class:      classifyRelayMessage(p2p.PingMessage{Nonce: 7}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.peerWriteLoop(peer)
+	}()
+
+	msg1, err := remoteWire.ReadMessage()
+	if err != nil {
+		close(svc.stopCh)
+		<-done
+		t.Fatalf("read first message: %v", err)
+	}
+	if _, ok := msg1.(p2p.PingMessage); !ok {
+		close(svc.stopCh)
+		<-done
+		t.Fatalf("first message type = %T, want PingMessage", msg1)
+	}
+	msg2, err := remoteWire.ReadMessage()
+	if err != nil {
+		close(svc.stopCh)
+		<-done
+		t.Fatalf("read second message: %v", err)
+	}
+	if _, ok := msg2.(p2p.InvMessage); !ok {
+		close(svc.stopCh)
+		<-done
+		t.Fatalf("second message type = %T, want InvMessage", msg2)
+	}
+
+	close(svc.stopCh)
+	<-done
+}
+
 func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 	peer := &peerConn{
 		sendQ:       make(chan outboundMessage, 4),
@@ -2809,6 +2926,50 @@ func TestOnTxReconMessageRequestsOnlyMissingTxIDs(t *testing.T) {
 	}
 	if len(req.TxIDs) != 1 || req.TxIDs[0] != missing {
 		t.Fatalf("requested txids = %x, want only missing tx", req.TxIDs)
+	}
+}
+
+func TestRunErlayReconcileRoundQueuesUnknownMempoolTxs(t *testing.T) {
+	pool := mempool.NewWithConfig(mempool.PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{71}, Vout: 0}
+	first := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
+	firstAdmission, err := pool.AcceptTx(first, consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept first tx: %v", err)
+	}
+	second := spendTxForNodeTest(t, 2, types.OutPoint{TxID: firstAdmission.TxID, Vout: 0}, 49, 3, 1)
+	if _, err := pool.AcceptTx(second, consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+	}, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept second tx: %v", err)
+	}
+
+	svc := &Service{
+		pool:  pool,
+		peers: make(map[string]*peerConn),
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.svc = svc
+	peer.noteKnownTxIDs([][32]byte{firstAdmission.TxID})
+	svc.peers[peer.addr] = peer
+
+	svc.runErlayReconcileRound()
+
+	envelope := <-peer.sendQ
+	recon, ok := envelope.msg.(p2p.TxReconMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want TxReconMessage", envelope.msg)
+	}
+	if len(recon.TxIDs) != 1 || recon.TxIDs[0] == firstAdmission.TxID {
+		t.Fatalf("reconcile txids = %x, want only unknown tx", recon.TxIDs)
 	}
 }
 
@@ -3467,9 +3628,9 @@ func TestRenderPublicDashboardPagesExposeRecentBlockAndTxLinks(t *testing.T) {
 		"10 tx",
 		"Current Orphan Blocks",
 		"Tx Relay Mode",
-		"reconciled batches",
+		"erlay reconciliation",
 		"Block Relay Mode",
-		"short-id blocks",
+		"graphene planner",
 	} {
 		if !strings.Contains(home, want) {
 			t.Fatalf("home page missing %q:\n%s", want, home)
@@ -3559,11 +3720,13 @@ func TestSummarizeDashboardPeerHostUsesHostLevelHealthAndTraffic(t *testing.T) {
 
 func TestPeerInfoUsesObservedHeight(t *testing.T) {
 	svc := &Service{
-		peers: make(map[string]*peerConn),
+		peers:      make(map[string]*peerConn),
+		knownPeers: make(map[string]storage.KnownPeerRecord),
 	}
 	peer := &peerConn{
 		addr:           "127.0.0.1:18444",
 		outbound:       true,
+		connectedAt:    time.Now().Add(-2 * time.Minute),
 		version:        p2p.VersionMessage{Height: 7, UserAgent: "bpu/go"},
 		controlQ:       make(chan outboundMessage, 1),
 		relayPriorityQ: make(chan outboundMessage, 1),
@@ -3575,6 +3738,7 @@ func TestPeerInfoUsesObservedHeight(t *testing.T) {
 	peer.relayPriorityQ <- outboundMessage{}
 	peer.sendQ <- outboundMessage{}
 	peer.localRelayTxs[[32]byte{1}] = localRelayFallbackState{announcedAt: time.Unix(101, 0)}
+	peer.noteUsefulTxs(1, time.Now())
 	peer.telemetry.noteTxRequestReceived(2)
 	peer.telemetry.noteTxNotFoundReceived(1)
 	peer.telemetry.noteKnownTxClears(3)
@@ -3590,10 +3754,35 @@ func TestPeerInfoUsesObservedHeight(t *testing.T) {
 	if info.PendingLocalRelayTxs != 1 || info.TxReqRecvItems != 2 || info.TxNotFoundReceived != 1 || info.KnownTxClears != 3 {
 		t.Fatalf("unexpected peer relay details: %+v", info)
 	}
+	if info.UsefulnessClass == "" || info.UsefulnessScore == 0 {
+		t.Fatalf("expected usefulness fields in peer info, got %+v", info)
+	}
 
 	peer.noteHeight(11)
 	if got := svc.PeerInfo()[0].Height; got != 11 {
 		t.Fatalf("peer height = %d, want observed height 11", got)
+	}
+}
+
+func TestPeerInfoReportsProtectionClass(t *testing.T) {
+	svc := &Service{
+		peers: make(map[string]*peerConn),
+		knownPeers: map[string]storage.KnownPeerRecord{
+			"127.0.0.1:18444": {Manual: true},
+		},
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.outbound = true
+	peer.connectedAt = time.Now().Add(-2 * time.Minute)
+	peer.noteUsefulBlocks(1, time.Now())
+	svc.peers[peer.addr] = peer
+
+	info := svc.PeerInfo()[0]
+	if !info.Manual || !info.Protected {
+		t.Fatalf("expected manual peer to be protected, got %+v", info)
+	}
+	if info.ProtectedClass != "manual" || info.UsefulnessClass != "manual" {
+		t.Fatalf("unexpected protection classification: %+v", info)
 	}
 }
 
@@ -3911,6 +4100,47 @@ func TestRebroadcastLocalTxsRetriesPeersMarkedKnown(t *testing.T) {
 	}
 }
 
+func TestLocalVersionAdvertisesErlayAndGrapheneServices(t *testing.T) {
+	svc := &Service{}
+	version := svc.localVersion()
+	for _, want := range []uint64{
+		p2p.ServiceNodeNetwork,
+		p2p.ServiceErlayTxRelay,
+		p2p.ServiceGrapheneBlockRelay,
+		p2p.ServiceGrapheneExtended,
+	} {
+		if version.Services&want == 0 {
+			t.Fatalf("services bitmap %b missing capability %b", version.Services, want)
+		}
+	}
+}
+
+func TestSelectBlockRelayPlanChoosesExtendedForPoorOverlap(t *testing.T) {
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	block := types.Block{
+		Header: types.BlockHeader{Version: 1, Timestamp: 203},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
+	}
+	for i := 0; i < 16; i++ {
+		block.Txs = append(block.Txs, types.Transaction{
+			Base: types.TxBase{
+				Version: 1,
+				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 41)}, Vout: 0}}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+			},
+		})
+	}
+	if plan := selectBlockRelayPlan(peer, block); plan != blockRelayPlanGrapheneExtended {
+		t.Fatalf("relay plan = %d, want extended", plan)
+	}
+	for _, tx := range block.Txs[1:] {
+		peer.noteKnownTxIDs([][32]byte{consensus.TxID(&tx)})
+	}
+	if plan := selectBlockRelayPlan(peer, block); plan != blockRelayPlanGrapheneP1 {
+		t.Fatalf("relay plan = %d, want protocol 1", plan)
+	}
+}
+
 func TestPeerOriginTransactionsAreNotTrackedForLocalRebroadcast(t *testing.T) {
 	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
 	svc, err := OpenService(ServiceConfig{
@@ -4050,6 +4280,52 @@ func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
 	}
 	if !svc.pool.Contains(consensus.TxID(&orphanTx)) {
 		t.Fatal("promoted orphan tx missing from mempool")
+	}
+}
+
+func TestApplyPeerBlockDoesNotRequireServiceStateMu(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders: %v", err)
+	}
+
+	done := make(chan error, 1)
+	svc.stateMu.RLock()
+	go func() {
+		applied, _, err := svc.applyPeerBlock(&block)
+		if err != nil {
+			done <- err
+			return
+		}
+		if !applied {
+			done <- fmt.Errorf("peer block did not become active")
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		svc.stateMu.RUnlock()
+		if err != nil {
+			t.Fatalf("applyPeerBlock under stateMu reader: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		svc.stateMu.RUnlock()
+		t.Fatal("applyPeerBlock blocked on service stateMu")
 	}
 }
 
@@ -4677,7 +4953,11 @@ func newPeerConnForTests(addr string) *peerConn {
 		knownTx:       make(map[[32]byte]struct{}),
 		localRelayTxs: make(map[[32]byte]localRelayFallbackState),
 		pendingThin:   make(map[[32]byte]*pendingThinBlock),
-		version:       p2p.VersionMessage{Height: 0, UserAgent: "bpu/go"},
+		version: p2p.VersionMessage{
+			Height:    0,
+			Services:  p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceGrapheneBlockRelay | p2p.ServiceGrapheneExtended | p2p.ServiceAvalancheOverlay,
+			UserAgent: "bpu/go",
+		},
 	}
 }
 
@@ -4715,6 +4995,126 @@ func TestPeerConnCoalescesTxBatches(t *testing.T) {
 	case extra := <-peer.sendQ:
 		t.Fatalf("unexpected extra envelope: %#v", extra.msg)
 	default:
+	}
+}
+
+func TestAvalanchePollRespondsWithPreferredTx(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	preferred := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	admissions, errs, _, _ := svc.submitDecodedTxs([]types.Transaction{preferred})
+	if errs[0] != nil || len(admissions[0].Accepted) != 1 {
+		t.Fatalf("submit preferred = (%+v, %v), want accepted", admissions[0], errs[0])
+	}
+	conflict := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 9, 1)
+	_, errs, _, _ = svc.submitDecodedTxs([]types.Transaction{conflict})
+	if !errors.Is(errs[0], mempool.ErrInputAlreadySpent) {
+		t.Fatalf("conflict err = %v, want ErrInputAlreadySpent", errs[0])
+	}
+
+	peer := newPeerConnForTests("127.0.0.1:20001")
+	if err := svc.onPeerMessage(peer, p2p.AvaPollMessage{
+		PollID: 9,
+		Items:  []types.OutPoint{{TxID: genesisTxID, Vout: 0}},
+	}); err != nil {
+		t.Fatalf("onPeerMessage poll: %v", err)
+	}
+
+	select {
+	case envelope := <-peer.sendQ:
+		vote, ok := envelope.msg.(p2p.AvaVoteMessage)
+		if !ok {
+			t.Fatalf("message type = %T, want AvaVoteMessage", envelope.msg)
+		}
+		if vote.PollID != 9 || len(vote.Votes) != 1 || !vote.Votes[0].HasOpinion {
+			t.Fatalf("unexpected vote payload: %+v", vote)
+		}
+		if want := consensus.TxID(&preferred); vote.Votes[0].TxID != want {
+			t.Fatalf("vote txid = %x, want %x", vote.Votes[0].TxID, want)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for avalanche vote")
+	}
+}
+
+func TestAvalancheFinalizesAndRejectsConflicts(t *testing.T) {
+	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	svc, err := OpenService(ServiceConfig{
+		Profile:                   types.Regtest,
+		DBPath:                    t.TempDir(),
+		AvalancheKSample:          3,
+		AvalancheBeta:             2,
+		AvalanchePollInterval:     50 * time.Millisecond,
+		AvalancheAlphaNumerator:   1,
+		AvalancheAlphaDenominator: 2,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	preferred := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	conflict := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 9, 1)
+	if _, err := svc.SubmitTx(preferred); err != nil {
+		t.Fatalf("SubmitTx preferred: %v", err)
+	}
+	_, errs, _, _ := svc.submitDecodedTxs([]types.Transaction{conflict})
+	if !errors.Is(errs[0], mempool.ErrInputAlreadySpent) {
+		t.Fatalf("conflict err = %v, want ErrInputAlreadySpent", errs[0])
+	}
+
+	peers := []*peerConn{
+		newPeerConnForTests("127.0.0.1:21001"),
+		newPeerConnForTests("127.0.0.1:21002"),
+		newPeerConnForTests("127.0.0.1:21003"),
+	}
+	svc.peerMu.Lock()
+	for _, peer := range peers {
+		peer.svc = svc
+		svc.peers[peer.addr] = peer
+	}
+	svc.peerMu.Unlock()
+
+	want := consensus.TxID(&preferred)
+	for round := 0; round < 2; round++ {
+		svc.avalancheManager().runPollStep(time.Now())
+		for _, peer := range peers {
+			select {
+			case envelope := <-peer.sendQ:
+				poll, ok := envelope.msg.(p2p.AvaPollMessage)
+				if !ok {
+					t.Fatalf("message type = %T, want AvaPollMessage", envelope.msg)
+				}
+				votes := make([]p2p.AvaVote, len(poll.Items))
+				for i := range votes {
+					votes[i] = p2p.AvaVote{HasOpinion: true, TxID: want}
+				}
+				svc.onPeerMessage(peer, p2p.AvaVoteMessage{PollID: poll.PollID, Votes: votes})
+			case <-time.After(100 * time.Millisecond):
+				t.Fatalf("timed out waiting for avalanche poll in round %d", round)
+			}
+		}
+	}
+
+	if err := svc.avalancheManager().rejectionError(conflict); !errors.Is(err, ErrAvalancheFinalConflict) {
+		t.Fatalf("rejection err = %v, want ErrAvalancheFinalConflict", err)
+	}
+	info := svc.avalancheManager().info()
+	if info.FinalizedConflictSets != 1 {
+		t.Fatalf("finalized conflict sets = %d, want 1", info.FinalizedConflictSets)
+	}
+	if info.VoteResponses != 6 {
+		t.Fatalf("vote responses = %d, want 6", info.VoteResponses)
 	}
 }
 
@@ -4896,5 +5296,271 @@ func TestEmitThroughputSummaryLogsExpectedFields(t *testing.T) {
 	}
 	if got := int(entry["inflight_tx_requests"].(float64)); got != 3 {
 		t.Fatalf("inflight_tx_requests = %d, want 3", got)
+	}
+}
+
+func TestEnqueuePriorityInvLogsSaturatedQueueAndTracksLaneDrops(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "debug"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.svc = &Service{logger: logger}
+	peer.relayPriorityQ = make(chan outboundMessage, 1)
+	peer.relayPriorityQ <- outboundMessage{msg: p2p.PingMessage{Nonce: 1}}
+
+	items := []p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: [32]byte{9}}}
+	if err := peer.enqueueInvItems(items, true); err != nil {
+		t.Fatalf("enqueueInvItems: %v", err)
+	}
+
+	stats := peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepths(), peer.pendingLocalRelayCount())
+	if stats.DroppedInv != 1 || stats.DroppedPriorityInv != 1 {
+		t.Fatalf("unexpected dropped inv stats: %+v", stats)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "dropped relay inv due to saturated queue") || !strings.Contains(logged, "\"lane\":\"priority\"") {
+		t.Fatalf("expected saturated priority queue log, got %s", logged)
+	}
+}
+
+func TestFilterQueuedTxIDsLogsSuppressionBurst(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "debug"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.svc = &Service{logger: logger}
+	known := [32]byte{1}
+	peer.knownTx[known] = struct{}{}
+
+	txids := make([][32]byte, 0, 10)
+	for i := 0; i < 10; i++ {
+		txids = append(txids, known)
+	}
+	filtered := peer.filterQueuedTxIDs(txids, true)
+	if len(filtered) != 0 {
+		t.Fatalf("filtered txids = %d, want 0", len(filtered))
+	}
+	if !strings.Contains(buf.String(), "suppressed relay work before enqueue") || !strings.Contains(buf.String(), "\"kind\":\"tx_recon\"") {
+		t.Fatalf("expected suppression log, got %s", buf.String())
+	}
+}
+
+func TestRelayPeerStatsExposeLanePressureCounters(t *testing.T) {
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	peer.telemetry.noteDroppedInv(2, relayQueueLanePriority)
+	peer.telemetry.noteDroppedInv(3, relayQueueLaneSend)
+	peer.telemetry.noteDroppedTxs(4, relayQueueLaneSend)
+	peer.telemetry.noteWriterStarvation(relayQueueLaneControl)
+	peer.telemetry.noteWriterStarvation(relayQueueLanePriority)
+	peer.telemetry.noteWriterStarvation(relayQueueLaneSend)
+
+	stats := peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepths(), peer.pendingLocalRelayCount())
+	if stats.DroppedPriorityInv != 2 || stats.DroppedSendInv != 3 || stats.DroppedSendTxs != 4 {
+		t.Fatalf("unexpected lane drop stats: %+v", stats)
+	}
+	if stats.ControlStarvation != 1 || stats.PriorityStarvation != 1 || stats.SendStarvation != 1 {
+		t.Fatalf("unexpected lane starvation stats: %+v", stats)
+	}
+}
+
+func TestEnsureInboundCapacityEvictsLowValuePeerAndLogs(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "info"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	now := time.Now()
+	goodA := newPeerConnForTests("127.0.0.1:18444")
+	goodA.connectedAt = now.Add(-2 * time.Minute)
+	goodA.noteHeight(25)
+	goodA.noteUsefulBlocks(1, now)
+
+	goodB := newPeerConnForTests("127.0.0.1:18445")
+	goodB.connectedAt = now.Add(-2 * time.Minute)
+	goodB.noteHeight(24)
+	goodB.noteUsefulHeaders(1, now)
+
+	low := newPeerConnForTests("127.0.0.1:18446")
+	low.connectedAt = now.Add(-10 * time.Minute)
+
+	svc := &Service{
+		cfg:    ServiceConfig{MaxInboundPeers: 3},
+		logger: logger,
+		peers: map[string]*peerConn{
+			goodA.addr: goodA,
+			goodB.addr: goodB,
+			low.addr:   low,
+		},
+		stopCh: make(chan struct{}),
+	}
+
+	if ok := svc.peerManager().ensureInboundCapacity("127.0.0.1:19000"); !ok {
+		t.Fatal("expected inbound capacity manager to evict low-value peer")
+	}
+	if _, ok := svc.peers[low.addr]; ok {
+		t.Fatalf("expected low-value peer %s to be evicted", low.addr)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "evicting low-value inbound peer to admit candidate") {
+		t.Fatalf("expected inbound eviction log, got %s", logged)
+	}
+	if !strings.Contains(logged, low.addr) || !strings.Contains(logged, "127.0.0.1:19000") {
+		t.Fatalf("expected candidate and victim in inbound eviction log, got %s", logged)
+	}
+}
+
+func TestEnsureInboundCapacityRejectsWhenPeersProtected(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "info"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	now := time.Now()
+	peerA := newPeerConnForTests("127.0.0.1:18444")
+	peerA.connectedAt = now.Add(-2 * time.Minute)
+	peerA.noteHeight(25)
+	peerA.noteUsefulBlocks(1, now)
+
+	peerB := newPeerConnForTests("127.0.0.1:18445")
+	peerB.connectedAt = now.Add(-2 * time.Minute)
+	peerB.noteHeight(24)
+	peerB.noteUsefulHeaders(1, now)
+
+	svc := &Service{
+		cfg:    ServiceConfig{MaxInboundPeers: 2},
+		logger: logger,
+		peers: map[string]*peerConn{
+			peerA.addr: peerA,
+			peerB.addr: peerB,
+		},
+		stopCh: make(chan struct{}),
+	}
+
+	if ok := svc.peerManager().ensureInboundCapacity("127.0.0.1:19001"); ok {
+		t.Fatal("expected inbound capacity manager to reject candidate when peers are protected")
+	}
+	if !strings.Contains(buf.String(), "all inbound slots currently protected") {
+		t.Fatalf("expected protected inbound rejection log, got %s", buf.String())
+	}
+}
+
+func TestReserveOutboundTargetReplacesLowValuePeerAndLogs(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "info"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	now := time.Now().UTC()
+	manual := newPeerConnForTests("127.0.0.1:18444")
+	manual.outbound = true
+	manual.connectedAt = now.Add(-3 * time.Minute)
+	manual.noteHeight(50)
+	manual.noteUsefulBlocks(1, now)
+
+	low := newPeerConnForTests("127.0.0.1:18445")
+	low.outbound = true
+	low.connectedAt = now.Add(-10 * time.Minute)
+
+	svc := &Service{
+		cfg:    ServiceConfig{MaxOutboundPeers: 2},
+		logger: logger,
+		peers: map[string]*peerConn{
+			manual.addr: manual,
+			low.addr:    low,
+		},
+		outboundPeers: map[string]struct{}{
+			manual.addr: {},
+			low.addr:    {},
+		},
+		knownPeers: map[string]storage.KnownPeerRecord{
+			manual.addr:       {Manual: true, LastSeen: now, LastSuccess: now},
+			low.addr:          {LastSeen: now.Add(-6 * time.Hour), FailureCount: 2},
+			"127.0.0.1:18446": {LastSeen: now, LastSuccess: now},
+		},
+		stopCh: make(chan struct{}),
+	}
+
+	reservation, reserved, err := svc.peerManager().reserveOutboundTarget("127.0.0.1:18446", false)
+	if err != nil {
+		t.Fatalf("reserve outbound target: %v", err)
+	}
+	if !reserved {
+		t.Fatal("expected outbound candidate to reserve a replacement slot")
+	}
+	if reservation.evictedAddr != low.addr {
+		t.Fatalf("evicted addr = %s, want %s", reservation.evictedAddr, low.addr)
+	}
+	if _, ok := svc.outboundPeers[low.addr]; ok {
+		t.Fatalf("expected low-value outbound target %s to be removed", low.addr)
+	}
+	if _, ok := svc.outboundPeers["127.0.0.1:18446"]; !ok {
+		t.Fatal("expected replacement outbound target to be installed")
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "evicting lower-value outbound target to make room for candidate") {
+		t.Fatalf("expected outbound replacement log, got %s", logged)
+	}
+	if !strings.Contains(logged, low.addr) || !strings.Contains(logged, "127.0.0.1:18446") {
+		t.Fatalf("expected candidate and victim in outbound replacement log, got %s", logged)
+	}
+}
+
+func TestRefillOutboundPeersRebalancesLowValueLearnedPeer(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:          types.Regtest,
+		DBPath:           t.TempDir(),
+		MaxOutboundPeers: 2,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	now := time.Now().UTC()
+	manual := newPeerConnForTests("127.0.0.1:18444")
+	manual.outbound = true
+	manual.connectedAt = now.Add(-3 * time.Minute)
+	manual.noteHeight(50)
+	manual.noteUsefulBlocks(1, now)
+
+	low := newPeerConnForTests("127.0.0.1:18445")
+	low.outbound = true
+	low.connectedAt = now.Add(-10 * time.Minute)
+
+	svc.peerMu.Lock()
+	svc.peers = map[string]*peerConn{
+		manual.addr: manual,
+		low.addr:    low,
+	}
+	svc.outboundPeers = map[string]struct{}{
+		manual.addr: {},
+		low.addr:    {},
+	}
+	svc.knownPeers = map[string]storage.KnownPeerRecord{
+		manual.addr:       {Manual: true, LastSeen: now, LastSuccess: now},
+		low.addr:          {LastSeen: now.Add(-6 * time.Hour), FailureCount: 2},
+		"127.0.0.1:18446": {LastSeen: now, LastSuccess: now},
+	}
+	svc.peerMu.Unlock()
+
+	svc.peerManager().refillOutboundPeers()
+
+	svc.peerMu.RLock()
+	defer svc.peerMu.RUnlock()
+	if _, ok := svc.outboundPeers[low.addr]; ok {
+		t.Fatalf("expected rebalance to remove low-value outbound target %s", low.addr)
+	}
+	if _, ok := svc.outboundPeers["127.0.0.1:18446"]; !ok {
+		t.Fatal("expected rebalance to install the better learned outbound target")
 	}
 }

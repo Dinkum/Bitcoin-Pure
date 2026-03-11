@@ -23,6 +23,13 @@ type PerformanceCounters struct {
 	BlocksAccepted        uint64 `json:"blocks_accepted"`
 	TemplateRebuilds      uint64 `json:"template_rebuilds"`
 	TemplateInterruptions uint64 `json:"template_interruptions"`
+	ErlayRounds           uint64 `json:"erlay_rounds"`
+	ErlayRequestedTxs     uint64 `json:"erlay_requested_txs"`
+	GrapheneP1Plans       uint64 `json:"graphene_p1_plans"`
+	GrapheneExtendedPlans uint64 `json:"graphene_extended_plans"`
+	GrapheneDecodeFails   uint64 `json:"graphene_decode_failures"`
+	GrapheneExtRecoveries uint64 `json:"graphene_extended_recoveries"`
+	LegacyRelayFallbacks  uint64 `json:"legacy_relay_fallbacks"`
 	PeerStallEvents       uint64 `json:"peer_stall_events"`
 	TxReconRetries        uint64 `json:"tx_recon_retries"`
 	DirectFallbackBatches uint64 `json:"direct_fallback_batches"`
@@ -192,6 +199,13 @@ func (s *Service) PerformanceMetrics() PerformanceMetrics {
 			BlocksAccepted:        s.throughput.blocksAccepted.Load(),
 			TemplateRebuilds:      s.throughput.templateRebuilds.Load(),
 			TemplateInterruptions: s.throughput.templateInterruptions.Load(),
+			ErlayRounds:           s.throughput.erlayRounds.Load(),
+			ErlayRequestedTxs:     s.throughput.erlayRequestedTxs.Load(),
+			GrapheneP1Plans:       s.throughput.grapheneP1Plans.Load(),
+			GrapheneExtendedPlans: s.throughput.grapheneExtPlans.Load(),
+			GrapheneDecodeFails:   s.throughput.grapheneDecodeFails.Load(),
+			GrapheneExtRecoveries: s.throughput.grapheneExtRecoveries.Load(),
+			LegacyRelayFallbacks:  s.throughput.legacyRelayFallbacks.Load(),
 			PeerStallEvents:       stallEvents,
 			TxReconRetries:        s.throughput.txReconRetries.Load(),
 			DirectFallbackBatches: s.throughput.directFallbackBatches.Load(),

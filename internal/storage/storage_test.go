@@ -7,6 +7,7 @@ import (
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
+	"github.com/cockroachdb/pebble"
 )
 
 func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
@@ -617,6 +618,89 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	}
 	if hashAtHeight == nil || *hashAtHeight != blockHash {
 		t.Fatal("active height index mismatch after delta append")
+	}
+	if err := store.WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes: %v", err)
+	}
+	rawHeightIndex, err := store.get(heightIndexKey(1))
+	if err != nil {
+		t.Fatalf("raw height index: %v", err)
+	}
+	if len(rawHeightIndex) != 32 {
+		t.Fatalf("raw height index len = %d, want 32", len(rawHeightIndex))
+	}
+}
+
+func TestDerivedIndexesReplayFromJournalOnReopen(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	block, utxos := sampleBlockAndUTXOs()
+	hash := consensus.HeaderHash(&block.Header)
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	work, err := consensus.BlockWork(block.Header.NBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutValidatedBlock(&block, &BlockIndexEntry{
+		Height:         0,
+		ParentHash:     block.Header.PrevBlockHash,
+		Header:         block.Header,
+		ChainWork:      work,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RewriteActiveHeights(0, 0, []BlockIndexEntry{{
+		Height:         0,
+		ParentHash:     block.Header.PrevBlockHash,
+		Header:         block.Header,
+		ChainWork:      work,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash before the async derived-index worker catches up.
+	if err := store.db.Set(metaDerivedJournalSeqKey, encodeU64(0), pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Delete(heightIndexKey(0), pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes reopen: %v", err)
+	}
+	rawHeightIndex, err := reopened.get(heightIndexKey(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rawHeightIndex) != 32 {
+		t.Fatalf("raw height index len = %d, want 32", len(rawHeightIndex))
+	}
+	if got, err := reopened.GetBlockHashByHeight(0); err != nil || got == nil || *got != hash {
+		t.Fatalf("GetBlockHashByHeight(0) = (%x, %v), want (%x, nil)", got, err, hash)
 	}
 }
 

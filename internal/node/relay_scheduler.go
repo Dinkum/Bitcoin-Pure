@@ -54,10 +54,21 @@ func (r *relayScheduler) broadcastAcceptedTxsToPeers(peers []*peerConn, accepted
 		return
 	}
 	txids := make([][32]byte, 0, len(accepted))
+	invItems := make([]p2p.InvVector, 0, len(accepted))
+	erlayPeers := make([]*peerConn, 0, len(peers))
+	legacyPeers := make([]*peerConn, 0, len(peers))
 	for _, item := range accepted {
 		txids = append(txids, item.TxID)
+		invItems = append(invItems, p2p.InvVector{Type: p2p.InvTypeTx, Hash: item.TxID})
 	}
-	for _, batch := range planTxRelayRecon(peers, txids) {
+	for _, peer := range peers {
+		if peer.supportsErlayTxRelay() {
+			erlayPeers = append(erlayPeers, peer)
+			continue
+		}
+		legacyPeers = append(legacyPeers, peer)
+	}
+	for _, batch := range planTxRelayRecon(erlayPeers, txids) {
 		if err := batch.peer.enqueueTxRecon(p2p.TxReconMessage{TxIDs: batch.txids}); err != nil {
 			r.svc.logger.Debug("relay txrecon enqueue failed",
 				slog.String("addr", batch.peer.addr),
@@ -66,4 +77,5 @@ func (r *relayScheduler) broadcastAcceptedTxsToPeers(peers []*peerConn, accepted
 			)
 		}
 	}
+	r.broadcastInvToPeers(legacyPeers, invItems)
 }

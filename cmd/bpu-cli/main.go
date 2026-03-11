@@ -327,6 +327,12 @@ func runServe(args []string) error {
 	stallTimeout := fs.Duration("stall-timeout", 0, "")
 	maxMessageBytes := fs.Int("max-message-bytes", 0, "")
 	minRelayFeePerByte := fs.Uint64("min-relay-fee-per-byte", 0, "")
+	avalancheMode := fs.String("avalanche", "", "")
+	avalancheK := fs.Int("avalanche-k", 0, "")
+	avalancheAlphaNumerator := fs.Int("avalanche-alpha-numerator", 0, "")
+	avalancheAlphaDenominator := fs.Int("avalanche-alpha-denominator", 0, "")
+	avalancheBeta := fs.Int("avalanche-beta", 0, "")
+	avalanchePollInterval := fs.Duration("avalanche-poll-interval", 0, "")
 	miningMode := fs.String("mining", "", "")
 	minerWorkers := fs.Int("miner-workers", 0, "")
 	minerKeyHashHex := fs.String("miner-keyhash", "", "")
@@ -412,6 +418,29 @@ func runServe(args []string) error {
 	}
 	if *minRelayFeePerByte > 0 {
 		cfg.MinRelayFeePerByte = *minRelayFeePerByte
+	}
+	if *avalancheMode != "" {
+		switch strings.ToLower(strings.TrimSpace(*avalancheMode)) {
+		case "on", "off":
+			cfg.AvalancheMode = strings.ToLower(strings.TrimSpace(*avalancheMode))
+		default:
+			return fmt.Errorf("invalid --avalanche value %q: want on or off", *avalancheMode)
+		}
+	}
+	if *avalancheK > 0 {
+		cfg.AvalancheKSample = *avalancheK
+	}
+	if *avalancheAlphaNumerator > 0 {
+		cfg.AvalancheAlphaNumerator = *avalancheAlphaNumerator
+	}
+	if *avalancheAlphaDenominator > 0 {
+		cfg.AvalancheAlphaDenominator = *avalancheAlphaDenominator
+	}
+	if *avalancheBeta > 0 {
+		cfg.AvalancheBeta = *avalancheBeta
+	}
+	if *avalanchePollInterval > 0 {
+		cfg.AvalanchePollIntervalMS = int(avalanchePollInterval.Milliseconds())
 	}
 	if *miningMode != "" {
 		switch strings.ToLower(strings.TrimSpace(*miningMode)) {
@@ -504,6 +533,12 @@ func runServe(args []string) error {
 		MaxAncestors:              cfg.MaxAncestors,
 		MaxDescendants:            cfg.MaxDescendants,
 		MaxOrphans:                cfg.MaxOrphans,
+		AvalancheMode:             cfg.AvalancheMode,
+		AvalancheKSample:          cfg.AvalancheKSample,
+		AvalancheAlphaNumerator:   cfg.AvalancheAlphaNumerator,
+		AvalancheAlphaDenominator: cfg.AvalancheAlphaDenominator,
+		AvalancheBeta:             cfg.AvalancheBeta,
+		AvalanchePollInterval:     time.Duration(cfg.AvalanchePollIntervalMS) * time.Millisecond,
 		MinerEnabled:              cfg.MinerEnabled,
 		MinerWorkers:              cfg.MinerWorkers,
 		MinerKeyHash:              keyHash,
@@ -524,6 +559,7 @@ func runServe(args []string) error {
 		slog.Int("max_ancestors", cfg.MaxAncestors),
 		slog.Int("max_descendants", cfg.MaxDescendants),
 		slog.Int("max_orphans", cfg.MaxOrphans),
+		slog.String("avalanche_mode", cfg.AvalancheMode),
 		slog.Bool("miner_enabled", cfg.MinerEnabled),
 		slog.Int("miner_workers", cfg.MinerWorkers),
 	)
@@ -543,6 +579,7 @@ func runServe(args []string) error {
 	}
 	fmt.Printf("log: %s\n", cfg.LogPath)
 	fmt.Printf("log_format: %s\n", cfg.LogFormat)
+	fmt.Printf("avalanche: %s\n", cfg.AvalancheMode)
 	if cfg.MinerEnabled {
 		if cfg.MinerWorkers > 0 {
 			fmt.Printf("miner_workers: %d\n", cfg.MinerWorkers)
@@ -715,6 +752,8 @@ func runWallet(args []string) error {
 		return runWalletReceive(args[1:])
 	case "send":
 		return runWalletSend(args[1:])
+	case "cpfp":
+		return runWalletCPFP(args[1:])
 	default:
 		return errors.New("unknown wallet subcommand")
 	}
@@ -945,13 +984,14 @@ func runWalletSend(args []string) error {
 	from := fs.String("from", "", "")
 	to := fs.String("to", "", "")
 	amount := fs.Uint64("amount", 0, "")
-	fee := fs.Uint64("fee", 1, "")
+	fee := fs.Uint64("fee", 0, "")
+	targetBlocks := fs.Int("target-blocks", 1, "")
 	yes := fs.Bool("yes", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *from == "" || *to == "" || *amount == 0 {
-		return errors.New("usage: bpu-cli wallet send --from NAME --to ADDRESS --amount ATOMS [--fee ATOMS] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+		return errors.New("usage: bpu-cli wallet send --from NAME --to ADDRESS --amount ATOMS [--fee ATOMS] [--target-blocks N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
@@ -973,11 +1013,23 @@ func runWalletSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	plan, err := store.BuildSend(*from, *to, *amount, *fee, utxos)
-	if err != nil {
-		return err
+	plan := wallet.SendPlan{}
+	if *fee > 0 {
+		plan, err = store.BuildSend(*from, *to, *amount, *fee, utxos)
+		if err != nil {
+			return err
+		}
+	} else {
+		feeRate, err := rpcEstimateFee(client, *targetBlocks)
+		if err != nil {
+			return err
+		}
+		plan, err = store.BuildSendAuto(*from, *to, *amount, feeRate, utxos)
+		if err != nil {
+			return err
+		}
 	}
-	if err := maybeConfirmSend(plan, *yes); err != nil {
+	if err := maybeConfirmWalletAction(renderSendPreview(plan), *yes); err != nil {
 		return err
 	}
 	var result struct {
@@ -994,20 +1046,84 @@ func runWalletSend(args []string) error {
 	if reportedTxID != plan.TransactionID {
 		return fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
 	}
-	spent := make([]types.OutPoint, 0, len(plan.Inputs))
-	for _, input := range plan.Inputs {
-		spent = append(spent, input.OutPoint)
-	}
-	if err := store.MarkSubmitted(*from, reportedTxID, spent); err != nil {
+	if err := store.MarkSubmitted(*from, reportedTxID, plan.Transaction, plan.Inputs); err != nil {
 		return err
 	}
-	fmt.Printf("wallet: %s\n", *from)
-	fmt.Printf("txid: %s\n", result.TxID)
-	fmt.Printf("amount: %d\n", plan.Amount)
-	fmt.Printf("fee: %d\n", plan.Fee)
-	if plan.Change > 0 && plan.ChangeAddress != nil {
-		fmt.Printf("change: %d -> %s\n", plan.Change, plan.ChangeAddress.Address)
+	printWalletAction(renderSendResult(plan, result.TxID))
+	return nil
+}
+
+func runWalletCPFP(args []string) error {
+	fs := flag.NewFlagSet("wallet cpfp", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	from := fs.String("from", "", "")
+	parent := fs.String("txid", "", "")
+	fee := fs.Uint64("fee", 0, "")
+	targetBlocks := fs.Int("target-blocks", 1, "")
+	yes := fs.Bool("yes", false, "")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+	if *from == "" || *parent == "" {
+		return errors.New("usage: bpu-cli wallet cpfp --from NAME --txid PARENT_TXID [--fee ATOMS] [--target-blocks N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	}
+	parentTxID, err := decodeHex32(*parent)
+	if err != nil {
+		return err
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
+	if err := reconcileWalletPending(store, client, *from); err != nil {
+		return err
+	}
+	var plan wallet.CPFPPlan
+	if *fee > 0 {
+		plan, err = store.BuildCPFPWithExactFee(*from, parentTxID, *fee)
+		if err != nil {
+			return err
+		}
+	} else {
+		feeRate, err := rpcEstimateFee(client, *targetBlocks)
+		if err != nil {
+			return err
+		}
+		plan, err = store.BuildCPFP(*from, parentTxID, feeRate)
+		if err != nil {
+			return err
+		}
+	}
+	if err := maybeConfirmWalletAction(renderCPFPPreview(plan), *yes); err != nil {
+		return err
+	}
+	var result struct {
+		TxID string `json:"txid"`
+		Fee  uint64 `json:"fee"`
+	}
+	if err := client.Call("submittx", map[string]string{"hex": plan.TransactionHex}, &result); err != nil {
+		return err
+	}
+	reportedTxID, err := decodeHex32(result.TxID)
+	if err != nil {
+		return err
+	}
+	if reportedTxID != plan.TransactionID {
+		return fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
+	}
+	if err := store.MarkSubmitted(*from, reportedTxID, plan.Transaction, []wallet.SelectedInput{plan.Input}); err != nil {
+		return err
+	}
+	printWalletAction(renderCPFPResult(plan, result.TxID))
 	return nil
 }
 
@@ -1722,23 +1838,93 @@ func rpcEstimateFee(client *cliRPCClient, targetBlocks int) (uint64, error) {
 	return result.FeePerByte, nil
 }
 
-func maybeConfirmSend(plan wallet.SendPlan, yes bool) error {
+type walletActionRow struct {
+	label string
+	value string
+}
+
+type walletActionView struct {
+	title string
+	rows  []walletActionRow
+}
+
+func renderSendPreview(plan wallet.SendPlan) walletActionView {
+	rows := []walletActionRow{
+		{label: "wallet", value: plan.WalletName},
+		{label: "to", value: plan.ToAddress},
+		{label: "amount", value: fmt.Sprintf("%d atoms", plan.Amount)},
+		{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+		{label: "inputs", value: fmt.Sprintf("%d (%d atoms)", len(plan.Inputs), plan.InputTotal)},
+		{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
+	}
+	if plan.Change > 0 && plan.ChangeAddress != nil {
+		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%d atoms -> %s", plan.Change, plan.ChangeAddress.Address)})
+	}
+	return walletActionView{title: "send", rows: rows}
+}
+
+func renderSendResult(plan wallet.SendPlan, txid string) walletActionView {
+	rows := []walletActionRow{
+		{label: "wallet", value: plan.WalletName},
+		{label: "txid", value: txid},
+		{label: "amount", value: fmt.Sprintf("%d atoms", plan.Amount)},
+		{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+	}
+	if plan.Change > 0 && plan.ChangeAddress != nil {
+		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%d atoms -> %s", plan.Change, plan.ChangeAddress.Address)})
+	}
+	return walletActionView{title: "submitted", rows: rows}
+}
+
+func renderCPFPPreview(plan wallet.CPFPPlan) walletActionView {
+	return walletActionView{
+		title: "cpfp",
+		rows: []walletActionRow{
+			{label: "wallet", value: plan.WalletName},
+			{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
+			{label: "source", value: fmt.Sprintf("%x:%d (%d atoms)", plan.Input.OutPoint.TxID, plan.Input.OutPoint.Vout, plan.Input.Value)},
+			{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
+			{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+			{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
+		},
+	}
+}
+
+func renderCPFPResult(plan wallet.CPFPPlan, txid string) walletActionView {
+	return walletActionView{
+		title: "submitted",
+		rows: []walletActionRow{
+			{label: "wallet", value: plan.WalletName},
+			{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
+			{label: "txid", value: txid},
+			{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
+			{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+		},
+	}
+}
+
+func formatWalletFee(fee uint64, feeRate uint64, estimatedBytes int) string {
+	if feeRate == 0 || estimatedBytes == 0 {
+		return fmt.Sprintf("%d atoms", fee)
+	}
+	return fmt.Sprintf("%d atoms (%d atoms/B, %d B)", fee, feeRate, estimatedBytes)
+}
+
+func printWalletAction(view walletActionView) {
+	fmt.Println(view.title)
+	for _, row := range view.rows {
+		fmt.Printf("  %-8s %s\n", row.label, row.value)
+	}
+}
+
+func maybeConfirmWalletAction(view walletActionView, yes bool) error {
 	if yes {
 		return nil
 	}
 	if !stdinLooksInteractive() {
-		return errors.New("wallet send requires --yes when stdin is not interactive")
+		return errors.New("wallet action requires --yes when stdin is not interactive")
 	}
-	fmt.Printf("from: %s\n", plan.WalletName)
-	fmt.Printf("to: %s\n", plan.ToAddress)
-	fmt.Printf("txid: %x\n", plan.TransactionID)
-	fmt.Printf("inputs: %d\n", len(plan.Inputs))
-	fmt.Printf("input_total: %d\n", plan.InputTotal)
-	fmt.Printf("amount: %d\n", plan.Amount)
-	fmt.Printf("fee: %d\n", plan.Fee)
-	if plan.Change > 0 && plan.ChangeAddress != nil {
-		fmt.Printf("change: %d -> %s\n", plan.Change, plan.ChangeAddress.Address)
-	}
+	printWalletAction(view)
 	fmt.Print("broadcast transaction? [y/N]: ")
 	var response string
 	if _, err := fmt.Fscanln(os.Stdin, &response); err != nil {
