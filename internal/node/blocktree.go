@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/storage"
@@ -58,6 +59,21 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 }
 
 func (p *PersistentChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSummary, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.applyBlockLocked(block)
+}
+
+func (p *PersistentChainState) ApplyBlockWithTiming(block *types.Block) (consensus.BlockValidationSummary, time.Duration, error) {
+	waitStarted := time.Now()
+	p.mu.Lock()
+	wait := time.Since(waitStarted)
+	defer p.mu.Unlock()
+	summary, err := p.applyBlockLocked(block)
+	return summary, wait, err
+}
+
+func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.BlockValidationSummary, error) {
 	if p.state.height == nil || p.state.tipHeader == nil {
 		return consensus.BlockValidationSummary{}, ErrNoTip
 	}

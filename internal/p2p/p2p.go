@@ -20,6 +20,7 @@ const (
 	maxAddrPerMessage     = 1000
 	maxTxBatchPerMessage  = 256
 	maxThinBlockTxs       = 200_000
+	maxAvalanchePollItems = 256
 )
 
 var (
@@ -28,6 +29,21 @@ var (
 	ErrBadChecksum     = errors.New("invalid payload checksum")
 	ErrBadCommand      = errors.New("invalid command")
 	ErrBadHandshake    = errors.New("invalid handshake sequence")
+)
+
+const (
+	// ServiceNodeNetwork marks a peer as a normal full-relay node.
+	ServiceNodeNetwork uint64 = 1 << iota
+	// ServiceErlayTxRelay enables Erlay-style steady-state tx relay.
+	ServiceErlayTxRelay
+	// ServiceGrapheneBlockRelay enables the compact block relay planner path.
+	ServiceGrapheneBlockRelay
+	// ServiceGrapheneExtended enables the poor-overlap block recovery path.
+	ServiceGrapheneExtended
+	// ServiceGrapheneMempoolRepair enables optional repair-only mempool sync.
+	ServiceGrapheneMempoolRepair
+	// ServiceAvalancheOverlay enables the non-consensus Avalanche poll/vote path.
+	ServiceAvalancheOverlay
 )
 
 type Command uint8
@@ -56,6 +72,8 @@ const (
 	CmdXThinBlock
 	CmdGetXBlockTx
 	CmdXBlockTx
+	CmdAvaPoll
+	CmdAvaVote
 )
 
 type InvType uint8
@@ -64,6 +82,7 @@ const (
 	InvTypeTx InvType = 1 + iota
 	InvTypeBlock
 	InvTypeBlockFull
+	InvTypeBlockExtended
 )
 
 type Message interface {
@@ -232,6 +251,25 @@ type XBlockTxMessage struct {
 
 func (XBlockTxMessage) Command() Command { return CmdXBlockTx }
 
+type AvaPollMessage struct {
+	PollID uint64
+	Items  []types.OutPoint
+}
+
+func (AvaPollMessage) Command() Command { return CmdAvaPoll }
+
+type AvaVote struct {
+	HasOpinion bool
+	TxID       [32]byte
+}
+
+type AvaVoteMessage struct {
+	PollID uint64
+	Votes  []AvaVote
+}
+
+func (AvaVoteMessage) Command() Command { return CmdAvaVote }
+
 type Conn struct {
 	net.Conn
 	magic      uint32
@@ -362,7 +400,7 @@ func encodeMessage(msg Message) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[20:28], m.Nonce)
 		buf = appendString(buf, m.UserAgent)
 		return buf, nil
-	case VerAckMessage, PingMessage, PongMessage, GetAddrMessage, AddrMessage, InvMessage, GetDataMessage, NotFoundMessage, GetHeadersMessage, HeadersMessage, GetBlocksMessage, BlockMessage, TxMessage, TxBatchMessage, TxReconMessage, TxRequestMessage, CompactBlockMessage, GetBlockTxMessage, BlockTxMessage, XThinBlockMessage, GetXBlockTxMessage, XBlockTxMessage:
+	case VerAckMessage, PingMessage, PongMessage, GetAddrMessage, AddrMessage, InvMessage, GetDataMessage, NotFoundMessage, GetHeadersMessage, HeadersMessage, GetBlocksMessage, BlockMessage, TxMessage, TxBatchMessage, TxReconMessage, TxRequestMessage, CompactBlockMessage, GetBlockTxMessage, BlockTxMessage, XThinBlockMessage, GetXBlockTxMessage, XBlockTxMessage, AvaPollMessage, AvaVoteMessage:
 		return encodePayload(msg)
 	default:
 		return nil, fmt.Errorf("unsupported message type %T", msg)
@@ -446,6 +484,14 @@ func encodePayload(msg Message) ([]byte, error) {
 			return nil, err
 		}
 		return encodeTxsWithLimit(buf, m.Txs, maxThinBlockTxs)
+	case AvaPollMessage:
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, m.PollID)
+		return encodeOutPoints(buf, m.Items, maxAvalanchePollItems)
+	case AvaVoteMessage:
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, m.PollID)
+		return encodeAvaVotes(buf, m.Votes, maxAvalanchePollItems)
 	default:
 		return nil, fmt.Errorf("unsupported message payload %T", msg)
 	}
@@ -670,9 +716,62 @@ func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Messa
 			return nil, err
 		}
 		return XBlockTxMessage{BlockHash: blockHash, Indexes: indexes, Txs: txs}, nil
+	case CmdAvaPoll:
+		pollID, err := r.readU64()
+		if err != nil {
+			return nil, err
+		}
+		items, err := r.readOutPoints(maxAvalanchePollItems)
+		if err != nil {
+			return nil, err
+		}
+		return AvaPollMessage{PollID: pollID, Items: items}, nil
+	case CmdAvaVote:
+		pollID, err := r.readU64()
+		if err != nil {
+			return nil, err
+		}
+		votes, err := r.readAvaVotes(maxAvalanchePollItems)
+		if err != nil {
+			return nil, err
+		}
+		return AvaVoteMessage{PollID: pollID, Votes: votes}, nil
 	default:
 		return nil, ErrBadCommand
 	}
+}
+
+func encodeOutPoints(buf []byte, items []types.OutPoint, limit int) ([]byte, error) {
+	if len(items) > limit {
+		return nil, fmt.Errorf("too many items: %d", len(items))
+	}
+	buf = append(buf, make([]byte, 4)...)
+	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(items)))
+	for _, item := range items {
+		buf = append(buf, item.TxID[:]...)
+		raw := make([]byte, 4)
+		binary.LittleEndian.PutUint32(raw, item.Vout)
+		buf = append(buf, raw...)
+	}
+	return buf, nil
+}
+
+func encodeAvaVotes(buf []byte, votes []AvaVote, limit int) ([]byte, error) {
+	if len(votes) > limit {
+		return nil, fmt.Errorf("too many items: %d", len(votes))
+	}
+	buf = append(buf, make([]byte, 4)...)
+	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(votes)))
+	for _, vote := range votes {
+		if vote.HasOpinion {
+			buf = append(buf, 1)
+			buf = append(buf, vote.TxID[:]...)
+			continue
+		}
+		buf = append(buf, 0)
+		buf = append(buf, make([]byte, 32)...)
+	}
+	return buf, nil
 }
 
 func encodePrefilledTxs(buf []byte, items []PrefilledTx, limit int) ([]byte, error) {
@@ -910,6 +1009,56 @@ func (r *reader) readInvs() ([]InvVector, error) {
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+func (r *reader) readOutPoints(limit int) ([]types.OutPoint, error) {
+	count, err := r.readU32()
+	if err != nil {
+		return nil, err
+	}
+	if int(count) > limit {
+		return nil, ErrPayloadTooLarge
+	}
+	out := make([]types.OutPoint, 0, count)
+	for i := uint32(0); i < count; i++ {
+		hash, err := r.take(32)
+		if err != nil {
+			return nil, err
+		}
+		vout, err := r.readU32()
+		if err != nil {
+			return nil, err
+		}
+		var txid [32]byte
+		copy(txid[:], hash)
+		out = append(out, types.OutPoint{TxID: txid, Vout: vout})
+	}
+	return out, nil
+}
+
+func (r *reader) readAvaVotes(limit int) ([]AvaVote, error) {
+	count, err := r.readU32()
+	if err != nil {
+		return nil, err
+	}
+	if int(count) > limit {
+		return nil, ErrPayloadTooLarge
+	}
+	out := make([]AvaVote, 0, count)
+	for i := uint32(0); i < count; i++ {
+		flag, err := r.take(1)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := r.take(32)
+		if err != nil {
+			return nil, err
+		}
+		vote := AvaVote{HasOpinion: flag[0] != 0}
+		copy(vote.TxID[:], hash)
+		out = append(out, vote)
+	}
+	return out, nil
 }
 
 func (r *reader) readLocatorPayload() ([][32]byte, [32]byte, error) {

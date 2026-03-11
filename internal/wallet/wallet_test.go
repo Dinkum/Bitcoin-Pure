@@ -1,13 +1,31 @@
 package wallet
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
 )
+
+func TestCashAddrReferenceExample(t *testing.T) {
+	payload, err := hex.DecodeString("211b74ca4686f81efda5641767fc84ef16dafe0b")
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	addr, err := encodeCashAddress("bitcoincash", cashAddrTypeP2PKH, payload)
+	if err != nil {
+		t.Fatalf("encodeCashAddress: %v", err)
+	}
+	if want := "bitcoincash:qqs3kax2g6r0s8ha54jpwelusnh3dkh7pvu23rzrru"; addr != want {
+		t.Fatalf("cashaddr = %q, want %q", addr, want)
+	}
+}
 
 func TestCreateWalletAndReceiveAddress(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
@@ -20,6 +38,9 @@ func TestCreateWalletAndReceiveAddress(t *testing.T) {
 	}
 	if entry.Name != "alice" {
 		t.Fatalf("wallet name = %q, want alice", entry.Name)
+	}
+	if !strings.HasPrefix(first.Address, "bpu:") {
+		t.Fatalf("first address = %q, want cashaddr prefix", first.Address)
 	}
 	if first.Index != 0 || first.Change {
 		t.Fatalf("first address = %+v, want index 0 external", first)
@@ -44,6 +65,53 @@ func TestCreateWalletAndReceiveAddress(t *testing.T) {
 	}
 	if latest := loaded.LatestReceiveAddress(); latest == nil || latest.Index != 1 {
 		t.Fatalf("latest receive address = %+v, want index 1", latest)
+	}
+}
+
+func TestParseAddressRejectsMixedCase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	mixed := strings.ToUpper(first.Address[:4]) + first.Address[4:]
+	if _, err := ParseAddress(mixed); !errors.Is(err, ErrInvalidAddress) {
+		t.Fatalf("ParseAddress mixed case err = %v, want ErrInvalidAddress", err)
+	}
+}
+
+func TestOpenNormalizesLegacyStoredAddressStrings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), StoreFileName)
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	created, _, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	legacy := created
+	legacy.Addresses[0].Address = "bpu1" + legacy.Addresses[0].KeyHashHex
+	buf, err := json.Marshal([]Wallet{legacy})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, append(buf, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	loaded, err := reopened.Wallet("alice")
+	if err != nil {
+		t.Fatalf("Wallet: %v", err)
+	}
+	if got := loaded.Addresses[0].Address; !strings.HasPrefix(got, "bpu:") {
+		t.Fatalf("normalized address = %q, want cashaddr", got)
 	}
 }
 
@@ -128,11 +196,7 @@ func TestReconcilePendingDropsMissingMempoolTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
 	}
-	spent := make([]types.OutPoint, 0, len(plan.Inputs))
-	for _, input := range plan.Inputs {
-		spent = append(spent, input.OutPoint)
-	}
-	if err := store.MarkSubmitted("alice", plan.TransactionID, spent); err != nil {
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	removed, err := store.ReconcilePending("alice", map[[32]byte]struct{}{})
@@ -194,11 +258,7 @@ func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
 	}
-	spent := make([]types.OutPoint, 0, len(plan.Inputs))
-	for _, input := range plan.Inputs {
-		spent = append(spent, input.OutPoint)
-	}
-	if err := store.MarkSubmitted("alice", plan.TransactionID, spent); err != nil {
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	summary, err := store.Balance("alice", []SpendableUTXO{
@@ -219,5 +279,122 @@ func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 	}
 	if summary.PendingCount != 1 {
 		t.Fatalf("pending count = %d, want 1", summary.PendingCount)
+	}
+}
+
+func TestBuildSendAutoChoosesFeeFromEstimatedSize(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	dest, err := store.NewReceiveAddress("alice")
+	if err != nil {
+		t.Fatalf("NewReceiveAddress: %v", err)
+	}
+	plan, err := store.BuildSendAuto("alice", dest.Address, 60, 2, []SpendableUTXO{
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 2_000, KeyHash: keyHash},
+	})
+	if err != nil {
+		t.Fatalf("BuildSendAuto: %v", err)
+	}
+	if plan.FeeRate != 2 {
+		t.Fatalf("fee rate = %d, want 2", plan.FeeRate)
+	}
+	if plan.EstimatedBytes != EstimateSignedTxBytes(1, 2) {
+		t.Fatalf("estimated bytes = %d, want %d", plan.EstimatedBytes, EstimateSignedTxBytes(1, 2))
+	}
+	if plan.Fee != uint64(plan.EstimatedBytes)*plan.FeeRate {
+		t.Fatalf("fee = %d, want %d", plan.Fee, uint64(plan.EstimatedBytes)*plan.FeeRate)
+	}
+	if plan.Change == 0 || plan.ChangeAddress == nil {
+		t.Fatal("expected auto-fee send to keep change")
+	}
+}
+
+func TestMarkSubmittedTracksWalletOwnedOutputsForCPFP(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	dest, err := store.NewReceiveAddress("alice")
+	if err != nil {
+		t.Fatalf("NewReceiveAddress: %v", err)
+	}
+	plan, err := store.BuildSend("alice", dest.Address, 10, 1, []SpendableUTXO{{
+		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+		Value:    50,
+		KeyHash:  keyHash,
+	}})
+	if err != nil {
+		t.Fatalf("BuildSend: %v", err)
+	}
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	pendingUTXOs, err := store.PendingSpendableUTXOs("alice", &plan.TransactionID)
+	if err != nil {
+		t.Fatalf("PendingSpendableUTXOs: %v", err)
+	}
+	if len(pendingUTXOs) == 0 {
+		t.Fatal("expected wallet-owned pending outputs")
+	}
+}
+
+func TestBuildCPFPUsesPendingWalletOutput(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	dest, err := store.NewReceiveAddress("alice")
+	if err != nil {
+		t.Fatalf("NewReceiveAddress: %v", err)
+	}
+	parent, err := store.BuildSend("alice", dest.Address, 10, 1, []SpendableUTXO{{
+		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+		Value:    1_000,
+		KeyHash:  keyHash,
+	}})
+	if err != nil {
+		t.Fatalf("BuildSend: %v", err)
+	}
+	if err := store.MarkSubmitted("alice", parent.TransactionID, parent.Transaction, parent.Inputs); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	child, err := store.BuildCPFP("alice", parent.TransactionID, 2)
+	if err != nil {
+		t.Fatalf("BuildCPFP: %v", err)
+	}
+	if child.ParentTxID != parent.TransactionID {
+		t.Fatalf("parent txid = %x, want %x", child.ParentTxID, parent.TransactionID)
+	}
+	if child.Input.OutPoint.TxID != parent.TransactionID {
+		t.Fatalf("child input txid = %x, want parent %x", child.Input.OutPoint.TxID, parent.TransactionID)
+	}
+	if child.Fee == 0 || child.Amount == 0 {
+		t.Fatalf("child fee/amount = %d/%d, want positive values", child.Fee, child.Amount)
 	}
 }

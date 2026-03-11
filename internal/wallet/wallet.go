@@ -20,7 +20,6 @@ import (
 )
 
 const (
-	AddressPrefix = "bpu1"
 	StoreFileName = "wallets.json"
 )
 
@@ -57,6 +56,15 @@ type PendingTx struct {
 	TxID      string            `json:"txid"`
 	CreatedAt time.Time         `json:"created_at"`
 	Spent     []PendingOutPoint `json:"spent"`
+	Outputs   []PendingOutput   `json:"outputs,omitempty"`
+}
+
+type PendingOutput struct {
+	Vout       uint32 `json:"vout"`
+	Value      uint64 `json:"value"`
+	Address    string `json:"address"`
+	KeyHashHex string `json:"keyhash_hex"`
+	Change     bool   `json:"change"`
 }
 
 type PendingOutPoint struct {
@@ -81,10 +89,27 @@ type SendPlan struct {
 	ToAddress      string
 	Amount         uint64
 	Fee            uint64
+	FeeRate        uint64
 	Change         uint64
 	InputTotal     uint64
+	EstimatedBytes int
 	Inputs         []SelectedInput
 	ChangeAddress  *Address
+	Transaction    types.Transaction
+	TransactionID  [32]byte
+	TransactionHex string
+}
+
+type CPFPPlan struct {
+	WalletName     string
+	ParentTxID     [32]byte
+	Amount         uint64
+	Fee            uint64
+	FeeRate        uint64
+	InputTotal     uint64
+	EstimatedBytes int
+	Input          SelectedInput
+	SweepAddress   Address
 	Transaction    types.Transaction
 	TransactionID  [32]byte
 	TransactionHex string
@@ -113,32 +138,23 @@ func Open(path string) (*Store, error) {
 	if err := json.Unmarshal(buf, &store.wallets); err != nil {
 		return nil, err
 	}
+	// Legacy wallets may still have placeholder `bpu1<hex>` address strings in
+	// storage. Recompute the display address from the canonical key hash so the
+	// wallet surface hard-cuts to cashaddr without needing a separate migration.
+	for wi := range store.wallets {
+		for ai := range store.wallets[wi].Addresses {
+			keyHash, err := decodeHash(store.wallets[wi].Addresses[ai].KeyHashHex)
+			if err != nil {
+				continue
+			}
+			store.wallets[wi].Addresses[ai].Address = EncodeAddress(keyHash)
+		}
+	}
 	return store, nil
 }
 
 func StorePath(dir string) string {
 	return filepath.Join(filepath.Clean(dir), StoreFileName)
-}
-
-func EncodeAddress(keyHash [32]byte) string {
-	return AddressPrefix + hex.EncodeToString(keyHash[:])
-}
-
-func ParseAddress(raw string) ([32]byte, error) {
-	var keyHash [32]byte
-	raw = strings.TrimSpace(strings.ToLower(raw))
-	switch {
-	case raw == "":
-		return keyHash, ErrInvalidAddress
-	case strings.HasPrefix(raw, AddressPrefix):
-		raw = strings.TrimPrefix(raw, AddressPrefix)
-	}
-	buf, err := hex.DecodeString(raw)
-	if err != nil || len(buf) != len(keyHash) {
-		return keyHash, ErrInvalidAddress
-	}
-	copy(keyHash[:], buf)
-	return keyHash, nil
 }
 
 func (s *Store) List() []Wallet {
@@ -243,66 +259,149 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 	if err != nil {
 		return SendPlan{}, err
 	}
-
-	outputs := []types.TxOutput{{ValueAtoms: amount, KeyHash: destKeyHash}}
-	var changeAddr *Address
 	change := total - required
-	if change > 0 {
-		// Persist change addresses before broadcast so a later-confirmed self output is still recoverable
-		// even if the operator loses the pending-send context locally.
-		addr, err := newAddress(nextAddressIndex(*wallet), true)
-		if err != nil {
-			return SendPlan{}, err
-		}
-		wallet.Addresses = append(wallet.Addresses, addr)
-		if err := s.save(); err != nil {
-			return SendPlan{}, err
-		}
-		changeAddr = &addr
-		outputs = append(outputs, types.TxOutput{ValueAtoms: change, KeyHash: mustParseKeyHash(addr.KeyHashHex)})
+	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destKeyHash), destKeyHash, amount, fee, change)
+	if err != nil {
+		return SendPlan{}, err
 	}
+	plan.InputTotal = total
+	plan.EstimatedBytes = len(plan.Transaction.Encode())
+	return plan, nil
+}
 
+func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, utxos []SpendableUTXO) (SendPlan, error) {
+	if feeRate == 0 {
+		return SendPlan{}, errors.New("fee rate must be positive")
+	}
+	wallet, _, ok := s.findWallet(name)
+	if !ok {
+		return SendPlan{}, ErrWalletNotFound
+	}
+	destKeyHash, err := ParseAddress(to)
+	if err != nil {
+		return SendPlan{}, err
+	}
+	available, err := spendableCoins(*wallet, utxos)
+	if err != nil {
+		return SendPlan{}, err
+	}
+	selected, total, fee, change, estimatedBytes, err := selectCoinsForAutoFee(available, amount, feeRate)
+	if err != nil {
+		return SendPlan{}, err
+	}
+	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destKeyHash), destKeyHash, amount, fee, change)
+	if err != nil {
+		return SendPlan{}, err
+	}
+	plan.InputTotal = total
+	plan.FeeRate = feeRate
+	plan.EstimatedBytes = estimatedBytes
+	return plan, nil
+}
+
+func (s *Store) BuildCPFP(name string, parentTxID [32]byte, feeRate uint64) (CPFPPlan, error) {
+	if feeRate == 0 {
+		return CPFPPlan{}, errors.New("fee rate must be positive")
+	}
+	input, wallet, err := s.selectPendingCPFPInput(name, parentTxID)
+	if err != nil {
+		return CPFPPlan{}, err
+	}
+	estimatedBytes := estimateSignedTxBytes(1, 1)
+	fee := feeRate * uint64(estimatedBytes)
+	if fee == 0 {
+		return CPFPPlan{}, ErrInsufficientFunds
+	}
+	return s.buildCPFPPlan(wallet, parentTxID, input, fee, feeRate, estimatedBytes)
+}
+
+func (s *Store) BuildCPFPWithExactFee(name string, parentTxID [32]byte, fee uint64) (CPFPPlan, error) {
+	if fee == 0 {
+		return CPFPPlan{}, errors.New("fee must be positive")
+	}
+	input, wallet, err := s.selectPendingCPFPInput(name, parentTxID)
+	if err != nil {
+		return CPFPPlan{}, err
+	}
+	estimatedBytes := estimateSignedTxBytes(1, 1)
+	feeRate := fee / uint64(estimatedBytes)
+	if fee%uint64(estimatedBytes) != 0 {
+		feeRate++
+	}
+	return s.buildCPFPPlan(wallet, parentTxID, input, fee, feeRate, estimatedBytes)
+}
+
+func (s *Store) selectPendingCPFPInput(name string, parentTxID [32]byte) (SelectedInput, *Wallet, error) {
+	wallet, _, ok := s.findWallet(name)
+	if !ok {
+		return SelectedInput{}, nil, ErrWalletNotFound
+	}
+	pendingUTXOs, err := s.PendingSpendableUTXOs(name, &parentTxID)
+	if err != nil {
+		return SelectedInput{}, nil, err
+	}
+	available, err := spendableCoins(*wallet, pendingUTXOs)
+	if err != nil {
+		return SelectedInput{}, nil, err
+	}
+	if len(available) == 0 {
+		return SelectedInput{}, nil, ErrInsufficientFunds
+	}
+	return available[0], wallet, nil
+}
+
+func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input SelectedInput, fee uint64, feeRate uint64, estimatedBytes int) (CPFPPlan, error) {
+	if fee == 0 || input.Value <= fee {
+		return CPFPPlan{}, ErrInsufficientFunds
+	}
+	// Sweep the child output back to a fresh internal address so the bump path
+	// stays wallet-owned and easy to follow in later balance/history views.
+	addr, err := newAddress(nextAddressIndex(*wallet), true)
+	if err != nil {
+		return CPFPPlan{}, err
+	}
+	wallet.Addresses = append(wallet.Addresses, addr)
+	if err := s.save(); err != nil {
+		return CPFPPlan{}, err
+	}
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
-			Inputs:  make([]types.TxInput, 0, len(selected)),
-			Outputs: outputs,
+			Inputs:  []types.TxInput{{PrevOut: input.OutPoint}},
+			Outputs: []types.TxOutput{{
+				ValueAtoms: input.Value - fee,
+				KeyHash:    mustParseKeyHash(addr.KeyHashHex),
+			}},
 		},
-		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, len(selected))},
+		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, 1)},
 	}
-	inputAmounts := make([]uint64, len(selected))
-	for i, coin := range selected {
-		tx.Base.Inputs = append(tx.Base.Inputs, types.TxInput{PrevOut: coin.OutPoint})
-		inputAmounts[i] = coin.Value
+	msg, err := consensus.Sighash(&tx, 0, []uint64{input.Value})
+	if err != nil {
+		return CPFPPlan{}, err
 	}
-	for i, coin := range selected {
-		msg, err := consensus.Sighash(&tx, i, inputAmounts)
-		if err != nil {
-			return SendPlan{}, err
-		}
-		pubKey, sig, err := signAddress(coin.Address, &msg)
-		if err != nil {
-			return SendPlan{}, err
-		}
-		tx.Auth.Entries[i] = types.TxAuthEntry{PubKey: pubKey, Signature: sig}
+	pubKey, sig, err := signAddress(input.Address, &msg)
+	if err != nil {
+		return CPFPPlan{}, err
 	}
+	tx.Auth.Entries[0] = types.TxAuthEntry{PubKey: pubKey, Signature: sig}
 	txid := consensus.TxID(&tx)
-	return SendPlan{
+	return CPFPPlan{
 		WalletName:     wallet.Name,
-		ToAddress:      EncodeAddress(destKeyHash),
-		Amount:         amount,
+		ParentTxID:     parentTxID,
+		Amount:         input.Value - fee,
 		Fee:            fee,
-		Change:         change,
-		InputTotal:     total,
-		Inputs:         selected,
-		ChangeAddress:  changeAddr,
+		FeeRate:        feeRate,
+		InputTotal:     input.Value,
+		EstimatedBytes: estimatedBytes,
+		Input:          input,
+		SweepAddress:   addr,
 		Transaction:    tx,
 		TransactionID:  txid,
 		TransactionHex: hex.EncodeToString(tx.Encode()),
 	}, nil
 }
 
-func (s *Store) MarkSubmitted(name string, txid [32]byte, spent []types.OutPoint) error {
+func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, inputs []SelectedInput) error {
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return ErrWalletNotFound
@@ -310,9 +409,11 @@ func (s *Store) MarkSubmitted(name string, txid [32]byte, spent []types.OutPoint
 	entry := PendingTx{
 		TxID:      hex.EncodeToString(txid[:]),
 		CreatedAt: time.Now().UTC(),
-		Spent:     make([]PendingOutPoint, 0, len(spent)),
+		Spent:     make([]PendingOutPoint, 0, len(inputs)),
+		Outputs:   walletOwnedOutputs(*wallet, tx),
 	}
-	for _, outPoint := range spent {
+	for _, input := range inputs {
+		outPoint := input.OutPoint
 		entry.Spent = append(entry.Spent, PendingOutPoint{
 			TxID: hex.EncodeToString(outPoint.TxID[:]),
 			Vout: outPoint.Vout,
@@ -325,6 +426,35 @@ func (s *Store) MarkSubmitted(name string, txid [32]byte, spent []types.OutPoint
 	}
 	wallet.Pending = append(wallet.Pending, entry)
 	return s.save()
+}
+
+func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]SpendableUTXO, error) {
+	wallet, _, ok := s.findWallet(name)
+	if !ok {
+		return nil, ErrWalletNotFound
+	}
+	out := make([]SpendableUTXO, 0)
+	for _, pending := range wallet.Pending {
+		txid, err := decodeHash(pending.TxID)
+		if err != nil {
+			continue
+		}
+		if parentTxID != nil && txid != *parentTxID {
+			continue
+		}
+		for _, output := range pending.Outputs {
+			keyHash, err := decodeHash(output.KeyHashHex)
+			if err != nil {
+				continue
+			}
+			out = append(out, SpendableUTXO{
+				OutPoint: types.OutPoint{TxID: txid, Vout: output.Vout},
+				Value:    output.Value,
+				KeyHash:  keyHash,
+			})
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) SpendableKeyHashes(name string) ([][32]byte, error) {
@@ -502,6 +632,136 @@ func selectCoins(coins []SelectedInput, required uint64) ([]SelectedInput, uint6
 		}
 	}
 	return nil, 0, ErrInsufficientFunds
+}
+
+func selectCoinsForAutoFee(coins []SelectedInput, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
+	selected := make([]SelectedInput, 0, len(coins))
+	var total uint64
+	for _, coin := range coins {
+		selected = append(selected, coin)
+		total += coin.Value
+		feeNoChange := feeRate * uint64(estimateSignedTxBytes(len(selected), 1))
+		if total < amount+feeNoChange {
+			continue
+		}
+		feeWithChange := feeRate * uint64(estimateSignedTxBytes(len(selected), 2))
+		if total >= amount+feeWithChange {
+			return selected, total, feeWithChange, total - amount - feeWithChange, estimateSignedTxBytes(len(selected), 2), nil
+		}
+		// If we can fund the payment at the requested fee rate but not a second
+		// wallet-owned change output, collapse the remainder into fee instead of
+		// manufacturing dust-like change that would immediately need another spend.
+		return selected, total, total - amount, 0, estimateSignedTxBytes(len(selected), 1), nil
+	}
+	return nil, 0, 0, 0, 0, ErrInsufficientFunds
+}
+
+func EstimateSignedTxBytes(inputCount int, outputCount int) int {
+	return estimateSignedTxBytes(inputCount, outputCount)
+}
+
+func estimateSignedTxBytes(inputCount int, outputCount int) int {
+	return 4 + // version
+		varIntLen(inputCount) +
+		(inputCount * 36) +
+		varIntLen(outputCount) +
+		(outputCount * 40) +
+		varIntLen(inputCount) +
+		(inputCount * 96)
+}
+
+func varIntLen(count int) int {
+	switch {
+	case count < 0xfd:
+		return 1
+	case count <= 0xffff:
+		return 3
+	case uint64(count) <= 0xffff_ffff:
+		return 5
+	default:
+		return 9
+	}
+}
+
+func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destKeyHash [32]byte, amount uint64, fee uint64, change uint64) (SendPlan, error) {
+	outputs := []types.TxOutput{{ValueAtoms: amount, KeyHash: destKeyHash}}
+	var changeAddr *Address
+	if change > 0 {
+		// Persist change addresses before broadcast so a later-confirmed self output is still recoverable
+		// even if the operator loses the pending-send context locally.
+		addr, err := newAddress(nextAddressIndex(*wallet), true)
+		if err != nil {
+			return SendPlan{}, err
+		}
+		wallet.Addresses = append(wallet.Addresses, addr)
+		if err := s.save(); err != nil {
+			return SendPlan{}, err
+		}
+		changeAddr = &addr
+		outputs = append(outputs, types.TxOutput{ValueAtoms: change, KeyHash: mustParseKeyHash(addr.KeyHashHex)})
+	}
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  make([]types.TxInput, 0, len(inputs)),
+			Outputs: outputs,
+		},
+		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, len(inputs))},
+	}
+	inputAmounts := make([]uint64, len(inputs))
+	inputTotal := uint64(0)
+	for i, coin := range inputs {
+		tx.Base.Inputs = append(tx.Base.Inputs, types.TxInput{PrevOut: coin.OutPoint})
+		inputAmounts[i] = coin.Value
+		inputTotal += coin.Value
+	}
+	for i, coin := range inputs {
+		msg, err := consensus.Sighash(&tx, i, inputAmounts)
+		if err != nil {
+			return SendPlan{}, err
+		}
+		pubKey, sig, err := signAddress(coin.Address, &msg)
+		if err != nil {
+			return SendPlan{}, err
+		}
+		tx.Auth.Entries[i] = types.TxAuthEntry{PubKey: pubKey, Signature: sig}
+	}
+	txid := consensus.TxID(&tx)
+	return SendPlan{
+		WalletName:     wallet.Name,
+		ToAddress:      toAddress,
+		Amount:         amount,
+		Fee:            fee,
+		Change:         change,
+		InputTotal:     inputTotal,
+		Inputs:         inputs,
+		ChangeAddress:  changeAddr,
+		Transaction:    tx,
+		TransactionID:  txid,
+		TransactionHex: hex.EncodeToString(tx.Encode()),
+	}, nil
+}
+
+func walletOwnedOutputs(wallet Wallet, tx types.Transaction) []PendingOutput {
+	addressByKeyHash := make(map[[32]byte]Address, len(wallet.Addresses))
+	for _, addr := range wallet.Addresses {
+		addressByKeyHash[mustParseKeyHash(addr.KeyHashHex)] = addr
+	}
+	out := make([]PendingOutput, 0)
+	for vout, output := range tx.Base.Outputs {
+		addr, ok := addressByKeyHash[output.KeyHash]
+		if !ok {
+			continue
+		}
+		out = append(out, PendingOutput{
+			Vout:       uint32(vout),
+			Value:      output.ValueAtoms,
+			Address:    addr.Address,
+			KeyHashHex: addr.KeyHashHex,
+			Change:     addr.Change,
+		})
+	}
+	return out
 }
 
 func mustParseKeyHash(raw string) [32]byte {

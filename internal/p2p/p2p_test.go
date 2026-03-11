@@ -177,6 +177,68 @@ func TestConnTxReconRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConnAvalanchePollVoteRoundTrip(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	sender := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
+	receiver := NewConn(right, MagicForProfile(types.Regtest), 1<<20)
+	poll := AvaPollMessage{
+		PollID: 42,
+		Items: []types.OutPoint{
+			{TxID: [32]byte{1}, Vout: 3},
+			{TxID: [32]byte{2}, Vout: 7},
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sender.WriteMessage(poll)
+	}()
+
+	received, err := receiver.ReadMessage()
+	if err != nil {
+		t.Fatalf("read poll: %v", err)
+	}
+	gotPoll, ok := received.(AvaPollMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want AvaPollMessage", received)
+	}
+	if gotPoll.PollID != poll.PollID || len(gotPoll.Items) != 2 || gotPoll.Items[1].Vout != 7 {
+		t.Fatalf("unexpected poll payload: %+v", gotPoll)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("write poll: %v", err)
+	}
+
+	vote := AvaVoteMessage{
+		PollID: 42,
+		Votes: []AvaVote{
+			{HasOpinion: true, TxID: [32]byte{9}},
+			{HasOpinion: false},
+		},
+	}
+	go func() {
+		done <- sender.WriteMessage(vote)
+	}()
+
+	received, err = receiver.ReadMessage()
+	if err != nil {
+		t.Fatalf("read vote: %v", err)
+	}
+	gotVote, ok := received.(AvaVoteMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want AvaVoteMessage", received)
+	}
+	if gotVote.PollID != vote.PollID || len(gotVote.Votes) != 2 || !gotVote.Votes[0].HasOpinion || gotVote.Votes[0].TxID != ([32]byte{9}) || gotVote.Votes[1].HasOpinion {
+		t.Fatalf("unexpected vote payload: %+v", gotVote)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("write vote: %v", err)
+	}
+}
+
 func TestConnXThinRoundTrip(t *testing.T) {
 	left, right := net.Pipe()
 	defer left.Close()

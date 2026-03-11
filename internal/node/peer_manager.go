@@ -26,6 +26,9 @@ const (
 	autoPeerFailureCeiling  = 3
 	controlQueueBurstLimit  = 8
 	priorityQueueBurstLimit = 4
+	sendQueueBurstLimit     = 1
+	inboundProtectionWindow = 45 * time.Second
+	outboundReplacementGap  = 250.0
 )
 
 type outboundAddrCandidate struct {
@@ -33,6 +36,50 @@ type outboundAddrCandidate struct {
 	record   storage.KnownPeerRecord
 	netgroup string
 	score    float64
+}
+
+type peerProtectionClass string
+
+const (
+	peerProtectionNone              peerProtectionClass = ""
+	peerProtectionManual            peerProtectionClass = "manual"
+	peerProtectionPreferredDownload peerProtectionClass = "preferred_download"
+	peerProtectionRecentlyUseful    peerProtectionClass = "recently_useful"
+)
+
+type peerUsefulnessClass string
+
+const (
+	peerUsefulnessLowValue          peerUsefulnessClass = "low_value"
+	peerUsefulnessCatchUp           peerUsefulnessClass = "catch_up"
+	peerUsefulnessFullRelay         peerUsefulnessClass = "full_relay"
+	peerUsefulnessPreferredDownload peerUsefulnessClass = "preferred_download"
+	peerUsefulnessManual            peerUsefulnessClass = "manual"
+	peerUsefulnessInactiveTarget    peerUsefulnessClass = "inactive_target"
+)
+
+type peerRetentionState struct {
+	Score             float64
+	Protected         bool
+	Manual            bool
+	PreferredDownload bool
+	ProtectionClass   peerProtectionClass
+	UsefulnessClass   peerUsefulnessClass
+	LastUsefulUnix    int64
+	LastRelayActivity int64
+	HeaderStalls      int
+	BlockStalls       int
+	TxStalls          int
+	PendingLocalRelay int
+	SessionAgeSeconds int64
+}
+
+type outboundReservation struct {
+	snapshot     map[string]storage.KnownPeerRecord
+	evictedPeer  *peerConn
+	evictedAddr  string
+	candidate    peerRetentionState
+	evictedState peerRetentionState
 }
 
 func (m *peerManager) acceptLoop() {
@@ -47,8 +94,7 @@ func (m *peerManager) acceptLoop() {
 				return
 			}
 		}
-		if !m.canAcceptInboundPeer() {
-			m.svc.logger.Warn("rejecting inbound peer: inbound limit reached", slog.String("addr", conn.RemoteAddr().String()))
+		if !m.ensureInboundCapacity(conn.RemoteAddr().String()) {
 			_ = conn.Close()
 			continue
 		}
@@ -58,6 +104,42 @@ func (m *peerManager) acceptLoop() {
 			m.handlePeer(conn, false, "")
 		}()
 	}
+}
+
+func (m *peerManager) ensureInboundCapacity(candidateAddr string) bool {
+	m.svc.peerMu.Lock()
+	if m.svc.cfg.MaxInboundPeers <= 0 {
+		m.svc.peerMu.Unlock()
+		return true
+	}
+	inbound := 0
+	for _, peer := range m.svc.peers {
+		if !peer.outbound {
+			inbound++
+		}
+	}
+	if inbound < m.svc.cfg.MaxInboundPeers {
+		m.svc.peerMu.Unlock()
+		return true
+	}
+	now := time.Now()
+	localHeaderHeight := m.svc.headerHeight()
+	preferred := m.svc.syncManager().preferredDownloadPeerAddrsLocked(now, localHeaderHeight)
+	victim, victimState := m.selectInboundEvictionTargetLocked(now, localHeaderHeight, preferred)
+	if victim == nil {
+		m.svc.peerMu.Unlock()
+		m.svc.logger.Warn("rejecting inbound peer: all inbound slots currently protected",
+			slog.String("candidate_addr", candidateAddr),
+			slog.Int("max_inbound", m.svc.cfg.MaxInboundPeers),
+			slog.Int("inbound_peers", inbound),
+		)
+		return false
+	}
+	delete(m.svc.peers, victim.addr)
+	m.svc.peerMu.Unlock()
+	m.logPeerEvictionDecision("evicting low-value inbound peer to admit candidate", candidateAddr, victim.addr, false, victimState, peerRetentionState{})
+	m.disconnectPeer(victim)
+	return true
 }
 
 func (m *peerManager) canAcceptInboundPeer() bool {
@@ -91,28 +173,17 @@ func (m *peerManager) connectPeer(addr string, manual bool) error {
 		)
 		return nil
 	}
-	m.svc.peerMu.Lock()
-	if _, ok := m.svc.outboundPeers[addr]; ok {
-		m.svc.peerMu.Unlock()
+	reservation, reserved, err := m.reserveOutboundTarget(addr, manual)
+	if err != nil {
+		return err
+	}
+	if !reserved {
 		return nil
 	}
-	if m.svc.cfg.MaxOutboundPeers > 0 && len(m.svc.outboundPeers) >= m.svc.cfg.MaxOutboundPeers {
-		m.svc.peerMu.Unlock()
-		return fmt.Errorf("outbound peer limit reached")
+	if reservation.evictedPeer != nil {
+		m.disconnectPeer(reservation.evictedPeer)
 	}
-	m.svc.outboundPeers[addr] = struct{}{}
-	record := m.svc.knownPeers[addr]
-	if manual {
-		record.Manual = true
-	}
-	if record.LastSeen.IsZero() {
-		record.LastSeen = time.Now().UTC()
-	}
-	m.svc.knownPeers[addr] = normalizeKnownPeerRecord(record)
-	trimKnownPeerMapLocked(m.svc.knownPeers)
-	snapshot := cloneKnownPeerMap(m.svc.knownPeers)
-	m.svc.peerMu.Unlock()
-	if err := m.svc.chainState.Store().WriteKnownPeers(snapshot); err != nil {
+	if err := m.svc.chainState.Store().WriteKnownPeers(reservation.snapshot); err != nil {
 		m.svc.logger.Warn("failed to persist peer address book",
 			slog.String("addr", addr),
 			slog.Any("error", err),
@@ -125,6 +196,62 @@ func (m *peerManager) connectPeer(addr string, manual bool) error {
 		m.maintainOutboundPeer(addr)
 	}()
 	return nil
+}
+
+func (m *peerManager) reserveOutboundTarget(addr string, manual bool) (outboundReservation, bool, error) {
+	now := time.Now().UTC()
+	m.svc.peerMu.Lock()
+	if _, ok := m.svc.outboundPeers[addr]; ok {
+		m.svc.peerMu.Unlock()
+		return outboundReservation{}, false, nil
+	}
+	reservation := outboundReservation{}
+	if m.svc.cfg.MaxOutboundPeers > 0 && len(m.svc.outboundPeers) >= m.svc.cfg.MaxOutboundPeers {
+		localHeaderHeight := m.svc.headerHeight()
+		preferred := m.svc.syncManager().preferredDownloadPeerAddrsLocked(now, localHeaderHeight)
+		candidate := m.outboundCandidateStateLocked(addr, manual, now)
+		victimAddr, victimPeer, victimState, ok := m.selectOutboundEvictionTargetLocked(addr, candidate, now, localHeaderHeight, preferred)
+		if !ok {
+			m.svc.peerMu.Unlock()
+			log := m.svc.logger.Debug
+			if manual {
+				log = m.svc.logger.Warn
+			}
+			log("refusing outbound candidate: all outbound slots are protected or higher value",
+				slog.String("candidate_addr", addr),
+				slog.Bool("candidate_manual", candidate.Manual),
+				slog.String("candidate_usefulness", string(candidate.UsefulnessClass)),
+				slog.Float64("candidate_score", candidate.Score),
+				slog.Int("outbound_targets", len(m.svc.outboundPeers)),
+				slog.Int("max_outbound", m.svc.cfg.MaxOutboundPeers),
+			)
+			return outboundReservation{}, false, fmt.Errorf("outbound peer limit reached")
+		}
+		delete(m.svc.outboundPeers, victimAddr)
+		if victimPeer != nil {
+			delete(m.svc.peers, victimAddr)
+		}
+		reservation.evictedPeer = victimPeer
+		reservation.evictedAddr = victimAddr
+		reservation.candidate = candidate
+		reservation.evictedState = victimState
+	}
+	m.svc.outboundPeers[addr] = struct{}{}
+	record := m.svc.knownPeers[addr]
+	if manual {
+		record.Manual = true
+	}
+	if record.LastSeen.IsZero() {
+		record.LastSeen = now
+	}
+	m.svc.knownPeers[addr] = normalizeKnownPeerRecord(record)
+	trimKnownPeerMapLocked(m.svc.knownPeers)
+	reservation.snapshot = cloneKnownPeerMap(m.svc.knownPeers)
+	m.svc.peerMu.Unlock()
+	if reservation.evictedAddr != "" {
+		m.logPeerEvictionDecision("evicting lower-value outbound target to make room for candidate", addr, reservation.evictedAddr, true, reservation.evictedState, reservation.candidate)
+	}
+	return reservation, true, nil
 }
 
 func (m *peerManager) outboundPeerCount() int {
@@ -339,55 +466,35 @@ func (m *peerManager) peerPingLoop(peer *peerConn) {
 }
 
 func (m *peerManager) peerWriteLoop(peer *peerConn) {
-	controlBurst := 0
-	priorityBurst := 0
 	for {
-		if drained, stop := m.drainPeerQueue(peer, peer.controlQ, 1); stop {
+		// Drain in strict priority order with bounded bursts so tx fanout cannot
+		// indefinitely starve control traffic or block-relay announcements.
+		if drained, stop := m.drainPeerQueue(peer, peer.controlQ, controlQueueBurstLimit); stop {
 			return
-		} else if controlBurst < controlQueueBurstLimit && drained {
-			controlBurst++
-			priorityBurst = 0
+		} else if drained > 0 {
 			continue
 		}
-		if drained, stop := m.drainPeerQueue(peer, peer.relayPriorityQ, 1); stop {
+		if drained, stop := m.drainPeerQueue(peer, peer.relayPriorityQ, priorityQueueBurstLimit); stop {
 			return
-		} else if priorityBurst < priorityQueueBurstLimit && drained {
-			priorityBurst++
-			controlBurst = 0
+		} else if drained > 0 {
 			continue
 		}
-		controlBurst = 0
-		priorityBurst = 0
-
-		controlQ := peer.controlQ
-		relayPriorityQ := peer.relayPriorityQ
-		sendQ := peer.sendQ
-		select {
-		case <-m.svc.stopCh:
+		if drained, stop := m.drainPeerQueue(peer, peer.sendQ, sendQueueBurstLimit); stop {
 			return
-		case <-peer.closed:
+		} else if drained > 0 {
+			continue
+		}
+		if !m.waitAndWriteNextPeerEnvelope(peer) {
 			return
-		case envelope := <-controlQ:
-			if !m.svc.writePeerEnvelope(peer, envelope) {
-				return
-			}
-		case envelope := <-relayPriorityQ:
-			if !m.svc.writePeerEnvelope(peer, envelope) {
-				return
-			}
-		case envelope := <-sendQ:
-			if !m.svc.writePeerEnvelope(peer, envelope) {
-				return
-			}
 		}
 	}
 }
 
-func (m *peerManager) drainPeerQueue(peer *peerConn, q chan outboundMessage, limit int) (bool, bool) {
+func (m *peerManager) drainPeerQueue(peer *peerConn, q chan outboundMessage, limit int) (int, bool) {
 	if q == nil || limit <= 0 {
-		return false, false
+		return 0, false
 	}
-	drained := false
+	drained := 0
 	for i := 0; i < limit; i++ {
 		select {
 		case <-m.svc.stopCh:
@@ -395,7 +502,7 @@ func (m *peerManager) drainPeerQueue(peer *peerConn, q chan outboundMessage, lim
 		case <-peer.closed:
 			return drained, true
 		case envelope := <-q:
-			drained = true
+			drained++
 			if !m.svc.writePeerEnvelope(peer, envelope) {
 				return drained, true
 			}
@@ -404,6 +511,42 @@ func (m *peerManager) drainPeerQueue(peer *peerConn, q chan outboundMessage, lim
 		}
 	}
 	return drained, false
+}
+
+func (m *peerManager) waitAndWriteNextPeerEnvelope(peer *peerConn) bool {
+	if envelope, ok := m.tryDequeuePeerEnvelope(peer.controlQ); ok {
+		return m.svc.writePeerEnvelope(peer, envelope)
+	}
+	if envelope, ok := m.tryDequeuePeerEnvelope(peer.relayPriorityQ); ok {
+		return m.svc.writePeerEnvelope(peer, envelope)
+	}
+	if envelope, ok := m.tryDequeuePeerEnvelope(peer.sendQ); ok {
+		return m.svc.writePeerEnvelope(peer, envelope)
+	}
+	select {
+	case <-m.svc.stopCh:
+		return false
+	case <-peer.closed:
+		return false
+	case envelope := <-peer.controlQ:
+		return m.svc.writePeerEnvelope(peer, envelope)
+	case envelope := <-peer.relayPriorityQ:
+		return m.svc.writePeerEnvelope(peer, envelope)
+	case envelope := <-peer.sendQ:
+		return m.svc.writePeerEnvelope(peer, envelope)
+	}
+}
+
+func (m *peerManager) tryDequeuePeerEnvelope(q chan outboundMessage) (outboundMessage, bool) {
+	if q == nil {
+		return outboundMessage{}, false
+	}
+	select {
+	case envelope := <-q:
+		return envelope, true
+	default:
+		return outboundMessage{}, false
+	}
 }
 
 func (m *peerManager) outboundRefillLoop() {
@@ -425,11 +568,23 @@ func (m *peerManager) refillOutboundPeers() {
 	}
 	need := m.svc.cfg.MaxOutboundPeers - m.outboundPeerCount()
 	if need <= 0 {
+		m.rebalanceOutboundPeers()
 		return
 	}
 	for _, addr := range m.outboundRefillCandidates(need) {
 		if err := m.connectPeer(addr, false); err != nil {
 			m.svc.logger.Debug("outbound refill skipped candidate",
+				slog.String("addr", addr),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
+
+func (m *peerManager) rebalanceOutboundPeers() {
+	for _, addr := range m.outboundRefillCandidates(1) {
+		if err := m.connectPeer(addr, false); err != nil {
+			m.svc.logger.Debug("outbound rebalance skipped candidate",
 				slog.String("addr", addr),
 				slog.Any("error", err),
 			)
@@ -530,13 +685,25 @@ func (m *peerManager) PeerInfo() []PeerInfo {
 	for _, peer := range m.svc.peers {
 		stats := peer.syncSnapshot()
 		relay := peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepths(), peer.pendingLocalRelayCount())
+		ava := peer.avalancheSnapshot()
+		avaSupported := peer.supportsAvalancheOverlay()
+		avaWeight := uint64(0)
+		if avaSupported && m.svc.avalancheManager().enabled() {
+			avaWeight = 1
+		}
+		retention := m.peerRetentionStateLocked(peer, now, localHeaderHeight, preferred)
 		out = append(out, PeerInfo{
 			Addr:                  peer.addr,
 			Outbound:              peer.outbound,
+			Manual:                retention.Manual,
 			Height:                peer.snapshotHeight(),
 			UserAgent:             peer.version.UserAgent,
 			LastProgress:          peer.snapshotProgressUnix(),
 			LastUseful:            stats.lastUsefulUnix(),
+			Protected:             retention.Protected,
+			ProtectedClass:        string(retention.ProtectionClass),
+			UsefulnessClass:       string(retention.UsefulnessClass),
+			UsefulnessScore:       int(retention.Score),
 			PreferredDownload:     preferred[peer.addr],
 			DownloadScore:         stats.downloadScore(now, localHeaderHeight),
 			HeaderStalls:          stats.HeaderStalls,
@@ -553,12 +720,252 @@ func (m *peerManager) PeerInfo() []PeerInfo {
 			TxNotFoundReceived:    relay.TxNotFoundReceived,
 			KnownTxClears:         relay.KnownTxClears,
 			WriterStarvation:      relay.WriterStarvationEvents,
+			AvalancheSupported:    avaSupported,
+			AvalancheWeight:       avaWeight,
+			AvalanchePollsSent:    ava.pollsSent,
+			AvalanchePollsRecv:    ava.pollsReceived,
+			AvalancheVotesSent:    ava.votesSent,
+			AvalancheVotesRecv:    ava.votesReceived,
 		})
 	}
 	slices.SortFunc(out, func(a, b PeerInfo) int {
 		return strings.Compare(a.Addr, b.Addr)
 	})
 	return out
+}
+
+func (m *peerManager) selectInboundEvictionTargetLocked(now time.Time, localHeaderHeight uint64, preferred map[string]bool) (*peerConn, peerRetentionState) {
+	var victim *peerConn
+	var victimState peerRetentionState
+	for _, peer := range m.svc.peers {
+		if peer.outbound {
+			continue
+		}
+		state := m.peerRetentionStateLocked(peer, now, localHeaderHeight, preferred)
+		if state.Protected || state.UsefulnessClass != peerUsefulnessLowValue {
+			continue
+		}
+		if victim == nil || m.peerStateLessUseful(state, victimState, peer.addr, victim.addr) {
+			victim = peer
+			victimState = state
+		}
+	}
+	return victim, victimState
+}
+
+func (m *peerManager) selectOutboundEvictionTargetLocked(candidateAddr string, candidate peerRetentionState, now time.Time, localHeaderHeight uint64, preferred map[string]bool) (string, *peerConn, peerRetentionState, bool) {
+	var victimPeer *peerConn
+	var victimAddr string
+	var victimState peerRetentionState
+	for addr := range m.svc.outboundPeers {
+		if addr == candidateAddr {
+			continue
+		}
+		record := m.svc.knownPeers[addr]
+		if record.Manual {
+			continue
+		}
+		peer, active := m.svc.peers[addr]
+		if active && !peer.outbound {
+			continue
+		}
+		var state peerRetentionState
+		if active {
+			state = m.peerRetentionStateLocked(peer, now, localHeaderHeight, preferred)
+			if state.Protected {
+				continue
+			}
+			if !candidate.Manual && state.UsefulnessClass != peerUsefulnessLowValue {
+				continue
+			}
+		} else {
+			state = m.inactiveOutboundTargetStateLocked(record, now)
+			if state.Protected {
+				continue
+			}
+		}
+		if !candidate.Manual && candidate.Score <= state.Score+outboundReplacementGap {
+			continue
+		}
+		if victimAddr == "" || m.peerStateLessUseful(state, victimState, addr, victimAddr) {
+			victimAddr = addr
+			victimPeer = peer
+			victimState = state
+		}
+	}
+	return victimAddr, victimPeer, victimState, victimAddr != ""
+}
+
+func (m *peerManager) peerRetentionStateLocked(peer *peerConn, now time.Time, localHeaderHeight uint64, preferred map[string]bool) peerRetentionState {
+	stats := peer.syncSnapshot()
+	relay := peer.telemetry.snapshot(peer.addr, peer.outbound, peer.queueDepths(), peer.pendingLocalRelayCount())
+	var lastRelayAt time.Time
+	if relay.LastRelayActivityUnix > 0 {
+		lastRelayAt = time.Unix(relay.LastRelayActivityUnix, 0)
+	}
+	var lastUsefulAt time.Time
+	if stats.lastUsefulUnix() > 0 {
+		lastUsefulAt = time.Unix(stats.lastUsefulUnix(), 0)
+	}
+	record := m.svc.knownPeers[peer.addr]
+	if peer.targetAddr != "" {
+		if targetRecord, ok := m.svc.knownPeers[peer.targetAddr]; ok {
+			record = targetRecord
+		}
+	}
+	state := peerRetentionState{
+		Score:             float64(m.svc.syncManager().downloadPeerScore(peer, now, localHeaderHeight)),
+		Manual:            record.Manual,
+		PreferredDownload: preferred[peer.addr],
+		LastUsefulUnix:    stats.lastUsefulUnix(),
+		LastRelayActivity: relay.LastRelayActivityUnix,
+		HeaderStalls:      stats.HeaderStalls,
+		BlockStalls:       stats.BlockStalls,
+		TxStalls:          stats.TxStalls,
+		PendingLocalRelay: relay.PendingLocalRelayTxs,
+		SessionAgeSeconds: int64(now.Sub(peer.connectedAt).Seconds()),
+	}
+	if state.Manual {
+		state.Protected = true
+		state.ProtectionClass = peerProtectionManual
+		state.UsefulnessClass = peerUsefulnessManual
+		state.Score += 1_000_000
+		return state
+	}
+	preferredUseful := state.PreferredDownload && (stats.UsefulBlocks > 0 || stats.UsefulHeaders > 0 || stats.UsefulTxs > 0 || peer.snapshotHeight() > localHeaderHeight || stats.lastUsefulUnix() > 0)
+	if preferredUseful {
+		state.Protected = true
+		state.ProtectionClass = peerProtectionPreferredDownload
+		state.UsefulnessClass = peerUsefulnessPreferredDownload
+		state.Score += 50_000
+	}
+	if !lastUsefulAt.IsZero() {
+		switch age := now.Sub(lastUsefulAt); {
+		case age <= 15*time.Second:
+			state.Score += 5_000
+		case age <= time.Minute:
+			state.Score += 1_500
+		case age <= 5*time.Minute:
+			state.Score += 300
+		}
+	}
+	if relay.LastRelayActivityUnix > 0 {
+		switch age := now.Sub(lastRelayAt); {
+		case age <= 15*time.Second:
+			state.Score += 1_200
+		case age <= time.Minute:
+			state.Score += 400
+		}
+	}
+	if !peer.canServeDownloads(now) {
+		state.Score -= 750
+	}
+	if relay.WriterStarvationEvents > 0 {
+		state.Score -= float64(relay.WriterStarvationEvents * 100)
+	}
+	if !state.Protected && (!lastUsefulAt.IsZero() && now.Sub(lastUsefulAt) <= inboundProtectionWindow || relay.LastRelayActivityUnix > 0 && now.Sub(lastRelayAt) <= inboundProtectionWindow) {
+		state.Protected = true
+		state.ProtectionClass = peerProtectionRecentlyUseful
+		state.Score += 10_000
+	}
+	switch {
+	case state.UsefulnessClass != "":
+	case stats.UsefulBlocks > 0 || stats.UsefulHeaders > 0 || stats.UsefulTxs > 0 || relay.LastRelayActivityUnix > 0:
+		state.UsefulnessClass = peerUsefulnessFullRelay
+	case state.Score <= 0 || (state.SessionAgeSeconds >= 60 && stats.lastUsefulUnix() == 0 && relay.LastRelayActivityUnix == 0):
+		state.UsefulnessClass = peerUsefulnessLowValue
+	default:
+		state.UsefulnessClass = peerUsefulnessCatchUp
+	}
+	if !state.Protected && state.UsefulnessClass == peerUsefulnessFullRelay && !lastUsefulAt.IsZero() && now.Sub(lastUsefulAt) <= inboundProtectionWindow {
+		state.Protected = true
+		state.ProtectionClass = peerProtectionRecentlyUseful
+		state.Score += 10_000
+	}
+	return state
+}
+
+func (m *peerManager) outboundCandidateStateLocked(addr string, manual bool, now time.Time) peerRetentionState {
+	record := m.svc.knownPeers[addr]
+	if manual {
+		record.Manual = true
+	}
+	state := peerRetentionState{
+		Score:           scoreKnownPeer(record, now),
+		Manual:          record.Manual,
+		UsefulnessClass: peerUsefulnessInactiveTarget,
+	}
+	if state.Manual {
+		state.Protected = true
+		state.ProtectionClass = peerProtectionManual
+		state.UsefulnessClass = peerUsefulnessManual
+	}
+	return state
+}
+
+func (m *peerManager) inactiveOutboundTargetStateLocked(record storage.KnownPeerRecord, now time.Time) peerRetentionState {
+	state := peerRetentionState{
+		Score:           scoreKnownPeer(record, now),
+		Manual:          record.Manual,
+		UsefulnessClass: peerUsefulnessInactiveTarget,
+	}
+	if state.Manual {
+		state.Protected = true
+		state.ProtectionClass = peerProtectionManual
+		state.UsefulnessClass = peerUsefulnessManual
+		return state
+	}
+	if state.Score <= 0 {
+		state.UsefulnessClass = peerUsefulnessLowValue
+	}
+	return state
+}
+
+func (m *peerManager) peerStateLessUseful(left peerRetentionState, right peerRetentionState, leftAddr string, rightAddr string) bool {
+	if left.Score != right.Score {
+		return left.Score < right.Score
+	}
+	if left.SessionAgeSeconds != right.SessionAgeSeconds {
+		return left.SessionAgeSeconds > right.SessionAgeSeconds
+	}
+	return comparePeerAddrs(leftAddr, rightAddr) < 0
+}
+
+func (m *peerManager) disconnectPeer(peer *peerConn) {
+	if peer == nil {
+		return
+	}
+	m.svc.releasePeerBlockRequests(peer.addr)
+	m.svc.releasePeerTxRequests(peer.addr)
+	peer.close()
+	if peer.wire != nil {
+		_ = peer.wire.Close()
+	}
+}
+
+func (m *peerManager) logPeerEvictionDecision(msg string, candidateAddr string, evictedAddr string, outbound bool, evicted peerRetentionState, candidate peerRetentionState) {
+	attrs := []any{
+		slog.String("candidate_addr", candidateAddr),
+		slog.String("evicted_addr", evictedAddr),
+		slog.Bool("outbound", outbound),
+		slog.String("evicted_usefulness", string(evicted.UsefulnessClass)),
+		slog.String("evicted_protected_class", string(evicted.ProtectionClass)),
+		slog.Float64("evicted_score", evicted.Score),
+		slog.Int("evicted_header_stalls", evicted.HeaderStalls),
+		slog.Int("evicted_block_stalls", evicted.BlockStalls),
+		slog.Int("evicted_tx_stalls", evicted.TxStalls),
+		slog.Int64("evicted_last_useful_unix", evicted.LastUsefulUnix),
+		slog.Int64("evicted_last_relay_activity_unix", evicted.LastRelayActivity),
+		slog.Int64("evicted_session_age_seconds", evicted.SessionAgeSeconds),
+	}
+	if candidateAddr != "" {
+		attrs = append(attrs,
+			slog.Bool("candidate_manual", candidate.Manual),
+			slog.String("candidate_usefulness", string(candidate.UsefulnessClass)),
+			slog.Float64("candidate_score", candidate.Score),
+		)
+	}
+	m.svc.logger.Info(msg, attrs...)
 }
 
 func (m *peerManager) peerByAddr(addr string) *peerConn {

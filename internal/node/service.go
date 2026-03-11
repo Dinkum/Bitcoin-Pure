@@ -43,6 +43,8 @@ import (
 const (
 	localOriginRebroadcastInterval = 30 * time.Second
 	maxPendingPeerBlocks           = 512
+	erlayReconcileInterval         = 5 * time.Second
+	erlayReconcileBatchLimit       = 256
 )
 
 var ErrBlockHeaderNotIndexed = errors.New("block header not indexed")
@@ -71,6 +73,12 @@ type ServiceConfig struct {
 	MaxAncestors              int
 	MaxDescendants            int
 	MaxOrphans                int
+	AvalancheMode             string
+	AvalancheKSample          int
+	AvalancheAlphaNumerator   int
+	AvalancheAlphaDenominator int
+	AvalancheBeta             int
+	AvalanchePollInterval     time.Duration
 	MinerEnabled              bool
 	MinerWorkers              int
 	MinerKeyHash              [32]byte
@@ -78,18 +86,19 @@ type ServiceConfig struct {
 }
 
 type ServiceInfo struct {
-	Profile        string   `json:"profile"`
-	TipHeight      uint64   `json:"tip_height"`
-	HeaderHeight   uint64   `json:"header_height"`
-	TipHeaderHash  string   `json:"tip_header_hash"`
-	UTXORoot       string   `json:"utxo_root"`
-	MempoolSize    int      `json:"mempool_size"`
-	RPCAddr        string   `json:"rpc_addr"`
-	P2PAddr        string   `json:"p2p_addr"`
-	Peers          []string `json:"peers"`
-	MinerEnabled   bool     `json:"miner_enabled"`
-	MinerWorkers   int      `json:"miner_workers"`
-	GenesisFixture string   `json:"genesis_fixture"`
+	Profile        string        `json:"profile"`
+	TipHeight      uint64        `json:"tip_height"`
+	HeaderHeight   uint64        `json:"header_height"`
+	TipHeaderHash  string        `json:"tip_header_hash"`
+	UTXORoot       string        `json:"utxo_root"`
+	MempoolSize    int           `json:"mempool_size"`
+	RPCAddr        string        `json:"rpc_addr"`
+	P2PAddr        string        `json:"p2p_addr"`
+	Peers          []string      `json:"peers"`
+	Avalanche      AvalancheInfo `json:"avalanche"`
+	MinerEnabled   bool          `json:"miner_enabled"`
+	MinerWorkers   int           `json:"miner_workers"`
+	GenesisFixture string        `json:"genesis_fixture"`
 }
 
 type ChainStateInfo struct {
@@ -114,6 +123,8 @@ type MempoolInfo struct {
 	HighFee            uint64 `json:"high_fee"`
 	MinRelayFeePerByte uint64 `json:"min_relay_fee_per_byte"`
 	CandidateFrontier  int    `json:"candidate_frontier"`
+	AvalancheConflicts int    `json:"avalanche_conflicts"`
+	AvalancheFinalized int    `json:"avalanche_finalized"`
 }
 
 type MiningInfo struct {
@@ -184,6 +195,12 @@ type PeerRelayStats struct {
 	DroppedInv             int     `json:"dropped_inv_items"`
 	DroppedTxs             int     `json:"dropped_tx_items"`
 	WriterStarvationEvents int     `json:"writer_starvation_events"`
+	DroppedPriorityInv     int     `json:"dropped_priority_inv_items,omitempty"`
+	DroppedSendInv         int     `json:"dropped_send_inv_items,omitempty"`
+	DroppedSendTxs         int     `json:"dropped_send_tx_items,omitempty"`
+	ControlStarvation      int     `json:"control_starvation_events,omitempty"`
+	PriorityStarvation     int     `json:"priority_starvation_events,omitempty"`
+	SendStarvation         int     `json:"send_starvation_events,omitempty"`
 	LastRelayActivityUnix  int64   `json:"last_relay_activity_unix,omitempty"`
 	RelayEvents            int     `json:"relay_events"`
 	RelayAvgMS             float64 `json:"relay_avg_ms,omitempty"`
@@ -231,6 +248,7 @@ type Service struct {
 	syncMgr          *syncManager
 	relaySched       *relayScheduler
 	minerMgr         *minerManager
+	avaMgr           *avalancheManager
 	mineHeaderFn     func(types.BlockHeader, consensus.ChainParams, func(uint32) bool) (types.BlockHeader, bool, error)
 	nodeID           string
 	dashboard        dashboardCache
@@ -280,9 +298,35 @@ type peerConn struct {
 	localRelayTxs   map[[32]byte]localRelayFallbackState
 	thinMu          sync.Mutex
 	pendingThin     map[[32]byte]*pendingThinBlock
+	blockRelayMu    sync.Mutex
+	blockRelay      peerBlockRelayState
+	erlayMu         sync.Mutex
+	erlayState      peerErlayState
 	telemetry       peerRelayTelemetry
 	syncMu          sync.Mutex
 	syncState       peerSyncState
+	avaMu           sync.Mutex
+	avaState        peerAvalancheState
+}
+
+type peerAvalancheState struct {
+	pollsSent     int
+	pollsReceived int
+	votesSent     int
+	votesReceived int
+}
+
+type peerBlockRelayState struct {
+	pendingExtendedRecovery map[[32]byte]struct{}
+}
+
+type peerErlayState struct {
+	roundsStarted int
+	roundsHit     int
+	cursor        int
+	lastRoundAt   time.Time
+	lastSetSize   int
+	lastMissing   int
 }
 
 type peerSyncState struct {
@@ -313,6 +357,19 @@ const (
 	relayQueueLaneSend
 )
 
+func (l relayQueueLane) String() string {
+	switch l {
+	case relayQueueLaneControl:
+		return "control"
+	case relayQueueLanePriority:
+		return "priority"
+	case relayQueueLaneSend:
+		return "send"
+	default:
+		return "unknown"
+	}
+}
+
 type relayMessageClass struct {
 	txInvItems           int
 	blockInvItems        int
@@ -326,6 +383,23 @@ type relayMessageClass struct {
 	txReconItems         int
 	txReqMsgs            int
 	txReqItems           int
+}
+
+func (c relayMessageClass) logAttrs() []slog.Attr {
+	return []slog.Attr{
+		slog.Int("tx_inv_items", c.txInvItems),
+		slog.Int("block_inv_items", c.blockInvItems),
+		slog.Int("block_send_items", c.blockSendItems),
+		slog.Int("block_request_items", c.blockReqItems),
+		slog.Int("tx_batch_messages", c.txBatchMsgs),
+		slog.Int("tx_batch_items", c.txBatchItems),
+		slog.Int("tx_recon_messages", c.txReconMsgs),
+		slog.Int("tx_recon_items", c.txReconItems),
+		slog.Int("tx_request_messages", c.txReqMsgs),
+		slog.Int("tx_request_items", c.txReqItems),
+		slog.Int("fallback_tx_batch_messages", c.fallbackTxBatchMsgs),
+		slog.Int("fallback_tx_batch_items", c.fallbackTxBatchItems),
+	}
 }
 
 type peerRelayTelemetry struct {
@@ -361,6 +435,12 @@ type peerRelayTelemetry struct {
 	droppedInv            int
 	droppedTxs            int
 	writerStarvation      int
+	droppedPriorityInv    int
+	droppedSendInv        int
+	droppedSendTxs        int
+	controlStarvation     int
+	priorityStarvation    int
+	sendStarvation        int
 	lastRelayActivityUnix int64
 	relaySamples          []float64
 }
@@ -374,6 +454,21 @@ type queueDepthSnapshot struct {
 
 type localRelayFallbackState struct {
 	announcedAt time.Time
+}
+
+type blockRelayPlan uint8
+
+const (
+	blockRelayPlanFull blockRelayPlan = iota + 1
+	blockRelayPlanGrapheneP1
+	blockRelayPlanGrapheneExtended
+)
+
+type blockOverlapEstimate struct {
+	KnownTxs   int
+	MissingTxs int
+	TotalTxs   int
+	HitRate    float64
 }
 
 type blockDownloadRequest struct {
@@ -777,6 +872,24 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	if cfg.MaxOrphans <= 0 {
 		cfg.MaxOrphans = 128
 	}
+	if cfg.AvalancheMode == "" {
+		cfg.AvalancheMode = "on"
+	}
+	if cfg.AvalancheKSample <= 0 {
+		cfg.AvalancheKSample = 16
+	}
+	if cfg.AvalancheAlphaNumerator <= 0 {
+		cfg.AvalancheAlphaNumerator = 3
+	}
+	if cfg.AvalancheAlphaDenominator <= 0 {
+		cfg.AvalancheAlphaDenominator = 4
+	}
+	if cfg.AvalancheBeta <= 0 {
+		cfg.AvalancheBeta = 15
+	}
+	if cfg.AvalanchePollInterval <= 0 {
+		cfg.AvalanchePollInterval = 200 * time.Millisecond
+	}
 	if cfg.MinerEnabled && cfg.MinerWorkers <= 0 {
 		cfg.MinerWorkers = defaultMinerWorkers()
 	}
@@ -879,6 +992,7 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	svc.syncMgr = &syncManager{svc: svc}
 	svc.relaySched = &relayScheduler{svc: svc}
 	svc.minerMgr = &minerManager{svc: svc}
+	svc.avaMgr = newAvalancheManager(svc)
 	svc.rememberKnownPeers(cfg.Peers)
 	if persistedPeers, err := chainState.Store().LoadKnownPeers(); err != nil {
 		chainState.Close()
@@ -890,6 +1004,7 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 		svc.cacheRecentHeader(genesis.Header)
 		svc.cacheRecentBlock(*genesis)
 	}
+	svc.avalancheManager().logConfig()
 	return svc, nil
 }
 
@@ -1000,6 +1115,18 @@ func (s *Service) Start(ctx context.Context) error {
 			defer s.wg.Done()
 			s.localRebroadcastLoop()
 		}()
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.erlayReconcileLoop()
+		}()
+		if s.avalancheManager().enabled() {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.avalancheManager().pollLoop()
+			}()
+		}
 	}
 	if s.cfg.MinerEnabled {
 		s.logger.Info("continuous miner enabled", slog.Int("workers", s.cfg.MinerWorkers))
@@ -1041,6 +1168,13 @@ func (s *Service) relayManager() *relayScheduler {
 	return s.relaySched
 }
 
+func (s *Service) avalancheManager() *avalancheManager {
+	if s.avaMgr == nil {
+		s.avaMgr = newAvalancheManager(s)
+	}
+	return s.avaMgr
+}
+
 func (s *Service) minerManager() *minerManager {
 	if s.minerMgr == nil {
 		s.minerMgr = &minerManager{svc: s}
@@ -1078,6 +1212,12 @@ func (p *peerConn) send(msg p2p.Message) error {
 	return p.enqueueDirectMessage(envelope)
 }
 
+const (
+	relaySuppressionLogThreshold = 8
+	relayDropWarnThreshold       = 16
+	relayQueueWarnDepth          = 384
+)
+
 func (p *peerConn) enqueueDirectMessage(envelope outboundMessage) error {
 	timer := time.NewTimer(controlMessageEnqueueTimeout)
 	defer timer.Stop()
@@ -1095,9 +1235,10 @@ func (p *peerConn) enqueueDirectMessage(envelope outboundMessage) error {
 		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	case <-timer.C:
-		p.telemetry.noteWriterStarvation()
+		p.telemetry.noteWriterStarvation(relayQueueLaneControl)
 		if p.svc != nil {
 			p.svc.noteWriterStarvation(1)
+			p.logRelayQueuePressure(slog.LevelWarn, "control queue enqueue timed out", relayQueueLaneControl, envelope.class, 1)
 		}
 		return errors.New("peer send queue saturated")
 	}
@@ -1171,7 +1312,14 @@ func (p *peerConn) enqueueInvItems(items []p2p.InvVector, priority bool) error {
 		return nil
 	default:
 		p.releaseQueuedInv(items)
-		p.telemetry.noteDroppedInv(len(items))
+		p.telemetry.noteDroppedInv(len(items), envelope.lane)
+		if priority || len(items) >= relayDropWarnThreshold || p.queueDepths().total >= relayQueueWarnDepth {
+			level := slog.LevelWarn
+			if !priority {
+				level = slog.LevelDebug
+			}
+			p.logRelayQueuePressure(level, "dropped relay inv due to saturated queue", envelope.lane, envelope.class, len(items))
+		}
 		return nil
 	}
 }
@@ -1226,7 +1374,10 @@ func (p *peerConn) enqueueFallbackTxBatch(msg p2p.TxBatchMessage) error {
 		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	default:
-		p.telemetry.noteDroppedTxs(len(msg.Txs))
+		p.telemetry.noteDroppedTxs(len(msg.Txs), envelope.lane)
+		if len(msg.Txs) >= relayDropWarnThreshold || p.queueDepths().send >= relayQueueWarnDepth {
+			p.logRelayQueuePressure(slog.LevelWarn, "dropped fallback tx batch due to saturated send queue", envelope.lane, envelope.class, len(msg.Txs))
+		}
 		return nil
 	}
 }
@@ -1299,6 +1450,42 @@ func (p *peerConn) queueDepths() queueDepthSnapshot {
 	return depths
 }
 
+func (p *peerConn) logRelayQueuePressure(level slog.Level, msg string, lane relayQueueLane, class relayMessageClass, items int) {
+	if p == nil || p.svc == nil || p.svc.logger == nil {
+		return
+	}
+	depths := p.queueDepths()
+	attrs := []slog.Attr{
+		slog.String("addr", p.addr),
+		slog.String("lane", lane.String()),
+		slog.Int("items", items),
+		slog.Int("queue_depth", depths.total),
+		slog.Int("control_queue_depth", depths.control),
+		slog.Int("priority_queue_depth", depths.priority),
+		slog.Int("send_queue_depth", depths.send),
+	}
+	attrs = append(attrs, class.logAttrs()...)
+	p.svc.logger.LogAttrs(context.Background(), level, msg, attrs...)
+}
+
+func (p *peerConn) maybeLogRelaySuppression(kind string, duplicateQueued int, suppressedKnown int, class relayMessageClass) {
+	if p == nil || p.svc == nil || p.svc.logger == nil {
+		return
+	}
+	total := duplicateQueued + suppressedKnown
+	if total < relaySuppressionLogThreshold && class.blockInvItems == 0 && class.blockSendItems == 0 && class.blockReqItems == 0 {
+		return
+	}
+	attrs := []slog.Attr{
+		slog.String("addr", p.addr),
+		slog.String("kind", kind),
+		slog.Int("duplicate_queued", duplicateQueued),
+		slog.Int("suppressed_known", suppressedKnown),
+	}
+	attrs = append(attrs, class.logAttrs()...)
+	p.svc.logger.LogAttrs(context.Background(), slog.LevelDebug, "suppressed relay work before enqueue", attrs...)
+}
+
 func (p *peerConn) clearRelayState() {
 	p.invMu.Lock()
 	p.queuedInv = make(map[p2p.InvVector]int)
@@ -1340,7 +1527,9 @@ func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bo
 	peer.releaseRelayBatch(envelope.msg)
 	peer.telemetry.noteSent(envelope, peer.queueDepth())
 	if budget := relayLaneBudget(envelope.lane); budget > 0 && time.Since(envelope.enqueuedAt) > budget {
+		peer.telemetry.noteWriterStarvation(envelope.lane)
 		s.noteWriterStarvation(1)
+		peer.logRelayQueuePressure(slog.LevelWarn, "relay lane exceeded latency budget", envelope.lane, envelope.class, 1)
 	}
 	s.noteRelaySent(envelope.class)
 	return true
@@ -1418,6 +1607,11 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 		return s.onTxReconMessage(peer, m)
 	case p2p.TxRequestMessage:
 		return s.onTxRequestMessage(peer, m)
+	case p2p.AvaPollMessage:
+		return s.avalancheManager().onPoll(peer, m)
+	case p2p.AvaVoteMessage:
+		s.avalancheManager().onVote(peer, m)
+		return nil
 	case p2p.CompactBlockMessage:
 		return s.onCompactBlockMessage(peer, m)
 	case p2p.GetBlockTxMessage:
@@ -1456,6 +1650,7 @@ func (s *Service) Info() ServiceInfo {
 		RPCAddr:        s.cfg.RPCAddr,
 		P2PAddr:        s.cfg.P2PAddr,
 		Peers:          peers,
+		Avalanche:      s.avalancheManager().info(),
 		MinerEnabled:   s.cfg.MinerEnabled,
 		MinerWorkers:   s.cfg.MinerWorkers,
 		GenesisFixture: s.cfg.GenesisFixture,
@@ -1502,6 +1697,7 @@ func (s *Service) MempoolInfo() MempoolInfo {
 		MinRelayFeePerByte: s.cfg.MinRelayFeePerByte,
 		CandidateFrontier:  s.pool.SelectionCandidateCount(),
 	}
+	info.AvalancheConflicts, info.AvalancheFinalized = s.avalancheManager().metricsForMempool()
 	return info
 }
 
@@ -1806,6 +2002,12 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 	}()
 	rules := consensus.DefaultConsensusRules()
 	if len(txs) == 1 {
+		if err := s.avalancheManager().rejectionError(txs[0]); err != nil {
+			errs[0] = err
+			orphanCount = s.pool.OrphanCount()
+			mempoolSize = s.pool.Count()
+			return admissions, errs, orphanCount, mempoolSize
+		}
 		admission, err := s.pool.AcceptTx(txs[0], s.chainUtxoSnapshot(), rules)
 		if err != nil {
 			errs[0] = err
@@ -1819,6 +2021,8 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 		if len(accepted) > 0 {
 			s.invalidateBlockTemplate("tx_admission")
 		}
+		s.avalancheManager().noteAcceptedAdmissions(admissions)
+		s.avalancheManager().noteRejectedConflicts(txs, errs)
 		s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
 		s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
 		return admissions, errs, orphanCount, mempoolSize
@@ -1831,6 +2035,8 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 		if len(accepted) > 0 {
 			s.invalidateBlockTemplate("tx_admission")
 		}
+		s.avalancheManager().noteAcceptedAdmissions(admissions)
+		s.avalancheManager().noteRejectedConflicts(txs, errs)
 		s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
 		s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
 		return admissions, errs, orphanCount, mempoolSize
@@ -1865,6 +2071,8 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 	if len(accepted) > 0 {
 		s.invalidateBlockTemplate("tx_admission")
 	}
+	s.avalancheManager().noteAcceptedAdmissions(admissions)
+	s.avalancheManager().noteRejectedConflicts(txs, errs)
 	s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
 	s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
 	return admissions, errs, orphanCount, mempoolSize
@@ -1898,6 +2106,10 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 	var fallbackChainUtxos consensus.UtxoSet
 
 	for i, tx := range txs {
+		if err := s.avalancheManager().rejectionError(tx); err != nil {
+			errs[i] = err
+			continue
+		}
 		if currentTip := s.chainTipHash(); currentTip != tipHash {
 			if retried {
 				if fallbackTipHash != currentTip {
@@ -1971,6 +2183,10 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 	var fallbackTipHash [32]byte
 	var fallbackChainUtxos consensus.UtxoSet
 	for i, tx := range txs {
+		if err := s.avalancheManager().rejectionError(tx); err != nil {
+			errs[i] = err
+			continue
+		}
 		if prepareErrs[i] != nil {
 			errs[i] = prepareErrs[i]
 			continue
@@ -2051,6 +2267,10 @@ func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempoo
 		go func() {
 			defer wg.Done()
 			for idx := range indexCh {
+				if err := s.avalancheManager().rejectionError(txs[idx]); err != nil {
+					errs[idx] = err
+					continue
+				}
 				item, err := s.pool.PrepareAdmissionShared(txs[idx], view, chainUtxos, rules)
 				if err != nil {
 					errs[idx] = err
@@ -2179,6 +2399,7 @@ func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) 
 	s.stateMu.Unlock()
 
 	s.pool.RemoveConfirmed(&block)
+	s.avalancheManager().onBlockAccepted(&block)
 	s.promoteReadyOrphansAfterBlock(&block)
 	s.removeLocalRebroadcastForBlock(&block)
 	s.invalidateBlockTemplate("tip_advanced")
@@ -2354,6 +2575,49 @@ func buildCompactBlockMessage(block types.Block) p2p.Message {
 		Prefilled: prefilled,
 		ShortIDs:  shortIDs,
 	}
+}
+
+func (p *peerConn) estimateBlockOverlap(block types.Block) blockOverlapEstimate {
+	estimate := blockOverlapEstimate{}
+	if len(block.Txs) <= 1 {
+		return estimate
+	}
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	estimate.TotalTxs = len(block.Txs) - 1
+	for _, tx := range block.Txs[1:] {
+		txid := consensus.TxID(&tx)
+		if _, ok := p.knownTx[txid]; ok {
+			estimate.KnownTxs++
+			continue
+		}
+		estimate.MissingTxs++
+	}
+	if estimate.TotalTxs > 0 {
+		estimate.HitRate = float64(estimate.KnownTxs) / float64(estimate.TotalTxs)
+	}
+	return estimate
+}
+
+func shouldPreferGrapheneExtended(estimate blockOverlapEstimate) bool {
+	if estimate.TotalTxs == 0 {
+		return false
+	}
+	if estimate.MissingTxs >= 128 {
+		return true
+	}
+	return estimate.HitRate < 0.65
+}
+
+func selectBlockRelayPlan(peer *peerConn, block types.Block) blockRelayPlan {
+	if peer == nil || !peer.supportsGrapheneBlockRelay() {
+		return blockRelayPlanFull
+	}
+	estimate := peer.estimateBlockOverlap(block)
+	if peer.supportsGrapheneExtended() && shouldPreferGrapheneExtended(estimate) {
+		return blockRelayPlanGrapheneExtended
+	}
+	return blockRelayPlanGrapheneP1
 }
 
 func reconstructXThinBlock(msg p2p.XThinBlockMessage, matches map[uint64][]types.Transaction) (*pendingThinBlock, []uint32) {
@@ -2765,37 +3029,28 @@ func (s *Service) applyPeerBlock(block *types.Block) (bool, time.Duration, error
 	if err != nil {
 		return false, 0, err
 	}
-	lockWaitStarted := time.Now()
-	s.stateMu.Lock()
-	s.perf.noteBlockApplyLockWaitDuration(time.Since(lockWaitStarted))
-	// We already hold stateMu here, so read the committed tip fields directly
-	// instead of calling helpers like blockHeight() that would try to take it again.
 	beforeHeight := uint64(0)
-	if tipHeight := s.chainState.ChainState().TipHeight(); tipHeight != nil {
-		beforeHeight = *tipHeight
-	}
 	var beforeHash [32]byte
-	if tip := s.chainState.ChainState().TipHeader(); tip != nil {
-		beforeHash = consensus.HeaderHash(tip)
+	if view, ok := s.chainState.CommittedView(); ok {
+		beforeHeight = view.Height
+		beforeHash = view.TipHash
 	}
 	if entry == nil {
-		s.stateMu.Unlock()
 		return false, 0, fmt.Errorf("%w: %x", ErrBlockHeaderNotIndexed, hash)
 	}
-	if _, err := s.chainState.ApplyBlock(block); err != nil {
-		s.stateMu.Unlock()
+	if _, lockWait, err := s.chainState.ApplyBlockWithTiming(block); err != nil {
 		return false, 0, err
+	} else {
+		s.perf.noteBlockApplyLockWaitDuration(lockWait)
 	}
 	afterHeight := uint64(0)
-	if tipHeight := s.chainState.ChainState().TipHeight(); tipHeight != nil {
-		afterHeight = *tipHeight
-	}
 	var afterHash [32]byte
-	if tip := s.chainState.ChainState().TipHeader(); tip != nil {
-		afterHash = consensus.HeaderHash(tip)
+	if view, ok := s.chainState.CommittedView(); ok {
+		afterHeight = view.Height
+		afterHash = view.TipHash
 	}
-	s.stateMu.Unlock()
 	s.pool.RemoveConfirmed(block)
+	s.avalancheManager().onBlockAccepted(block)
 	s.promoteReadyOrphansAfterBlock(block)
 	s.removeLocalRebroadcastForBlock(block)
 	s.cacheRecentBlock(*block)
@@ -2844,6 +3099,47 @@ func (s *Service) rebroadcastLocalTxs() {
 		accepted = append(accepted, mempool.AcceptedTx{TxID: txid})
 	}
 	s.broadcastAcceptedTxsToPeersRetry(peers, accepted)
+}
+
+func (s *Service) erlayReconcileLoop() {
+	ticker := time.NewTicker(erlayReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.runErlayReconcileRound()
+		}
+	}
+}
+
+func (s *Service) runErlayReconcileRound() {
+	peers := s.peerSnapshot()
+	if len(peers) == 0 {
+		return
+	}
+	snapshot := s.pool.Snapshot()
+	if len(snapshot) == 0 {
+		return
+	}
+	for _, peer := range peers {
+		if !peer.supportsErlayTxRelay() {
+			continue
+		}
+		txids := peer.planErlayReconcileRound(snapshot, erlayReconcileBatchLimit)
+		if len(txids) == 0 {
+			continue
+		}
+		s.noteErlayRound(len(txids))
+		if err := peer.enqueueTxRecon(p2p.TxReconMessage{TxIDs: txids}); err != nil && s.logger != nil {
+			s.logger.Debug("erlay reconcile round enqueue failed",
+				slog.String("addr", peer.addr),
+				slog.Int("count", len(txids)),
+				slog.Any("error", err),
+			)
+		}
+	}
 }
 
 func (s *Service) promoteReadyOrphansAfterBlock(block *types.Block) {
@@ -4099,6 +4395,8 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		return s.MiningInfo(), nil
 	case "getpeerinfo":
 		return s.PeerInfo(), nil
+	case "getavalancheinfo":
+		return s.avalancheManager().info(), nil
 	case "getmetrics":
 		return s.PerformanceMetrics(), nil
 	case "getheader":
@@ -4485,10 +4783,15 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 type PeerInfo struct {
 	Addr                  string `json:"addr"`
 	Outbound              bool   `json:"outbound"`
+	Manual                bool   `json:"manual,omitempty"`
 	Height                uint64 `json:"height"`
 	UserAgent             string `json:"user_agent"`
 	LastProgress          int64  `json:"last_progress_unix"`
 	LastUseful            int64  `json:"last_useful_unix,omitempty"`
+	Protected             bool   `json:"eviction_protected,omitempty"`
+	ProtectedClass        string `json:"protected_class,omitempty"`
+	UsefulnessClass       string `json:"usefulness_class,omitempty"`
+	UsefulnessScore       int    `json:"usefulness_score,omitempty"`
 	PreferredDownload     bool   `json:"preferred_download,omitempty"`
 	DownloadScore         int    `json:"download_score,omitempty"`
 	HeaderStalls          int    `json:"header_stalls,omitempty"`
@@ -4505,6 +4808,12 @@ type PeerInfo struct {
 	TxNotFoundReceived    int    `json:"tx_not_found_received,omitempty"`
 	KnownTxClears         int    `json:"known_tx_clears,omitempty"`
 	WriterStarvation      int    `json:"writer_starvation_events,omitempty"`
+	AvalancheSupported    bool   `json:"avalanche_supported,omitempty"`
+	AvalancheWeight       uint64 `json:"avalanche_weight,omitempty"`
+	AvalanchePollsSent    int    `json:"avalanche_polls_sent,omitempty"`
+	AvalanchePollsRecv    int    `json:"avalanche_polls_received,omitempty"`
+	AvalancheVotesSent    int    `json:"avalanche_votes_sent,omitempty"`
+	AvalancheVotesRecv    int    `json:"avalanche_votes_received,omitempty"`
 }
 
 func (s *Service) PeerInfo() []PeerInfo             { return s.peerManager().PeerInfo() }
@@ -4643,6 +4952,109 @@ func (p *peerConn) snapshotHeight() uint64 {
 	return p.version.Height
 }
 
+func (p *peerConn) advertisesService(bit uint64) bool {
+	// Tests and older in-process peers may leave Services unset; keep feature
+	// paths enabled by default unless a peer explicitly advertises a bitmap.
+	if p.version.Services == 0 {
+		return true
+	}
+	return p.version.Services&bit != 0
+}
+
+func (p *peerConn) supportsErlayTxRelay() bool {
+	return p.advertisesService(p2p.ServiceErlayTxRelay)
+}
+
+func (p *peerConn) supportsAvalancheOverlay() bool {
+	if p.version.Services == 0 {
+		return false
+	}
+	return p.version.Services&p2p.ServiceAvalancheOverlay != 0
+}
+
+func (p *peerConn) supportsGrapheneBlockRelay() bool {
+	return p.advertisesService(p2p.ServiceGrapheneBlockRelay)
+}
+
+func (p *peerConn) supportsGrapheneExtended() bool {
+	return p.advertisesService(p2p.ServiceGrapheneExtended)
+}
+
+func (p *peerConn) markGrapheneRecoveryPending(hash [32]byte) {
+	p.blockRelayMu.Lock()
+	defer p.blockRelayMu.Unlock()
+	if p.blockRelay.pendingExtendedRecovery == nil {
+		p.blockRelay.pendingExtendedRecovery = make(map[[32]byte]struct{})
+	}
+	p.blockRelay.pendingExtendedRecovery[hash] = struct{}{}
+}
+
+func (p *peerConn) clearGrapheneRecoveryPending(hash [32]byte) bool {
+	p.blockRelayMu.Lock()
+	defer p.blockRelayMu.Unlock()
+	if p.blockRelay.pendingExtendedRecovery == nil {
+		return false
+	}
+	_, ok := p.blockRelay.pendingExtendedRecovery[hash]
+	delete(p.blockRelay.pendingExtendedRecovery, hash)
+	return ok
+}
+
+func (p *peerConn) planErlayReconcileRound(entries []mempool.SnapshotEntry, limit int) [][32]byte {
+	if len(entries) == 0 || limit <= 0 {
+		return nil
+	}
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	p.erlayMu.Lock()
+	defer p.erlayMu.Unlock()
+
+	if p.knownTx == nil {
+		p.knownTx = make(map[[32]byte]struct{})
+	}
+	if p.erlayState.cursor >= len(entries) {
+		p.erlayState.cursor = 0
+	}
+
+	txids := make([][32]byte, 0, minInt(limit, len(entries)))
+	start := p.erlayState.cursor
+	index := start
+	scanned := 0
+	for scanned < len(entries) && len(txids) < limit {
+		txid := entries[index].TxID
+		if _, ok := p.knownTx[txid]; !ok {
+			txids = append(txids, txid)
+		}
+		index++
+		if index >= len(entries) {
+			index = 0
+		}
+		scanned++
+	}
+
+	p.erlayState.cursor = index
+	if len(txids) > 0 {
+		p.erlayState.roundsStarted++
+		p.erlayState.lastRoundAt = time.Now()
+		p.erlayState.lastSetSize = len(txids)
+	}
+	return txids
+}
+
+func (p *peerConn) noteErlayRoundResult(setSize int, missing int) {
+	p.erlayMu.Lock()
+	defer p.erlayMu.Unlock()
+	if setSize <= 0 {
+		return
+	}
+	if missing < setSize {
+		p.erlayState.roundsHit++
+	}
+	p.erlayState.lastSetSize = setSize
+	p.erlayState.lastMissing = missing
+	p.erlayState.lastRoundAt = time.Now()
+}
+
 func (p *peerConn) snapshotProgressUnix() int64 {
 	if unix := p.lastProgress.Load(); unix > 0 {
 		return unix
@@ -4671,6 +5083,36 @@ func unixTimeOrZero(unix int64) time.Time {
 	return time.Unix(unix, 0)
 }
 
+func (p *peerConn) noteAvalanchePollSent() {
+	p.avaMu.Lock()
+	p.avaState.pollsSent++
+	p.avaMu.Unlock()
+}
+
+func (p *peerConn) noteAvalanchePollReceived() {
+	p.avaMu.Lock()
+	p.avaState.pollsReceived++
+	p.avaMu.Unlock()
+}
+
+func (p *peerConn) noteAvalancheVoteSent() {
+	p.avaMu.Lock()
+	p.avaState.votesSent++
+	p.avaMu.Unlock()
+}
+
+func (p *peerConn) noteAvalancheVoteReceived() {
+	p.avaMu.Lock()
+	p.avaState.votesReceived++
+	p.avaMu.Unlock()
+}
+
+func (p *peerConn) avalancheSnapshot() peerAvalancheState {
+	p.avaMu.Lock()
+	defer p.avaMu.Unlock()
+	return p.avaState
+}
+
 func defaultDashboardValue(value, fallback string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallback
@@ -4687,7 +5129,7 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 		case p2p.InvTypeTx:
 			requestedTxIDs = append(requestedTxIDs, item.Hash)
 		case p2p.InvTypeBlock:
-			blockMsg, ok, err := s.preferredBlockRelayMessage(item.Hash)
+			blockMsg, ok, err := s.preferredBlockRelayMessage(peer, item.Hash)
 			if err != nil {
 				return err
 			}
@@ -4696,6 +5138,16 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 				continue
 			}
 			send = append(send, blockMsg)
+		case p2p.InvTypeBlockExtended:
+			block, ok, err := s.loadBlock(item.Hash)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				notFound = append(notFound, item)
+				continue
+			}
+			send = append(send, buildXThinBlockMessage(block))
 		case p2p.InvTypeBlockFull:
 			block, ok, err := s.loadBlock(item.Hash)
 			if err != nil {
@@ -4763,12 +5215,17 @@ func (s *Service) onXThinBlockMessage(peer *peerConn, msg p2p.XThinBlockMessage)
 	if len(missing) == 0 {
 		peer.deletePendingThin(state.hash)
 		if err := s.acceptThinBlock(peer, state.block()); err != nil {
+			peer.clearGrapheneRecoveryPending(state.hash)
 			return s.requestFullBlock(peer, state.hash)
+		}
+		if peer.clearGrapheneRecoveryPending(state.hash) {
+			s.noteGrapheneExtendedRecovery()
 		}
 		return nil
 	}
 	if shouldFallbackToFullBlock(state, missing) {
 		peer.deletePendingThin(state.hash)
+		peer.clearGrapheneRecoveryPending(state.hash)
 		return s.requestFullBlock(peer, state.hash)
 	}
 	peer.storePendingThin(state)
@@ -4783,13 +5240,15 @@ func (s *Service) onCompactBlockMessage(peer *peerConn, msg p2p.CompactBlockMess
 	if len(missing) == 0 {
 		peer.deletePendingThin(state.hash)
 		if err := s.acceptThinBlock(peer, state.block()); err != nil {
-			return s.requestFullBlock(peer, state.hash)
+			s.noteGrapheneDecodeFailure()
+			return s.requestGrapheneExtendedBlock(peer, state.hash)
 		}
 		return nil
 	}
 	if shouldFallbackToFullBlock(state, missing) {
 		peer.deletePendingThin(state.hash)
-		return s.requestFullBlock(peer, state.hash)
+		s.noteGrapheneDecodeFailure()
+		return s.requestGrapheneExtendedBlock(peer, state.hash)
 	}
 	peer.storePendingThin(state)
 	return peer.send(p2p.GetBlockTxMessage{BlockHash: state.hash, Indexes: missing})
@@ -4862,7 +5321,11 @@ func (s *Service) onXBlockTxMessage(peer *peerConn, msg p2p.XBlockTxMessage) err
 	}
 	peer.deletePendingThin(msg.BlockHash)
 	if err := s.acceptThinBlock(peer, state.block()); err != nil {
+		peer.clearGrapheneRecoveryPending(msg.BlockHash)
 		return s.requestFullBlock(peer, msg.BlockHash)
+	}
+	if peer.clearGrapheneRecoveryPending(msg.BlockHash) {
+		s.noteGrapheneExtendedRecovery()
 	}
 	return nil
 }
@@ -4874,31 +5337,44 @@ func (s *Service) onBlockTxMessage(peer *peerConn, msg p2p.BlockTxMessage) error
 	}
 	if len(msg.Indexes) != len(msg.Txs) {
 		peer.deletePendingThin(msg.BlockHash)
-		return s.requestFullBlock(peer, msg.BlockHash)
+		s.noteGrapheneDecodeFailure()
+		return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 	}
 	for i, index := range msg.Indexes {
 		if !state.fill(index, msg.Txs[i]) {
 			peer.deletePendingThin(msg.BlockHash)
-			return s.requestFullBlock(peer, msg.BlockHash)
+			s.noteGrapheneDecodeFailure()
+			return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 		}
 	}
 	if !state.complete() {
 		peer.deletePendingThin(msg.BlockHash)
-		return s.requestFullBlock(peer, msg.BlockHash)
+		s.noteGrapheneDecodeFailure()
+		return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 	}
 	peer.deletePendingThin(msg.BlockHash)
 	if err := s.acceptThinBlock(peer, state.block()); err != nil {
-		return s.requestFullBlock(peer, msg.BlockHash)
+		s.noteGrapheneDecodeFailure()
+		return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 	}
 	return nil
 }
 
-func (s *Service) preferredBlockRelayMessage(hash [32]byte) (p2p.Message, bool, error) {
+func (s *Service) preferredBlockRelayMessage(peer *peerConn, hash [32]byte) (p2p.Message, bool, error) {
 	block, ok, err := s.loadBlock(hash)
 	if err != nil || !ok {
 		return nil, ok, err
 	}
-	return buildCompactBlockMessage(block), true, nil
+	plan := selectBlockRelayPlan(peer, block)
+	s.noteGraphenePlan(plan)
+	switch plan {
+	case blockRelayPlanGrapheneExtended:
+		return buildXThinBlockMessage(block), true, nil
+	case blockRelayPlanGrapheneP1:
+		return buildCompactBlockMessage(block), true, nil
+	default:
+		return p2p.BlockMessage{Block: block}, true, nil
+	}
 }
 
 func (s *Service) loadBlock(hash [32]byte) (types.Block, bool, error) {
@@ -4920,7 +5396,18 @@ func (s *Service) acceptThinBlock(peer *peerConn, block types.Block) error {
 }
 
 func (s *Service) requestFullBlock(peer *peerConn, hash [32]byte) error {
+	if peer != nil {
+		peer.clearGrapheneRecoveryPending(hash)
+	}
 	return peer.send(p2p.GetDataMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlockFull, Hash: hash}}})
+}
+
+func (s *Service) requestGrapheneExtendedBlock(peer *peerConn, hash [32]byte) error {
+	if peer == nil || !peer.supportsGrapheneExtended() {
+		return s.requestFullBlock(peer, hash)
+	}
+	peer.markGrapheneRecoveryPending(hash)
+	return peer.send(p2p.GetDataMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlockExtended, Hash: hash}}})
 }
 
 func (s *Service) onTxReconMessage(peer *peerConn, msg p2p.TxReconMessage) error {
@@ -4928,6 +5415,7 @@ func (s *Service) onTxReconMessage(peer *peerConn, msg p2p.TxReconMessage) error
 		return nil
 	}
 	missing := s.pool.MissingTxIDs(msg.TxIDs)
+	peer.noteErlayRoundResult(len(msg.TxIDs), len(missing))
 	if s.logger != nil {
 		s.logger.Debug("processed tx reconciliation announcement",
 			slog.String("addr", peer.addr),
@@ -4994,7 +5482,13 @@ func (s *Service) broadcastInvToPeers(peers []*peerConn, items []p2p.InvVector) 
 }
 func (s *Service) broadcastAcceptedTxsToPeers(peers []*peerConn, accepted []mempool.AcceptedTx) {
 	s.relayManager().broadcastAcceptedTxsToPeers(peers, accepted)
-	s.scheduleLocalRelayFallbacks(peers, accepted)
+	erlayPeers := make([]*peerConn, 0, len(peers))
+	for _, peer := range peers {
+		if peer.supportsErlayTxRelay() {
+			erlayPeers = append(erlayPeers, peer)
+		}
+	}
+	s.scheduleLocalRelayFallbacks(erlayPeers, accepted)
 }
 
 func (s *Service) broadcastAcceptedTxsToPeersRetry(peers []*peerConn, accepted []mempool.AcceptedTx) {
@@ -5005,7 +5499,16 @@ func (s *Service) broadcastAcceptedTxsToPeersRetry(peers []*peerConn, accepted [
 	for _, item := range accepted {
 		txids = append(txids, item.TxID)
 	}
-	for _, batch := range planTxRelayRecon(peers, txids) {
+	erlayPeers := make([]*peerConn, 0, len(peers))
+	legacyPeers := make([]*peerConn, 0, len(peers))
+	for _, peer := range peers {
+		if peer.supportsErlayTxRelay() {
+			erlayPeers = append(erlayPeers, peer)
+			continue
+		}
+		legacyPeers = append(legacyPeers, peer)
+	}
+	for _, batch := range planTxRelayRecon(erlayPeers, txids) {
 		if err := batch.peer.enqueueTxReconRetry(p2p.TxReconMessage{TxIDs: batch.txids}); err != nil {
 			if s.logger != nil {
 				s.logger.Debug("relay retry txrecon enqueue failed",
@@ -5015,6 +5518,13 @@ func (s *Service) broadcastAcceptedTxsToPeersRetry(peers []*peerConn, accepted [
 				)
 			}
 		}
+	}
+	if len(legacyPeers) > 0 {
+		items := make([]p2p.InvVector, 0, len(txids))
+		for _, txid := range txids {
+			items = append(items, p2p.InvVector{Type: p2p.InvTypeTx, Hash: txid})
+		}
+		s.broadcastInvToPeers(legacyPeers, items)
 	}
 }
 
@@ -5224,7 +5734,7 @@ func classifyRelayMessage(msg p2p.Message) relayMessageClass {
 		class.txReqItems = len(m.TxIDs)
 	case p2p.GetDataMessage:
 		for _, item := range m.Items {
-			if item.Type == p2p.InvTypeBlock || item.Type == p2p.InvTypeBlockFull {
+			if item.Type == p2p.InvTypeBlock || item.Type == p2p.InvTypeBlockFull || item.Type == p2p.InvTypeBlockExtended {
 				class.blockReqItems++
 			}
 		}
@@ -5270,6 +5780,7 @@ func (p *peerConn) filterQueuedInv(items []p2p.InvVector) []p2p.InvVector {
 		if p.svc != nil {
 			p.svc.noteDuplicateSuppression(duplicates)
 		}
+		p.maybeLogRelaySuppression("inv", duplicates, 0, classifyRelayMessage(p2p.InvMessage{Items: items}))
 	}
 	return filtered
 }
@@ -5320,6 +5831,9 @@ func (p *peerConn) filterQueuedTxs(txs []types.Transaction) []types.Transaction 
 			p.svc.noteDuplicateSuppression(suppressedKnown)
 		}
 	}
+	if duplicateQueued > 0 || suppressedKnown > 0 {
+		p.maybeLogRelaySuppression("tx_batch", duplicateQueued, suppressedKnown, classifyRelayMessage(p2p.TxBatchMessage{Txs: txs}))
+	}
 	return filtered
 }
 
@@ -5354,6 +5868,9 @@ func (p *peerConn) filterQueuedTxIDs(txids [][32]byte, suppressKnown bool) [][32
 		if p.svc != nil {
 			p.svc.noteDuplicateSuppression(suppressedKnownCount)
 		}
+	}
+	if duplicateQueued > 0 || suppressedKnownCount > 0 {
+		p.maybeLogRelaySuppression("tx_recon", duplicateQueued, suppressedKnownCount, classifyRelayMessage(p2p.TxReconMessage{TxIDs: txids}))
 	}
 	return filtered
 }
@@ -5475,7 +5992,7 @@ func (p *peerConn) flushPendingReconAfterDelay() {
 		txidCount += len(batch)
 		p.enqueueRelayRecon(batch)
 	}
-	if p.svc != nil && len(batches) > 0 {
+	if p.svc != nil && p.svc.logger != nil && len(batches) > 0 {
 		p.svc.perf.noteRelayFlushDuration(time.Since(startedAt))
 		p.svc.logger.Debug("flushed pending tx reconciliation",
 			slog.String("addr", p.addr),
@@ -5567,7 +6084,10 @@ func (p *peerConn) enqueueRelayTxs(txs []types.Transaction) error {
 		return nil
 	default:
 		p.releaseQueuedTxs(txs)
-		p.telemetry.noteDroppedTxs(len(txs))
+		p.telemetry.noteDroppedTxs(len(txs), envelope.lane)
+		if len(txs) >= relayDropWarnThreshold || p.queueDepths().send >= relayQueueWarnDepth {
+			p.logRelayQueuePressure(slog.LevelWarn, "dropped tx relay batch due to saturated send queue", envelope.lane, envelope.class, len(txs))
+		}
 		return nil
 	}
 }
@@ -5591,7 +6111,10 @@ func (p *peerConn) enqueueRelayRecon(txids [][32]byte) error {
 		return nil
 	default:
 		p.releaseQueuedTxIDs(txids)
-		p.telemetry.noteDroppedTxs(len(txids))
+		p.telemetry.noteDroppedTxs(len(txids), envelope.lane)
+		if len(txids) >= relayDropWarnThreshold || p.queueDepths().send >= relayQueueWarnDepth {
+			p.logRelayQueuePressure(slog.LevelWarn, "dropped tx reconciliation batch due to saturated send queue", envelope.lane, envelope.class, len(txids))
+		}
 		return nil
 	}
 }
@@ -5846,22 +6369,39 @@ func (t *peerRelayTelemetry) noteKnownTxClears(count int) {
 	t.knownTxClears += count
 }
 
-func (t *peerRelayTelemetry) noteWriterStarvation() {
+func (t *peerRelayTelemetry) noteWriterStarvation(lane relayQueueLane) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.writerStarvation++
+	switch lane {
+	case relayQueueLaneControl:
+		t.controlStarvation++
+	case relayQueueLanePriority:
+		t.priorityStarvation++
+	case relayQueueLaneSend:
+		t.sendStarvation++
+	}
 }
 
-func (t *peerRelayTelemetry) noteDroppedInv(count int) {
+func (t *peerRelayTelemetry) noteDroppedInv(count int, lane relayQueueLane) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.droppedInv += count
+	switch lane {
+	case relayQueueLanePriority:
+		t.droppedPriorityInv += count
+	case relayQueueLaneSend:
+		t.droppedSendInv += count
+	}
 }
 
-func (t *peerRelayTelemetry) noteDroppedTxs(count int) {
+func (t *peerRelayTelemetry) noteDroppedTxs(count int, lane relayQueueLane) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.droppedTxs += count
+	if lane == relayQueueLaneSend {
+		t.droppedSendTxs += count
+	}
 }
 
 func (t *peerRelayTelemetry) noteSent(envelope outboundMessage, _ int) {
@@ -5886,9 +6426,6 @@ func (t *peerRelayTelemetry) noteSent(envelope outboundMessage, _ int) {
 	if envelope.class.txInvItems != 0 || envelope.class.blockInvItems != 0 || envelope.class.txBatchItems != 0 || envelope.class.txReconItems != 0 || envelope.class.txReqItems != 0 {
 		delay := time.Since(envelope.enqueuedAt)
 		t.relaySamples = append(t.relaySamples, float64(delay.Microseconds())/1000)
-		if relayLaneBudget(envelope.lane) > 0 && delay > relayLaneBudget(envelope.lane) {
-			t.writerStarvation++
-		}
 	}
 }
 
@@ -5947,6 +6484,12 @@ func (t *peerRelayTelemetry) snapshot(addr string, outbound bool, queueDepth que
 		DroppedInv:             t.droppedInv,
 		DroppedTxs:             t.droppedTxs,
 		WriterStarvationEvents: t.writerStarvation,
+		DroppedPriorityInv:     t.droppedPriorityInv,
+		DroppedSendInv:         t.droppedSendInv,
+		DroppedSendTxs:         t.droppedSendTxs,
+		ControlStarvation:      t.controlStarvation,
+		PriorityStarvation:     t.priorityStarvation,
+		SendStarvation:         t.sendStarvation,
 		LastRelayActivityUnix:  t.lastRelayActivityUnix,
 		RelayEvents:            len(t.relaySamples),
 	}
@@ -6315,8 +6858,8 @@ func renderPublicDashboardHome(view *publicDashboardView) string {
 		dashboardKeyValueRow{Key: "Peers", Value: fmt.Sprintf("%d", len(view.peers))},
 		dashboardKeyValueRow{Key: "Mempool", Value: fmt.Sprintf("%d tx", view.mempool.Count)},
 		dashboardKeyValueRow{Key: "Current Orphan Blocks", Value: fmt.Sprintf("%d", view.performance.Gauges.PendingPeerBlocks)},
-		dashboardKeyValueRow{Key: "Tx Relay Mode", Value: "reconciled batches"},
-		dashboardKeyValueRow{Key: "Block Relay Mode", Value: "short-id blocks"},
+		dashboardKeyValueRow{Key: "Tx Relay Mode", Value: "erlay reconciliation"},
+		dashboardKeyValueRow{Key: "Block Relay Mode", Value: "graphene planner"},
 	))
 	body.WriteString("\n")
 
@@ -8161,9 +8704,13 @@ func randomNonce() uint64 {
 }
 
 func (s *Service) localVersion() p2p.VersionMessage {
+	services := p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceGrapheneBlockRelay | p2p.ServiceGrapheneExtended
+	if s.avalancheManager().enabled() {
+		services |= p2p.ServiceAvalancheOverlay
+	}
 	return p2p.VersionMessage{
 		Protocol:  1,
-		Services:  1,
+		Services:  services,
 		Height:    s.blockHeight(),
 		Nonce:     randomNonce(),
 		UserAgent: "bpu/go",

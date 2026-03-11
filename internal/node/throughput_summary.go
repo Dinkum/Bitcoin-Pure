@@ -20,6 +20,13 @@ type throughputSummaryTelemetry struct {
 	blocksAccepted        atomic.Uint64
 	templateRebuilds      atomic.Uint64
 	templateInterruptions atomic.Uint64
+	erlayRounds           atomic.Uint64
+	erlayRequestedTxs     atomic.Uint64
+	grapheneP1Plans       atomic.Uint64
+	grapheneExtPlans      atomic.Uint64
+	grapheneDecodeFails   atomic.Uint64
+	grapheneExtRecoveries atomic.Uint64
+	legacyRelayFallbacks  atomic.Uint64
 	txReconRetries        atomic.Uint64
 	directFallbackBatches atomic.Uint64
 	directFallbackTxs     atomic.Uint64
@@ -91,6 +98,32 @@ func (s *Service) noteTxReconRetry(count int) {
 	if count > 0 {
 		s.throughput.txReconRetries.Add(uint64(count))
 	}
+}
+
+func (s *Service) noteErlayRound(requested int) {
+	if requested > 0 {
+		s.throughput.erlayRounds.Add(1)
+		s.throughput.erlayRequestedTxs.Add(uint64(requested))
+	}
+}
+
+func (s *Service) noteGraphenePlan(plan blockRelayPlan) {
+	switch plan {
+	case blockRelayPlanGrapheneP1:
+		s.throughput.grapheneP1Plans.Add(1)
+	case blockRelayPlanGrapheneExtended:
+		s.throughput.grapheneExtPlans.Add(1)
+	default:
+		s.throughput.legacyRelayFallbacks.Add(1)
+	}
+}
+
+func (s *Service) noteGrapheneDecodeFailure() {
+	s.throughput.grapheneDecodeFails.Add(1)
+}
+
+func (s *Service) noteGrapheneExtendedRecovery() {
+	s.throughput.grapheneExtRecoveries.Add(1)
 }
 
 func (s *Service) noteDirectFallback(msgs int, items int) {

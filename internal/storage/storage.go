@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -15,19 +16,22 @@ import (
 )
 
 var (
-	metaProfileKey          = []byte("meta/profile")
-	metaHeaderTipHeightKey  = []byte("meta/header_tip_height")
-	metaHeaderTipHeaderKey  = []byte("meta/header_tip_header")
-	metaTipHeightKey        = []byte("meta/tip_height")
-	metaTipHeaderKey        = []byte("meta/tip_header")
-	metaBlockSizeStateKey   = []byte("meta/block_size_state")
-	blockPrefix             = []byte("blocks/")
-	blockIndexPrefix        = []byte("block_index/")
-	blockUndoPrefix         = []byte("block_undo/")
-	headerHeightIndexPrefix = []byte("header_height_index/")
-	heightIndexPrefix       = []byte("height_index/")
-	knownPeerPrefix         = []byte("known_peer/")
-	utxoPrefix              = []byte("utxo/")
+	metaProfileKey           = []byte("meta/profile")
+	metaHeaderTipHeightKey   = []byte("meta/header_tip_height")
+	metaHeaderTipHeaderKey   = []byte("meta/header_tip_header")
+	metaTipHeightKey         = []byte("meta/tip_height")
+	metaTipHeaderKey         = []byte("meta/tip_header")
+	metaBlockSizeStateKey    = []byte("meta/block_size_state")
+	metaJournalNextSeqKey    = []byte("meta/journal_next_seq")
+	metaDerivedJournalSeqKey = []byte("meta/derived_journal_seq")
+	blockPrefix              = []byte("blocks/")
+	blockIndexPrefix         = []byte("block_index/")
+	blockUndoPrefix          = []byte("block_undo/")
+	headerHeightIndexPrefix  = []byte("header_height_index/")
+	heightIndexPrefix        = []byte("height_index/")
+	knownPeerPrefix          = []byte("known_peer/")
+	journalPrefix            = []byte("journal/")
+	utxoPrefix               = []byte("utxo/")
 )
 
 var (
@@ -79,6 +83,31 @@ type HeaderBatchEntry struct {
 
 type ChainStore struct {
 	db *pebble.DB
+
+	deriveNotify chan struct{}
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+}
+
+type chainJournalKind uint8
+
+const (
+	journalSetBlockHeight chainJournalKind = 1 + iota
+	journalRewriteBlockHeights
+	journalSetHeaderHeight
+	journalRewriteHeaderHeights
+)
+
+type chainJournalHeightHash struct {
+	Height uint64
+	Hash   [32]byte
+}
+
+type chainJournalEntry struct {
+	Kind         chainJournalKind
+	ForkHeight   uint64
+	OldTipHeight uint64
+	Pairs        []chainJournalHeightHash
 }
 
 type noopLogger struct{}
@@ -94,7 +123,18 @@ func Open(path string) (*ChainStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ChainStore{db: db}, nil
+	store := &ChainStore{
+		db:           db,
+		deriveNotify: make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
+	}
+	store.wg.Add(1)
+	go func() {
+		defer store.wg.Done()
+		store.derivedIndexLoop()
+	}()
+	store.notifyDerivedReplay()
+	return store, nil
 }
 
 func (s *ChainStore) Close() error {
@@ -102,6 +142,10 @@ func (s *ChainStore) Close() error {
 		return nil
 	}
 	logging.Component("storage").Info("closing pebble chain store")
+	if s.stopCh != nil {
+		close(s.stopCh)
+	}
+	s.wg.Wait()
 	return s.db.Close()
 }
 
@@ -325,6 +369,7 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	logging.Component("storage").Info("wrote full chain state",
 		slog.Uint64("height", state.Height),
 		slog.Int("utxo_count", len(state.UTXOs)),
@@ -380,6 +425,7 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	logging.Component("storage").Info("rewrote chain state via utxo delta",
 		slog.Uint64("height", next.Height),
 		slog.Int("deleted_utxos", deleted),
@@ -395,9 +441,17 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 	if err := writeHeaderMeta(batch, state); err != nil {
 		return err
 	}
+	hash := consensus.HeaderHash(&state.TipHeader)
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind:  journalSetHeaderHeight,
+		Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
+	}); err != nil {
+		return err
+	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	logging.Component("storage").Info("wrote header state", slog.Uint64("height", state.Height))
 	return nil
 }
@@ -424,24 +478,23 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 		}
 	}
 	if len(activeEntries) != 0 {
-		for height := forkHeight + 1; height <= oldTipHeight; height++ {
-			if err := batch.Delete(headerHeightIndexKey(height), nil); err != nil {
-				return err
-			}
-			if height == ^uint64(0) {
-				break
-			}
-		}
+		pairs := make([]chainJournalHeightHash, 0, len(activeEntries))
 		for _, entry := range activeEntries {
-			hash := consensus.HeaderHash(&entry.Header)
-			if err := batch.Set(headerHeightIndexKey(entry.Height), hash[:], nil); err != nil {
-				return err
-			}
+			pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: consensus.HeaderHash(&entry.Header)})
+		}
+		if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+			Kind:         journalRewriteHeaderHeights,
+			ForkHeight:   forkHeight,
+			OldTipHeight: oldTipHeight,
+			Pairs:        pairs,
+		}); err != nil {
+			return err
 		}
 	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	logging.Component("storage").Info("wrote header batch",
 		slog.Uint64("height", state.Height),
 		slog.Int("count", len(entries)),
@@ -456,12 +509,19 @@ func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 	if err != nil {
 		return err
 	}
-	if err := putBlockBatch(batch, block, entry, true); err != nil {
+	if err := putBlockBatch(batch, block, entry, false); err != nil {
+		return err
+	}
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind:  journalSetBlockHeight,
+		Pairs: []chainJournalHeightHash{{Height: height, Hash: consensus.HeaderHash(&block.Header)}},
+	}); err != nil {
 		return err
 	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	hash := consensus.HeaderHash(&block.Header)
 	logging.Component("storage").Info("stored block",
 		slog.Uint64("height", height),
@@ -485,12 +545,16 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 		return err
 	}
 	hash := consensus.HeaderHash(header)
-	if err := batch.Set(headerHeightIndexKey(height), hash[:], nil); err != nil {
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind:  journalSetHeaderHeight,
+		Pairs: []chainJournalHeightHash{{Height: height, Hash: hash}},
+	}); err != nil {
 		return err
 	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	logging.Component("storage").Info("stored header",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
@@ -512,7 +576,7 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 	if err := writeMeta(batch, state); err != nil {
 		return err
 	}
-	if err := putBlockBatch(batch, block, *entry, true); err != nil {
+	if err := putBlockBatch(batch, block, *entry, false); err != nil {
 		return err
 	}
 	hash := consensus.HeaderHash(&block.Header)
@@ -529,9 +593,22 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 			return err
 		}
 	}
+	if err := s.appendJournalEntriesBatch(batch,
+		chainJournalEntry{
+			Kind:  journalSetBlockHeight,
+			Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
+		},
+		chainJournalEntry{
+			Kind:  journalSetHeaderHeight,
+			Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
+		},
+	); err != nil {
+		return err
+	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+	s.notifyDerivedReplay()
 	logging.Component("storage").Info("appended block delta",
 		slog.Uint64("height", state.Height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
@@ -573,50 +650,63 @@ func (s *ChainStore) preserveValidatedBlockIndex(entry BlockIndexEntry) (BlockIn
 func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	for height := forkHeight + 1; height <= oldTipHeight; height++ {
-		if err := batch.Delete(heightIndexKey(height), nil); err != nil {
-			return err
-		}
-		if height == ^uint64(0) {
-			break
-		}
-	}
+	pairs := make([]chainJournalHeightHash, 0, len(entries))
 	for _, entry := range entries {
 		hash := consensus.HeaderHash(&entry.Header)
-		if err := batch.Set(heightIndexKey(entry.Height), hash[:], nil); err != nil {
-			return err
-		}
+		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: hash})
 	}
-	return batch.Commit(pebble.NoSync)
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind:         journalRewriteBlockHeights,
+		ForkHeight:   forkHeight,
+		OldTipHeight: oldTipHeight,
+		Pairs:        pairs,
+	}); err != nil {
+		return err
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	s.notifyDerivedReplay()
+	return nil
 }
 
 func (s *ChainStore) RewriteActiveHeaderHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	for height := forkHeight + 1; height <= oldTipHeight; height++ {
-		if err := batch.Delete(headerHeightIndexKey(height), nil); err != nil {
-			return err
-		}
-		if height == ^uint64(0) {
-			break
-		}
-	}
+	pairs := make([]chainJournalHeightHash, 0, len(entries))
 	for _, entry := range entries {
 		hash := consensus.HeaderHash(&entry.Header)
-		if err := batch.Set(headerHeightIndexKey(entry.Height), hash[:], nil); err != nil {
-			return err
-		}
+		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: hash})
 	}
-	return batch.Commit(pebble.NoSync)
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind:         journalRewriteHeaderHeights,
+		ForkHeight:   forkHeight,
+		OldTipHeight: oldTipHeight,
+		Pairs:        pairs,
+	}); err != nil {
+		return err
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	s.notifyDerivedReplay()
+	return nil
 }
 
 func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(headerHeightIndexKey(height), hash[:], nil); err != nil {
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind:  journalSetHeaderHeight,
+		Pairs: []chainJournalHeightHash{{Height: height, Hash: hash}},
+	}); err != nil {
 		return err
 	}
-	return batch.Commit(pebble.NoSync)
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	s.notifyDerivedReplay()
+	return nil
 }
 
 func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
@@ -651,7 +741,7 @@ func (s *ChainStore) GetBlockHashByHeight(height uint64) (*[32]byte, error) {
 		return nil, err
 	}
 	if buf == nil {
-		return nil, nil
+		return s.derivedHashByHeight(height, false)
 	}
 	if len(buf) != 32 {
 		return nil, errors.New("invalid height index encoding")
@@ -667,7 +757,7 @@ func (s *ChainStore) GetHeaderHashByHeight(height uint64) (*[32]byte, error) {
 		return nil, err
 	}
 	if buf == nil {
-		return nil, nil
+		return s.derivedHashByHeight(height, true)
 	}
 	if len(buf) != 32 {
 		return nil, errors.New("invalid header height index encoding")
@@ -722,16 +812,222 @@ func (s *ChainStore) get(key []byte) ([]byte, error) {
 	return cloneBytes(value), nil
 }
 
+func (s *ChainStore) derivedHashByHeight(height uint64, header bool) (*[32]byte, error) {
+	tipHeightKey := metaTipHeightKey
+	tipHeaderKey := metaTipHeaderKey
+	if header {
+		tipHeightKey = metaHeaderTipHeightKey
+		tipHeaderKey = metaHeaderTipHeaderKey
+	}
+	heightBytes, err := s.get(tipHeightKey)
+	if err != nil {
+		return nil, err
+	}
+	headerBytes, err := s.get(tipHeaderKey)
+	if err != nil {
+		return nil, err
+	}
+	if (heightBytes == nil || headerBytes == nil) && header {
+		heightBytes, err = s.get(metaTipHeightKey)
+		if err != nil {
+			return nil, err
+		}
+		headerBytes, err = s.get(metaTipHeaderKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if heightBytes == nil || headerBytes == nil {
+		return nil, nil
+	}
+	tipHeight, err := decodeU64(heightBytes)
+	if err != nil {
+		return nil, err
+	}
+	if height > tipHeight {
+		return nil, nil
+	}
+	tipHeader, err := types.DecodeBlockHeader(headerBytes)
+	if err != nil {
+		return nil, err
+	}
+	hash := consensus.HeaderHash(&tipHeader)
+	if height == tipHeight {
+		return &hash, nil
+	}
+	cursorHash := hash
+	cursorHeight := tipHeight
+	for cursorHeight > height {
+		entry, err := s.GetBlockIndex(&cursorHash)
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			return nil, fmt.Errorf("missing block index for derived height lookup %x", cursorHash)
+		}
+		cursorHash = entry.ParentHash
+		cursorHeight--
+	}
+	return &cursorHash, nil
+}
+
+func (s *ChainStore) appendJournalEntriesBatch(batch *pebble.Batch, entries ...chainJournalEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	nextSeq, err := s.journalNextSeq()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := batch.Set(journalKey(nextSeq), encodeChainJournalEntry(entry), nil); err != nil {
+			return err
+		}
+		nextSeq++
+	}
+	return batch.Set(metaJournalNextSeqKey, encodeU64(nextSeq), nil)
+}
+
+func (s *ChainStore) appendJournalEntryBatch(batch *pebble.Batch, entry chainJournalEntry) error {
+	return s.appendJournalEntriesBatch(batch, entry)
+}
+
+func (s *ChainStore) journalNextSeq() (uint64, error) {
+	buf, err := s.get(metaJournalNextSeqKey)
+	if err != nil {
+		return 0, err
+	}
+	if buf == nil {
+		return 0, nil
+	}
+	return decodeU64(buf)
+}
+
+func (s *ChainStore) derivedJournalSeq() (uint64, error) {
+	buf, err := s.get(metaDerivedJournalSeqKey)
+	if err != nil {
+		return 0, err
+	}
+	if buf == nil {
+		return 0, nil
+	}
+	return decodeU64(buf)
+}
+
+func (s *ChainStore) notifyDerivedReplay() {
+	if s == nil || s.deriveNotify == nil {
+		return
+	}
+	select {
+	case s.deriveNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (s *ChainStore) derivedIndexLoop() {
+	for {
+		if err := s.replayDerivedIndexes(); err != nil {
+			logging.Component("storage").Warn("derived index replay failed", slog.Any("error", err))
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-s.stopCh:
+				return
+			}
+			continue
+		}
+		select {
+		case <-s.stopCh:
+			return
+		case <-s.deriveNotify:
+		}
+	}
+}
+
+func (s *ChainStore) replayDerivedIndexes() error {
+	for {
+		applied, err := s.applyNextJournalEntry()
+		if err != nil {
+			return err
+		}
+		if !applied {
+			return nil
+		}
+	}
+}
+
+func (s *ChainStore) applyNextJournalEntry() (bool, error) {
+	derivedSeq, err := s.derivedJournalSeq()
+	if err != nil {
+		return false, err
+	}
+	nextSeq, err := s.journalNextSeq()
+	if err != nil {
+		return false, err
+	}
+	if derivedSeq >= nextSeq {
+		return false, nil
+	}
+	buf, err := s.get(journalKey(derivedSeq))
+	if err != nil {
+		return false, err
+	}
+	if buf == nil {
+		batch := s.db.NewBatch()
+		defer batch.Close()
+		if err := batch.Set(metaDerivedJournalSeqKey, encodeU64(derivedSeq+1), nil); err != nil {
+			return false, err
+		}
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	entry, err := decodeChainJournalEntry(buf)
+	if err != nil {
+		return false, err
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := applyJournalEntryBatch(batch, entry); err != nil {
+		return false, err
+	}
+	if err := batch.Set(metaDerivedJournalSeqKey, encodeU64(derivedSeq+1), nil); err != nil {
+		return false, err
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *ChainStore) WaitForDerivedIndexes(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		derivedSeq, err := s.derivedJournalSeq()
+		if err != nil {
+			return err
+		}
+		nextSeq, err := s.journalNextSeq()
+		if err != nil {
+			return err
+		}
+		if derivedSeq >= nextSeq {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for derived indexes")
+		}
+		s.notifyDerivedReplay()
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
 	if err := writeHeaderMeta(batch, &StoredHeaderState{
 		Profile:   state.Profile,
 		Height:    state.Height,
 		TipHeader: state.TipHeader,
 	}); err != nil {
-		return err
-	}
-	tipHash := consensus.HeaderHash(&state.TipHeader)
-	if err := batch.Set(headerHeightIndexKey(state.Height), tipHash[:], nil); err != nil {
 		return err
 	}
 	if err := batch.Set(metaTipHeightKey, encodeU64(state.Height), nil); err != nil {
@@ -763,11 +1059,6 @@ func writeHeaderMeta(batch *pebble.Batch, state *StoredHeaderState) error {
 
 func putHeaderBatch(batch *pebble.Batch, entry BlockIndexEntry, active bool) error {
 	blockHash := consensus.HeaderHash(&entry.Header)
-	if active {
-		if err := batch.Set(heightIndexKey(entry.Height), blockHash[:], nil); err != nil {
-			return err
-		}
-	}
 	return batch.Set(blockIndexKey(blockHash), encodeBlockIndexEntry(entry), nil)
 }
 
@@ -828,6 +1119,10 @@ func blockUndoKey(hash [32]byte) []byte {
 	return append(append([]byte(nil), blockUndoPrefix...), hash[:]...)
 }
 
+func journalKey(seq uint64) []byte {
+	return append(append([]byte(nil), journalPrefix...), encodeU64(seq)...)
+}
+
 func heightIndexKey(height uint64) []byte {
 	return append(append([]byte(nil), heightIndexPrefix...), encodeU64(height)...)
 }
@@ -861,6 +1156,93 @@ func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
 	binary.LittleEndian.PutUint64(buf, entry.ValueAtoms)
 	buf = append(buf, entry.KeyHash[:]...)
 	return buf
+}
+
+func encodeChainJournalEntry(entry chainJournalEntry) []byte {
+	buf := make([]byte, 1+8+8+4)
+	buf[0] = byte(entry.Kind)
+	binary.LittleEndian.PutUint64(buf[1:9], entry.ForkHeight)
+	binary.LittleEndian.PutUint64(buf[9:17], entry.OldTipHeight)
+	binary.LittleEndian.PutUint32(buf[17:21], uint32(len(entry.Pairs)))
+	for _, pair := range entry.Pairs {
+		rawHeight := make([]byte, 8)
+		binary.LittleEndian.PutUint64(rawHeight, pair.Height)
+		buf = append(buf, rawHeight...)
+		buf = append(buf, pair.Hash[:]...)
+	}
+	return buf
+}
+
+func decodeChainJournalEntry(buf []byte) (chainJournalEntry, error) {
+	if len(buf) < 21 {
+		return chainJournalEntry{}, errors.New("invalid chain journal entry encoding")
+	}
+	entry := chainJournalEntry{
+		Kind:         chainJournalKind(buf[0]),
+		ForkHeight:   binary.LittleEndian.Uint64(buf[1:9]),
+		OldTipHeight: binary.LittleEndian.Uint64(buf[9:17]),
+	}
+	count := binary.LittleEndian.Uint32(buf[17:21])
+	buf = buf[21:]
+	if len(buf) != int(count)*(8+32) {
+		return chainJournalEntry{}, errors.New("invalid chain journal height/hash payload")
+	}
+	entry.Pairs = make([]chainJournalHeightHash, 0, count)
+	for i := uint32(0); i < count; i++ {
+		pair := chainJournalHeightHash{Height: binary.LittleEndian.Uint64(buf[:8])}
+		copy(pair.Hash[:], buf[8:40])
+		entry.Pairs = append(entry.Pairs, pair)
+		buf = buf[40:]
+	}
+	return entry, nil
+}
+
+func applyJournalEntryBatch(batch *pebble.Batch, entry chainJournalEntry) error {
+	switch entry.Kind {
+	case journalSetBlockHeight:
+		for _, pair := range entry.Pairs {
+			if err := batch.Set(heightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
+				return err
+			}
+		}
+	case journalRewriteBlockHeights:
+		for height := entry.ForkHeight + 1; height <= entry.OldTipHeight; height++ {
+			if err := batch.Delete(heightIndexKey(height), nil); err != nil {
+				return err
+			}
+			if height == ^uint64(0) {
+				break
+			}
+		}
+		for _, pair := range entry.Pairs {
+			if err := batch.Set(heightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
+				return err
+			}
+		}
+	case journalSetHeaderHeight:
+		for _, pair := range entry.Pairs {
+			if err := batch.Set(headerHeightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
+				return err
+			}
+		}
+	case journalRewriteHeaderHeights:
+		for height := entry.ForkHeight + 1; height <= entry.OldTipHeight; height++ {
+			if err := batch.Delete(headerHeightIndexKey(height), nil); err != nil {
+				return err
+			}
+			if height == ^uint64(0) {
+				break
+			}
+		}
+		for _, pair := range entry.Pairs {
+			if err := batch.Set(headerHeightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unknown chain journal kind %d", entry.Kind)
+	}
+	return nil
 }
 
 func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {

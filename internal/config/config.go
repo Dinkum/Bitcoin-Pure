@@ -33,6 +33,12 @@ type Config struct {
 	MaxAncestors                int      `json:"max_ancestors"`
 	MaxDescendants              int      `json:"max_descendants"`
 	MaxOrphans                  int      `json:"max_orphans"`
+	AvalancheMode               string   `json:"avalanche_mode"`
+	AvalancheKSample            int      `json:"avalanche_k_sample"`
+	AvalancheAlphaNumerator     int      `json:"avalanche_alpha_numerator"`
+	AvalancheAlphaDenominator   int      `json:"avalanche_alpha_denominator"`
+	AvalancheBeta               int      `json:"avalanche_beta"`
+	AvalanchePollIntervalMS     int      `json:"avalanche_poll_interval_ms"`
 	MinerEnabled                bool     `json:"miner_enabled"`
 	MinerWorkers                int      `json:"miner_workers"`
 	MinerKeyHashHex             string   `json:"miner_keyhash_hex"`
@@ -51,23 +57,29 @@ func Default() Config {
 		// Mining and some wallet/history RPCs can legitimately run for much
 		// longer than a few seconds on small nodes. Keep writes bounded, but
 		// high enough that long admin calls do not get cut off mid-response.
-		RPCWriteTimeoutMS:  15 * 60 * 1000,
-		RPCHeaderTimeoutMS: 2000,
-		RPCIdleTimeoutMS:   30000,
-		RPCMaxHeaderBytes:  8 << 10,
-		RPCMaxBodyBytes:    1 << 20,
-		P2PAddr:            "0.0.0.0:18444",
-		MaxInboundPeers:    32,
-		MaxOutboundPeers:   8,
-		HandshakeTimeoutMS: 5000,
-		StallTimeoutMS:     15000,
-		MaxMessageBytes:    64_000_000,
-		MinRelayFeePerByte: 1,
-		MaxAncestors:       256,
-		MaxDescendants:     256,
-		MaxOrphans:         128,
-		MinerEnabled:       false,
-		GenesisFixture:     "fixtures/genesis/regtest.json",
+		RPCWriteTimeoutMS:         15 * 60 * 1000,
+		RPCHeaderTimeoutMS:        2000,
+		RPCIdleTimeoutMS:          30000,
+		RPCMaxHeaderBytes:         8 << 10,
+		RPCMaxBodyBytes:           1 << 20,
+		P2PAddr:                   "0.0.0.0:18444",
+		MaxInboundPeers:           32,
+		MaxOutboundPeers:          8,
+		HandshakeTimeoutMS:        5000,
+		StallTimeoutMS:            15000,
+		MaxMessageBytes:           64_000_000,
+		MinRelayFeePerByte:        1,
+		MaxAncestors:              256,
+		MaxDescendants:            256,
+		MaxOrphans:                128,
+		AvalancheMode:             "on",
+		AvalancheKSample:          16,
+		AvalancheAlphaNumerator:   3,
+		AvalancheAlphaDenominator: 4,
+		AvalancheBeta:             15,
+		AvalanchePollIntervalMS:   200,
+		MinerEnabled:              false,
+		GenesisFixture:            "fixtures/genesis/regtest.json",
 	}
 }
 
