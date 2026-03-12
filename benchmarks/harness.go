@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ const (
 	ScenarioDirectSubmit       Scenario = "direct-submit"
 	ScenarioRPCBatch           Scenario = "rpc-batch"
 	ScenarioP2PRelay           Scenario = "p2p-relay"
+	ScenarioConfirmedBlocks    Scenario = "confirmed-blocks"
 	ScenarioUserMix            Scenario = "user-mix"
 	ScenarioChainedPackages    Scenario = "chained-packages"
 	ScenarioOrphanStorm        Scenario = "orphan-storm"
@@ -47,28 +49,43 @@ const (
 	TopologyMesh Topology = "mesh"
 )
 
+type TxOriginSpread string
+
+const (
+	// TxOriginOneNode preserves the historical benchmark behavior: one node
+	// originates the whole workload and the rest only receive relay traffic.
+	TxOriginOneNode TxOriginSpread = "one-node"
+	// TxOriginEven round-robins independent transactions across all nodes so
+	// relay measurements are not biased toward a single submitter.
+	TxOriginEven TxOriginSpread = "even"
+)
+
 type RunOptions struct {
-	Scenario     Scenario
-	Profile      types.ChainProfile
-	NodeCount    int
-	Topology     Topology
-	TxCount      int
-	BatchSize    int
-	Timeout      time.Duration
-	DBRoot       string
-	ProfileDir   string
-	SuppressLogs bool
+	Scenario       Scenario
+	Profile        types.ChainProfile
+	NodeCount      int
+	Topology       Topology
+	TxCount        int
+	BatchSize      int
+	TxsPerBlock    int
+	TxOriginSpread TxOriginSpread
+	Timeout        time.Duration
+	DBRoot         string
+	ProfileDir     string
+	SuppressLogs   bool
 }
 
 type SuiteOptions struct {
-	Profile      types.ChainProfile
-	NodeCount    int
-	TxCount      int
-	BatchSize    int
-	Timeout      time.Duration
-	DBRoot       string
-	ProfileDir   string
-	SuppressLogs bool
+	Profile        types.ChainProfile
+	NodeCount      int
+	TxCount        int
+	BatchSize      int
+	TxsPerBlock    int
+	TxOriginSpread TxOriginSpread
+	Timeout        time.Duration
+	DBRoot         string
+	ProfileDir     string
+	SuppressLogs   bool
 }
 
 type ProfilingReport struct {
@@ -76,24 +93,27 @@ type ProfilingReport struct {
 }
 
 type Report struct {
-	Scenario              string          `json:"scenario"`
-	Profile               string          `json:"profile"`
-	NodeCount             int             `json:"node_count"`
-	Topology              string          `json:"topology,omitempty"`
-	TxCount               int             `json:"tx_count"`
-	BatchSize             int             `json:"batch_size,omitempty"`
-	StartedAt             time.Time       `json:"started_at"`
-	CompletedAt           time.Time       `json:"completed_at"`
-	SubmissionDurationMS  float64         `json:"submission_duration_ms"`
-	ConvergenceDurationMS float64         `json:"convergence_duration_ms"`
-	SubmitTPS             float64         `json:"submit_tps"`
-	EndToEndTPS           float64         `json:"end_to_end_tps"`
-	Phases                PhaseReport     `json:"phases"`
-	Metrics               ScenarioMetrics `json:"metrics,omitempty"`
-	Profiling             ProfilingReport `json:"profiling,omitempty"`
-	Environment           Environment     `json:"environment"`
-	Nodes                 []NodeReport    `json:"nodes"`
-	Notes                 []string        `json:"notes,omitempty"`
+	Scenario             string          `json:"scenario"`
+	Profile              string          `json:"profile"`
+	NodeCount            int             `json:"node_count"`
+	Topology             string          `json:"topology,omitempty"`
+	TxCount              int             `json:"tx_count"`
+	BatchSize            int             `json:"batch_size,omitempty"`
+	TxsPerBlock          int             `json:"txs_per_block,omitempty"`
+	TxOriginSpread       string          `json:"tx_origin,omitempty"`
+	StartedAt            time.Time       `json:"started_at"`
+	CompletedAt          time.Time       `json:"completed_at"`
+	AdmissionDurationMS  float64         `json:"admission_duration_ms"`
+	CompletionDurationMS float64         `json:"completion_duration_ms"`
+	AdmissionTPS         float64         `json:"admission_tps"`
+	CompletionTPS        float64         `json:"completion_tps"`
+	ConfirmedTPS         float64         `json:"confirmed_tps,omitempty"`
+	Phases               PhaseReport     `json:"phases"`
+	Metrics              ScenarioMetrics `json:"metrics,omitempty"`
+	Profiling            ProfilingReport `json:"profiling,omitempty"`
+	Environment          Environment     `json:"environment"`
+	Nodes                []NodeReport    `json:"nodes"`
+	Notes                []string        `json:"notes,omitempty"`
 }
 
 type SuiteReport struct {
@@ -118,15 +138,19 @@ type Environment struct {
 }
 
 type NodeReport struct {
-	Name              string            `json:"name"`
-	RPCAddr           string            `json:"rpc_addr,omitempty"`
-	P2PAddr           string            `json:"p2p_addr,omitempty"`
-	PeerCount         int               `json:"peer_count"`
-	BlockHeight       uint64            `json:"block_height"`
-	HeaderHeight      uint64            `json:"header_height"`
-	MempoolCount      int               `json:"mempool_count"`
-	FullPropagationMS *float64          `json:"full_propagation_ms,omitempty"`
-	RelayPeers        []PeerRelayReport `json:"relay_peers,omitempty"`
+	Name                string            `json:"name"`
+	RPCAddr             string            `json:"rpc_addr,omitempty"`
+	P2PAddr             string            `json:"p2p_addr,omitempty"`
+	PeerCount           int               `json:"peer_count"`
+	BlockHeight         uint64            `json:"block_height"`
+	HeaderHeight        uint64            `json:"header_height"`
+	MempoolCount        int               `json:"mempool_count"`
+	SubmittedTxs        int               `json:"submitted_txs,omitempty"`
+	BlockSigChecks      uint64            `json:"block_sig_checks,omitempty"`
+	BlockSigFallbacks   uint64            `json:"block_sig_fallbacks,omitempty"`
+	BlockSigVerifyAvgMS float64           `json:"block_sig_verify_avg_ms,omitempty"`
+	CompletionMS        *float64          `json:"completion_ms,omitempty"`
+	RelayPeers          []PeerRelayReport `json:"relay_peers,omitempty"`
 }
 
 type PhaseReport struct {
@@ -138,6 +162,12 @@ type PhaseReport struct {
 
 type ScenarioMetrics struct {
 	AcceptedTxs          int     `json:"accepted_txs,omitempty"`
+	ConfirmedTxs         int     `json:"confirmed_txs,omitempty"`
+	ConfirmedBlocks      int     `json:"confirmed_blocks,omitempty"`
+	TargetTxsPerBlock    int     `json:"target_txs_per_block,omitempty"`
+	BlockConvergeAvgMS   float64 `json:"block_converge_avg_ms,omitempty"`
+	BlockConvergeP95MS   float64 `json:"block_converge_p95_ms,omitempty"`
+	BlockConvergeMaxMS   float64 `json:"block_converge_max_ms,omitempty"`
 	OrphanedTxs          int     `json:"orphaned_txs,omitempty"`
 	PromotedOrphans      int     `json:"promoted_orphans,omitempty"`
 	MaxOrphanCount       int     `json:"max_orphan_count,omitempty"`
@@ -211,31 +241,37 @@ type mempoolBenchConfig struct {
 }
 
 type workloadOutcome struct {
-	submitDone  time.Time
-	completed   time.Time
-	propagation map[string]time.Duration
-	phases      PhaseReport
-	metrics     ScenarioMetrics
-	extraNotes  []string
+	submitStarted   time.Time
+	submitDone      time.Time
+	admissionTime   time.Duration
+	completed       time.Time
+	propagation     map[string]time.Duration
+	submittedByNode map[string]int
+	phases          PhaseReport
+	metrics         ScenarioMetrics
+	extraNotes      []string
 }
 
 type submissionOutcome struct {
 	submitDone      time.Time
 	decodeMS        float64
 	validateAdmitMS float64
+	submittedByNode map[string]int
 	metrics         ScenarioMetrics
 }
 
 func DefaultRunOptions() RunOptions {
 	return RunOptions{
-		Scenario:     ScenarioP2PRelay,
-		Profile:      types.Regtest,
-		NodeCount:    5,
-		Topology:     TopologyMesh,
-		TxCount:      4_096,
-		BatchSize:    64,
-		Timeout:      30 * time.Second,
-		SuppressLogs: true,
+		Scenario:       ScenarioP2PRelay,
+		Profile:        types.Regtest,
+		NodeCount:      5,
+		Topology:       TopologyMesh,
+		TxCount:        4_096,
+		BatchSize:      64,
+		TxsPerBlock:    256,
+		TxOriginSpread: TxOriginOneNode,
+		Timeout:        30 * time.Second,
+		SuppressLogs:   true,
 	}
 }
 
@@ -244,6 +280,7 @@ func AvailableScenarios() []Scenario {
 		ScenarioDirectSubmit,
 		ScenarioRPCBatch,
 		ScenarioP2PRelay,
+		ScenarioConfirmedBlocks,
 		ScenarioUserMix,
 		ScenarioChainedPackages,
 		ScenarioOrphanStorm,
@@ -254,12 +291,14 @@ func AvailableScenarios() []Scenario {
 func DefaultSuiteOptions() SuiteOptions {
 	defaults := DefaultRunOptions()
 	return SuiteOptions{
-		Profile:      defaults.Profile,
-		NodeCount:    defaults.NodeCount,
-		TxCount:      defaults.TxCount,
-		BatchSize:    defaults.BatchSize,
-		Timeout:      defaults.Timeout,
-		SuppressLogs: defaults.SuppressLogs,
+		Profile:        defaults.Profile,
+		NodeCount:      defaults.NodeCount,
+		TxCount:        defaults.TxCount,
+		BatchSize:      defaults.BatchSize,
+		TxsPerBlock:    defaults.TxsPerBlock,
+		TxOriginSpread: defaults.TxOriginSpread,
+		Timeout:        defaults.Timeout,
+		SuppressLogs:   defaults.SuppressLogs,
 	}
 }
 
@@ -278,7 +317,11 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 	runCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	cluster, cleanup, err := openCluster(runCtx, opts)
+	// The benchmark timeout should stop the workload, not tear down live node
+	// services underneath an in-flight MineBlocks/submit call. Cluster lifetime is
+	// managed explicitly by cleanup so timeouts return errors instead of crashing
+	// the process with closed-store races.
+	cluster, cleanup, err := openCluster(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +338,7 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		if err != nil {
 			return nil, err
 		}
-		outcome, err = executeScenario(runCtx, cluster, opts, started)
+		outcome, err = executeScenario(runCtx, cluster, opts)
 		if err != nil {
 			_, _ = capture.Stop()
 			return nil, err
@@ -306,36 +349,53 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		}
 		profilingReport.Artifacts = artifacts
 	} else {
-		outcome, err = executeScenario(runCtx, cluster, opts, started)
+		outcome, err = executeScenario(runCtx, cluster, opts)
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	// Submit and end-to-end throughput should measure the actual workload window,
+	// not earlier cluster warmup such as funding seeding or readiness waits.
+	submitStarted := outcome.submitStarted
+	if submitStarted.IsZero() {
+		submitStarted = started
+	}
+	admissionElapsed := outcome.admissionTime
+	if admissionElapsed <= 0 {
+		admissionElapsed = outcome.submitDone.Sub(submitStarted)
+	}
 	report := &Report{
-		Scenario:              string(opts.Scenario),
-		Profile:               opts.Profile.String(),
-		NodeCount:             opts.NodeCount,
-		Topology:              reportTopology(opts),
-		TxCount:               opts.TxCount,
-		BatchSize:             opts.BatchSize,
-		StartedAt:             started,
-		CompletedAt:           outcome.completed,
-		SubmissionDurationMS:  durationMS(outcome.submitDone.Sub(started)),
-		ConvergenceDurationMS: outcome.phases.ConvergenceMS,
-		SubmitTPS:             ratePerSecond(opts.TxCount, outcome.submitDone.Sub(started)),
-		EndToEndTPS:           ratePerSecond(opts.TxCount, outcome.completed.Sub(started)),
-		Phases:                outcome.phases,
-		Metrics:               outcome.metrics,
-		Profiling:             profilingReport,
+		Scenario:             string(opts.Scenario),
+		Profile:              opts.Profile.String(),
+		NodeCount:            opts.NodeCount,
+		Topology:             reportTopology(opts),
+		TxCount:              opts.TxCount,
+		BatchSize:            opts.BatchSize,
+		TxOriginSpread:       string(opts.TxOriginSpread),
+		StartedAt:            started,
+		CompletedAt:          outcome.completed,
+		AdmissionDurationMS:  durationMS(admissionElapsed),
+		CompletionDurationMS: outcome.phases.ConvergenceMS,
+		AdmissionTPS:         ratePerSecond(opts.TxCount, admissionElapsed),
+		CompletionTPS:        ratePerSecond(opts.TxCount, outcome.completed.Sub(submitStarted)),
+		Phases:               outcome.phases,
+		Metrics:              outcome.metrics,
+		Profiling:            profilingReport,
 		Environment: Environment{
 			GoOS:      runtime.GOOS,
 			GoArch:    runtime.GOARCH,
 			GoVersion: runtime.Version(),
 			NumCPU:    runtime.NumCPU(),
 		},
-		Nodes: buildNodeReports(cluster, outcome.propagation),
+		Nodes: buildNodeReports(cluster, outcome.propagation, outcome.submittedByNode),
 		Notes: buildNotes(opts, outcome.extraNotes),
+	}
+	if opts.Scenario == ScenarioConfirmedBlocks {
+		report.TxsPerBlock = opts.TxsPerBlock
+	}
+	if report.Metrics.ConfirmedTxs > 0 {
+		report.ConfirmedTPS = ratePerSecond(report.Metrics.ConfirmedTxs, outcome.completed.Sub(submitStarted))
 	}
 	report.Metrics.TxBatchMessages, report.Metrics.TxBatchItems, report.Metrics.TxReconMessages, report.Metrics.TxReconItems, report.Metrics.TxRequestMessages, report.Metrics.TxRequestItems = aggregateRelayMetrics(report.Nodes)
 	return report, nil
@@ -355,7 +415,7 @@ func RunSuite(ctx context.Context, opts SuiteOptions) (*SuiteReport, error) {
 			NumCPU:    runtime.NumCPU(),
 		},
 		Notes: []string{
-			"Suite coverage mixes direct in-process submit, authenticated RPC batch submit, and real multi-node loopback relay.",
+			"Suite coverage mixes direct in-process submit, authenticated RPC batch submit, repeated confirmed-block runs, and real multi-node loopback relay.",
 			"Loopback cluster cases show BPU stack throughput with real node-to-node propagation but without WAN latency.",
 		},
 	}
@@ -386,10 +446,19 @@ func RenderMarkdown(report *Report) string {
 	if report.BatchSize > 0 {
 		b.WriteString(fmt.Sprintf("- Batch size: `%d`\n", report.BatchSize))
 	}
-	b.WriteString(fmt.Sprintf("- Submit duration: `%.2f ms`\n", report.SubmissionDurationMS))
-	b.WriteString(fmt.Sprintf("- Full convergence: `%.2f ms`\n", report.ConvergenceDurationMS))
-	b.WriteString(fmt.Sprintf("- Submit TPS: `%.2f`\n", report.SubmitTPS))
-	b.WriteString(fmt.Sprintf("- End-to-end TPS: `%.2f`\n", report.EndToEndTPS))
+	if report.TxsPerBlock > 0 {
+		b.WriteString(fmt.Sprintf("- Txs per block: `%d`\n", report.TxsPerBlock))
+	}
+	if report.TxOriginSpread != "" {
+		b.WriteString(fmt.Sprintf("- Tx origin: `%s`\n", report.TxOriginSpread))
+	}
+	b.WriteString(fmt.Sprintf("- Admission duration: `%.2f ms`\n", report.AdmissionDurationMS))
+	b.WriteString(fmt.Sprintf("- Completion duration: `%.2f ms`\n", report.CompletionDurationMS))
+	b.WriteString(fmt.Sprintf("- Admission TPS: `%.2f`\n", report.AdmissionTPS))
+	b.WriteString(fmt.Sprintf("- Completion TPS: `%.2f`\n", report.CompletionTPS))
+	if report.ConfirmedTPS > 0 {
+		b.WriteString(fmt.Sprintf("- Confirmed TPS: `%.2f`\n", report.ConfirmedTPS))
+	}
 	if len(report.Profiling.Artifacts) != 0 {
 		b.WriteString("\n## Profiles\n\n")
 		for _, artifact := range report.Profiling.Artifacts {
@@ -414,15 +483,23 @@ func RenderMarkdown(report *Report) string {
 		}
 	}
 	b.WriteString("\n## Nodes\n\n")
-	b.WriteString("| Name | Peers | Block Height | Header Height | Mempool | Full Propagation |\n")
-	b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: |\n")
+	b.WriteString("| Name | Peers | Submitted | Block Height | Header Height | Mempool | Completion |\n")
+	b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, node := range report.Nodes {
 		propagation := "-"
-		if node.FullPropagationMS != nil {
-			propagation = fmt.Sprintf("%.2f ms", *node.FullPropagationMS)
+		if node.CompletionMS != nil {
+			propagation = fmt.Sprintf("%.2f ms", *node.CompletionMS)
 		}
-		b.WriteString(fmt.Sprintf("| %s | %d | %d | %d | %d | %s |\n",
-			node.Name, node.PeerCount, node.BlockHeight, node.HeaderHeight, node.MempoolCount, propagation))
+		b.WriteString(fmt.Sprintf("| %s | %d | %d | %d | %d | %d | %s |\n",
+			node.Name, node.PeerCount, node.SubmittedTxs, node.BlockHeight, node.HeaderHeight, node.MempoolCount, propagation))
+	}
+	if rows := signatureMetricRows(report.Nodes); len(rows) != 0 {
+		b.WriteString("\n## Block Signature Verification\n\n")
+		b.WriteString("| Node | Sig Checks | Batch Fallbacks | Verify Avg |\n")
+		b.WriteString("| --- | ---: | ---: | ---: |\n")
+		for _, row := range rows {
+			b.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", row[0], row[1], row[2], row[3]))
+		}
 	}
 	if peers := flattenRelayPeers(report.Nodes); len(peers) != 0 {
 		b.WriteString("\n## Relay Peers\n\n")
@@ -459,21 +536,22 @@ func RenderSuiteMarkdown(report *SuiteReport) string {
 	b.WriteString(fmt.Sprintf("- Started: `%s`\n", report.StartedAt.UTC().Format(time.RFC3339)))
 	b.WriteString(fmt.Sprintf("- Completed: `%s`\n", report.CompletedAt.UTC().Format(time.RFC3339)))
 	b.WriteString("\n## Summary\n\n")
-	b.WriteString("| Case | Scenario | Nodes | Topology | Tx Count | Submit TPS | End-to-End TPS | Validate / Admit | Relay Fanout | Convergence |\n")
-	b.WriteString("| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	b.WriteString("| Case | Scenario | Nodes | Topology | Tx Count | Admission TPS | Completion TPS | Confirmed TPS | Validate / Admit | Relay Fanout | Convergence |\n")
+	b.WriteString("| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, suiteCase := range report.Cases {
 		topology := suiteCase.Report.Topology
 		if topology == "" {
 			topology = "-"
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %d | %s | %d | %.2f | %.2f | %.2f ms | %.2f ms | %.2f ms |\n",
+		b.WriteString(fmt.Sprintf("| %s | %s | %d | %s | %d | %.2f | %.2f | %.2f | %.2f ms | %.2f ms | %.2f ms |\n",
 			suiteCase.Name,
 			suiteCase.Report.Scenario,
 			suiteCase.Report.NodeCount,
 			topology,
 			suiteCase.Report.TxCount,
-			suiteCase.Report.SubmitTPS,
-			suiteCase.Report.EndToEndTPS,
+			suiteCase.Report.AdmissionTPS,
+			suiteCase.Report.CompletionTPS,
+			suiteCase.Report.ConfirmedTPS,
 			suiteCase.Report.Phases.ValidateAdmitMS,
 			suiteCase.Report.Phases.RelayFanoutMS,
 			suiteCase.Report.Phases.ConvergenceMS,
@@ -493,8 +571,8 @@ func RenderASCIISummary(report *Report) string {
 		fmt.Sprintf("Scenario    %s", report.Scenario),
 		fmt.Sprintf("Profile     %s", report.Profile),
 		fmt.Sprintf("Layout      %d nodes%s", report.NodeCount, asciiTopologySuffix(report.Topology)),
-		fmt.Sprintf("Workload    %d txs%s", report.TxCount, asciiBatchSuffix(report.BatchSize)),
-		fmt.Sprintf("Throughput  submit %.2f tx/s | end-to-end %.2f tx/s", report.SubmitTPS, report.EndToEndTPS),
+		fmt.Sprintf("Workload    %d txs%s%s%s", report.TxCount, asciiBatchSuffix(report.BatchSize), asciiBlockTargetSuffix(report.TxsPerBlock), asciiTxOriginSuffix(report.TxOriginSpread)),
+		fmt.Sprintf("Throughput  admission %.2f tx/s | completion %.2f tx/s", report.AdmissionTPS, report.CompletionTPS),
 		fmt.Sprintf("Phases      decode %.2f ms | admit %.2f ms | fanout %.2f ms | converge %.2f ms",
 			report.Phases.DecodeMS,
 			report.Phases.ValidateAdmitMS,
@@ -502,11 +580,17 @@ func RenderASCIISummary(report *Report) string {
 			report.Phases.ConvergenceMS,
 		),
 	}
+	if report.ConfirmedTPS > 0 {
+		lines = append(lines, fmt.Sprintf("Confirmed   %.2f tx/s", report.ConfirmedTPS))
+	}
 	if len(report.Profiling.Artifacts) != 0 {
 		lines = append(lines, fmt.Sprintf("Profiles    %d artifacts in %s", len(report.Profiling.Artifacts), filepath.Dir(report.Profiling.Artifacts[0].Path)))
 	}
 	for _, row := range scenarioMetricRows(report.Metrics) {
 		lines = append(lines, fmt.Sprintf("Metric      %s: %s", row[0], row[1]))
+	}
+	if sigLine := asciiSignatureSummary(report.Nodes); sigLine != "" {
+		lines = append(lines, sigLine)
 	}
 	if slowest := slowestNode(report.Nodes); slowest != "" {
 		lines = append(lines, slowest)
@@ -597,6 +681,12 @@ func withDefaults(opts RunOptions) RunOptions {
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = defaults.BatchSize
 	}
+	if opts.TxsPerBlock <= 0 {
+		opts.TxsPerBlock = defaults.TxsPerBlock
+	}
+	if opts.TxOriginSpread == "" {
+		opts.TxOriginSpread = defaults.TxOriginSpread
+	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaults.Timeout
 	}
@@ -617,6 +707,12 @@ func withSuiteDefaults(opts SuiteOptions) SuiteOptions {
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = defaults.BatchSize
 	}
+	if opts.TxsPerBlock <= 0 {
+		opts.TxsPerBlock = defaults.TxsPerBlock
+	}
+	if opts.TxOriginSpread == "" {
+		opts.TxOriginSpread = defaults.TxOriginSpread
+	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaults.Timeout
 	}
@@ -625,9 +721,14 @@ func withSuiteDefaults(opts SuiteOptions) SuiteOptions {
 
 func validateOptions(opts RunOptions) error {
 	switch opts.Scenario {
-	case ScenarioDirectSubmit, ScenarioRPCBatch, ScenarioP2PRelay, ScenarioUserMix, ScenarioChainedPackages, ScenarioOrphanStorm, ScenarioBlockTemplateBuild:
+	case ScenarioDirectSubmit, ScenarioRPCBatch, ScenarioP2PRelay, ScenarioConfirmedBlocks, ScenarioUserMix, ScenarioChainedPackages, ScenarioOrphanStorm, ScenarioBlockTemplateBuild:
 	default:
 		return fmt.Errorf("unsupported scenario: %s", opts.Scenario)
+	}
+	switch opts.TxOriginSpread {
+	case TxOriginOneNode, TxOriginEven:
+	default:
+		return fmt.Errorf("unsupported tx origin spread: %s", opts.TxOriginSpread)
 	}
 	if !opts.Profile.IsRegtestLike() {
 		return fmt.Errorf("benchmark suite currently supports regtest-style profiles only")
@@ -635,8 +736,14 @@ func validateOptions(opts RunOptions) error {
 	if opts.Scenario == ScenarioP2PRelay && opts.NodeCount < 2 {
 		return fmt.Errorf("p2p-relay requires at least 2 nodes")
 	}
-	if opts.Scenario != ScenarioP2PRelay && opts.NodeCount != 1 {
+	if opts.Scenario == ScenarioConfirmedBlocks && opts.NodeCount < 1 {
+		return fmt.Errorf("confirmed-blocks requires at least 1 node")
+	}
+	if opts.Scenario != ScenarioP2PRelay && opts.Scenario != ScenarioConfirmedBlocks && opts.NodeCount != 1 {
 		return fmt.Errorf("%s requires exactly 1 node", opts.Scenario)
+	}
+	if opts.Scenario == ScenarioConfirmedBlocks && opts.TxsPerBlock <= 0 {
+		return fmt.Errorf("confirmed-blocks requires txs_per_block > 0")
 	}
 	switch opts.Topology {
 	case TopologyLine, TopologyMesh:
@@ -650,6 +757,9 @@ func validateOptions(opts RunOptions) error {
 	if opts.TxCount > maxSeedable {
 		return fmt.Errorf("tx count %d exceeds current benchmark seed capacity %d for %s; lower --txs or extend the funding strategy", opts.TxCount, maxSeedable, opts.Profile)
 	}
+	if opts.Scenario == ScenarioConfirmedBlocks && opts.TxsPerBlock > opts.TxCount {
+		return fmt.Errorf("txs_per_block %d exceeds tx count %d", opts.TxsPerBlock, opts.TxCount)
+	}
 	return nil
 }
 
@@ -659,104 +769,134 @@ type suiteCase struct {
 }
 
 func suiteCases(opts SuiteOptions) []suiteCase {
+	blockTxsPerBlock := min(opts.TxsPerBlock, opts.TxCount)
+	if blockTxsPerBlock <= 0 {
+		blockTxsPerBlock = max(1, min(opts.BatchSize, opts.TxCount))
+	}
 	cases := []suiteCase{
 		{
 			Name: "direct-submit",
 			Options: RunOptions{
-				Scenario:     ScenarioDirectSubmit,
-				Profile:      opts.Profile,
-				NodeCount:    1,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "direct-submit"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "direct-submit"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioDirectSubmit,
+				Profile:        opts.Profile,
+				NodeCount:      1,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "direct-submit"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "direct-submit"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 		{
 			Name: "rpc-batch",
 			Options: RunOptions{
-				Scenario:     ScenarioRPCBatch,
-				Profile:      opts.Profile,
-				NodeCount:    1,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "rpc-batch"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "rpc-batch"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioRPCBatch,
+				Profile:        opts.Profile,
+				NodeCount:      1,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "rpc-batch"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "rpc-batch"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 		{
 			Name: "user-mix",
 			Options: RunOptions{
-				Scenario:     ScenarioUserMix,
-				Profile:      opts.Profile,
-				NodeCount:    1,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "user-mix"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "user-mix"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioUserMix,
+				Profile:        opts.Profile,
+				NodeCount:      1,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "user-mix"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "user-mix"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 		{
 			Name: "chained-packages",
 			Options: RunOptions{
-				Scenario:     ScenarioChainedPackages,
-				Profile:      opts.Profile,
-				NodeCount:    1,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "chained-packages"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "chained-packages"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioChainedPackages,
+				Profile:        opts.Profile,
+				NodeCount:      1,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "chained-packages"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "chained-packages"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 		{
 			Name: "orphan-storm",
 			Options: RunOptions{
-				Scenario:     ScenarioOrphanStorm,
-				Profile:      opts.Profile,
-				NodeCount:    1,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "orphan-storm"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "orphan-storm"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioOrphanStorm,
+				Profile:        opts.Profile,
+				NodeCount:      1,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "orphan-storm"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "orphan-storm"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 		{
 			Name: "block-template-rebuild",
 			Options: RunOptions{
-				Scenario:     ScenarioBlockTemplateBuild,
-				Profile:      opts.Profile,
-				NodeCount:    1,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "block-template-rebuild"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "block-template-rebuild"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioBlockTemplateBuild,
+				Profile:        opts.Profile,
+				NodeCount:      1,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxsPerBlock:    opts.TxsPerBlock,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "block-template-rebuild"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "block-template-rebuild"),
+				SuppressLogs:   opts.SuppressLogs,
+			},
+		},
+		{
+			Name: "confirmed-blocks-2-line",
+			Options: RunOptions{
+				Scenario:       ScenarioConfirmedBlocks,
+				Profile:        opts.Profile,
+				NodeCount:      2,
+				Topology:       TopologyLine,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxsPerBlock:    blockTxsPerBlock,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "confirmed-blocks-2-line"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "confirmed-blocks-2-line"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 		{
 			Name: "p2p-relay-2-line",
 			Options: RunOptions{
-				Scenario:     ScenarioP2PRelay,
-				Profile:      opts.Profile,
-				NodeCount:    2,
-				Topology:     TopologyLine,
-				TxCount:      opts.TxCount,
-				BatchSize:    opts.BatchSize,
-				Timeout:      opts.Timeout,
-				DBRoot:       suiteDBRoot(opts.DBRoot, "p2p-relay-2-line"),
-				ProfileDir:   suiteProfileRoot(opts.ProfileDir, "p2p-relay-2-line"),
-				SuppressLogs: opts.SuppressLogs,
+				Scenario:       ScenarioP2PRelay,
+				Profile:        opts.Profile,
+				NodeCount:      2,
+				Topology:       TopologyLine,
+				TxCount:        opts.TxCount,
+				BatchSize:      opts.BatchSize,
+				TxsPerBlock:    opts.TxsPerBlock,
+				TxOriginSpread: opts.TxOriginSpread,
+				Timeout:        opts.Timeout,
+				DBRoot:         suiteDBRoot(opts.DBRoot, "p2p-relay-2-line"),
+				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "p2p-relay-2-line"),
+				SuppressLogs:   opts.SuppressLogs,
 			},
 		},
 	}
@@ -765,31 +905,35 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 			suiteCase{
 				Name: "p2p-relay-line",
 				Options: RunOptions{
-					Scenario:     ScenarioP2PRelay,
-					Profile:      opts.Profile,
-					NodeCount:    opts.NodeCount,
-					Topology:     TopologyLine,
-					TxCount:      opts.TxCount,
-					BatchSize:    opts.BatchSize,
-					Timeout:      opts.Timeout,
-					DBRoot:       suiteDBRoot(opts.DBRoot, "p2p-relay-line"),
-					ProfileDir:   suiteProfileRoot(opts.ProfileDir, "p2p-relay-line"),
-					SuppressLogs: opts.SuppressLogs,
+					Scenario:       ScenarioP2PRelay,
+					Profile:        opts.Profile,
+					NodeCount:      opts.NodeCount,
+					Topology:       TopologyLine,
+					TxCount:        opts.TxCount,
+					BatchSize:      opts.BatchSize,
+					TxsPerBlock:    opts.TxsPerBlock,
+					TxOriginSpread: opts.TxOriginSpread,
+					Timeout:        opts.Timeout,
+					DBRoot:         suiteDBRoot(opts.DBRoot, "p2p-relay-line"),
+					ProfileDir:     suiteProfileRoot(opts.ProfileDir, "p2p-relay-line"),
+					SuppressLogs:   opts.SuppressLogs,
 				},
 			},
 			suiteCase{
 				Name: "p2p-relay-mesh",
 				Options: RunOptions{
-					Scenario:     ScenarioP2PRelay,
-					Profile:      opts.Profile,
-					NodeCount:    opts.NodeCount,
-					Topology:     TopologyMesh,
-					TxCount:      opts.TxCount,
-					BatchSize:    opts.BatchSize,
-					Timeout:      opts.Timeout,
-					DBRoot:       suiteDBRoot(opts.DBRoot, "p2p-relay-mesh"),
-					ProfileDir:   suiteProfileRoot(opts.ProfileDir, "p2p-relay-mesh"),
-					SuppressLogs: opts.SuppressLogs,
+					Scenario:       ScenarioP2PRelay,
+					Profile:        opts.Profile,
+					NodeCount:      opts.NodeCount,
+					Topology:       TopologyMesh,
+					TxCount:        opts.TxCount,
+					BatchSize:      opts.BatchSize,
+					TxsPerBlock:    opts.TxsPerBlock,
+					TxOriginSpread: opts.TxOriginSpread,
+					Timeout:        opts.Timeout,
+					DBRoot:         suiteDBRoot(opts.DBRoot, "p2p-relay-mesh"),
+					ProfileDir:     suiteProfileRoot(opts.ProfileDir, "p2p-relay-mesh"),
+					SuppressLogs:   opts.SuppressLogs,
 				},
 			},
 		)
@@ -824,14 +968,20 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 			if benchNode.cancel != nil {
 				benchNode.cancel()
 			}
-			if benchNode.svc != nil {
-				_ = benchNode.svc.Close()
-			}
 			if benchNode.errCh != nil {
 				select {
 				case <-benchNode.errCh:
 				case <-time.After(2 * time.Second):
+					if benchNode.svc != nil {
+						_ = benchNode.svc.Close()
+					}
+					select {
+					case <-benchNode.errCh:
+					case <-time.After(2 * time.Second):
+					}
 				}
+			} else if benchNode.svc != nil {
+				_ = benchNode.svc.Close()
 			}
 		}
 		if opts.DBRoot == "" {
@@ -847,7 +997,7 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 		}
 		rpcAddr := ""
 		authToken := ""
-		if opts.Scenario == ScenarioRPCBatch && i == 0 {
+		if (opts.Scenario == ScenarioRPCBatch && i == 0) || opts.Scenario == ScenarioConfirmedBlocks {
 			rpcAddr, err = reserveLoopbackAddr()
 			if err != nil {
 				cleanup()
@@ -886,7 +1036,7 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 			MaxAncestors:       mempoolCfg.maxAncestors,
 			MaxDescendants:     mempoolCfg.maxDescendants,
 			MaxOrphans:         mempoolCfg.maxOrphans,
-			MinerKeyHash:       keyHashForSeed(byte(i + 1)),
+			MinerPubKey:        pubKeyForSeed(byte(i + 1)),
 			GenesisFixture:     "fixtures/genesis/regtest.json",
 		}, genesis)
 		if err != nil {
@@ -1022,8 +1172,9 @@ func benchmarkMempoolConfig(opts RunOptions) mempoolBenchConfig {
 	return cfg
 }
 
-func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOptions, started time.Time) (workloadOutcome, error) {
+func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOptions) (workloadOutcome, error) {
 	submitter := cluster[0]
+	submitters := benchmarkSubmitters(cluster, opts)
 	const seedReadyHeight = 1
 	switch opts.Scenario {
 	case ScenarioDirectSubmit, ScenarioRPCBatch, ScenarioP2PRelay:
@@ -1037,7 +1188,19 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		if _, err := waitForMempoolCounts(ctx, cluster, 0, time.Time{}); err != nil {
 			return workloadOutcome{}, err
 		}
-		return runSubmissionScenario(ctx, cluster, submitter, opts, started, txs)
+		return runSubmissionScenario(ctx, cluster, submitters, opts, txs)
+	case ScenarioConfirmedBlocks:
+		txs, err := seedSpendableFanout(submitter.svc, opts.TxCount)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+		if err := waitForHeights(ctx, cluster, seedReadyHeight); err != nil {
+			return workloadOutcome{}, err
+		}
+		if _, err := waitForMempoolCounts(ctx, cluster, 0, time.Time{}); err != nil {
+			return workloadOutcome{}, err
+		}
+		return runConfirmedBlocksScenario(ctx, cluster, submitter, submitters, opts, txs)
 	case ScenarioUserMix:
 		txs, metrics, err := seedUserMixWorkload(submitter.svc, opts.TxCount)
 		if err != nil {
@@ -1049,7 +1212,7 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		if _, err := waitForMempoolCounts(ctx, cluster, 0, time.Time{}); err != nil {
 			return workloadOutcome{}, err
 		}
-		outcome, err := runSubmissionScenario(ctx, cluster, submitter, opts, started, txs)
+		outcome, err := runSubmissionScenario(ctx, cluster, submitters, opts, txs)
 		if err != nil {
 			return workloadOutcome{}, err
 		}
@@ -1065,7 +1228,7 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		if err := waitForHeights(ctx, cluster, seedReadyHeight); err != nil {
 			return workloadOutcome{}, err
 		}
-		outcome, err := runDirectSubmitSequence(ctx, cluster, submitter, started, txs)
+		outcome, err := runDirectSubmitSequence(ctx, cluster, submitter, txs)
 		if err != nil {
 			return workloadOutcome{}, err
 		}
@@ -1080,7 +1243,7 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		if err := waitForHeights(ctx, cluster, seedReadyHeight); err != nil {
 			return workloadOutcome{}, err
 		}
-		outcome, err := runDirectSubmitSequence(ctx, cluster, submitter, started, txs)
+		outcome, err := runDirectSubmitSequence(ctx, cluster, submitter, txs)
 		if err != nil {
 			return workloadOutcome{}, err
 		}
@@ -1093,7 +1256,7 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		if err := waitForHeights(ctx, cluster, seedReadyHeight); err != nil {
 			return workloadOutcome{}, err
 		}
-		outcome, err := runTemplateRebuildScenario(ctx, cluster, submitter, started, txs, opts.BatchSize)
+		outcome, err := runTemplateRebuildScenario(ctx, cluster, submitter, txs, opts.BatchSize)
 		if err != nil {
 			return workloadOutcome{}, err
 		}
@@ -1106,20 +1269,159 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 	}
 }
 
-func runSubmissionScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, opts RunOptions, started time.Time, txs []types.Transaction) (workloadOutcome, error) {
+func benchmarkSubmitters(cluster []*clusterNode, opts RunOptions) []*clusterNode {
+	if len(cluster) == 0 {
+		return nil
+	}
+	if opts.TxOriginSpread == TxOriginEven && opts.NodeCount > 1 &&
+		(opts.Scenario == ScenarioP2PRelay || opts.Scenario == ScenarioConfirmedBlocks) {
+		return cluster
+	}
+	return []*clusterNode{cluster[0]}
+}
+
+func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, submitters []*clusterNode, opts RunOptions, txs []types.Transaction) (workloadOutcome, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
 	submitStarted := time.Now()
-	submission, err := submitWorkload(submitter, txs, opts)
+	metrics := ScenarioMetrics{
+		TargetTxsPerBlock: min(opts.TxsPerBlock, len(txs)),
+	}
+	if metrics.TargetTxsPerBlock <= 0 {
+		metrics.TargetTxsPerBlock = len(txs)
+	}
+	blockConvergenceSamples := make([]float64, 0, (len(txs)+metrics.TargetTxsPerBlock-1)/metrics.TargetTxsPerBlock)
+	var admissionElapsed time.Duration
+	submittedByNode := make(map[string]int, len(submitters))
+	currentHeight := uint64(1)
+	submitterOffset := 0
+	for start := 0; start < len(txs); start += metrics.TargetTxsPerBlock {
+		end := start + metrics.TargetTxsPerBlock
+		if end > len(txs) {
+			end = len(txs)
+		}
+		wave := txs[start:end]
+		// Keep each round bounded so the run spans multiple confirmed blocks
+		// instead of collapsing into a single oversized mempool wave.
+		admitStarted := time.Now()
+		for i, tx := range wave {
+			target := submitters[(submitterOffset+i)%len(submitters)]
+			admission, err := target.svc.SubmitTx(tx)
+			if err != nil {
+				return workloadOutcome{}, err
+			}
+			metrics.AcceptedTxs += len(admission.Accepted)
+			submittedByNode[target.name]++
+		}
+		submitterOffset = (submitterOffset + len(wave)) % len(submitters)
+		admissionElapsed += time.Since(admitStarted)
+		if _, err := waitForMempoolCounts(ctx, cluster, len(wave), time.Time{}); err != nil {
+			return workloadOutcome{}, err
+		}
+		minedBlock, minedHashHex, err := buildConfirmedBenchmarkBlock(submitter.svc, opts.Profile)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+		blockStarted := time.Now()
+		hashes, err := submitter.svc.MineBlocks(1)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+		if len(hashes) != 1 || hashes[0] != minedHashHex {
+			return workloadOutcome{}, fmt.Errorf("mined block hash mismatch: got %v want %s", hashes, minedHashHex)
+		}
+		if err := submitBlockToFollowers(client, cluster[1:], minedBlock); err != nil {
+			return workloadOutcome{}, err
+		}
+		currentHeight++
+		heightReached, err := waitForHeightsReached(ctx, cluster, currentHeight, blockStarted)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+		blockConvergenceSamples = append(blockConvergenceSamples, durationMS(maxDuration(heightReached)))
+		metrics.ConfirmedTxs += len(wave)
+		metrics.ConfirmedBlocks++
+	}
+	completion, err := waitForMempoolCounts(ctx, cluster, 0, submitStarted)
 	if err != nil {
 		return workloadOutcome{}, err
 	}
-	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), started)
+	if len(blockConvergenceSamples) > 0 {
+		metrics.BlockConvergeAvgMS = averageFloat64(blockConvergenceSamples)
+		metrics.BlockConvergeP95MS = percentileFloat64(blockConvergenceSamples, 95)
+		metrics.BlockConvergeMaxMS = maxFloat64(blockConvergenceSamples)
+	}
+	completed := time.Now()
+	return workloadOutcome{
+		submitStarted:   submitStarted,
+		submitDone:      submitStarted.Add(admissionElapsed),
+		admissionTime:   admissionElapsed,
+		completed:       completed,
+		propagation:     completion,
+		submittedByNode: submittedByNode,
+		phases: PhaseReport{
+			ValidateAdmitMS: durationMS(admissionElapsed),
+			ConvergenceMS:   durationMS(maxDuration(completion)),
+		},
+		metrics: metrics,
+		extraNotes: []string{
+			fmt.Sprintf("Confirmed-blocks runs submit up to %d transactions per round, waits for mempool convergence, mines one block on node-0, and waits for block-height convergence before the next round.", metrics.TargetTxsPerBlock),
+		},
+	}, nil
+}
+
+func buildConfirmedBenchmarkBlock(svc *node.Service, profile types.ChainProfile) (types.Block, string, error) {
+	block, err := svc.BuildBlockTemplate()
+	if err != nil {
+		return types.Block{}, "", err
+	}
+	minedHeader, err := consensus.MineHeader(block.Header, consensus.ParamsForProfile(profile))
+	if err != nil {
+		return types.Block{}, "", err
+	}
+	block.Header = minedHeader
+	hash := consensus.HeaderHash(&block.Header)
+	return block, hex.EncodeToString(hash[:]), nil
+}
+
+func submitBlockToFollowers(client *http.Client, followers []*clusterNode, block types.Block) error {
+	if len(followers) == 0 {
+		return nil
+	}
+	blockHex := hex.EncodeToString(block.Encode())
+	for _, follower := range followers {
+		if follower.rpcAddr == "" {
+			return fmt.Errorf("%s missing rpc endpoint for confirmed-block benchmark", follower.name)
+		}
+		var out struct {
+			Applied bool `json:"applied"`
+		}
+		if err := callRPC(client, follower.rpcAddr, follower.authToken, "submitblock", map[string]string{"hex": blockHex}, &out); err != nil {
+			if strings.Contains(err.Error(), "block already known") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func runSubmissionScenario(ctx context.Context, cluster []*clusterNode, submitters []*clusterNode, opts RunOptions, txs []types.Transaction) (workloadOutcome, error) {
+	submitStarted := time.Now()
+	submission, err := submitWorkload(submitters, txs, opts)
+	if err != nil {
+		return workloadOutcome{}, err
+	}
+	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), submitStarted)
 	if err != nil {
 		return workloadOutcome{}, err
 	}
 	outcome := workloadOutcome{
-		submitDone:  submission.submitDone,
-		completed:   time.Now(),
-		propagation: propagation,
+		submitStarted:   submitStarted,
+		submitDone:      submission.submitDone,
+		admissionTime:   submission.submitDone.Sub(submitStarted),
+		completed:       time.Now(),
+		propagation:     propagation,
+		submittedByNode: submission.submittedByNode,
 		phases: PhaseReport{
 			DecodeMS:        submission.decodeMS,
 			ValidateAdmitMS: submission.validateAdmitMS,
@@ -1140,7 +1442,7 @@ func runSubmissionScenario(ctx context.Context, cluster []*clusterNode, submitte
 	return outcome, nil
 }
 
-func runDirectSubmitSequence(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, started time.Time, txs []types.Transaction) (workloadOutcome, error) {
+func runDirectSubmitSequence(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, txs []types.Transaction) (workloadOutcome, error) {
 	submitStarted := time.Now()
 	metrics := ScenarioMetrics{}
 	for _, tx := range txs {
@@ -1160,14 +1462,16 @@ func runDirectSubmitSequence(ctx context.Context, cluster []*clusterNode, submit
 		}
 	}
 	submitDone := time.Now()
-	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), started)
+	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), submitStarted)
 	if err != nil {
 		return workloadOutcome{}, err
 	}
 	return workloadOutcome{
-		submitDone:  submitDone,
-		completed:   time.Now(),
-		propagation: propagation,
+		submitStarted: submitStarted,
+		submitDone:    submitDone,
+		admissionTime: submitDone.Sub(submitStarted),
+		completed:     time.Now(),
+		propagation:   propagation,
 		phases: PhaseReport{
 			ValidateAdmitMS: durationMS(submitDone.Sub(submitStarted)),
 			ConvergenceMS:   durationMS(maxDuration(propagation)),
@@ -1176,7 +1480,7 @@ func runDirectSubmitSequence(ctx context.Context, cluster []*clusterNode, submit
 	}, nil
 }
 
-func runTemplateRebuildScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, started time.Time, txs []types.Transaction, batchSize int) (workloadOutcome, error) {
+func runTemplateRebuildScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, txs []types.Transaction, batchSize int) (workloadOutcome, error) {
 	submitStarted := time.Now()
 	metrics := ScenarioMetrics{}
 	if batchSize <= 0 {
@@ -1204,7 +1508,7 @@ func runTemplateRebuildScenario(ctx context.Context, cluster []*clusterNode, sub
 		metrics.TemplateSelectedTxs = max(metrics.TemplateSelectedTxs, len(template.Txs)-1)
 	}
 	submitDone := time.Now()
-	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), started)
+	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), submitStarted)
 	if err != nil {
 		return workloadOutcome{}, err
 	}
@@ -1216,9 +1520,11 @@ func runTemplateRebuildScenario(ctx context.Context, cluster []*clusterNode, sub
 	metrics.TemplateCacheHits = templateStats.CacheHits
 	metrics.TemplateFrontier = templateStats.FrontierCandidates
 	return workloadOutcome{
-		submitDone:  submitDone,
-		completed:   time.Now(),
-		propagation: propagation,
+		submitStarted: submitStarted,
+		submitDone:    submitDone,
+		admissionTime: submitDone.Sub(submitStarted),
+		completed:     time.Now(),
+		propagation:   propagation,
 		phases: PhaseReport{
 			ValidateAdmitMS: durationMS(submitDone.Sub(submitStarted)),
 			ConvergenceMS:   durationMS(maxDuration(propagation)),
@@ -1227,22 +1533,29 @@ func runTemplateRebuildScenario(ctx context.Context, cluster []*clusterNode, sub
 	}, nil
 }
 
-func submitWorkload(submitter *clusterNode, txs []types.Transaction, opts RunOptions) (submissionOutcome, error) {
+func submitWorkload(submitters []*clusterNode, txs []types.Transaction, opts RunOptions) (submissionOutcome, error) {
+	if len(submitters) == 0 {
+		return submissionOutcome{}, errors.New("benchmark has no submitter nodes")
+	}
 	switch opts.Scenario {
 	case ScenarioDirectSubmit, ScenarioP2PRelay, ScenarioUserMix:
 		started := time.Now()
 		metrics := ScenarioMetrics{}
-		for _, tx := range txs {
+		submittedByNode := make(map[string]int, len(submitters))
+		for i, tx := range txs {
+			submitter := submitters[i%len(submitters)]
 			admission, err := submitter.svc.SubmitTx(tx)
 			if err != nil {
 				return submissionOutcome{}, err
 			}
 			metrics.AcceptedTxs += len(admission.Accepted)
+			submittedByNode[submitter.name]++
 		}
 		submitDone := time.Now()
 		return submissionOutcome{
 			submitDone:      submitDone,
 			validateAdmitMS: durationMS(submitDone.Sub(started)),
+			submittedByNode: submittedByNode,
 			metrics:         metrics,
 		}, nil
 	case ScenarioRPCBatch:
@@ -1250,11 +1563,15 @@ func submitWorkload(submitter *clusterNode, txs []types.Transaction, opts RunOpt
 		metrics := ScenarioMetrics{}
 		var decodeMS float64
 		var validateAdmitMS float64
+		submittedByNode := make(map[string]int, len(submitters))
+		batchIndex := 0
 		for start := 0; start < len(txs); start += opts.BatchSize {
 			end := start + opts.BatchSize
 			if end > len(txs) {
 				end = len(txs)
 			}
+			submitter := submitters[batchIndex%len(submitters)]
+			batchIndex++
 			var out struct {
 				Accepted                int     `json:"accepted"`
 				DecodeDurationMS        float64 `json:"decode_duration_ms"`
@@ -1268,11 +1585,13 @@ func submitWorkload(submitter *clusterNode, txs []types.Transaction, opts RunOpt
 			metrics.AcceptedTxs += out.Accepted
 			decodeMS += out.DecodeDurationMS
 			validateAdmitMS += out.ValidateAdmitDurationMS
+			submittedByNode[submitter.name] += end - start
 		}
 		return submissionOutcome{
 			submitDone:      time.Now(),
 			decodeMS:        decodeMS,
 			validateAdmitMS: validateAdmitMS,
+			submittedByNode: submittedByNode,
 			metrics:         metrics,
 		}, nil
 	default:
@@ -1296,16 +1615,30 @@ func encodePackedTransactions(txs []types.Transaction) string {
 }
 
 func waitForHeights(ctx context.Context, nodes []*clusterNode, height uint64) error {
-	return waitForCondition(ctx, func() (bool, error) {
+	_, err := waitForHeightsReached(ctx, nodes, height, time.Time{})
+	return err
+}
+
+func waitForHeightsReached(ctx context.Context, nodes []*clusterNode, height uint64, started time.Time) (map[string]time.Duration, error) {
+	reached := make(map[string]time.Duration, len(nodes))
+	err := waitForCondition(ctx, func() (bool, error) {
+		allReached := true
 		for _, benchNode := range nodes {
-			if benchNode.svc.BlockHeight() < height {
-				return false, nil
+			if benchNode.svc.BlockHeight() >= height {
+				if !started.IsZero() {
+					if _, ok := reached[benchNode.name]; !ok {
+						reached[benchNode.name] = time.Since(started)
+					}
+				}
+				continue
 			}
+			allReached = false
 		}
-		return true, nil
+		return allReached, nil
 	}, func() string {
 		return heightStatus(nodes, height)
 	})
+	return reached, err
 }
 
 func waitForMempoolCounts(ctx context.Context, nodes []*clusterNode, target int, started time.Time) (map[string]time.Duration, error) {
@@ -1370,7 +1703,17 @@ func peerConnectivityStatus(nodes []*clusterNode, topology Topology) string {
 func heightStatus(nodes []*clusterNode, target uint64) string {
 	parts := make([]string, 0, len(nodes))
 	for _, benchNode := range nodes {
-		parts = append(parts, fmt.Sprintf("%s height=%d target=%d", benchNode.name, benchNode.svc.BlockHeight(), target))
+		debug := benchNode.svc.SyncDebugSnapshot()
+		parts = append(parts, fmt.Sprintf("%s height=%d target=%d header=%d mempool=%d inflight=%s pending=%s peers=%s",
+			benchNode.name,
+			debug.BlockHeight,
+			target,
+			debug.HeaderHeight,
+			debug.MempoolCount,
+			debug.InflightBlocks,
+			debug.PendingBlocks,
+			debug.PeerSync,
+		))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -1378,8 +1721,17 @@ func heightStatus(nodes []*clusterNode, target uint64) string {
 func mempoolStatus(nodes []*clusterNode, target int, reached map[string]time.Duration) string {
 	parts := make([]string, 0, len(nodes))
 	for _, benchNode := range nodes {
-		count := benchNode.svc.MempoolCount()
-		status := fmt.Sprintf("%s mempool=%d target=%d", benchNode.name, count, target)
+		debug := benchNode.svc.SyncDebugSnapshot()
+		status := fmt.Sprintf("%s mempool=%d target=%d height=%d header=%d inflight=%s pending=%s peers=%s",
+			benchNode.name,
+			debug.MempoolCount,
+			target,
+			debug.BlockHeight,
+			debug.HeaderHeight,
+			debug.InflightBlocks,
+			debug.PendingBlocks,
+			debug.PeerSync,
+		)
 		if dur, ok := reached[benchNode.name]; ok {
 			status = fmt.Sprintf("%s reached=%s", status, dur.Round(time.Millisecond))
 		}
@@ -1403,22 +1755,27 @@ func waitForTCPListener(addr string) error {
 	}
 }
 
-func buildNodeReports(nodes []*clusterNode, reached map[string]time.Duration) []NodeReport {
+func buildNodeReports(nodes []*clusterNode, reached map[string]time.Duration, submittedByNode map[string]int) []NodeReport {
 	out := make([]NodeReport, 0, len(nodes))
 	for _, benchNode := range nodes {
+		perf := benchNode.svc.PerformanceMetrics()
 		report := NodeReport{
-			Name:         benchNode.name,
-			RPCAddr:      benchNode.rpcAddr,
-			P2PAddr:      benchNode.p2pAddr,
-			PeerCount:    benchNode.svc.PeerCount(),
-			BlockHeight:  benchNode.svc.BlockHeight(),
-			HeaderHeight: benchNode.svc.HeaderHeight(),
-			MempoolCount: benchNode.svc.MempoolCount(),
-			RelayPeers:   buildPeerRelayReports(benchNode.svc.RelayPeerStats()),
+			Name:                benchNode.name,
+			RPCAddr:             benchNode.rpcAddr,
+			P2PAddr:             benchNode.p2pAddr,
+			PeerCount:           benchNode.svc.PeerCount(),
+			BlockHeight:         benchNode.svc.BlockHeight(),
+			HeaderHeight:        benchNode.svc.HeaderHeight(),
+			MempoolCount:        benchNode.svc.MempoolCount(),
+			SubmittedTxs:        submittedByNode[benchNode.name],
+			BlockSigChecks:      perf.Counters.BlockSigChecks,
+			BlockSigFallbacks:   perf.Counters.BlockSigFallbacks,
+			BlockSigVerifyAvgMS: perf.Latency.BlockSigVerify.AvgMS,
+			RelayPeers:          buildPeerRelayReports(benchNode.svc.RelayPeerStats()),
 		}
 		if reachedAt, ok := reached[benchNode.name]; ok {
 			ms := durationMS(reachedAt)
-			report.FullPropagationMS = &ms
+			report.CompletionMS = &ms
 		}
 		out = append(out, report)
 	}
@@ -1426,7 +1783,10 @@ func buildNodeReports(nodes []*clusterNode, reached map[string]time.Duration) []
 }
 
 func reportTopology(opts RunOptions) string {
-	if opts.Scenario != ScenarioP2PRelay {
+	if opts.NodeCount <= 1 {
+		return ""
+	}
+	if opts.Scenario != ScenarioP2PRelay && opts.Scenario != ScenarioConfirmedBlocks {
 		return ""
 	}
 	return string(opts.Topology)
@@ -1439,6 +1799,11 @@ func buildNotes(opts RunOptions, extra []string) []string {
 	switch opts.Scenario {
 	case ScenarioDirectSubmit, ScenarioRPCBatch, ScenarioP2PRelay:
 		notes = append([]string{"Independent fanout spends are used so relay and admission are not dominated by tx chaining."}, notes...)
+	case ScenarioConfirmedBlocks:
+		notes = append([]string{
+			"Confirmed-blocks submits transactions in waves, waits for mempool convergence, mines one block, and waits for the new height to converge before the next wave.",
+			"The mined block is then pushed to follower nodes through submitblock so confirmation timing stays deterministic even though locally mined block relay remains conservative.",
+		}, notes...)
 	case ScenarioUserMix:
 		notes = append([]string{"Mixed-user traffic combines broad one-input payments, change outputs, and short follow-up chains so the workload looks more like many wallets than a single lab pattern."}, notes...)
 	case ScenarioChainedPackages:
@@ -1448,8 +1813,14 @@ func buildNotes(opts RunOptions, extra []string) []string {
 	case ScenarioBlockTemplateBuild:
 		notes = append([]string{"Package-heavy mempool batches are followed by live block-template rebuilds against the real miner selection path."}, notes...)
 	}
-	if opts.Scenario == ScenarioP2PRelay {
+	if opts.NodeCount > 1 && (opts.Scenario == ScenarioP2PRelay || opts.Scenario == ScenarioConfirmedBlocks) {
 		notes = append(notes, fmt.Sprintf("Real P2P relay is measured across %d nodes using the %s topology.", opts.NodeCount, opts.Topology))
+		switch opts.TxOriginSpread {
+		case TxOriginEven:
+			notes = append(notes, fmt.Sprintf("Independent transactions are submitted round-robin across all %d nodes.", opts.NodeCount))
+		default:
+			notes = append(notes, "Transactions originate from node-0 only so the rest of the cluster acts purely as relay and confirmation followers.")
+		}
 	}
 	if opts.Scenario == ScenarioRPCBatch {
 		notes = append(notes, "Submission uses authenticated HTTP JSON-RPC submitpackedtxbatch to keep live stress focused on transport and admission rather than hex expansion.")
@@ -1619,6 +1990,20 @@ func scenarioMetricRows(metrics ScenarioMetrics) [][2]string {
 	if metrics.AcceptedTxs > 0 {
 		rows = append(rows, [2]string{"Accepted txs", strconv.Itoa(metrics.AcceptedTxs)})
 	}
+	if metrics.ConfirmedTxs > 0 {
+		rows = append(rows, [2]string{"Confirmed txs", strconv.Itoa(metrics.ConfirmedTxs)})
+	}
+	if metrics.ConfirmedBlocks > 0 {
+		rows = append(rows, [2]string{"Confirmed blocks", strconv.Itoa(metrics.ConfirmedBlocks)})
+	}
+	if metrics.TargetTxsPerBlock > 0 {
+		rows = append(rows, [2]string{"Target txs per block", strconv.Itoa(metrics.TargetTxsPerBlock)})
+	}
+	if metrics.BlockConvergeAvgMS > 0 {
+		rows = append(rows, [2]string{"Block converge avg", fmt.Sprintf("%.2f ms", metrics.BlockConvergeAvgMS)})
+		rows = append(rows, [2]string{"Block converge p95", fmt.Sprintf("%.2f ms", metrics.BlockConvergeP95MS)})
+		rows = append(rows, [2]string{"Block converge max", fmt.Sprintf("%.2f ms", metrics.BlockConvergeMaxMS)})
+	}
 	if metrics.OrphanedTxs > 0 {
 		rows = append(rows, [2]string{"Orphaned txs", strconv.Itoa(metrics.OrphanedTxs)})
 	}
@@ -1688,24 +2073,91 @@ func asciiBatchSuffix(batchSize int) string {
 	return fmt.Sprintf(" / batch %d", batchSize)
 }
 
+func asciiBlockTargetSuffix(txsPerBlock int) string {
+	if txsPerBlock <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" / block %d", txsPerBlock)
+}
+
+func asciiTxOriginSuffix(origin string) string {
+	if origin == "" {
+		return ""
+	}
+	return fmt.Sprintf(" / origin %s", origin)
+}
+
+func formatCountWithCommas(value uint64) string {
+	raw := strconv.FormatUint(value, 10)
+	if len(raw) <= 3 {
+		return raw
+	}
+	var b strings.Builder
+	prefix := len(raw) % 3
+	if prefix == 0 {
+		prefix = 3
+	}
+	b.WriteString(raw[:prefix])
+	for i := prefix; i < len(raw); i += 3 {
+		b.WriteByte(',')
+		b.WriteString(raw[i : i+3])
+	}
+	return b.String()
+}
+
+func signatureMetricRows(nodes []NodeReport) [][]string {
+	rows := make([][]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node.BlockSigChecks == 0 && node.BlockSigFallbacks == 0 && node.BlockSigVerifyAvgMS == 0 {
+			continue
+		}
+		rows = append(rows, []string{
+			node.Name,
+			formatCountWithCommas(node.BlockSigChecks),
+			formatCountWithCommas(node.BlockSigFallbacks),
+			fmt.Sprintf("%.2f ms", node.BlockSigVerifyAvgMS),
+		})
+	}
+	return rows
+}
+
+func asciiSignatureSummary(nodes []NodeReport) string {
+	var totalChecks uint64
+	var totalFallbacks uint64
+	var weightedVerifyMS float64
+	for _, node := range nodes {
+		totalChecks += node.BlockSigChecks
+		totalFallbacks += node.BlockSigFallbacks
+		weightedVerifyMS += node.BlockSigVerifyAvgMS * float64(node.BlockSigChecks)
+	}
+	if totalChecks == 0 && totalFallbacks == 0 {
+		return ""
+	}
+	avgVerifyMS := 0.0
+	if totalChecks > 0 {
+		avgVerifyMS = weightedVerifyMS / float64(totalChecks)
+	}
+	return fmt.Sprintf("Sig Verify  %d checks | %d fallbacks | %.2f ms avg", totalChecks, totalFallbacks, avgVerifyMS)
+}
+
 func slowestNode(nodes []NodeReport) string {
 	var (
 		name string
 		best float64
 	)
 	for _, node := range nodes {
-		if node.FullPropagationMS == nil {
+		if node.CompletionMS == nil {
 			continue
 		}
-		if *node.FullPropagationMS > best {
-			best = *node.FullPropagationMS
+		if *node.CompletionMS > best {
+			best = *node.CompletionMS
 			name = node.Name
 		}
 	}
 	if name == "" {
 		return ""
 	}
-	return fmt.Sprintf("Slowest     %s full propagation %.2f ms", name, best)
+	return fmt.Sprintf("Slowest     %s completion %.2f ms", name, best)
 }
 
 func hottestPeer(rows []relayPeerRow) string {
@@ -1734,13 +2186,14 @@ func hottestPeer(rows []relayPeerRow) string {
 }
 
 func asciiSuiteTable(cases []SuiteCaseReport) []string {
-	header := fmt.Sprintf("%-24s %10s %10s %10s %10s", "Case", "Submit", "End2End", "Fanout", "Converge")
+	header := fmt.Sprintf("%-24s %10s %10s %10s %10s %10s", "Case", "Admit", "Complete", "Confirm", "Fanout", "Converge")
 	rows := []string{header}
 	for _, suiteCase := range cases {
-		rows = append(rows, fmt.Sprintf("%-24s %10.2f %10.2f %10.2f %10.2f",
+		rows = append(rows, fmt.Sprintf("%-24s %10.2f %10.2f %10.2f %10.2f %10.2f",
 			suiteCase.Name,
-			suiteCase.Report.SubmitTPS,
-			suiteCase.Report.EndToEndTPS,
+			suiteCase.Report.AdmissionTPS,
+			suiteCase.Report.CompletionTPS,
+			suiteCase.Report.ConfirmedTPS,
 			suiteCase.Report.Phases.RelayFanoutMS,
 			suiteCase.Report.Phases.ConvergenceMS,
 		))
@@ -1784,9 +2237,8 @@ func loadGenesisFixture() (*types.Block, error) {
 	return &block, nil
 }
 
-func keyHashForSeed(seed byte) [32]byte {
-	pub, _ := crypto.SignSchnorrForTest([32]byte{seed}, &[32]byte{})
-	return crypto.KeyHash(&pub)
+func pubKeyForSeed(seed byte) [32]byte {
+	return crypto.XOnlyPubKeyFromSecret([32]byte{seed})
 }
 
 func signSingleInputTx(tx types.Transaction, spenderSeed byte, prevValue uint64) (types.Transaction, error) {
@@ -1794,12 +2246,12 @@ func signSingleInputTx(tx types.Transaction, spenderSeed byte, prevValue uint64)
 	if err != nil {
 		return types.Transaction{}, err
 	}
-	pubKey, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
-	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
 	return tx, nil
 }
 
-func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputKeyHash [32]byte, outputs int) (types.Transaction, []uint64, error) {
+func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputPubKey [32]byte, outputs int) (types.Transaction, []uint64, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
@@ -1808,7 +2260,7 @@ func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, o
 		},
 	}
 	for i := range tx.Base.Outputs {
-		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, KeyHash: outputKeyHash}
+		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, PubKey: outputPubKey}
 	}
 	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
 	if err != nil {
@@ -1840,12 +2292,12 @@ func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, o
 	return tx, values, nil
 }
 
-func buildChildTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputKeyHash [32]byte) (types.Transaction, error) {
+func buildChildTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputPubKey [32]byte) (types.Transaction, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: []types.TxOutput{{ValueAtoms: 1, KeyHash: outputKeyHash}},
+			Outputs: []types.TxOutput{{ValueAtoms: 1, PubKey: outputPubKey}},
 		},
 	}
 	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
@@ -1878,7 +2330,7 @@ func seedFundingOutputs(svc *node.Service, outputCount int, recipientSeed byte) 
 	}
 	keyHashes := make([][32]byte, outputCount)
 	for i := range keyHashes {
-		keyHashes[i] = keyHashForSeed(recipientSeed)
+		keyHashes[i] = pubKeyForSeed(recipientSeed)
 	}
 	funding, err := svc.MineFundingOutputs(keyHashes)
 	if err != nil {
@@ -1903,7 +2355,7 @@ func buildFanoutTxToRecipients(spenderSeed byte, prevOut types.OutPoint, prevVal
 		},
 	}
 	for i, keyHash := range recipients {
-		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, KeyHash: keyHash}
+		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, PubKey: keyHash}
 	}
 	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
 	if err != nil {
@@ -1944,7 +2396,7 @@ func seedFundingOutputsForUsers(svc *node.Service, outputCount, userCount int) (
 	seeds := make([]byte, 0, outputCount)
 	for i := 0; i < outputCount; i++ {
 		seed := byte(2 + (i % userCount))
-		recipients = append(recipients, keyHashForSeed(seed))
+		recipients = append(recipients, pubKeyForSeed(seed))
 		seeds = append(seeds, seed)
 	}
 	funding, err := svc.MineFundingOutputs(recipients)
@@ -1963,14 +2415,14 @@ func seedFundingOutputsForUsers(svc *node.Service, outputCount, userCount int) (
 	return outputs, nil
 }
 
-func buildPaymentWithChangeTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, paymentKeyHash, changeKeyHash [32]byte) (types.Transaction, uint64, error) {
+func buildPaymentWithChangeTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, paymentPubKey, changePubKey [32]byte) (types.Transaction, uint64, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
 			Outputs: []types.TxOutput{
-				{ValueAtoms: 1, KeyHash: paymentKeyHash},
-				{ValueAtoms: 1, KeyHash: changeKeyHash},
+				{ValueAtoms: 1, PubKey: paymentPubKey},
+				{ValueAtoms: 1, PubKey: changePubKey},
 			},
 		},
 	}
@@ -2005,10 +2457,10 @@ func seedSpendableFanout(svc *node.Service, txCount int) ([]types.Transaction, e
 	if err != nil {
 		return nil, err
 	}
-	childKeyHash := keyHashForSeed(3)
+	childPubKey := pubKeyForSeed(3)
 	txs := make([]types.Transaction, 0, txCount)
 	for _, output := range outputs {
-		tx, err := buildChildTx(2, output.OutPoint, output.Value, childKeyHash)
+		tx, err := buildChildTx(2, output.OutPoint, output.Value, childPubKey)
 		if err != nil {
 			if errors.Is(err, consensus.ErrInputsLessThanOutputs) {
 				return nil, fmt.Errorf("tx count %d exceeds current benchmark seed capacity; lower --txs (the default suite uses %d)", txCount, DefaultRunOptions().TxCount)
@@ -2042,7 +2494,7 @@ func seedUserMixWorkload(svc *node.Service, txCount int) ([]types.Transaction, S
 			queue := pendingChanges[output.SpenderSeed]
 			change := queue[0]
 			pendingChanges[output.SpenderSeed] = queue[1:]
-			tx, err := buildChildTx(change.spenderSeed, change.outPoint, change.value, keyHashForSeed(byte(90+(change.recipientTag%64))))
+			tx, err := buildChildTx(change.spenderSeed, change.outPoint, change.value, pubKeyForSeed(byte(90+(change.recipientTag%64))))
 			if err != nil {
 				return nil, ScenarioMetrics{}, err
 			}
@@ -2052,7 +2504,7 @@ func seedUserMixWorkload(svc *node.Service, txCount int) ([]types.Transaction, S
 		}
 
 		paymentSeed := byte(120 + (output.RecipientTag % 80))
-		tx, changeValue, err := buildPaymentWithChangeTx(output.SpenderSeed, output.OutPoint, output.Value, keyHashForSeed(paymentSeed), keyHashForSeed(output.SpenderSeed))
+		tx, changeValue, err := buildPaymentWithChangeTx(output.SpenderSeed, output.OutPoint, output.Value, pubKeyForSeed(paymentSeed), pubKeyForSeed(output.SpenderSeed))
 		if err != nil {
 			return nil, ScenarioMetrics{}, err
 		}
@@ -2077,7 +2529,7 @@ func seedChainedPackages(svc *node.Service, txCount, batchSize int) ([]types.Tra
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	keyHash := keyHashForSeed(2)
+	keyHash := pubKeyForSeed(2)
 	txs := make([]types.Transaction, 0, txCount)
 	for _, output := range outputs {
 		prevOut := output.OutPoint
@@ -2104,7 +2556,7 @@ func seedOrphanStorm(svc *node.Service, txCount int) ([]types.Transaction, error
 	parents := make([]types.Transaction, 0, parentCount)
 	children := make([]types.Transaction, 0, txCount/2)
 	for _, output := range outputs {
-		parent, err := buildChildTx(2, output.OutPoint, output.Value, keyHashForSeed(3))
+		parent, err := buildChildTx(2, output.OutPoint, output.Value, pubKeyForSeed(3))
 		if err != nil {
 			return nil, err
 		}
@@ -2113,7 +2565,7 @@ func seedOrphanStorm(svc *node.Service, txCount int) ([]types.Transaction, error
 			continue
 		}
 		parentOut := types.OutPoint{TxID: consensus.TxID(&parent), Vout: 0}
-		child, err := buildChildTx(3, parentOut, parent.Base.Outputs[0].ValueAtoms, keyHashForSeed(4))
+		child, err := buildChildTx(3, parentOut, parent.Base.Outputs[0].ValueAtoms, pubKeyForSeed(4))
 		if err != nil {
 			return nil, err
 		}
@@ -2278,7 +2730,7 @@ func canSeedTxCount(txCount int, coinbaseValue uint64) (bool, error) {
 	if perOutput == 0 {
 		return false, nil
 	}
-	_, err := buildChildTx(2, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, perOutput, keyHashForSeed(3))
+	_, err := buildChildTx(2, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, perOutput, pubKeyForSeed(3))
 	if err != nil {
 		if errors.Is(err, consensus.ErrInputsLessThanOutputs) {
 			return false, nil

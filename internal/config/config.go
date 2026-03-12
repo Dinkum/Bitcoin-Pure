@@ -39,9 +39,10 @@ type Config struct {
 	AvalancheAlphaDenominator   int      `json:"avalanche_alpha_denominator"`
 	AvalancheBeta               int      `json:"avalanche_beta"`
 	AvalanchePollIntervalMS     int      `json:"avalanche_poll_interval_ms"`
+	DandelionEnabled            bool     `json:"dandelion_enabled"`
 	MinerEnabled                bool     `json:"miner_enabled"`
 	MinerWorkers                int      `json:"miner_workers"`
-	MinerKeyHashHex             string   `json:"miner_keyhash_hex"`
+	MinerPubKeyHex             string   `json:"miner_pubkey_hex"`
 	GenesisFixture              string   `json:"genesis_fixture"`
 }
 
@@ -78,6 +79,7 @@ func Default() Config {
 		AvalancheAlphaDenominator: 4,
 		AvalancheBeta:             15,
 		AvalanchePollIntervalMS:   200,
+		DandelionEnabled:          false,
 		MinerEnabled:              false,
 		GenesisFixture:            "fixtures/genesis/regtest.json",
 	}

@@ -59,11 +59,10 @@ Transaction
 │  ├─ output_count : varint
 │  └─ outputs[] : TxOutput
 │     ├─ value_atoms : uint64
-│     └─ keyhash : bytes32
+│     └─ pubkey : bytes32
 └─ Auth
    ├─ auth_count : varint
    └─ entries[] : TxAuthEntry
-      ├─ pubkey : bytes32
       └─ signature : bytes64
 ```
 
@@ -79,7 +78,7 @@ Transaction
 │  ├─ output_count : varint
 │  └─ outputs[] : TxOutput
 │     ├─ value_atoms : uint64
-│     └─ keyhash : bytes32
+│     └─ pubkey : bytes32
 └─ Auth
    └─ auth_count : varint = 0
 ```
@@ -124,31 +123,26 @@ with no additional wrapper or outer framing.
 - Type: `uint64`
 - Encoding: little-endian
 
-### 6.5 `keyhash`
-
-- Type: `bytes32`
-- Encoding: raw 32 bytes
-
-### 6.6 `pubkey`
+### 6.5 `pubkey`
 
 - Type: `bytes32`
 - Encoding: raw 32 bytes
 - Meaning: x-only secp256k1 public key
 
-### 6.7 `signature`
+### 6.6 `signature`
 
 - Type: `bytes64`
 - Encoding: raw 64 bytes
 - Meaning: Schnorr signature
 
-### 6.8 `coinbase_height`
+### 6.7 `coinbase_height`
 
 - Type: canonical varint
 - Meaning: block height committed by a coinbase transaction
 
 `coinbase_height` is part of `base` and therefore part of `txid`.
 
-### 6.9 `coinbase_extra_nonce`
+### 6.8 `coinbase_extra_nonce`
 
 - Type: `bytes16`
 - Encoding: raw 16 bytes
@@ -176,7 +170,7 @@ There is no `scriptSig`, no `sequence`, no annex, and no witness structure.
 A transaction output contains exactly:
 
 1. `value_atoms`
-2. `keyhash`
+2. `pubkey`
 
 Serialized size of one output:
 
@@ -188,12 +182,11 @@ There is exactly one consensus output shape.
 
 A transaction auth entry contains exactly:
 
-1. `pubkey`
-2. `signature`
+1. `signature`
 
 Serialized size of one auth entry:
 
-- `32 + 64 = 96` bytes
+- `64` bytes
 
 Auth entries are positional:
 
@@ -294,7 +287,7 @@ Each input encodes exactly as:
 Each output encodes exactly as:
 
 1. `value_atoms` as 8 little-endian bytes
-2. `keyhash` as 32 raw bytes
+2. `pubkey` as 32 raw bytes
 
 ## 12. Auth Encoding
 
@@ -305,8 +298,7 @@ The transaction `auth` region is exactly:
 
 Each auth entry encodes exactly as:
 
-1. `pubkey` as 32 raw bytes
-2. `signature` as 64 raw bytes
+1. `signature` as 64 raw bytes
 
 Additional auth bytes are not permitted.
 

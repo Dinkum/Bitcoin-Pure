@@ -29,8 +29,8 @@ func main() {
 
 	fmt.Printf("scenario: %s\n", report.Scenario)
 	fmt.Printf("tx_count: %d\n", report.TxCount)
-	fmt.Printf("submit_tps: %.2f\n", report.SubmitTPS)
-	fmt.Printf("end_to_end_tps: %.2f\n", report.EndToEndTPS)
+	fmt.Printf("admission_tps: %.2f\n", report.AdmissionTPS)
+	fmt.Printf("completion_tps: %.2f\n", report.CompletionTPS)
 	fmt.Printf("report_json: %s\n", base+".json")
 	fmt.Printf("report_markdown: %s\n", base+".md")
 	os.Exit(0)

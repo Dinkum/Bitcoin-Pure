@@ -29,12 +29,11 @@ func sampleTx() Transaction {
 			}},
 			Outputs: []TxOutput{{
 				ValueAtoms: 42,
-				KeyHash:    [32]byte{2},
+				PubKey:    [32]byte{2},
 			}},
 		},
 		Auth: TxAuth{
 			Entries: []TxAuthEntry{{
-				PubKey:    [32]byte{3},
 				Signature: [64]byte{4},
 			}},
 		},
@@ -70,7 +69,7 @@ func TestBlockRoundtrip(t *testing.T) {
 				CoinbaseExtraNonce: testCoinbaseExtraNonce(1),
 				Outputs: []TxOutput{{
 					ValueAtoms: 50,
-					KeyHash:    [32]byte{5},
+					PubKey:    [32]byte{5},
 				}},
 			},
 		}},
@@ -93,7 +92,7 @@ func TestCoinbaseTransactionRoundtripPreservesHeight(t *testing.T) {
 			Inputs:             []TxInput{},
 			Outputs: []TxOutput{{
 				ValueAtoms: 50,
-				KeyHash:    [32]byte{9},
+				PubKey:    [32]byte{9},
 			}},
 		},
 		Auth: TxAuth{Entries: []TxAuthEntry{}},

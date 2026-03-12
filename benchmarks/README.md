@@ -12,10 +12,22 @@ Run a real 5-node relay benchmark and emit JSON plus Markdown reports:
 go run ./cmd/bpu-cli bench run --scenario p2p-relay --nodes 5 --topology mesh --txs 4096 --batch-size 64
 ```
 
+Run repeated confirmed blocks with a fixed per-block transaction wave:
+
+```bash
+go run ./cmd/bpu-cli bench run --scenario confirmed-blocks --nodes 5 --topology mesh --txs 4096 --txs-per-block 512 --batch-size 64
+```
+
+Spread transaction origin evenly across the cluster instead of submitting from node-0 only:
+
+```bash
+go run ./cmd/bpu-cli bench run --scenario confirmed-blocks --nodes 5 --topology mesh --txs 4096 --txs-per-block 512 --batch-size 64 --tx-origin even
+```
+
 Run the full benchmark suite with direct submit, RPC batch, chained package, orphan storm, block-template rebuild, 2-node relay, and 5-node relay reports:
 
 ```bash
-go run ./cmd/bpu-cli bench suite --nodes 5 --txs 4096 --batch-size 64
+go run ./cmd/bpu-cli bench suite --nodes 5 --txs 4096 --batch-size 64 --txs-per-block 512
 ```
 
 Run direct in-process microbenchmarks:
@@ -34,6 +46,8 @@ Current coverage:
 - direct `Service.SubmitTx`
 - hex decode plus submit
 - loopback RPC `submittxbatch`
+- repeated confirmed blocks with mempool convergence before each mined block
+  - follower nodes ingest the mined block through `submitblock` so confirmed timing is reproducible even while local mined-block relay remains conservative
 - chained ancestor-package admission
 - orphan pool stress plus promotion
 - live block-template rebuild cadence against package-aware selection
@@ -44,6 +58,16 @@ Current coverage:
 - tx reconciliation/request counters for the Erlay-style relay path
 - template rebuild reports now expose incremental frontier behavior rather than full recompute-only timing
 - suite summaries with per-case JSON, Markdown, and ASCII output
+
+Throughput fields:
+- `admission_tps`: transactions per second during the submit/admit window only
+- `completion_tps`: transactions per second until the scenario reaches its terminal state
+- `confirmed_tps`: transactions per second until transactions are block-confirmed across the scenario; only present for `confirmed-blocks`
+
+Key knobs:
+- `--batch-size`: submit-side batching for RPC and workload shaping
+- `--txs-per-block`: only for `confirmed-blocks`; caps each submission wave so the run spans multiple mined blocks
+- `--tx-origin`: `one-node` or `even`; `even` round-robins independent submissions across all benchmark nodes
 
 Reports are written under `benchmarks/reports/` by default. `bench run` writes one JSON and one Markdown file, while `bench suite` writes `suite.json`, `suite.md`, and one JSON/Markdown pair per case.
 

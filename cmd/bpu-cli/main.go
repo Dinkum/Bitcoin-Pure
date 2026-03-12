@@ -80,6 +80,8 @@ func run(args []string) error {
 		return runValidateBlock(args[1:])
 	case "chain":
 		return runChain(args[1:])
+	case "snapshot":
+		return runSnapshot(args[1:])
 	default:
 		return usageError()
 	}
@@ -115,6 +117,8 @@ func runBenchRun(args []string) error {
 	topologyRaw := fs.String("topology", string(benchmarks.DefaultRunOptions().Topology), "")
 	txs := fs.Int("txs", benchmarks.DefaultRunOptions().TxCount, "")
 	batchSize := fs.Int("batch-size", benchmarks.DefaultRunOptions().BatchSize, "")
+	txsPerBlock := fs.Int("txs-per-block", benchmarks.DefaultRunOptions().TxsPerBlock, "")
+	txOrigin := fs.String("tx-origin", string(benchmarks.DefaultRunOptions().TxOriginSpread), "")
 	timeout := fs.Duration("timeout", benchmarks.DefaultRunOptions().Timeout, "")
 	reportPath := fs.String("report", "", "")
 	markdownPath := fs.String("markdown", "", "")
@@ -130,16 +134,18 @@ func runBenchRun(args []string) error {
 		return err
 	}
 	opts := benchmarks.RunOptions{
-		Scenario:     benchmarks.Scenario(*scenarioRaw),
-		Profile:      profile,
-		NodeCount:    *nodes,
-		Topology:     benchmarks.Topology(*topologyRaw),
-		TxCount:      *txs,
-		BatchSize:    *batchSize,
-		Timeout:      *timeout,
-		DBRoot:       *dbRoot,
-		ProfileDir:   *profileDir,
-		SuppressLogs: *suppressLogs,
+		Scenario:       benchmarks.Scenario(*scenarioRaw),
+		Profile:        profile,
+		NodeCount:      *nodes,
+		Topology:       benchmarks.Topology(*topologyRaw),
+		TxCount:        *txs,
+		BatchSize:      *batchSize,
+		TxsPerBlock:    *txsPerBlock,
+		TxOriginSpread: benchmarks.TxOriginSpread(*txOrigin),
+		Timeout:        *timeout,
+		DBRoot:         *dbRoot,
+		ProfileDir:     *profileDir,
+		SuppressLogs:   *suppressLogs,
 	}
 
 	report, err := benchmarks.Run(context.Background(), opts)
@@ -169,10 +175,19 @@ func runBenchRun(args []string) error {
 	if report.BatchSize > 0 {
 		fmt.Printf("batch_size: %d\n", report.BatchSize)
 	}
-	fmt.Printf("submit_tps: %.2f\n", report.SubmitTPS)
-	fmt.Printf("end_to_end_tps: %.2f\n", report.EndToEndTPS)
-	fmt.Printf("submission_duration_ms: %.2f\n", report.SubmissionDurationMS)
-	fmt.Printf("convergence_duration_ms: %.2f\n", report.ConvergenceDurationMS)
+	if report.TxsPerBlock > 0 {
+		fmt.Printf("txs_per_block: %d\n", report.TxsPerBlock)
+	}
+	if report.TxOriginSpread != "" {
+		fmt.Printf("tx_origin: %s\n", report.TxOriginSpread)
+	}
+	fmt.Printf("admission_tps: %.2f\n", report.AdmissionTPS)
+	fmt.Printf("completion_tps: %.2f\n", report.CompletionTPS)
+	if report.ConfirmedTPS > 0 {
+		fmt.Printf("confirmed_tps: %.2f\n", report.ConfirmedTPS)
+	}
+	fmt.Printf("admission_duration_ms: %.2f\n", report.AdmissionDurationMS)
+	fmt.Printf("completion_duration_ms: %.2f\n", report.CompletionDurationMS)
 	if len(report.Profiling.Artifacts) != 0 {
 		fmt.Printf("profile_dir: %s\n", filepath.Dir(report.Profiling.Artifacts[0].Path))
 	}
@@ -190,6 +205,8 @@ func runBenchSuite(args []string) error {
 	nodes := fs.Int("nodes", benchmarks.DefaultSuiteOptions().NodeCount, "")
 	txs := fs.Int("txs", benchmarks.DefaultSuiteOptions().TxCount, "")
 	batchSize := fs.Int("batch-size", benchmarks.DefaultSuiteOptions().BatchSize, "")
+	txsPerBlock := fs.Int("txs-per-block", benchmarks.DefaultSuiteOptions().TxsPerBlock, "")
+	txOrigin := fs.String("tx-origin", string(benchmarks.DefaultSuiteOptions().TxOriginSpread), "")
 	timeout := fs.Duration("timeout", benchmarks.DefaultSuiteOptions().Timeout, "")
 	reportDir := fs.String("out", "", "")
 	dbRoot := fs.String("db-root", "", "")
@@ -204,14 +221,16 @@ func runBenchSuite(args []string) error {
 		return err
 	}
 	opts := benchmarks.SuiteOptions{
-		Profile:      profile,
-		NodeCount:    *nodes,
-		TxCount:      *txs,
-		BatchSize:    *batchSize,
-		Timeout:      *timeout,
-		DBRoot:       *dbRoot,
-		ProfileDir:   *profileDir,
-		SuppressLogs: *suppressLogs,
+		Profile:        profile,
+		NodeCount:      *nodes,
+		TxCount:        *txs,
+		BatchSize:      *batchSize,
+		TxsPerBlock:    *txsPerBlock,
+		TxOriginSpread: benchmarks.TxOriginSpread(*txOrigin),
+		Timeout:        *timeout,
+		DBRoot:         *dbRoot,
+		ProfileDir:     *profileDir,
+		SuppressLogs:   *suppressLogs,
 	}
 	report, err := benchmarks.RunSuite(context.Background(), opts)
 	if err != nil {
@@ -231,8 +250,12 @@ func runBenchSuite(args []string) error {
 	}
 	fmt.Printf("report_dir: %s\n", *reportDir)
 	for _, suiteCase := range report.Cases {
-		fmt.Printf("%s_submit_tps: %.2f\n", strings.ReplaceAll(suiteCase.Name, "-", "_"), suiteCase.Report.SubmitTPS)
-		fmt.Printf("%s_end_to_end_tps: %.2f\n", strings.ReplaceAll(suiteCase.Name, "-", "_"), suiteCase.Report.EndToEndTPS)
+		slug := strings.ReplaceAll(suiteCase.Name, "-", "_")
+		fmt.Printf("%s_admission_tps: %.2f\n", slug, suiteCase.Report.AdmissionTPS)
+		fmt.Printf("%s_completion_tps: %.2f\n", slug, suiteCase.Report.CompletionTPS)
+		if suiteCase.Report.ConfirmedTPS > 0 {
+			fmt.Printf("%s_confirmed_tps: %.2f\n", slug, suiteCase.Report.ConfirmedTPS)
+		}
 	}
 	fmt.Println()
 	fmt.Println(benchmarks.RenderSuiteASCIISummary(report))
@@ -328,6 +351,7 @@ func runServe(args []string) error {
 	maxMessageBytes := fs.Int("max-message-bytes", 0, "")
 	minRelayFeePerByte := fs.Uint64("min-relay-fee-per-byte", 0, "")
 	avalancheMode := fs.String("avalanche", "", "")
+	dandelionMode := fs.String("dandelion", "", "")
 	avalancheK := fs.Int("avalanche-k", 0, "")
 	avalancheAlphaNumerator := fs.Int("avalanche-alpha-numerator", 0, "")
 	avalancheAlphaDenominator := fs.Int("avalanche-alpha-denominator", 0, "")
@@ -335,7 +359,7 @@ func runServe(args []string) error {
 	avalanchePollInterval := fs.Duration("avalanche-poll-interval", 0, "")
 	miningMode := fs.String("mining", "", "")
 	minerWorkers := fs.Int("miner-workers", 0, "")
-	minerKeyHashHex := fs.String("miner-keyhash", "", "")
+	minerPubKeyHex := fs.String("miner-pubkey", "", "")
 	genesisFixture := fs.String("genesis", "", "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -427,6 +451,16 @@ func runServe(args []string) error {
 			return fmt.Errorf("invalid --avalanche value %q: want on or off", *avalancheMode)
 		}
 	}
+	if *dandelionMode != "" {
+		switch strings.ToLower(strings.TrimSpace(*dandelionMode)) {
+		case "on":
+			cfg.DandelionEnabled = true
+		case "off":
+			cfg.DandelionEnabled = false
+		default:
+			return fmt.Errorf("invalid --dandelion value %q: want on or off", *dandelionMode)
+		}
+	}
 	if *avalancheK > 0 {
 		cfg.AvalancheKSample = *avalancheK
 	}
@@ -456,8 +490,8 @@ func runServe(args []string) error {
 		cfg.MinerWorkers = *minerWorkers
 		cfg.MinerEnabled = true
 	}
-	if *minerKeyHashHex != "" {
-		cfg.MinerKeyHashHex = *minerKeyHashHex
+	if *minerPubKeyHex != "" {
+		cfg.MinerPubKeyHex = *minerPubKeyHex
 	}
 	if *genesisFixture != "" {
 		cfg.GenesisFixture = *genesisFixture
@@ -498,15 +532,15 @@ func runServe(args []string) error {
 	}
 	if addr, walletPath, err := ensureMiningWalletProvisioned(resolvedConfigPath, &cfg); err != nil {
 		return err
-	} else if addr.KeyHashHex != "" {
+	} else if addr.PubKeyHex != "" {
 		logger.Info("provisioned mining wallet",
 			slog.String("wallet", "miner"),
 			slog.String("wallet_path", walletPath),
 			slog.String("receive_address", addr.Address),
-			slog.String("keyhash", addr.KeyHashHex),
+			slog.String("pubkey", addr.PubKeyHex),
 		)
 	}
-	keyHash, err := node.ParseMinerKeyHash(cfg.MinerKeyHashHex)
+	pubKey, err := node.ParseMinerPubKey(cfg.MinerPubKeyHex)
 	if err != nil {
 		return err
 	}
@@ -539,9 +573,10 @@ func runServe(args []string) error {
 		AvalancheAlphaDenominator: cfg.AvalancheAlphaDenominator,
 		AvalancheBeta:             cfg.AvalancheBeta,
 		AvalanchePollInterval:     time.Duration(cfg.AvalanchePollIntervalMS) * time.Millisecond,
+		DandelionEnabled:          cfg.DandelionEnabled,
 		MinerEnabled:              cfg.MinerEnabled,
 		MinerWorkers:              cfg.MinerWorkers,
-		MinerKeyHash:              keyHash,
+		MinerPubKey:               pubKey,
 		GenesisFixture:            cfg.GenesisFixture,
 	}, &loadedGenesis.Block)
 	if err != nil {
@@ -560,6 +595,7 @@ func runServe(args []string) error {
 		slog.Int("max_descendants", cfg.MaxDescendants),
 		slog.Int("max_orphans", cfg.MaxOrphans),
 		slog.String("avalanche_mode", cfg.AvalancheMode),
+		slog.Bool("dandelion_enabled", cfg.DandelionEnabled),
 		slog.Bool("miner_enabled", cfg.MinerEnabled),
 		slog.Int("miner_workers", cfg.MinerWorkers),
 	)
@@ -580,6 +616,7 @@ func runServe(args []string) error {
 	fmt.Printf("log: %s\n", cfg.LogPath)
 	fmt.Printf("log_format: %s\n", cfg.LogFormat)
 	fmt.Printf("avalanche: %s\n", cfg.AvalancheMode)
+	fmt.Printf("dandelion: %t\n", cfg.DandelionEnabled)
 	if cfg.MinerEnabled {
 		if cfg.MinerWorkers > 0 {
 			fmt.Printf("miner_workers: %d\n", cfg.MinerWorkers)
@@ -785,7 +822,7 @@ func runWalletCreate(args []string) error {
 	fmt.Printf("wallet: %s\n", entry.Name)
 	fmt.Printf("created_at: %s\n", entry.CreatedAt.Format(time.RFC3339))
 	fmt.Printf("receive_address: %s\n", addr.Address)
-	fmt.Printf("keyhash: %s\n", addr.KeyHashHex)
+	fmt.Printf("pubkey: %s\n", addr.PubKeyHex)
 	return nil
 }
 
@@ -845,11 +882,11 @@ func runWalletBalance(args []string) error {
 	if err := reconcileWalletPending(store, client, fs.Arg(0)); err != nil {
 		return err
 	}
-	keyHashes, err := store.SpendableKeyHashes(fs.Arg(0))
+	pubKeys, err := store.SpendablePubKeys(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	utxos, err := rpcUTXOsByKeyHashes(client, keyHashes)
+	utxos, err := rpcUTXOsByPubKeys(client, pubKeys)
 	if err != nil {
 		return err
 	}
@@ -888,12 +925,12 @@ func runWalletHistory(args []string) error {
 	if err != nil {
 		return err
 	}
-	keyHashes, err := store.SpendableKeyHashes(fs.Arg(0))
+	pubKeys, err := store.SpendablePubKeys(fs.Arg(0))
 	if err != nil {
 		return err
 	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
-	activity, err := rpcWalletActivityByKeyHashes(client, keyHashes, *limit)
+	activity, err := rpcWalletActivityByPubKeys(client, pubKeys, *limit)
 	if err != nil {
 		return err
 	}
@@ -970,7 +1007,7 @@ func runWalletReceive(args []string) error {
 	}
 	fmt.Printf("wallet: %s\n", fs.Arg(0))
 	fmt.Printf("receive_address: %s\n", addr.Address)
-	fmt.Printf("keyhash: %s\n", addr.KeyHashHex)
+	fmt.Printf("pubkey: %s\n", addr.PubKeyHex)
 	return nil
 }
 
@@ -1005,11 +1042,11 @@ func runWalletSend(args []string) error {
 	if err := reconcileWalletPending(store, client, *from); err != nil {
 		return err
 	}
-	keyHashes, err := store.SpendableKeyHashes(*from)
+	pubKeys, err := store.SpendablePubKeys(*from)
 	if err != nil {
 		return err
 	}
-	utxos, err := rpcUTXOsByKeyHashes(client, keyHashes)
+	utxos, err := rpcUTXOsByPubKeys(client, pubKeys)
 	if err != nil {
 		return err
 	}
@@ -1524,7 +1561,7 @@ func loadGenesisFixtureFromPath(path string) (*loadedGenesisFixture, error) {
 	for vout, output := range block.Txs[0].Base.Outputs {
 		utxos[types.OutPoint{TxID: txID, Vout: uint32(vout)}] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:     output.PubKey,
 		}
 	}
 	gotUTXORoot := fmt.Sprintf("%x", consensus.ComputedUTXORoot(utxos))
@@ -1692,12 +1729,12 @@ func openWalletStore(walletDir string, cfg config.Config) (*wallet.Store, string
 }
 
 func ensureMiningWalletProvisioned(configPath string, cfg *config.Config) (wallet.Address, string, error) {
-	if cfg == nil || !cfg.MinerEnabled || strings.TrimSpace(cfg.MinerKeyHashHex) != "" {
+	if cfg == nil || !cfg.MinerEnabled || strings.TrimSpace(cfg.MinerPubKeyHex) != "" {
 		return wallet.Address{}, "", nil
 	}
 	configPath = strings.TrimSpace(configPath)
 	if configPath == "" {
-		return wallet.Address{}, "", errors.New("mining auto-setup requires a config file path when miner_keyhash_hex is empty")
+		return wallet.Address{}, "", errors.New("mining auto-setup requires a config file path when miner_pubkey_hex is empty")
 	}
 	store, walletPath, err := openWalletStore("", *cfg)
 	if err != nil {
@@ -1724,7 +1761,7 @@ func ensureMiningWalletProvisioned(configPath string, cfg *config.Config) (walle
 	default:
 		return wallet.Address{}, "", err
 	}
-	cfg.MinerKeyHashHex = addr.KeyHashHex
+	cfg.MinerPubKeyHex = addr.PubKeyHex
 	if err := config.Save(configPath, *cfg); err != nil {
 		return wallet.Address{}, "", err
 	}
@@ -1762,22 +1799,22 @@ func reconcileWalletPending(store *wallet.Store, client *cliRPCClient, walletNam
 	return err
 }
 
-func rpcUTXOsByKeyHashes(client *cliRPCClient, keyHashes [][32]byte) ([]wallet.SpendableUTXO, error) {
+func rpcUTXOsByPubKeys(client *cliRPCClient, pubKeys [][32]byte) ([]wallet.SpendableUTXO, error) {
 	params := struct {
-		KeyHashes []string `json:"keyhashes"`
-	}{KeyHashes: make([]string, 0, len(keyHashes))}
-	for _, keyHash := range keyHashes {
-		params.KeyHashes = append(params.KeyHashes, hex.EncodeToString(keyHash[:]))
+		PubKeys []string `json:"pubkeys"`
+	}{PubKeys: make([]string, 0, len(pubKeys))}
+	for _, pubKey := range pubKeys {
+		params.PubKeys = append(params.PubKeys, hex.EncodeToString(pubKey[:]))
 	}
 	var result struct {
 		UTXOs []struct {
-			TxID    string `json:"txid"`
-			Vout    uint32 `json:"vout"`
-			Value   uint64 `json:"value"`
-			KeyHash string `json:"keyhash"`
+			TxID   string `json:"txid"`
+			Vout   uint32 `json:"vout"`
+			Value  uint64 `json:"value"`
+			PubKey string `json:"pubkey"`
 		} `json:"utxos"`
 	}
-	if err := client.Call("getutxosbykeyhashes", params, &result); err != nil {
+	if err := client.Call("getutxosbypubkeys", params, &result); err != nil {
 		return nil, err
 	}
 	out := make([]wallet.SpendableUTXO, 0, len(result.UTXOs))
@@ -1786,14 +1823,14 @@ func rpcUTXOsByKeyHashes(client *cliRPCClient, keyHashes [][32]byte) ([]wallet.S
 		if err != nil {
 			return nil, err
 		}
-		keyHash, err := decodeHex32(item.KeyHash)
+		pubKey, err := decodeHex32(item.PubKey)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, wallet.SpendableUTXO{
 			OutPoint: types.OutPoint{TxID: txid, Vout: item.Vout},
 			Value:    item.Value,
-			KeyHash:  keyHash,
+			PubKey:   pubKey,
 		})
 	}
 	return out, nil
@@ -1811,18 +1848,18 @@ type walletActivityRPCItem struct {
 	Net       int64  `json:"net"`
 }
 
-func rpcWalletActivityByKeyHashes(client *cliRPCClient, keyHashes [][32]byte, limit int) ([]walletActivityRPCItem, error) {
+func rpcWalletActivityByPubKeys(client *cliRPCClient, pubKeys [][32]byte, limit int) ([]walletActivityRPCItem, error) {
 	params := struct {
-		KeyHashes []string `json:"keyhashes"`
-		Limit     int      `json:"limit"`
-	}{KeyHashes: make([]string, 0, len(keyHashes)), Limit: limit}
-	for _, keyHash := range keyHashes {
-		params.KeyHashes = append(params.KeyHashes, hex.EncodeToString(keyHash[:]))
+		PubKeys []string `json:"pubkeys"`
+		Limit   int      `json:"limit"`
+	}{PubKeys: make([]string, 0, len(pubKeys)), Limit: limit}
+	for _, pubKey := range pubKeys {
+		params.PubKeys = append(params.PubKeys, hex.EncodeToString(pubKey[:]))
 	}
 	var result struct {
 		Activity []walletActivityRPCItem `json:"activity"`
 	}
-	if err := client.Call("getwalletactivitybykeyhashes", params, &result); err != nil {
+	if err := client.Call("getwalletactivitybypubkeys", params, &result); err != nil {
 		return nil, err
 	}
 	return result.Activity, nil
@@ -1962,7 +1999,7 @@ func fileExists(path string) bool {
 }
 
 func usageError() error {
-	return errors.New("usage: bpu-cli <serve|bench|wallet|validate-tx|validate-block|chain>")
+	return errors.New("usage: bpu-cli <serve|bench|wallet|validate-tx|validate-block|chain|snapshot>")
 }
 
 func defaultGenesisFixture(profile types.ChainProfile) string {

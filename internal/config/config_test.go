@@ -10,7 +10,10 @@ import (
 func TestDefaultConfigDisablesMiningWithoutDestination(t *testing.T) {
 	cfg := Default()
 	if cfg.MinerEnabled {
-		t.Fatal("default config should keep mining disabled until a miner keyhash is configured")
+		t.Fatal("default config should keep mining disabled until a miner pubkey is configured")
+	}
+	if cfg.DandelionEnabled {
+		t.Fatal("default config should keep dandelion relay disabled")
 	}
 }
 
@@ -32,7 +35,8 @@ func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	cfg := Default()
 	cfg.MinerEnabled = true
-	cfg.MinerKeyHashHex = "abcd"
+	cfg.DandelionEnabled = true
+	cfg.MinerPubKeyHex = "abcd"
 	if err := Save(path, cfg); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -40,10 +44,13 @@ func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if loaded.MinerKeyHashHex != cfg.MinerKeyHashHex {
-		t.Fatalf("miner keyhash = %q, want %q", loaded.MinerKeyHashHex, cfg.MinerKeyHashHex)
+	if loaded.MinerPubKeyHex != cfg.MinerPubKeyHex {
+		t.Fatalf("miner pubkey = %q, want %q", loaded.MinerPubKeyHex, cfg.MinerPubKeyHex)
 	}
 	if !loaded.MinerEnabled {
 		t.Fatal("expected miner_enabled to round-trip")
+	}
+	if !loaded.DandelionEnabled {
+		t.Fatal("expected dandelion_enabled to round-trip")
 	}
 }

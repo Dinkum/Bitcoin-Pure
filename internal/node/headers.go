@@ -16,9 +16,10 @@ type HeaderReplaySummary struct {
 }
 
 type HeaderChain struct {
-	params    consensus.ChainParams
-	height    *uint64
-	tipHeader *types.BlockHeader
+	params      consensus.ChainParams
+	height      *uint64
+	tipHeader   *types.BlockHeader
+	recentTimes []uint64
 }
 
 type PersistentHeaderChain struct {
@@ -46,6 +47,7 @@ func (c *HeaderChain) InitializeTip(height uint64, header types.BlockHeader) err
 	}
 	c.height = &height
 	c.tipHeader = &header
+	c.recentTimes = []uint64{header.Timestamp}
 	return nil
 }
 
@@ -65,8 +67,9 @@ func (c *HeaderChain) ApplyHeader(header *types.BlockHeader) error {
 		return ErrNoTip
 	}
 	if err := consensus.ValidateHeader(header, consensus.PrevBlockContext{
-		Height: *c.height,
-		Header: *c.tipHeader,
+		Height:         *c.height,
+		Header:         *c.tipHeader,
+		MedianTimePast: consensus.MedianTimePast(c.recentTimes),
 	}, c.params); err != nil {
 		return err
 	}
@@ -74,6 +77,7 @@ func (c *HeaderChain) ApplyHeader(header *types.BlockHeader) error {
 	c.height = &height
 	tip := *header
 	c.tipHeader = &tip
+	c.recentTimes = appendRecentTime(c.recentTimes, header.Timestamp)
 	logging.Component("headers").Info("validated header",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", consensus.HeaderHash(header))),
@@ -142,6 +146,12 @@ func OpenPersistentHeaderChain(path string, profile types.ChainProfile) (*Persis
 			store.Close()
 			return nil, err
 		}
+		recentTimes, err := loadIndexedAncestorTimestamps(store, consensus.HeaderHash(&stored.TipHeader), 11)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		chain.recentTimes = recentTimes
 		logger.Info("loaded persisted header chain", slog.Uint64("height", stored.Height))
 	} else {
 		chain = NewHeaderChain(profile)

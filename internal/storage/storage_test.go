@@ -23,10 +23,10 @@ func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
 }
 
 func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {
-	coinbase := testCoinbase(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}})
+	coinbase := testCoinbase(0, []types.TxOutput{{ValueAtoms: 50, PubKey: [32]byte{7}}})
 	coinbaseTxID := consensus.TxID(&coinbase)
 	utxos := consensus.UtxoSet{
-		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: [32]byte{7}},
+		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: 50, PubKey: [32]byte{7}},
 	}
 	block := types.Block{
 		Header: types.BlockHeader{
@@ -563,7 +563,7 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nextCoinbase := testCoinbase(1, []types.TxOutput{{ValueAtoms: 25, KeyHash: [32]byte{9}}})
+	nextCoinbase := testCoinbase(1, []types.TxOutput{{ValueAtoms: 25, PubKey: [32]byte{9}}})
 	next := types.Block{
 		Header: types.BlockHeader{
 			Version:        1,
@@ -578,7 +578,7 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	}
 	nextTxID := consensus.TxID(&next.Txs[0])
 	nextOut := types.OutPoint{TxID: nextTxID, Vout: 0}
-	nextEntry := consensus.UtxoEntry{ValueAtoms: 25, KeyHash: [32]byte{9}}
+	nextEntry := consensus.UtxoEntry{ValueAtoms: 25, PubKey: [32]byte{9}}
 	nextWork, err := consensus.BlockWork(next.Header.NBits)
 	if err != nil {
 		t.Fatal(err)
@@ -822,9 +822,9 @@ func TestRewriteFullStateDeltaReplacesOnlyChangedUTXOs(t *testing.T) {
 		TipHeader:      block.Header,
 		BlockSizeState: sampleBlockSizeState(),
 		UTXOs: consensus.UtxoSet{
-			unchangedOut: {ValueAtoms: 11, KeyHash: [32]byte{1}},
-			updatedOut:   {ValueAtoms: 12, KeyHash: [32]byte{2}},
-			deletedOut:   {ValueAtoms: 13, KeyHash: [32]byte{3}},
+			unchangedOut: {ValueAtoms: 11, PubKey: [32]byte{1}},
+			updatedOut:   {ValueAtoms: 12, PubKey: [32]byte{2}},
+			deletedOut:   {ValueAtoms: 13, PubKey: [32]byte{3}},
 		},
 	}
 	if err := store.WriteFullState(initial); err != nil {
@@ -839,9 +839,9 @@ func TestRewriteFullStateDeltaReplacesOnlyChangedUTXOs(t *testing.T) {
 		TipHeader:      nextHeader,
 		BlockSizeState: consensus.BlockSizeState{BlockSize: 512, Epsilon: 16_000_000, Beta: 16_000_000},
 		UTXOs: consensus.UtxoSet{
-			unchangedOut: {ValueAtoms: 11, KeyHash: [32]byte{1}},
-			updatedOut:   {ValueAtoms: 99, KeyHash: [32]byte{4}},
-			createdOut:   {ValueAtoms: 21, KeyHash: [32]byte{5}},
+			unchangedOut: {ValueAtoms: 11, PubKey: [32]byte{1}},
+			updatedOut:   {ValueAtoms: 99, PubKey: [32]byte{4}},
+			createdOut:   {ValueAtoms: 21, PubKey: [32]byte{5}},
 		},
 	}
 	if err := store.RewriteFullStateDelta(initial, next); err != nil {

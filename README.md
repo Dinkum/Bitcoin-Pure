@@ -39,7 +39,7 @@ Useful flags:
 - `--peer <host:port>` seeds the node with a peer.
 - `--update` pulls a fresh checkout from Git and deploys it atomically.
 
-Fresh installs keep mining off until `miner_keyhash_hex` is configured, so a new node does not mine to an unknown destination by default.
+Fresh installs keep mining off until `miner_pubkey_hex` is configured, so a new node does not mine to an unknown destination by default.
 
 Examples:
 

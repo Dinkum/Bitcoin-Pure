@@ -64,7 +64,7 @@ func BenchmarkRPCSubmitTxBatch32(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer cleanup()
-	b.ReportMetric(report.EndToEndTPS, "tx/s")
+	b.ReportMetric(report.AdmissionTPS, "tx/s")
 }
 
 func openSingleServiceBenchmark(tb testing.TB, txCount int) (*node.Service, []types.Transaction, func(), error) {

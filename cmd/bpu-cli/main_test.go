@@ -10,7 +10,7 @@ import (
 	"bitcoin-pure/internal/wallet"
 )
 
-func TestEnsureMiningWalletProvisionedCreatesWalletAndPersistsKeyhash(t *testing.T) {
+func TestEnsureMiningWalletProvisionedCreatesWalletAndPersistsPubKey(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "config.json")
 	cfg := config.Default()
@@ -24,19 +24,19 @@ func TestEnsureMiningWalletProvisionedCreatesWalletAndPersistsKeyhash(t *testing
 	if err != nil {
 		t.Fatalf("ensureMiningWalletProvisioned: %v", err)
 	}
-	if addr.KeyHashHex == "" {
-		t.Fatal("expected generated miner keyhash")
+	if addr.PubKeyHex == "" {
+		t.Fatal("expected generated miner pubkey")
 	}
-	if cfg.MinerKeyHashHex != addr.KeyHashHex {
-		t.Fatalf("config miner keyhash = %q, want %q", cfg.MinerKeyHashHex, addr.KeyHashHex)
+	if cfg.MinerPubKeyHex != addr.PubKeyHex {
+		t.Fatalf("config miner pubkey = %q, want %q", cfg.MinerPubKeyHex, addr.PubKeyHex)
 	}
 
 	loaded, err := config.Load(configPath)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if loaded.MinerKeyHashHex != addr.KeyHashHex {
-		t.Fatalf("persisted miner keyhash = %q, want %q", loaded.MinerKeyHashHex, addr.KeyHashHex)
+	if loaded.MinerPubKeyHex != addr.PubKeyHex {
+		t.Fatalf("persisted miner pubkey = %q, want %q", loaded.MinerPubKeyHex, addr.PubKeyHex)
 	}
 
 	store, err := wallet.Open(walletPath)
@@ -48,8 +48,8 @@ func TestEnsureMiningWalletProvisionedCreatesWalletAndPersistsKeyhash(t *testing
 		t.Fatalf("Wallet(miner): %v", err)
 	}
 	latest := minerWallet.LatestReceiveAddress()
-	if latest == nil || latest.KeyHashHex != addr.KeyHashHex {
-		t.Fatalf("latest receive address = %+v, want keyhash %q", latest, addr.KeyHashHex)
+	if latest == nil || latest.PubKeyHex != addr.PubKeyHex {
+		t.Fatalf("latest receive address = %+v, want pubkey %q", latest, addr.PubKeyHex)
 	}
 }
 
@@ -76,13 +76,13 @@ func TestEnsureMiningWalletProvisionedReusesExistingMinerWallet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first ensureMiningWalletProvisioned: %v", err)
 	}
-	cfg.MinerKeyHashHex = ""
+	cfg.MinerPubKeyHex = ""
 	second, _, err := ensureMiningWalletProvisioned(configPath, &cfg)
 	if err != nil {
 		t.Fatalf("second ensureMiningWalletProvisioned: %v", err)
 	}
-	if second.KeyHashHex != first.KeyHashHex {
-		t.Fatalf("reused keyhash = %q, want %q", second.KeyHashHex, first.KeyHashHex)
+	if second.PubKeyHex != first.PubKeyHex {
+		t.Fatalf("reused pubkey = %q, want %q", second.PubKeyHex, first.PubKeyHex)
 	}
 
 	store, _, err := openWalletStore("", cfg)
@@ -98,10 +98,10 @@ func TestEnsureMiningWalletProvisionedReusesExistingMinerWallet(t *testing.T) {
 	}
 }
 
-func TestEnsureMiningWalletProvisionedNoopsWhenKeyhashConfigured(t *testing.T) {
+func TestEnsureMiningWalletProvisionedNoopsWhenPubKeyConfigured(t *testing.T) {
 	cfg := config.Default()
 	cfg.MinerEnabled = true
-	cfg.MinerKeyHashHex = "abcd"
+	cfg.MinerPubKeyHex = "abcd"
 	addr, walletPath, err := ensureMiningWalletProvisioned("", &cfg)
 	if err != nil {
 		t.Fatalf("ensureMiningWalletProvisioned: %v", err)

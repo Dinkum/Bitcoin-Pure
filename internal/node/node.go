@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"bitcoin-pure/internal/consensus"
@@ -50,6 +51,7 @@ type ChainState struct {
 	rules          consensus.ConsensusRules
 	height         *uint64
 	tipHeader      *types.BlockHeader
+	recentTimes    []uint64
 	blockSizeState consensus.BlockSizeState
 	utxos          consensus.UtxoSet
 	utxoAcc        *utreexo.Accumulator
@@ -59,6 +61,11 @@ type PersistentChainState struct {
 	mu    sync.RWMutex
 	state *ChainState
 	store *storage.ChainStore
+}
+
+type appliedBlockDetail struct {
+	summary     consensus.BlockValidationSummary
+	createdUTXO map[types.OutPoint]consensus.UtxoEntry
 }
 
 func NewChainState(profile types.ChainProfile) *ChainState {
@@ -90,6 +97,7 @@ func (c *ChainState) InitializeTip(height uint64, header types.BlockHeader, bloc
 	}
 	c.height = &height
 	c.tipHeader = &header
+	c.recentTimes = []uint64{header.Timestamp}
 	c.blockSizeState = blockSizeState
 	c.utxos = cloneUtxos(utxos)
 	acc, err := consensus.UtxoAccumulator(c.utxos)
@@ -139,7 +147,7 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 	for vout, output := range coinbase.Base.Outputs {
 		utxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:     output.PubKey,
 		}
 	}
 	seededBlockSizeState := consensus.NewBlockSizeState(c.params)
@@ -174,16 +182,31 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 }
 
 func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSummary, error) {
-	logger := logging.Component("chain")
+	detail, err := c.applyBlockDetailed(block)
+	if err != nil {
+		return consensus.BlockValidationSummary{}, err
+	}
+	hash := consensus.HeaderHash(&block.Header)
+	logging.Component("chain").Info("validated block",
+		slog.Uint64("height", detail.summary.Height),
+		slog.String("hash", fmt.Sprintf("%x", hash)),
+		slog.Int("txs", len(block.Txs)),
+		slog.Int("utxo_count", len(c.utxos)),
+		slog.Uint64("next_block_size_limit", consensus.NextBlockSizeLimit(detail.summary.NextBlockSizeState, c.params)),
+	)
+	return detail.summary, nil
+}
+
+func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail, error) {
 	if c.height == nil || c.tipHeader == nil {
-		return consensus.BlockValidationSummary{}, ErrNoTip
+		return appliedBlockDetail{}, ErrNoTip
 	}
 	// The published chain UTXO map is immutable. Validation runs against that
 	// shared base view and only swaps in a freshly materialized post-block map
 	// once the block is fully validated.
-	summary, finalUtxos, nextAcc, err := consensus.ValidateAndApplyBlockViewWithAccumulator(
+	summary, overlay, nextAcc, err := consensus.ValidateAndApplyBlockOverlayWithAccumulator(
 		block,
-		consensus.PrevBlockContext{Height: *c.height, Header: *c.tipHeader},
+		c.prevBlockContext(),
 		c.blockSizeState,
 		c.utxos,
 		c.utxoAcc,
@@ -191,24 +214,19 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 		c.rules,
 	)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return appliedBlockDetail{}, err
 	}
+	finalUtxos := overlay.Materialize()
+	createdUTXO := overlay.CreatedEntriesClone()
 	height := summary.Height
 	c.height = &height
 	tip := block.Header
 	c.tipHeader = &tip
+	c.recentTimes = appendRecentTime(c.recentTimes, block.Header.Timestamp)
 	c.blockSizeState = summary.NextBlockSizeState
 	c.utxos = finalUtxos
 	c.utxoAcc = nextAcc
-	hash := consensus.HeaderHash(&block.Header)
-	logger.Info("validated block",
-		slog.Uint64("height", summary.Height),
-		slog.String("hash", fmt.Sprintf("%x", hash)),
-		slog.Int("txs", len(block.Txs)),
-		slog.Int("utxo_count", len(c.utxos)),
-		slog.Uint64("next_block_size_limit", consensus.NextBlockSizeLimit(summary.NextBlockSizeState, c.params)),
-	)
-	return summary, nil
+	return appliedBlockDetail{summary: summary, createdUTXO: createdUTXO}, nil
 }
 
 func (c *ChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySummary, error) {
@@ -328,6 +346,12 @@ func OpenPersistentChainStateWithRules(path string, profile types.ChainProfile, 
 			store.Close()
 			return nil, err
 		}
+		recentTimes, err := loadIndexedAncestorTimestamps(store, consensus.HeaderHash(&stored.TipHeader), 11)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		state.recentTimes = recentTimes
 		state.WithRules(rules)
 		logger.Info("loaded persisted chain state",
 			slog.Uint64("height", stored.Height),
@@ -437,7 +461,7 @@ func createdUTXOs(block types.Block) map[types.OutPoint]consensus.UtxoEntry {
 		for vout, output := range tx.Base.Outputs {
 			created[types.OutPoint{TxID: txHash, Vout: uint32(vout)}] = consensus.UtxoEntry{
 				ValueAtoms: output.ValueAtoms,
-				KeyHash:    output.KeyHash,
+				PubKey:     output.PubKey,
 			}
 		}
 	}
@@ -466,4 +490,45 @@ func cloneBlockHeaderPtr(header *types.BlockHeader) *types.BlockHeader {
 	}
 	out := *header
 	return &out
+}
+
+func (c *ChainState) prevBlockContext() consensus.PrevBlockContext {
+	return consensus.PrevBlockContext{
+		Height:         *c.height,
+		Header:         *c.tipHeader,
+		MedianTimePast: consensus.MedianTimePast(c.recentTimes),
+	}
+}
+
+func appendRecentTime(times []uint64, timestamp uint64) []uint64 {
+	const medianWindow = 11
+	next := append(append([]uint64(nil), times...), timestamp)
+	if len(next) > medianWindow {
+		next = next[len(next)-medianWindow:]
+	}
+	return next
+}
+
+func loadIndexedAncestorTimestamps(store *storage.ChainStore, tipHash [32]byte, limit int) ([]uint64, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	times := make([]uint64, 0, limit)
+	cursorHash := tipHash
+	for len(times) < limit {
+		entry, err := store.GetBlockIndex(&cursorHash)
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			return nil, fmt.Errorf("missing block index for timestamp window %x", cursorHash)
+		}
+		times = append(times, entry.Header.Timestamp)
+		if entry.Height == 0 {
+			break
+		}
+		cursorHash = entry.ParentHash
+	}
+	slices.Reverse(times)
+	return times, nil
 }

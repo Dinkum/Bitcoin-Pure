@@ -63,10 +63,9 @@ The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are to be in
 
 For any BPU output controlled by a MuSig2 wallet:
 
-- the on-chain output keyhash is `SHA256(aggregate_xonly_pubkey_child)`,
-- the spend reveals exactly one 32-byte x-only aggregate pubkey,
+- the on-chain output pubkey is `aggregate_xonly_pubkey_child`,
 - the spend includes exactly one 64-byte Schnorr signature,
-- validators verify it exactly as any other BPU spend.
+- validators verify it against the referenced UTXO pubkey exactly as any other BPU spend.
 
 Consensus remains unaware of the underlying signer set.
 
@@ -195,8 +194,8 @@ Given a derivation path `/<account>/<chain>/<index>`:
 
 1. Derive `child_plain` using normal unhardened BIP32 CKDpub from the synthetic xpub.
 2. Convert `child_plain` to `child_xonly` using BIP340 x-only conversion.
-3. Compute `keyhash = SHA256(child_xonly)`.
-4. Encode the BPU address from the standard BPU address version plus `keyhash`.
+3. Set `pubkey = child_xonly`.
+4. Encode the BPU address from the standard BPU address version plus `pubkey`.
 
 The derived `child_xonly` is the pubkey that MUST appear on-chain when spending that output.
 
@@ -210,7 +209,7 @@ For each path step:
 - the tweak mode is plain,
 - the tweaks are applied in path order inside the MuSig2 signing session.
 
-Signers MUST NOT sign for a derived child unless the locally computed derived `child_xonly` hashes to the referenced UTXO keyhash.
+Signers MUST NOT sign for a derived child unless the locally computed derived `child_xonly` equals the referenced UTXO pubkey.
 
 ### 7.5 Discovery
 
@@ -293,7 +292,7 @@ input:
     txid: <32-byte hex>
     vout: <uint32>
   amount: <uint64 atoms>
-  utxo_keyhash: <32-byte hex>
+  utxo_pubkey: <32-byte x-only hex>
   wallet_id: <32-byte hex>
   participants_sorted:
     - <33-byte compressed pubkey hex>
@@ -314,10 +313,10 @@ input:
 Required behavior:
 
 - `amount` MUST match the referenced UTXO amount.
-- `utxo_keyhash` MUST match the referenced UTXO keyhash.
+- `utxo_pubkey` MUST match the referenced UTXO pubkey.
 - `wallet_id`, `participants_sorted`, `aggpk_plain`, `aggpk_xonly`, and `derivation_path` MUST all agree.
 - `final_pubkey` MUST equal the locally derived `child_xonly` for the input path.
-- `SHA256(final_pubkey)` MUST equal `utxo_keyhash`.
+- `final_pubkey` MUST equal `utxo_pubkey`.
 
 `pubnonces`, `partial_sigs`, `final_pubkey`, and `final_sig` are added progressively during signing.
 
@@ -330,7 +329,7 @@ Recommended fields:
 ```yaml
 output:
   value: <uint64 atoms>
-  keyhash: <32-byte hex>
+  pubkey: <32-byte x-only hex>
   is_change: <bool>
   wallet_id: <32-byte hex optional>
   aggpk_plain: <33-byte hex optional>
@@ -345,7 +344,7 @@ If `is_change = true`, then:
 - `wallet_id` MUST be present,
 - `aggpk_plain` SHOULD be present,
 - `derivation_path` MUST be present,
-- signers MUST recompute the child key and verify that `SHA256(child_xonly) == keyhash`.
+- signers MUST recompute the child key and verify that `child_xonly == pubkey`.
 
 Absent valid change metadata, signers SHOULD treat the output as external unless local policy says otherwise.
 
@@ -409,7 +408,7 @@ Before producing a partial signature for an input, the signer MUST verify all of
 
 - the referenced prevout and amount are correct,
 - the locally derived `child_xonly` matches `final_pubkey`,
-- `SHA256(child_xonly) == utxo_keyhash`,
+- `child_xonly == utxo_pubkey`,
 - the derivation path belongs to this wallet,
 - the participant set and aggregate key match the local wallet record,
 - the full unsigned transaction base is acceptable,
@@ -459,10 +458,9 @@ When all partial signatures are present and valid, the coordinator or final sign
 
 For each BPU input, the final on-chain auth material is:
 
-- `pubkey = final_pubkey`
 - `signature = final_sig`
 
-`final_sig` MUST verify as a BIP340 Schnorr signature under `final_pubkey` and `msg_i`.
+`final_sig` MUST verify as a BIP340 Schnorr signature under the referenced UTXO pubkey, which MUST equal `final_pubkey`, and `msg_i`.
 
 ## 11. Coordinator Requirements
 
@@ -561,7 +559,7 @@ Conforming wallets SHOULD implement the following defaults:
 - Nonce reuse can expose secret keys.
 - A malicious coordinator can cause aborts or confusion if signers do not verify transaction details and contribution sets.
 - Duplicate participant keys may be valid mathematically but are dangerous operationally.
-- Because BPU outputs commit only to `SHA256(pubkey)`, the signer must verify that the derived aggregate child pubkey hashes to the referenced UTXO keyhash before signing.
+- Because BPU outputs commit directly to x-only public keys, the signer must verify that the derived aggregate child pubkey equals the referenced UTXO pubkey before signing.
 
 ## 16. Suggested Integration Into BPU Main Spec
 

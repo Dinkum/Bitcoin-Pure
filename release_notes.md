@@ -1,5 +1,28 @@
 # Release Notes
 
+## v0.1.14
+Major
+- Added deterministic UTXO snapshot verification tooling. The repo now ships fixed-height snapshot fixtures plus `bpu-cli snapshot root` and `bpu-cli snapshot verify` so canonical snapshot state can be reconstructed and checked against the committed header `utxo_root`.
+- Added optional `utxo_root`-anchored UTXO proof APIs. The node now exposes single-outpoint membership and exclusion proofs with anchored verification over the active chain, and the accumulator proof format is documented for external consumers.
+- Added an explicit Dandelion++ transaction-relay mode with a real operator flag. The tx relay path can now stem first-seen transactions to one outbound peer before fluffing them onto the normal relay plane, while remaining disabled by default for conservative rollout.
+- Added a dedicated confirmed-block throughput benchmark and cleaned up benchmark terminology. Reports now distinguish `admission_tps`, `completion_tps`, and `confirmed_tps`, support configurable `txs_per_block` and `tx-origin` spread, and emit compact Markdown plus ASCII summaries with attached profile artifacts.
+- Landed the biggest confirmed-throughput optimization pass so far on the steady-state block path:
+  - active-tip block extensions now validate against an immutable snapshot outside the exclusive chainstate lock, then commit only if the tip is unchanged
+  - large block Schnorr signature sets now batch-verify across worker chunks in parallel while preserving exact validity on fallback
+  - on the tracked 3-node `regtest` confirmed-block benchmark (`2048 tx`, `512 tx/block`, `batch-size 64`), confirmed throughput improved from `781.28 tx/s` to `996.59 tx/s`, a `27.6%` increase
+  - on that same workload, average block convergence dropped from `338.11 ms` to `192.58 ms`, a `43.0%` improvement
+  - average block signature verify time dropped from `127.37 ms` to `45.76 ms`, a `64.1%` reduction
+
+Minor
+- Locked in the deterministic median-time-past header rule in consensus and the main spec: block timestamps must be strictly greater than the median of the previous 11 timestamps on the same branch.
+- Added a standalone stealth-address design stub under `specs/` that maps cleanly onto the existing keyhash and x-only pubkey model without introducing consensus changes.
+- Added standalone relay specs for Dandelion++ and compact-block fallback behavior, plus supporting relay/spec notes under `specs/`.
+- Added a non-consensus `SPEC.md` note recommending batch Schnorr verification with exact per-signature fallback before final rejection.
+- Added a first-class compact-block relay capability as the conservative compatibility fallback block-propagation mode, with matching telemetry and tests.
+- Hardened missing-block catch-up so canonical active-header ancestry drives block requests even when the rebuildable active height index is sparse or lagging, removing a repair-only detour from the steady-state sync path.
+- Expanded node and benchmark observability with block-signature counters, batch-fallback counters, signature-verify timing, richer timeout state dumps, and cleaner high-signal benchmark Markdown sections.
+- Fixed benchmark accounting so submit/admission timing no longer includes warmup and seeding work, making reported throughput match the actual workload window.
+
 ## v0.1.13
 Major
 - Fixed full-block validation so later non-coinbase transactions can spend outputs created earlier in the same block, matching the spec's atomic block-apply rule.

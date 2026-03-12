@@ -88,6 +88,9 @@ func (m *minerManager) BuildBlockTemplate() (types.Block, error) {
 
 func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, error) {
 	startedAt := time.Now()
+	if m.svc.cfg.MinerPubKey == ([32]byte{}) {
+		return types.Block{}, 0, errors.New("miner pubkey is required for block template assembly")
+	}
 	ctx, err := m.chainTemplateContext()
 	if err != nil {
 		return types.Block{}, 0, err
@@ -246,7 +249,7 @@ func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedE
 
 	coinbase := coinbaseTxForHeight(ctx.height+1, []types.TxOutput{{
 		ValueAtoms: consensus.SubsidyAtoms(ctx.height+1, params) + totalFees,
-		KeyHash:    m.svc.cfg.MinerKeyHash,
+		PubKey:    m.svc.cfg.MinerPubKey,
 	}})
 	coinbaseTxID := consensus.TxID(&coinbase)
 
@@ -532,7 +535,7 @@ func selectedEntryLeaves(entries []mempool.SnapshotEntry) []utreexo.UtxoLeaf {
 			created = append(created, utreexo.UtxoLeaf{
 				OutPoint:   types.OutPoint{TxID: entry.TxID, Vout: uint32(vout)},
 				ValueAtoms: output.ValueAtoms,
-				KeyHash:    output.KeyHash,
+				PubKey:    output.PubKey,
 			})
 		}
 	}

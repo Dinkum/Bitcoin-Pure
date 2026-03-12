@@ -47,6 +47,8 @@ const (
 	erlayReconcileBatchLimit       = 256
 )
 
+var dandelionFluffDelay = 2 * time.Second
+
 var ErrBlockHeaderNotIndexed = errors.New("block header not indexed")
 
 type ServiceConfig struct {
@@ -79,9 +81,10 @@ type ServiceConfig struct {
 	AvalancheAlphaDenominator int
 	AvalancheBeta             int
 	AvalanchePollInterval     time.Duration
+	DandelionEnabled          bool
 	MinerEnabled              bool
 	MinerWorkers              int
-	MinerKeyHash              [32]byte
+	MinerPubKey               [32]byte
 	GenesisFixture            string
 }
 
@@ -130,7 +133,7 @@ type MempoolInfo struct {
 type MiningInfo struct {
 	Enabled           bool               `json:"enabled"`
 	Workers           int                `json:"workers"`
-	MinerKeyHash      string             `json:"miner_keyhash,omitempty"`
+	MinerPubKey       string             `json:"miner_pubkey,omitempty"`
 	CurrentBits       uint32             `json:"current_bits"`
 	NextBits          uint32             `json:"next_bits"`
 	Difficulty        float64            `json:"difficulty"`
@@ -138,10 +141,10 @@ type MiningInfo struct {
 	Template          BlockTemplateStats `json:"template"`
 }
 
-type KeyHashUTXO struct {
+type PubKeyUTXO struct {
 	OutPoint types.OutPoint
 	Value    uint64
-	KeyHash  [32]byte
+	PubKey   [32]byte
 }
 
 type WalletActivity struct {
@@ -264,6 +267,15 @@ type Service struct {
 	closeOnce        sync.Once
 	closeErr         error
 	wg               sync.WaitGroup
+}
+
+type SyncDebugSnapshot struct {
+	BlockHeight    uint64
+	HeaderHeight   uint64
+	MempoolCount   int
+	PeerSync       string
+	InflightBlocks string
+	PendingBlocks  string
 }
 
 type peerConn struct {
@@ -460,7 +472,7 @@ type blockRelayPlan uint8
 
 const (
 	blockRelayPlanFull blockRelayPlan = iota + 1
-	blockRelayPlanGrapheneP1
+	blockRelayPlanCompactFallback
 	blockRelayPlanGrapheneExtended
 )
 
@@ -643,9 +655,9 @@ type dashboardTxInput struct {
 }
 
 type dashboardTxOutput struct {
-	Index   int
-	Amount  uint64
-	KeyHash [32]byte
+	Index  int
+	Amount uint64
+	PubKey [32]byte
 }
 
 type dashboardPowSummary struct {
@@ -788,12 +800,12 @@ type dashboardSystemSummary struct {
 type FundingOutput struct {
 	OutPoint  types.OutPoint
 	Value     uint64
-	KeyHash   [32]byte
+	PubKey    [32]byte
 	BlockHash [32]byte
 }
 
 type StressLaneInfo struct {
-	ReserveKeyHash  string `json:"reserve_keyhash"`
+	ReservePubKey   string `json:"reserve_pubkey"`
 	ReserveUTXOs    int    `json:"reserve_utxos"`
 	ReserveAtoms    uint64 `json:"reserve_atoms"`
 	PendingBatches  int    `json:"pending_batches"`
@@ -847,8 +859,8 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	if cfg.RPCAddr != "" && cfg.RPCAuthToken == "" && !isLoopbackAddr(cfg.RPCAddr) {
 		return nil, errors.New("rpc auth token is required for non-loopback rpc binds")
 	}
-	if cfg.MinerEnabled && cfg.MinerKeyHash == ([32]byte{}) {
-		return nil, errors.New("miner keyhash is required when mining is enabled")
+	if cfg.MinerEnabled && cfg.MinerPubKey == ([32]byte{}) {
+		return nil, errors.New("miner pubkey is required when mining is enabled")
 	}
 	if cfg.MaxInboundPeers <= 0 {
 		cfg.MaxInboundPeers = 32
@@ -1709,8 +1721,8 @@ func (s *Service) MiningInfo() MiningInfo {
 		TargetSpacingSecs: uint64(params.TargetSpacingSecs),
 		Template:          s.BlockTemplateStats(),
 	}
-	if s.cfg.MinerKeyHash != ([32]byte{}) {
-		info.MinerKeyHash = hex.EncodeToString(s.cfg.MinerKeyHash[:])
+	if s.cfg.MinerPubKey != ([32]byte{}) {
+		info.MinerPubKey = hex.EncodeToString(s.cfg.MinerPubKey[:])
 	}
 	s.stateMu.RLock()
 	view, ok := s.chainState.CommittedView()
@@ -1761,13 +1773,13 @@ func (s *Service) SubmitTx(tx types.Transaction) (mempool.Admission, error) {
 	return admission, nil
 }
 
-func (s *Service) UTXOsByKeyHashes(keyHashes [][32]byte) []KeyHashUTXO {
-	if len(keyHashes) == 0 {
+func (s *Service) UTXOsByPubKeys(pubKeys [][32]byte) []PubKeyUTXO {
+	if len(pubKeys) == 0 {
 		return nil
 	}
-	wanted := make(map[[32]byte]struct{}, len(keyHashes))
-	for _, keyHash := range keyHashes {
-		wanted[keyHash] = struct{}{}
+	wanted := make(map[[32]byte]struct{}, len(pubKeys))
+	for _, pubKey := range pubKeys {
+		wanted[pubKey] = struct{}{}
 	}
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
@@ -1778,19 +1790,19 @@ func (s *Service) UTXOsByKeyHashes(keyHashes [][32]byte) []KeyHashUTXO {
 	} else {
 		utxos = view.UTXOs
 	}
-	out := make([]KeyHashUTXO, 0)
+	out := make([]PubKeyUTXO, 0)
 	for outPoint, entry := range utxos {
-		if _, ok := wanted[entry.KeyHash]; !ok {
+		if _, ok := wanted[entry.PubKey]; !ok {
 			continue
 		}
-		out = append(out, KeyHashUTXO{
+		out = append(out, PubKeyUTXO{
 			OutPoint: outPoint,
 			Value:    entry.ValueAtoms,
-			KeyHash:  entry.KeyHash,
+			PubKey:   entry.PubKey,
 		})
 	}
-	slices.SortFunc(out, func(a, b KeyHashUTXO) int {
-		if cmp := bytes.Compare(a.KeyHash[:], b.KeyHash[:]); cmp != 0 {
+	slices.SortFunc(out, func(a, b PubKeyUTXO) int {
+		if cmp := bytes.Compare(a.PubKey[:], b.PubKey[:]); cmp != 0 {
 			return cmp
 		}
 		if cmp := bytes.Compare(a.OutPoint.TxID[:], b.OutPoint.TxID[:]); cmp != 0 {
@@ -1856,8 +1868,8 @@ func (s *Service) EstimateFeeRate(targetBlocks int) uint64 {
 	return rates[index]
 }
 
-func (s *Service) WalletActivityByKeyHashes(keyHashes [][32]byte, limit int) ([]WalletActivity, error) {
-	if len(keyHashes) == 0 {
+func (s *Service) WalletActivityByPubKeys(pubKeys [][32]byte, limit int) ([]WalletActivity, error) {
+	if len(pubKeys) == 0 {
 		return nil, nil
 	}
 	s.stateMu.RLock()
@@ -1866,9 +1878,9 @@ func (s *Service) WalletActivityByKeyHashes(keyHashes [][32]byte, limit int) ([]
 	if !ok {
 		return nil, ErrNoTip
 	}
-	wanted := make(map[[32]byte]struct{}, len(keyHashes))
-	for _, keyHash := range keyHashes {
-		wanted[keyHash] = struct{}{}
+	wanted := make(map[[32]byte]struct{}, len(pubKeys))
+	for _, pubKey := range pubKeys {
+		wanted[pubKey] = struct{}{}
 	}
 	out := make([]WalletActivity, 0)
 	for height := view.Height + 1; height > 0; height-- {
@@ -1913,7 +1925,7 @@ func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, u
 	for i, tx := range block.Txs {
 		received := uint64(0)
 		for _, output := range tx.Base.Outputs {
-			if _, ok := wanted[output.KeyHash]; ok {
+			if _, ok := wanted[output.PubKey]; ok {
 				received += output.ValueAtoms
 			}
 		}
@@ -1927,7 +1939,7 @@ func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, u
 				entry := undo[undoIndex]
 				undoIndex++
 				inputSum += entry.Entry.ValueAtoms
-				if _, ok := wanted[entry.Entry.KeyHash]; ok {
+				if _, ok := wanted[entry.Entry.PubKey]; ok {
 					sent += entry.Entry.ValueAtoms
 				}
 			}
@@ -2024,7 +2036,7 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 		s.avalancheManager().noteAcceptedAdmissions(admissions)
 		s.avalancheManager().noteRejectedConflicts(txs, errs)
 		s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
-		s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
+		s.relayAcceptedTxs(s.peerSnapshotExcluding(source), accepted, source)
 		return admissions, errs, orphanCount, mempoolSize
 	}
 	if batchHasInternalDependencies(txs) {
@@ -2038,7 +2050,7 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 		s.avalancheManager().noteAcceptedAdmissions(admissions)
 		s.avalancheManager().noteRejectedConflicts(txs, errs)
 		s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
-		s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
+		s.relayAcceptedTxs(s.peerSnapshotExcluding(source), accepted, source)
 		return admissions, errs, orphanCount, mempoolSize
 	}
 	tipHash, chainUtxos := s.chainUtxoSnapshotWithTip()
@@ -2074,7 +2086,7 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 	s.avalancheManager().noteAcceptedAdmissions(admissions)
 	s.avalancheManager().noteRejectedConflicts(txs, errs)
 	s.noteLocalOriginAcceptedTxs(txs, admissions, errs, source)
-	s.broadcastAcceptedTxsToPeers(s.peerSnapshotExcluding(source), accepted)
+	s.relayAcceptedTxs(s.peerSnapshotExcluding(source), accepted, source)
 	return admissions, errs, orphanCount, mempoolSize
 }
 
@@ -2366,7 +2378,8 @@ func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) 
 		s.stateMu.Unlock()
 		return [32]byte{}, 0, errors.New("stale template")
 	}
-	if _, err := s.chainState.ApplyBlock(&block); err != nil {
+	summary, err := s.chainState.ApplyBlock(&block)
+	if err != nil {
 		s.stateMu.Unlock()
 		return [32]byte{}, 0, err
 	}
@@ -2400,12 +2413,21 @@ func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) 
 	s.invalidateBlockTemplate("tip_advanced")
 	s.cacheRecentBlock(block)
 	s.cacheRecentHeader(block.Header)
+	// Freshly mined blocks should not wait for peers to discover the header via
+	// inv and then kick off headers-first recovery. Pushing the header first keeps
+	// steady-state one-block catch-up responsive and avoids benchmark seeding
+	// stalls on the initial funding block.
+	s.broadcastHeaders([]types.BlockHeader{block.Header})
 	s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
 	s.noteBlockAccepted()
+	s.noteBlockSignatureVerification(summary)
 	s.logger.Info("block accepted",
 		slog.Uint64("height", height),
 		slog.String("hash", hex.EncodeToString(hash[:])),
 		slog.Int("txs", len(block.Txs)),
+		slog.Int("sig_checks", summary.SignatureChecks),
+		slog.Bool("sig_batch_fallback", summary.SignatureBatchFallback),
+		slog.Duration("sig_verify_duration", summary.SignatureVerifyTime),
 		slog.Int("mempool_size", s.pool.Count()),
 		slog.Duration("apply_duration", time.Since(startedAt)),
 	)
@@ -2446,7 +2468,7 @@ func (s *Service) buildFundingBlock(keyHashes [][32]byte) (types.Block, []Fundin
 		if i == len(keyHashes)-1 {
 			value += remainder
 		}
-		outputs[i] = types.TxOutput{ValueAtoms: value, KeyHash: keyHash}
+		outputs[i] = types.TxOutput{ValueAtoms: value, PubKey: keyHash}
 	}
 	coinbase := coinbaseTxForHeight(ctx.height+1, outputs)
 	coinbaseTxID := consensus.TxID(&coinbase)
@@ -2457,12 +2479,12 @@ func (s *Service) buildFundingBlock(keyHashes [][32]byte) (types.Block, []Fundin
 		fundingLeaves = append(fundingLeaves, utreexo.UtxoLeaf{
 			OutPoint:   outPoint,
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:     output.PubKey,
 		})
 		funding = append(funding, FundingOutput{
 			OutPoint: outPoint,
 			Value:    output.ValueAtoms,
-			KeyHash:  output.KeyHash,
+			PubKey:   output.PubKey,
 		})
 	}
 	finalAcc, err := ctx.utxoAcc.Apply(nil, fundingLeaves)
@@ -2597,7 +2619,7 @@ func coinbaseLeaves(txid [32]byte, outputs []types.TxOutput) []utreexo.UtxoLeaf 
 		leaves = append(leaves, utreexo.UtxoLeaf{
 			OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:     output.PubKey,
 		})
 	}
 	return leaves
@@ -2621,7 +2643,7 @@ func blockCreatedLeaves(txs []types.Transaction) []utreexo.UtxoLeaf {
 			created = append(created, utreexo.UtxoLeaf{
 				OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
 				ValueAtoms: output.ValueAtoms,
-				KeyHash:    output.KeyHash,
+				PubKey:     output.PubKey,
 			})
 		}
 	}
@@ -2728,14 +2750,14 @@ func shouldPreferGrapheneExtended(estimate blockOverlapEstimate) bool {
 }
 
 func selectBlockRelayPlan(peer *peerConn, block types.Block) blockRelayPlan {
-	if peer == nil || !peer.supportsGrapheneBlockRelay() {
+	if peer == nil || !peer.supportsCompactBlockRelay() {
 		return blockRelayPlanFull
 	}
 	estimate := peer.estimateBlockOverlap(block)
 	if peer.supportsGrapheneExtended() && shouldPreferGrapheneExtended(estimate) {
 		return blockRelayPlanGrapheneExtended
 	}
-	return blockRelayPlanGrapheneP1
+	return blockRelayPlanCompactFallback
 }
 
 func reconstructXThinBlock(msg p2p.XThinBlockMessage, matches map[uint64][]types.Transaction) (*pendingThinBlock, []uint32) {
@@ -3015,13 +3037,18 @@ func (s *Service) applyPeerHeaders(headers []types.BlockHeader) (int, error) {
 		return 0, fmt.Errorf("missing parent entry for header parent %x", parentHash)
 	}
 	prevEntry := *parentEntry
+	recentTimes, err := loadIndexedAncestorTimestamps(s.chainState.Store(), consensus.HeaderHash(&prevEntry.Header), 11)
+	if err != nil {
+		return 0, err
+	}
 	applied := 0
 	batchEntries := make([]storage.HeaderBatchEntry, 0, len(headers))
 	batchEntryByHash := make(map[[32]byte]storage.BlockIndexEntry, len(headers))
 	for _, header := range headers {
 		if err := consensus.ValidateHeader(&header, consensus.PrevBlockContext{
-			Height: prevEntry.Height,
-			Header: prevEntry.Header,
+			Height:         prevEntry.Height,
+			Header:         prevEntry.Header,
+			MedianTimePast: consensus.MedianTimePast(recentTimes),
 		}, s.headerChain.params); err != nil {
 			return applied, err
 		}
@@ -3042,6 +3069,7 @@ func (s *Service) applyPeerHeaders(headers []types.BlockHeader) (int, error) {
 		})
 		batchEntryByHash[consensus.HeaderHash(&header)] = prevEntry
 		s.cacheRecentHeader(header)
+		recentTimes = appendRecentTime(recentTimes, header.Timestamp)
 		applied++
 	}
 	currentTipHash := consensus.HeaderHash(s.headerChain.TipHeader())
@@ -3140,12 +3168,12 @@ func (s *Service) headerBranchEntriesLocked(tip storage.BlockIndexEntry, batchEn
 	}
 }
 
-func (s *Service) applyPeerBlock(block *types.Block) (bool, time.Duration, error) {
+func (s *Service) applyPeerBlock(block *types.Block) (bool, consensus.BlockValidationSummary, time.Duration, error) {
 	startedAt := time.Now()
 	hash := consensus.HeaderHash(&block.Header)
 	entry, err := s.chainState.Store().GetBlockIndex(&hash)
 	if err != nil {
-		return false, 0, err
+		return false, consensus.BlockValidationSummary{}, 0, err
 	}
 	beforeHeight := uint64(0)
 	var beforeHash [32]byte
@@ -3154,10 +3182,11 @@ func (s *Service) applyPeerBlock(block *types.Block) (bool, time.Duration, error
 		beforeHash = view.TipHash
 	}
 	if entry == nil {
-		return false, 0, fmt.Errorf("%w: %x", ErrBlockHeaderNotIndexed, hash)
+		return false, consensus.BlockValidationSummary{}, 0, fmt.Errorf("%w: %x", ErrBlockHeaderNotIndexed, hash)
 	}
-	if _, lockWait, err := s.chainState.ApplyBlockWithTiming(block); err != nil {
-		return false, 0, err
+	summary, lockWait, err := s.chainState.ApplyBlockWithTiming(block)
+	if err != nil {
+		return false, consensus.BlockValidationSummary{}, 0, err
 	} else {
 		s.perf.noteBlockApplyLockWaitDuration(lockWait)
 	}
@@ -3172,7 +3201,8 @@ func (s *Service) applyPeerBlock(block *types.Block) (bool, time.Duration, error
 	s.promoteReadyOrphansAfterBlock(block)
 	s.removeLocalRebroadcastForBlock(block)
 	s.cacheRecentBlock(*block)
-	return afterHeight != beforeHeight || afterHash != beforeHash, time.Since(startedAt), nil
+	s.noteBlockSignatureVerification(summary)
+	return afterHeight != beforeHeight || afterHash != beforeHash, summary, time.Since(startedAt), nil
 }
 
 func (s *Service) localRebroadcastLoop() {
@@ -3303,11 +3333,11 @@ func (s *Service) removeLocalRebroadcastForBlock(block *types.Block) {
 
 func (s *Service) acceptPeerBlockMessage(peer *peerConn, block *types.Block) error {
 	hash := consensus.HeaderHash(&block.Header)
-	applied, applyDuration, err := s.applyPeerBlock(block)
+	applied, summary, applyDuration, err := s.applyPeerBlock(block)
 	if errors.Is(err, ErrBlockHeaderNotIndexed) {
 		if _, seen := s.recentHeader(hash); seen {
 			if _, headerErr := s.applyPeerHeaders([]types.BlockHeader{block.Header}); headerErr == nil {
-				applied, applyDuration, err = s.applyPeerBlock(block)
+				applied, summary, applyDuration, err = s.applyPeerBlock(block)
 			}
 		}
 	}
@@ -3326,6 +3356,9 @@ func (s *Service) acceptPeerBlockMessage(peer *peerConn, block *types.Block) err
 			slog.String("addr", peer.addr),
 			slog.String("hash", fmt.Sprintf("%x", hash)),
 			slog.Uint64("block_height", s.blockHeight()),
+			slog.Int("sig_checks", summary.SignatureChecks),
+			slog.Bool("sig_batch_fallback", summary.SignatureBatchFallback),
+			slog.Duration("sig_verify_duration", summary.SignatureVerifyTime),
 			slog.Duration("apply_duration", applyDuration),
 		)
 		s.broadcastInv([]p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}})
@@ -3337,6 +3370,9 @@ func (s *Service) acceptPeerBlockMessage(peer *peerConn, block *types.Block) err
 			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
 			slog.Uint64("active_height", s.blockHeight()),
 			slog.Uint64("header_height", s.headerHeight()),
+			slog.Int("sig_checks", summary.SignatureChecks),
+			slog.Bool("sig_batch_fallback", summary.SignatureBatchFallback),
+			slog.Duration("sig_verify_duration", summary.SignatureVerifyTime),
 			slog.Duration("apply_duration", applyDuration),
 		)
 	}
@@ -3608,7 +3644,7 @@ func (s *Service) drainPendingPeerBlocks(parentHash [32]byte) {
 		children := s.pendingPeerBlockChildren(current)
 		for _, queued := range children {
 			hash := consensus.HeaderHash(&queued.block.Header)
-			applied, applyDuration, err := s.applyPeerBlock(&queued.block)
+			applied, summary, applyDuration, err := s.applyPeerBlock(&queued.block)
 			switch {
 			case err == nil:
 				s.releaseBlockRequest(hash)
@@ -3621,6 +3657,9 @@ func (s *Service) drainPendingPeerBlocks(parentHash [32]byte) {
 						slog.String("addr", queued.peerAddr),
 						slog.String("hash", fmt.Sprintf("%x", hash)),
 						slog.Uint64("block_height", s.blockHeight()),
+						slog.Int("sig_checks", summary.SignatureChecks),
+						slog.Bool("sig_batch_fallback", summary.SignatureBatchFallback),
+						slog.Duration("sig_verify_duration", summary.SignatureVerifyTime),
 						slog.Duration("apply_duration", applyDuration),
 						slog.Int("pending_remaining", s.pendingPeerBlockCount()),
 					)
@@ -3633,6 +3672,9 @@ func (s *Service) drainPendingPeerBlocks(parentHash [32]byte) {
 						slog.String("parent", shortHexBytes(queued.block.Header.PrevBlockHash, 16)),
 						slog.Uint64("active_height", s.blockHeight()),
 						slog.Uint64("header_height", s.headerHeight()),
+						slog.Int("sig_checks", summary.SignatureChecks),
+						slog.Bool("sig_batch_fallback", summary.SignatureBatchFallback),
+						slog.Duration("sig_verify_duration", summary.SignatureVerifyTime),
 						slog.Duration("apply_duration", applyDuration),
 					)
 				}
@@ -3791,9 +3833,8 @@ func stressLaneSecretKey() [32]byte {
 	return bpcrypto.TaggedHash("bpu-stress-lane-seed", []byte("regtest"))
 }
 
-func stressLaneReserveKeyHash() [32]byte {
-	pubKey := bpcrypto.XOnlyPubKeyFromSecret(stressLaneSecretKey())
-	return bpcrypto.KeyHash(&pubKey)
+func stressLaneReservePubKey() [32]byte {
+	return bpcrypto.XOnlyPubKeyFromSecret(stressLaneSecretKey())
 }
 
 func signStressLaneTx(tx types.Transaction, prevValue uint64) (types.Transaction, error) {
@@ -3801,35 +3842,35 @@ func signStressLaneTx(tx types.Transaction, prevValue uint64) (types.Transaction
 	if err != nil {
 		return types.Transaction{}, err
 	}
-	pubKey, sig := bpcrypto.SignSchnorr(stressLaneSecretKey(), &msg)
-	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	_, sig := bpcrypto.SignSchnorr(stressLaneSecretKey(), &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
 	return tx, nil
 }
 
-func buildStressLaneFanoutTx(prevOut types.OutPoint, prevValue uint64, keyHashes [][32]byte) (types.Transaction, []FundingOutput, error) {
-	if len(keyHashes) == 0 {
-		return types.Transaction{}, nil, errors.New("at least one key hash is required")
+func buildStressLaneFanoutTx(prevOut types.OutPoint, prevValue uint64, pubKeys [][32]byte) (types.Transaction, []FundingOutput, error) {
+	if len(pubKeys) == 0 {
+		return types.Transaction{}, nil, errors.New("at least one pubkey is required")
 	}
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: make([]types.TxOutput, len(keyHashes)),
+			Outputs: make([]types.TxOutput, len(pubKeys)),
 		},
 	}
-	for i, keyHash := range keyHashes {
-		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, KeyHash: keyHash}
+	for i, pubKey := range pubKeys {
+		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, PubKey: pubKey}
 	}
 	tx, err := signStressLaneTx(tx, prevValue)
 	if err != nil {
 		return types.Transaction{}, nil, err
 	}
 	fee := uint64(len(tx.Encode()))
-	if prevValue <= fee || prevValue-fee < uint64(len(keyHashes)) {
+	if prevValue <= fee || prevValue-fee < uint64(len(pubKeys)) {
 		return types.Transaction{}, nil, consensus.ErrInputsLessThanOutputs
 	}
-	perOutput := (prevValue - fee) / uint64(len(keyHashes))
-	remainder := (prevValue - fee) % uint64(len(keyHashes))
+	perOutput := (prevValue - fee) / uint64(len(pubKeys))
+	remainder := (prevValue - fee) % uint64(len(pubKeys))
 	for i := range tx.Base.Outputs {
 		value := perOutput
 		if i == len(tx.Base.Outputs)-1 {
@@ -3847,7 +3888,7 @@ func buildStressLaneFanoutTx(prevOut types.OutPoint, prevValue uint64, keyHashes
 		outputs = append(outputs, FundingOutput{
 			OutPoint: types.OutPoint{TxID: txid, Vout: uint32(vout)},
 			Value:    output.ValueAtoms,
-			KeyHash:  output.KeyHash,
+			PubKey:   output.PubKey,
 		})
 	}
 	return tx, outputs, nil
@@ -3856,7 +3897,7 @@ func buildStressLaneFanoutTx(prevOut types.OutPoint, prevValue uint64, keyHashes
 func stressLaneBatchConfirmed(utxos consensus.UtxoSet, outputs []FundingOutput) bool {
 	for _, output := range outputs {
 		entry, ok := utxos[output.OutPoint]
-		if !ok || entry.ValueAtoms != output.Value || entry.KeyHash != output.KeyHash {
+		if !ok || entry.ValueAtoms != output.Value || entry.PubKey != output.PubKey {
 			return false
 		}
 	}
@@ -3865,9 +3906,9 @@ func stressLaneBatchConfirmed(utxos consensus.UtxoSet, outputs []FundingOutput) 
 
 func (s *Service) stressLaneInfo() StressLaneInfo {
 	confirmed := s.chainUtxoSnapshot()
-	reserveKey := stressLaneReserveKeyHash()
-	info := StressLaneInfo{ReserveKeyHash: hex.EncodeToString(reserveKey[:])}
-	for _, utxo := range s.UTXOsByKeyHashes([][32]byte{reserveKey}) {
+	reserveKey := stressLaneReservePubKey()
+	info := StressLaneInfo{ReservePubKey: hex.EncodeToString(reserveKey[:])}
+	for _, utxo := range s.UTXOsByPubKeys([][32]byte{reserveKey}) {
 		info.ReserveUTXOs++
 		info.ReserveAtoms += utxo.Value
 	}
@@ -3895,7 +3936,7 @@ func (s *Service) ensureStressLaneReserve() error {
 	}
 	// Seed a confirmed reserve output once so live stress funding can fan out a
 	// normal signed transaction and let any network miner confirm it.
-	_, err := s.MineFundingOutputs([][32]byte{stressLaneReserveKeyHash()})
+	_, err := s.MineFundingOutputs([][32]byte{stressLaneReservePubKey()})
 	return err
 }
 
@@ -3905,7 +3946,7 @@ func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool)
 			return stressLaneBatch{}, StressLaneInfo{}, err
 		}
 	}
-	reserveUTXOs := s.UTXOsByKeyHashes([][32]byte{stressLaneReserveKeyHash()})
+	reserveUTXOs := s.UTXOsByPubKeys([][32]byte{stressLaneReservePubKey()})
 	if len(reserveUTXOs) == 0 {
 		return stressLaneBatch{}, s.stressLaneInfo(), errors.New("no confirmed stress reserve is available")
 	}
@@ -3917,10 +3958,10 @@ func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool)
 	}
 	tx, outputs, err := buildStressLaneFanoutTx(best.OutPoint, best.Value, keyHashes)
 	if err != nil && reserveTopUp && errors.Is(err, consensus.ErrInputsLessThanOutputs) {
-		if _, topUpErr := s.MineFundingOutputs([][32]byte{stressLaneReserveKeyHash()}); topUpErr != nil {
+		if _, topUpErr := s.MineFundingOutputs([][32]byte{stressLaneReservePubKey()}); topUpErr != nil {
 			return stressLaneBatch{}, StressLaneInfo{}, topUpErr
 		}
-		reserveUTXOs = s.UTXOsByKeyHashes([][32]byte{stressLaneReserveKeyHash()})
+		reserveUTXOs = s.UTXOsByPubKeys([][32]byte{stressLaneReservePubKey()})
 		if len(reserveUTXOs) == 0 {
 			return stressLaneBatch{}, StressLaneInfo{}, errors.New("stress reserve top-up did not publish a spendable output")
 		}
@@ -4160,7 +4201,7 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 		UTXORoot:    block.Header.UTXORoot,
 		Size:        len(block.Encode()),
 		TxCount:     len(block.Txs),
-		MinedByNode: blockMinedByKeyHash(block, s.cfg.MinerKeyHash),
+		MinedByNode: blockMinedByPubKey(block, s.cfg.MinerPubKey),
 	}
 	fees := make([]uint64, 0, len(block.Txs))
 	feeRates := make([]uint64, 0, len(block.Txs))
@@ -4181,9 +4222,9 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 		txPage.Outputs = make([]dashboardTxOutput, 0, len(tx.Base.Outputs))
 		for idx, output := range tx.Base.Outputs {
 			txPage.Outputs = append(txPage.Outputs, dashboardTxOutput{
-				Index:   idx,
-				Amount:  output.ValueAtoms,
-				KeyHash: output.KeyHash,
+				Index:  idx,
+				Amount: output.ValueAtoms,
+				PubKey: output.PubKey,
 			})
 		}
 		if !txPage.Coinbase {
@@ -4573,54 +4614,90 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			out = append(out, hex.EncodeToString(txid[:]))
 		}
 		return out, nil
-	case "getutxosbykeyhashes":
+	case "getutxosbypubkeys":
 		var params struct {
-			KeyHashes []string `json:"keyhashes"`
+			PubKeys []string `json:"pubkeys"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, err
 		}
-		keyHashes := make([][32]byte, 0, len(params.KeyHashes))
-		for _, raw := range params.KeyHashes {
-			keyHash, err := ParseMinerKeyHash(raw)
+		pubKeys := make([][32]byte, 0, len(params.PubKeys))
+		for _, raw := range params.PubKeys {
+			pubKey, err := ParseMinerPubKey(raw)
 			if err != nil {
 				return nil, err
 			}
-			keyHashes = append(keyHashes, keyHash)
+			pubKeys = append(pubKeys, pubKey)
 		}
-		utxos := s.UTXOsByKeyHashes(keyHashes)
+		utxos := s.UTXOsByPubKeys(pubKeys)
 		out := make([]map[string]any, 0, len(utxos))
 		for _, utxo := range utxos {
 			out = append(out, map[string]any{
-				"txid":    hex.EncodeToString(utxo.OutPoint.TxID[:]),
-				"vout":    utxo.OutPoint.Vout,
-				"value":   utxo.Value,
-				"keyhash": hex.EncodeToString(utxo.KeyHash[:]),
+				"txid":   hex.EncodeToString(utxo.OutPoint.TxID[:]),
+				"vout":   utxo.OutPoint.Vout,
+				"value":  utxo.Value,
+				"pubkey": hex.EncodeToString(utxo.PubKey[:]),
 			})
 		}
 		return map[string]any{"utxos": out, "count": len(out)}, nil
+	case "getutxoproof":
+		var params struct {
+			TxID string `json:"txid"`
+			Vout uint32 `json:"vout"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, err
+		}
+		txid, err := decodeProofHex32(params.TxID, "txid")
+		if err != nil {
+			return nil, err
+		}
+		proof, err := s.UTXOProof(types.OutPoint{TxID: txid, Vout: params.Vout})
+		if err != nil {
+			return nil, err
+		}
+		return EncodeRPCUTXOProof(proof), nil
+	case "verifyutxoproof":
+		var params struct {
+			Proof RPCAnchoredUTXOProof `json:"proof"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, err
+		}
+		proof, err := DecodeRPCUTXOProof(params.Proof)
+		if err != nil {
+			return nil, err
+		}
+		result, err := s.VerifyAnchoredUTXOProof(proof)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"valid":                result.Valid,
+			"anchor_matches_local": result.AnchorMatchesLocal,
+		}, nil
 	case "getstresslaneinfo":
 		if !s.cfg.Profile.IsRegtestLike() {
 			return nil, errors.New("stress lane info is only available on regtest-style profiles")
 		}
 		return s.stressLaneInfo(), nil
-	case "getwalletactivitybykeyhashes":
+	case "getwalletactivitybypubkeys":
 		var params struct {
-			KeyHashes []string `json:"keyhashes"`
-			Limit     int      `json:"limit"`
+			PubKeys []string `json:"pubkeys"`
+			Limit   int      `json:"limit"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, err
 		}
-		keyHashes := make([][32]byte, 0, len(params.KeyHashes))
-		for _, raw := range params.KeyHashes {
-			keyHash, err := ParseMinerKeyHash(raw)
+		pubKeys := make([][32]byte, 0, len(params.PubKeys))
+		for _, raw := range params.PubKeys {
+			pubKey, err := ParseMinerPubKey(raw)
 			if err != nil {
 				return nil, err
 			}
-			keyHashes = append(keyHashes, keyHash)
+			pubKeys = append(pubKeys, pubKey)
 		}
-		activity, err := s.WalletActivityByKeyHashes(keyHashes, params.Limit)
+		activity, err := s.WalletActivityByPubKeys(pubKeys, params.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -4804,23 +4881,23 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			return nil, errors.New("seedstresslanes is only available on regtest-style profiles")
 		}
 		var params struct {
-			KeyHashes           []string `json:"keyhashes"`
+			PubKeys             []string `json:"pubkeys"`
 			ReserveTopUp        *bool    `json:"reserve_top_up,omitempty"`
 			WaitForConfirmation *bool    `json:"wait_for_confirmation,omitempty"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, err
 		}
-		if len(params.KeyHashes) == 0 {
-			return nil, errors.New("keyhashes is required")
+		if len(params.PubKeys) == 0 {
+			return nil, errors.New("pubkeys is required")
 		}
-		keyHashes := make([][32]byte, 0, len(params.KeyHashes))
-		for _, raw := range params.KeyHashes {
-			keyHash, err := ParseMinerKeyHash(raw)
+		pubKeys := make([][32]byte, 0, len(params.PubKeys))
+		for _, raw := range params.PubKeys {
+			pubKey, err := ParseMinerPubKey(raw)
 			if err != nil {
 				return nil, err
 			}
-			keyHashes = append(keyHashes, keyHash)
+			pubKeys = append(pubKeys, pubKey)
 		}
 		reserveTopUp := true
 		if params.ReserveTopUp != nil {
@@ -4830,7 +4907,7 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		if params.WaitForConfirmation != nil {
 			waitForConfirmation = *params.WaitForConfirmation
 		}
-		outputs, info, pendingTxID, err := s.SeedStressLanes(keyHashes, reserveTopUp, waitForConfirmation)
+		outputs, info, pendingTxID, err := s.SeedStressLanes(pubKeys, reserveTopUp, waitForConfirmation)
 		if err != nil {
 			return nil, err
 		}
@@ -4840,7 +4917,7 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 				"txid":       hex.EncodeToString(output.OutPoint.TxID[:]),
 				"vout":       output.OutPoint.Vout,
 				"value":      output.Value,
-				"keyhash":    hex.EncodeToString(output.KeyHash[:]),
+				"pubkey":     hex.EncodeToString(output.PubKey[:]),
 				"block_hash": hex.EncodeToString(output.BlockHash[:]),
 			})
 		}
@@ -4863,7 +4940,12 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		applied, _, err := s.applyPeerBlock(&block)
+		applied, _, _, err := s.applyPeerBlock(&block)
+		if errors.Is(err, ErrBlockHeaderNotIndexed) {
+			if _, headerErr := s.applyPeerHeaders([]types.BlockHeader{block.Header}); headerErr == nil {
+				applied, _, _, err = s.applyPeerBlock(&block)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -5090,8 +5172,8 @@ func (p *peerConn) supportsAvalancheOverlay() bool {
 	return p.version.Services&p2p.ServiceAvalancheOverlay != 0
 }
 
-func (p *peerConn) supportsGrapheneBlockRelay() bool {
-	return p.advertisesService(p2p.ServiceGrapheneBlockRelay)
+func (p *peerConn) supportsCompactBlockRelay() bool {
+	return p.advertisesService(p2p.ServiceCompactBlockRelay)
 }
 
 func (p *peerConn) supportsGrapheneExtended() bool {
@@ -5484,11 +5566,11 @@ func (s *Service) preferredBlockRelayMessage(peer *peerConn, hash [32]byte) (p2p
 		return nil, ok, err
 	}
 	plan := selectBlockRelayPlan(peer, block)
-	s.noteGraphenePlan(plan)
+	s.noteBlockRelayPlan(plan)
 	switch plan {
 	case blockRelayPlanGrapheneExtended:
 		return buildXThinBlockMessage(block), true, nil
-	case blockRelayPlanGrapheneP1:
+	case blockRelayPlanCompactFallback:
 		return buildCompactBlockMessage(block), true, nil
 	default:
 		return p2p.BlockMessage{Block: block}, true, nil
@@ -5595,6 +5677,21 @@ func (s *Service) onTxRequestMessage(peer *peerConn, msg p2p.TxRequestMessage) e
 }
 
 func (s *Service) broadcastInv(items []p2p.InvVector) { s.relayManager().broadcastInv(items) }
+
+func (s *Service) broadcastHeaders(headers []types.BlockHeader) {
+	if len(headers) == 0 {
+		return
+	}
+	for _, peer := range s.peerSnapshot() {
+		if err := peer.send(p2p.HeadersMessage{Headers: headers}); err != nil && s.logger != nil {
+			s.logger.Debug("header broadcast enqueue failed",
+				slog.String("addr", peer.addr),
+				slog.Int("count", len(headers)),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
 func (s *Service) broadcastInvToPeers(peers []*peerConn, items []p2p.InvVector) {
 	s.relayManager().broadcastInvToPeers(peers, items)
 }
@@ -5607,6 +5704,30 @@ func (s *Service) broadcastAcceptedTxsToPeers(peers []*peerConn, accepted []memp
 		}
 	}
 	s.scheduleLocalRelayFallbacks(erlayPeers, accepted)
+}
+
+func (s *Service) relayAcceptedTxs(peers []*peerConn, accepted []mempool.AcceptedTx, source *peerConn) {
+	if len(peers) == 0 || len(accepted) == 0 {
+		return
+	}
+	if !s.cfg.DandelionEnabled {
+		s.broadcastAcceptedTxsToPeers(peers, accepted)
+		return
+	}
+	stemPeer := selectDandelionStemPeer(peers)
+	if stemPeer == nil {
+		s.broadcastAcceptedTxsToPeers(peers, accepted)
+		return
+	}
+	// Keep the first-hop footprint to one outbound peer, then fall back to the
+	// normal Erlay/legacy diffusion path after a short embargo.
+	s.broadcastAcceptedTxsToPeers([]*peerConn{stemPeer}, accepted)
+	sourceAddr := ""
+	if source != nil {
+		sourceAddr = source.addr
+	}
+	txids := acceptedTxIDs(accepted)
+	go s.runDandelionFluffAfterDelay(txids, sourceAddr)
 }
 
 func (s *Service) broadcastAcceptedTxsToPeersRetry(peers []*peerConn, accepted []mempool.AcceptedTx) {
@@ -5680,6 +5801,69 @@ func (s *Service) localOriginRelayTxIDs(accepted []mempool.AcceptedTx) [][32]byt
 		txids = append(txids, item.TxID)
 	}
 	return txids
+}
+
+func acceptedTxIDs(accepted []mempool.AcceptedTx) [][32]byte {
+	if len(accepted) == 0 {
+		return nil
+	}
+	txids := make([][32]byte, 0, len(accepted))
+	for _, item := range accepted {
+		txids = append(txids, item.TxID)
+	}
+	return txids
+}
+
+func selectDandelionStemPeer(peers []*peerConn) *peerConn {
+	candidates := make([]*peerConn, 0, len(peers))
+	for _, peer := range peers {
+		if peer == nil || !peer.outbound {
+			continue
+		}
+		candidates = append(candidates, peer)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	slices.SortFunc(candidates, func(a, b *peerConn) int {
+		return strings.Compare(a.addr, b.addr)
+	})
+	return candidates[0]
+}
+
+func (s *Service) runDandelionFluffAfterDelay(txids [][32]byte, sourceAddr string) {
+	if len(txids) == 0 {
+		return
+	}
+	timer := time.NewTimer(dandelionFluffDelay)
+	defer timer.Stop()
+	select {
+	case <-s.stopCh:
+		return
+	case <-timer.C:
+	}
+	due := make([]mempool.AcceptedTx, 0, len(txids))
+	for _, txid := range txids {
+		if !s.pool.Contains(txid) {
+			continue
+		}
+		due = append(due, mempool.AcceptedTx{TxID: txid})
+	}
+	if len(due) == 0 {
+		return
+	}
+	peers := s.peerSnapshot()
+	if sourceAddr != "" {
+		filtered := peers[:0]
+		for _, peer := range peers {
+			if peer.addr == sourceAddr {
+				continue
+			}
+			filtered = append(filtered, peer)
+		}
+		peers = filtered
+	}
+	s.broadcastAcceptedTxsToPeers(peers, due)
 }
 
 func (s *Service) runLocalRelayFallback(peer *peerConn, txids [][32]byte) {
@@ -6688,6 +6872,7 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	out := make([][32]byte, 0, limit)
+	gapDetected := false
 	blockTip := s.chainState.ChainState().TipHeight()
 	headerTip := s.headerChain.TipHeight()
 	if blockTip == nil || headerTip == nil {
@@ -6712,15 +6897,15 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 		}
 	}
 	for height := startHeight; height <= *headerTip && len(out) < limit; height++ {
-		// Missing index entries indicate the derived height map has a real gap.
-		// Missing-block requests should stop and let the repair path rebuild the
-		// index before we ask peers for blocks from an ambiguous active branch.
+		// Missing derived index entries are worth flagging for repair, but they
+		// should not block steady-state sync: the canonical active header path is
+		// still the source of truth for which blocks we need next.
 		indexedHash, err := s.chainState.Store().GetIndexedHeaderHashByHeight(height)
 		if err != nil {
 			return nil, false, err
 		}
 		if indexedHash == nil {
-			return out, true, nil
+			gapDetected = true
 		}
 		hash, err := s.chainState.Store().GetCanonicalHeaderHashByHeight(height)
 		if err != nil {
@@ -6740,7 +6925,7 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 			out = append(out, *hash)
 		}
 	}
-	return out, false, nil
+	return out, gapDetected, nil
 }
 
 func (s *Service) firstMissingActiveBlockHeightLocked(blockTipHeight uint64, blockTipHash [32]byte) (uint64, error) {
@@ -7431,6 +7616,11 @@ func renderPerformanceSection(summary PerformanceMetrics) string {
 		{"blocks", formatWithCommas(summary.Counters.BlocksAccepted)},
 		{"orphans", formatWithCommas(summary.Counters.OrphanPromotions)},
 	}))
+	out.WriteString(formatDashboardColumns("Signatures", [][2]string{
+		{"checks", formatWithCommas(summary.Counters.BlockSigChecks)},
+		{"fallbacks", formatWithCommas(summary.Counters.BlockSigFallbacks)},
+		{"mempool", formatWithCommas(summary.Gauges.MempoolTxs)},
+	}))
 	out.WriteString(formatDashboardColumns("Relay", [][2]string{
 		{"tx items", formatWithCommas(summary.Counters.RelayedTxItems)},
 		{"block items", formatWithCommas(summary.Counters.RelayedBlockItems)},
@@ -7463,6 +7653,7 @@ func renderPerformanceSection(summary PerformanceMetrics) string {
 		{label: " Admission", stats: summary.Latency.Admission},
 		{label: " Template ", stats: summary.Latency.Template},
 		{label: " Apply    ", stats: summary.Latency.BlockApply},
+		{label: " Sig      ", stats: summary.Latency.BlockSigVerify},
 		{label: " Relay    ", stats: summary.Latency.RelayFlush},
 		{label: " Sync     ", stats: summary.Latency.SyncReq},
 	} {
@@ -7893,8 +8084,8 @@ func renderTxInputs(tx dashboardTxPage) string {
 func renderTxOutputs(tx dashboardTxPage) string {
 	var out strings.Builder
 	for _, output := range tx.Outputs {
-		out.WriteString(fmt.Sprintf(" vout %-2d  amount %-10s  keyhash %s\n",
-			output.Index, formatAtoms(output.Amount), shortHexBytes(output.KeyHash, 18)))
+		out.WriteString(fmt.Sprintf(" vout %-2d  amount %-10s  pubkey  %s\n",
+			output.Index, formatAtoms(output.Amount), shortHexBytes(output.PubKey, 18)))
 	}
 	return out.String()
 }
@@ -7929,12 +8120,12 @@ func deriveNodeID(cfg ServiceConfig) string {
 	return strings.ToUpper(hex.EncodeToString(sum[:6]))
 }
 
-func blockMinedByKeyHash(block *types.Block, keyHash [32]byte) bool {
+func blockMinedByPubKey(block *types.Block, pubKey [32]byte) bool {
 	if len(block.Txs) == 0 || len(block.Txs[0].Base.Outputs) == 0 {
 		return false
 	}
 	for _, output := range block.Txs[0].Base.Outputs {
-		if output.KeyHash == keyHash {
+		if output.PubKey == pubKey {
 			return true
 		}
 	}
@@ -8051,6 +8242,17 @@ func (s *Service) peerSyncDebugSummary(limit int) string {
 		))
 	}
 	return out.String()
+}
+
+func (s *Service) SyncDebugSnapshot() SyncDebugSnapshot {
+	return SyncDebugSnapshot{
+		BlockHeight:    s.BlockHeight(),
+		HeaderHeight:   s.HeaderHeight(),
+		MempoolCount:   s.MempoolCount(),
+		PeerSync:       s.peerSyncDebugSummary(4),
+		InflightBlocks: s.inflightBlockDebugSummary(6),
+		PendingBlocks:  s.pendingPeerBlockDebugSummary(6),
+	}
 }
 
 func headersDebugSummary(headers []types.BlockHeader, limit int) string {
@@ -8832,7 +9034,7 @@ func randomNonce() uint64 {
 }
 
 func (s *Service) localVersion() p2p.VersionMessage {
-	services := p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceGrapheneBlockRelay | p2p.ServiceGrapheneExtended
+	services := p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceCompactBlockRelay | p2p.ServiceGrapheneExtended
 	if s.avalancheManager().enabled() {
 		services |= p2p.ServiceAvalancheOverlay
 	}
@@ -8845,19 +9047,22 @@ func (s *Service) localVersion() p2p.VersionMessage {
 	}
 }
 
-func ParseMinerKeyHash(raw string) ([32]byte, error) {
-	var keyHash [32]byte
+func ParseMinerPubKey(raw string) ([32]byte, error) {
+	var pubKey [32]byte
 	if raw == "" {
-		return keyHash, nil
+		return pubKey, nil
 	}
 	raw = strings.TrimSpace(raw)
 	buf, err := hex.DecodeString(raw)
 	if err != nil {
-		return keyHash, err
+		return pubKey, err
 	}
 	if len(buf) != 32 {
-		return keyHash, errors.New("miner keyhash must be 32 bytes hex")
+		return pubKey, errors.New("miner pubkey must be 32 bytes hex")
 	}
-	copy(keyHash[:], buf)
-	return keyHash, nil
+	copy(pubKey[:], buf)
+	if !bpcrypto.IsValidXOnlyPubKey(&pubKey) {
+		return pubKey, errors.New("miner pubkey must be a valid x-only secp256k1 public key")
+	}
+	return pubKey, nil
 }

@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"bitcoin-pure/internal/consensus"
+	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
 )
 
@@ -1038,7 +1039,7 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLoo
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:    output.PubKey,
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1073,7 +1074,7 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:    output.PubKey,
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1108,7 +1109,7 @@ func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup co
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:    output.PubKey,
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1435,22 +1436,37 @@ type appliedTxUndo struct {
 func applyCandidatePackage(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []*Entry, rules consensus.ConsensusRules) (uint64, bool) {
 	undos := make([]appliedTxUndo, 0, len(entries))
 	newlyClaimed := make([]types.OutPoint, 0, len(entries))
-	var totalFees uint64
+	pendingClaims := make([]types.OutPoint, 0, len(entries))
+	prepared := make([]consensus.PreparedTxValidation, 0, len(entries))
+	signatureChecks := make([]crypto.SchnorrBatchItem, 0, len(entries))
+	seenPackageClaims := make(map[types.OutPoint]struct{}, len(entries))
 	for _, entry := range entries {
 		for _, input := range entry.Tx.Base.Inputs {
 			if _, ok := claimed[input.PrevOut]; ok {
-				rollbackAppliedPackage(currentUtxos, undos)
-				rollbackClaimedInputs(claimed, newlyClaimed)
 				return 0, false
 			}
+			if _, ok := seenPackageClaims[input.PrevOut]; ok {
+				return 0, false
+			}
+			seenPackageClaims[input.PrevOut] = struct{}{}
+			pendingClaims = append(pendingClaims, input.PrevOut)
 		}
-		summary, err := consensus.ValidateTxWithLookup(&entry.Tx, preBlockUtxos, rules)
+		txValidation, err := consensus.PrepareTxValidationWithLookup(&entry.Tx, preBlockUtxos, rules)
 		if err != nil {
-			rollbackAppliedPackage(currentUtxos, undos)
-			rollbackClaimedInputs(claimed, newlyClaimed)
 			return 0, false
 		}
-		totalFees += summary.Fee
+		prepared = append(prepared, txValidation)
+		signatureChecks = append(signatureChecks, txValidation.SignatureChecks...)
+	}
+	// Batch Schnorr verification is a non-consensus accelerator here: if the
+	// probabilistic batch pass does not clear, fall back to exact verification so
+	// template selection preserves identical acceptance behavior.
+	if !crypto.VerifySchnorrBatchXOnlyWithFallback(signatureChecks) {
+		return 0, false
+	}
+	var totalFees uint64
+	for i, entry := range entries {
+		totalFees += prepared[i].Summary.Fee
 		for _, input := range entry.Tx.Base.Inputs {
 			claimed[input.PrevOut] = struct{}{}
 			newlyClaimed = append(newlyClaimed, input.PrevOut)
@@ -1475,7 +1491,7 @@ func applyTxWithUndo(utxos *consensus.UtxoOverlay, tx types.Transaction, txid [3
 		out := types.OutPoint{TxID: txid, Vout: uint32(vout)}
 		utxos.Set(out, consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:    output.PubKey,
 		})
 		undo.created = append(undo.created, out)
 	}
@@ -1766,7 +1782,7 @@ func applyTx(utxos consensus.UtxoSet, tx types.Transaction, txid [32]byte) {
 	for vout, output := range tx.Base.Outputs {
 		utxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:    output.PubKey,
 		}
 	}
 }
