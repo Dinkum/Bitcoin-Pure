@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "profile": "regtest",
+  "genesis_fixture": "../genesis/regtest.json",
+  "chain_fixture": "../chains/regtest_bootstrap.json",
+  "height": 2,
+  "expected_header_hash_hex": "7b1c19b47fda73a8f1257201b465b8f253627b54d6679ea7a7237d648faebb48",
+  "expected_utxo_root_hex": "89937c242d821c308952134a0822e1f5ddc94cb5022ad49f8f35448e09a45b16",
+  "expected_utxo_count": 3,
+  "utxos": [
+    {
+      "txid_hex": "2e4dd108b54c5475266d9b94ff6bda88b86ba46c6d2cf32b18ee8d69184bdc30",
+      "vout": 0,
+      "value_atoms": 1,
+      "pubkey_hex": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    {
+      "txid_hex": "66b55727392f16cbed91f9cfbee0ea184bb011dda4fe29bbbbd1c51f1745f2da",
+      "vout": 0,
+      "value_atoms": 1000000000000,
+      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "txid_hex": "bf18fab685cbd65d5a1b4bcf389027819a72c16cb80d9d9164da8a736858e263",
+      "vout": 0,
+      "value_atoms": 1,
+      "pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ]
+}

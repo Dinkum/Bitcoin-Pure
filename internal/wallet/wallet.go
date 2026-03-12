@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"bitcoin-pure/internal/consensus"
-	bpcrypto "bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -47,8 +46,7 @@ type Address struct {
 	Change        bool      `json:"change"`
 	CreatedAt     time.Time `json:"created_at"`
 	Address       string    `json:"address"`
-	KeyHashHex    string    `json:"keyhash_hex"`
-	PublicKeyHex  string    `json:"public_key_hex"`
+	PubKeyHex     string    `json:"pubkey_hex"`
 	PrivateKeyHex string    `json:"private_key_hex"`
 }
 
@@ -63,7 +61,7 @@ type PendingOutput struct {
 	Vout       uint32 `json:"vout"`
 	Value      uint64 `json:"value"`
 	Address    string `json:"address"`
-	KeyHashHex string `json:"keyhash_hex"`
+	PubKeyHex  string `json:"pubkey_hex"`
 	Change     bool   `json:"change"`
 }
 
@@ -75,7 +73,7 @@ type PendingOutPoint struct {
 type SpendableUTXO struct {
 	OutPoint types.OutPoint
 	Value    uint64
-	KeyHash  [32]byte
+	PubKey   [32]byte
 }
 
 type SelectedInput struct {
@@ -138,16 +136,15 @@ func Open(path string) (*Store, error) {
 	if err := json.Unmarshal(buf, &store.wallets); err != nil {
 		return nil, err
 	}
-	// Legacy wallets may still have placeholder `bpu1<hex>` address strings in
-	// storage. Recompute the display address from the canonical key hash so the
-	// wallet surface hard-cuts to cashaddr without needing a separate migration.
+	// Recompute the display address from the canonical stored pubkey so the
+	// wallet surface stays consistent even if only the raw pubkey is persisted.
 	for wi := range store.wallets {
 		for ai := range store.wallets[wi].Addresses {
-			keyHash, err := decodeHash(store.wallets[wi].Addresses[ai].KeyHashHex)
+			pubKey, err := decodeHex32(store.wallets[wi].Addresses[ai].PubKeyHex)
 			if err != nil {
 				continue
 			}
-			store.wallets[wi].Addresses[ai].Address = EncodeAddress(keyHash)
+			store.wallets[wi].Addresses[ai].Address = EncodeAddress(pubKey)
 		}
 	}
 	return store, nil
@@ -220,7 +217,7 @@ func (s *Store) ReconcilePending(name string, mempool map[[32]byte]struct{}) (in
 	filtered := wallet.Pending[:0]
 	removed := 0
 	for _, pending := range wallet.Pending {
-		txid, err := decodeHash(pending.TxID)
+		txid, err := decodeHex32(pending.TxID)
 		if err != nil {
 			removed++
 			continue
@@ -246,7 +243,7 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 	if !ok {
 		return SendPlan{}, ErrWalletNotFound
 	}
-	destKeyHash, err := ParseAddress(to)
+	destPubKey, err := ParseAddress(to)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -260,7 +257,7 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 		return SendPlan{}, err
 	}
 	change := total - required
-	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destKeyHash), destKeyHash, amount, fee, change)
+	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destPubKey), destPubKey, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -277,7 +274,7 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if !ok {
 		return SendPlan{}, ErrWalletNotFound
 	}
-	destKeyHash, err := ParseAddress(to)
+	destPubKey, err := ParseAddress(to)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -289,7 +286,7 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if err != nil {
 		return SendPlan{}, err
 	}
-	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destKeyHash), destKeyHash, amount, fee, change)
+	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destPubKey), destPubKey, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -370,7 +367,7 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 			Inputs:  []types.TxInput{{PrevOut: input.OutPoint}},
 			Outputs: []types.TxOutput{{
 				ValueAtoms: input.Value - fee,
-				KeyHash:    mustParseKeyHash(addr.KeyHashHex),
+				PubKey:     mustParsePubKey(addr.PubKeyHex),
 			}},
 		},
 		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, 1)},
@@ -379,11 +376,11 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	pubKey, sig, err := signAddress(input.Address, &msg)
+	sig, err := signAddress(input.Address, &msg)
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	tx.Auth.Entries[0] = types.TxAuthEntry{PubKey: pubKey, Signature: sig}
+	tx.Auth.Entries[0] = types.TxAuthEntry{Signature: sig}
 	txid := consensus.TxID(&tx)
 	return CPFPPlan{
 		WalletName:     wallet.Name,
@@ -435,7 +432,7 @@ func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]Spen
 	}
 	out := make([]SpendableUTXO, 0)
 	for _, pending := range wallet.Pending {
-		txid, err := decodeHash(pending.TxID)
+		txid, err := decodeHex32(pending.TxID)
 		if err != nil {
 			continue
 		}
@@ -443,21 +440,21 @@ func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]Spen
 			continue
 		}
 		for _, output := range pending.Outputs {
-			keyHash, err := decodeHash(output.KeyHashHex)
+			pubKey, err := decodeHex32(output.PubKeyHex)
 			if err != nil {
 				continue
 			}
 			out = append(out, SpendableUTXO{
 				OutPoint: types.OutPoint{TxID: txid, Vout: output.Vout},
 				Value:    output.Value,
-				KeyHash:  keyHash,
+				PubKey:   pubKey,
 			})
 		}
 	}
 	return out, nil
 }
 
-func (s *Store) SpendableKeyHashes(name string) ([][32]byte, error) {
+func (s *Store) SpendablePubKeys(name string) ([][32]byte, error) {
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return nil, ErrWalletNotFound
@@ -465,12 +462,12 @@ func (s *Store) SpendableKeyHashes(name string) ([][32]byte, error) {
 	out := make([][32]byte, 0, len(wallet.Addresses))
 	seen := make(map[[32]byte]struct{}, len(wallet.Addresses))
 	for _, addr := range wallet.Addresses {
-		keyHash := mustParseKeyHash(addr.KeyHashHex)
-		if _, ok := seen[keyHash]; ok {
+		pubKey := mustParsePubKey(addr.PubKeyHex)
+		if _, ok := seen[pubKey]; ok {
 			continue
 		}
-		seen[keyHash] = struct{}{}
-		out = append(out, keyHash)
+		seen[pubKey] = struct{}{}
+		out = append(out, pubKey)
 	}
 	return out, nil
 }
@@ -537,47 +534,42 @@ func newAddress(index int, change bool) (Address, error) {
 	pubKey := schnorr.SerializePubKey(privKey.PubKey())
 	var xonly [32]byte
 	copy(xonly[:], pubKey)
-	keyHash := bpcrypto.KeyHash(&xonly)
 	var secret [32]byte
 	copy(secret[:], privKey.Serialize())
 	return Address{
 		Index:         index,
 		Change:        change,
 		CreatedAt:     time.Now().UTC(),
-		Address:       EncodeAddress(keyHash),
-		KeyHashHex:    hex.EncodeToString(keyHash[:]),
-		PublicKeyHex:  hex.EncodeToString(xonly[:]),
+		Address:       EncodeAddress(xonly),
+		PubKeyHex:     hex.EncodeToString(xonly[:]),
 		PrivateKeyHex: hex.EncodeToString(secret[:]),
 	}, nil
 }
 
-func signAddress(addr Address, msg *[32]byte) ([32]byte, [64]byte, error) {
-	var pubOut [32]byte
+func signAddress(addr Address, msg *[32]byte) ([64]byte, error) {
 	var sigOut [64]byte
 	secret, err := hex.DecodeString(addr.PrivateKeyHex)
 	if err != nil || len(secret) != 32 {
-		return pubOut, sigOut, errors.New("wallet private key is invalid")
+		return sigOut, errors.New("wallet private key is invalid")
 	}
 	privKey, _ := btcec.PrivKeyFromBytes(secret)
-	pubKey := schnorr.SerializePubKey(privKey.PubKey())
-	copy(pubOut[:], pubKey)
 	sig, err := schnorr.Sign(privKey, msg[:])
 	if err != nil {
-		return pubOut, sigOut, err
+		return sigOut, err
 	}
 	copy(sigOut[:], sig.Serialize())
-	return pubOut, sigOut, nil
+	return sigOut, nil
 }
 
 func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, error) {
-	addressesByKeyHash := make(map[[32]byte]Address, len(wallet.Addresses))
+	addressesByPubKey := make(map[[32]byte]Address, len(wallet.Addresses))
 	for _, addr := range wallet.Addresses {
-		addressesByKeyHash[mustParseKeyHash(addr.KeyHashHex)] = addr
+		addressesByPubKey[mustParsePubKey(addr.PubKeyHex)] = addr
 	}
 	pendingSpent := make(map[types.OutPoint]struct{})
 	for _, pending := range wallet.Pending {
 		for _, spent := range pending.Spent {
-			txid, err := decodeHash(spent.TxID)
+			txid, err := decodeHex32(spent.TxID)
 			if err != nil {
 				continue
 			}
@@ -586,7 +578,7 @@ func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, erro
 	}
 	out := make([]SelectedInput, 0, len(utxos))
 	for _, utxo := range utxos {
-		addr, ok := addressesByKeyHash[utxo.KeyHash]
+		addr, ok := addressesByPubKey[utxo.PubKey]
 		if !ok {
 			continue
 		}
@@ -667,7 +659,7 @@ func estimateSignedTxBytes(inputCount int, outputCount int) int {
 		varIntLen(outputCount) +
 		(outputCount * 40) +
 		varIntLen(inputCount) +
-		(inputCount * 96)
+		(inputCount * 64)
 }
 
 func varIntLen(count int) int {
@@ -683,8 +675,8 @@ func varIntLen(count int) int {
 	}
 }
 
-func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destKeyHash [32]byte, amount uint64, fee uint64, change uint64) (SendPlan, error) {
-	outputs := []types.TxOutput{{ValueAtoms: amount, KeyHash: destKeyHash}}
+func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destPubKey [32]byte, amount uint64, fee uint64, change uint64) (SendPlan, error) {
+	outputs := []types.TxOutput{{ValueAtoms: amount, PubKey: destPubKey}}
 	var changeAddr *Address
 	if change > 0 {
 		// Persist change addresses before broadcast so a later-confirmed self output is still recoverable
@@ -698,7 +690,7 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 			return SendPlan{}, err
 		}
 		changeAddr = &addr
-		outputs = append(outputs, types.TxOutput{ValueAtoms: change, KeyHash: mustParseKeyHash(addr.KeyHashHex)})
+		outputs = append(outputs, types.TxOutput{ValueAtoms: change, PubKey: mustParsePubKey(addr.PubKeyHex)})
 	}
 	tx := types.Transaction{
 		Base: types.TxBase{
@@ -720,11 +712,11 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 		if err != nil {
 			return SendPlan{}, err
 		}
-		pubKey, sig, err := signAddress(coin.Address, &msg)
+		sig, err := signAddress(coin.Address, &msg)
 		if err != nil {
 			return SendPlan{}, err
 		}
-		tx.Auth.Entries[i] = types.TxAuthEntry{PubKey: pubKey, Signature: sig}
+		tx.Auth.Entries[i] = types.TxAuthEntry{Signature: sig}
 	}
 	txid := consensus.TxID(&tx)
 	return SendPlan{
@@ -743,13 +735,13 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 }
 
 func walletOwnedOutputs(wallet Wallet, tx types.Transaction) []PendingOutput {
-	addressByKeyHash := make(map[[32]byte]Address, len(wallet.Addresses))
+	addressByPubKey := make(map[[32]byte]Address, len(wallet.Addresses))
 	for _, addr := range wallet.Addresses {
-		addressByKeyHash[mustParseKeyHash(addr.KeyHashHex)] = addr
+		addressByPubKey[mustParsePubKey(addr.PubKeyHex)] = addr
 	}
 	out := make([]PendingOutput, 0)
 	for vout, output := range tx.Base.Outputs {
-		addr, ok := addressByKeyHash[output.KeyHash]
+		addr, ok := addressByPubKey[output.PubKey]
 		if !ok {
 			continue
 		}
@@ -757,22 +749,22 @@ func walletOwnedOutputs(wallet Wallet, tx types.Transaction) []PendingOutput {
 			Vout:       uint32(vout),
 			Value:      output.ValueAtoms,
 			Address:    addr.Address,
-			KeyHashHex: addr.KeyHashHex,
+			PubKeyHex: addr.PubKeyHex,
 			Change:     addr.Change,
 		})
 	}
 	return out
 }
 
-func mustParseKeyHash(raw string) [32]byte {
-	keyHash, err := decodeHash(raw)
+func mustParsePubKey(raw string) [32]byte {
+	pubKey, err := decodeHex32(raw)
 	if err != nil {
-		panic(fmt.Sprintf("invalid stored keyhash %q: %v", raw, err))
+		panic(fmt.Sprintf("invalid stored pubkey %q: %v", raw, err))
 	}
-	return keyHash
+	return pubKey
 }
 
-func decodeHash(raw string) ([32]byte, error) {
+func decodeHex32(raw string) ([32]byte, error) {
 	var out [32]byte
 	buf, err := hex.DecodeString(strings.TrimSpace(raw))
 	if err != nil || len(buf) != len(out) {

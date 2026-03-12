@@ -17,11 +17,10 @@ type TxInput struct {
 
 type TxOutput struct {
 	ValueAtoms uint64
-	KeyHash    [32]byte
+	PubKey     [32]byte
 }
 
 type TxAuthEntry struct {
-	PubKey    [32]byte
 	Signature [64]byte
 }
 
@@ -337,7 +336,7 @@ func decodeTxInput(r *reader) (TxInput, error) {
 
 func (o TxOutput) Encode(out *[]byte) {
 	writeU64LE(out, o.ValueAtoms)
-	*out = append(*out, o.KeyHash[:]...)
+	*out = append(*out, o.PubKey[:]...)
 }
 
 func decodeTxOutput(r *reader) (TxOutput, error) {
@@ -345,28 +344,23 @@ func decodeTxOutput(r *reader) (TxOutput, error) {
 	if err != nil {
 		return TxOutput{}, err
 	}
-	keyHash, err := r.readArray32()
+	pubKey, err := r.readArray32()
 	if err != nil {
 		return TxOutput{}, err
 	}
-	return TxOutput{ValueAtoms: value, KeyHash: keyHash}, nil
+	return TxOutput{ValueAtoms: value, PubKey: pubKey}, nil
 }
 
 func (e TxAuthEntry) Encode(out *[]byte) {
-	*out = append(*out, e.PubKey[:]...)
 	*out = append(*out, e.Signature[:]...)
 }
 
 func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
-	pubKey, err := r.readArray32()
-	if err != nil {
-		return TxAuthEntry{}, err
-	}
 	signature, err := r.readArray64()
 	if err != nil {
 		return TxAuthEntry{}, err
 	}
-	return TxAuthEntry{PubKey: pubKey, Signature: signature}, nil
+	return TxAuthEntry{Signature: signature}, nil
 }
 
 func (b TxBase) Encode(out *[]byte) {

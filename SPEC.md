@@ -44,22 +44,16 @@ All on-chain amounts are integers in atoms. BPU is UI only.
 Outputs:
 - Each output:
   - value: uint64 integer number of atoms,
-  - keyhash: 32-byte SHA256(pubkey).
-
-Rationale:
-- Outputs commit to SHA256(pubkey), not the pubkey itself.
-- The pubkey is revealed only when the output is spent.
-- This preserves the single spend rule while minimizing long-lived public-key exposure of unspent outputs.
+  - pubkey: 32-byte x-only secp256k1 public key.
+- Design rationale: see Appendix A.1.
 
 Inputs / spends:
 - Each input references a previous output by (txid, output_index).
 - To spend an output, the transaction carries per input:
-  - a 32-byte x-only secp256k1 public key,
   - a 64-byte Schnorr signature.
 
 Validation for an input:
-- Compute SHA256(pubkey) and verify it equals the keyhash of the referenced UTXO.
-- Verify the Schnorr signature against the sighash message defined in §3.
+- Verify the Schnorr signature against the referenced UTXO pubkey and the sighash message defined in §3.
 
 There is exactly one output type and one spend rule.
 No script language, no multisig, no timelocks, no hashlocks, no OP_RETURN in consensus.
@@ -81,7 +75,7 @@ For each input i, the signature signs a hash of:
 - The list of all input prevouts:
   - For each input: (prev_txid, prev_output_index).
 - The list of all outputs:
-  - For each output: (value_in_atoms, keyhash).
+  - For each output: (value_in_atoms, pubkey).
 - The list of all input amounts:
   - For each input: the value_in_atoms of the referenced UTXO.
 
@@ -101,9 +95,9 @@ Internal transaction structure:
 - Base:
   - version,
   - list of inputs (prevouts: txid + index),
-  - list of outputs (value + keyhash).
+  - list of outputs (value + pubkey).
 - Auth:
-  - for each non-coinbase input: (pubkey, signature).
+  - for each non-coinbase input: (signature).
 
 Identifiers:
 - txid   = hash(Base) only (signatures excluded).
@@ -139,6 +133,11 @@ Header:
 - timestamp (UNIX time),
 - nBits (compact difficulty target),
 - nonce (uint64).
+
+Header timestamp validity:
+- Let `MTP(prev)` be the median of the timestamps of the previous 11 headers on the same branch.
+  - If fewer than 11 previous headers exist, use all available previous headers back to genesis.
+- A block is valid only if `header.timestamp > MTP(prev)`.
 
 Body:
 - Ordered list of transactions.
@@ -317,7 +316,6 @@ Header field:
 - utxo_root: 32-byte hash in each header.
 
 Meaning:
-Meaning:
 - utxo_root is a commitment to the entire set of currently unspent outputs after applying all transactions in this block.
 - utxo_root is a commitment to the current live UTXO map, not to an ordered transaction sequence.
 - Representation: canonical authenticated radix tree / Merklix-style tree:
@@ -325,10 +323,10 @@ Meaning:
     - outpoint = (txid, vout).
   - Each live UTXO leaf commits to:
     - value_in_atoms as uint64,
-    - keyhash,
+    - pubkey,
     - the canonical committed coin payload for BPU v1:
       - value_in_atoms as uint64,
-      - keyhash.
+      - pubkey.
   - Internal nodes commit to child hashes using fixed tagged hashing.
   - Empty branches, path compression rules, key encoding, leaf encoding,
     branch encoding, and root hashing are all consensus-defined.
@@ -380,8 +378,7 @@ Transaction is valid if:
 - No duplicate input references within the tx.
 - Sum(inputs) ≥ sum(outputs); difference is fee.
 - For each non-coinbase input:
-  - SHA256(pubkey) equals keyhash of the referenced UTXO.
-  - Schnorr signature verifies under sighash as defined in §3.
+  - Schnorr signature verifies under the referenced UTXO pubkey and the sighash as defined in §3.
 
 Block is valid if:
 - Header has correct PoW (hash ≤ target).
@@ -404,20 +401,29 @@ Block is valid if:
 ## PART B — NON-CONSENSUS BEHAVIOR
 ===============================
 
-11. P2P, Relay, and Mempool (Recommended)
+P2P, Relay, and Mempool (Recommended)
 -----------------------------------------
 Addresses:
 - CashAddr-style addresses (e.g. `bpu:...`) encoding:
   - address type + payload-size version bits,
-  - 32-byte keyhash payload,
+  - 32-byte x-only pubkey payload,
   - CashAddr checksum committed to the human-readable prefix.
 
-P2P:
+P2P / relay architecture:
 - Transport encryption is not required by spec; nodes MAY use plaintext transport by default.
-- Compact block relay:
-  - Blocks are announced via header + short txids; receivers reconstruct using mempool and only fetch missing txs.
-- Erlay-style transaction relay:
-  - Set reconciliation to avoid O(N²) gossip; peers exchange sketches of mempools.
+- Transactions:
+  - Nodes SHOULD use Erlay-style transaction relay as the sole steady-state mempool dissemination mechanism.
+  - Detailed recommended behavior is defined in `specs/tx_relay.md`.
+- Blocks:
+  - Nodes SHOULD use Graphene block relay as the preferred high-efficiency block propagation mode when both peers support it.
+  - A sender-side planner SHOULD choose between the default Graphene block path and Graphene Extended (phase 2) based on predicted mempool overlap.
+  - If default Graphene block decode fails, the receiver SHOULD escalate to Graphene Extended automatically.
+  - Detailed recommended behavior is defined in `specs/block_relay.md`.
+- Compatibility fallback:
+  - Compact-block relay is the universal compatibility fallback when Graphene-family relay is unavailable, unsupported, or fails.
+- Graphene-based mempool synchronization:
+  - Optional, disabled by default, and reserved for peer catch-up, cold-start recovery, or severe desynchronization.
+  - It MUST NOT become a second normal owner of mempool convergence beside Erlay.
 
 Mempool:
 - Default policy:
@@ -456,43 +462,48 @@ Goals:
 - exploit canonical transaction ordering (LTOR),
 - always provide a robust fallback path.
 
+Architecture:
+- Nodes SHOULD support Graphene-family compact block relay.
+- Preferred high-efficiency block relay is the default Graphene block path with applicable Phase 1 (v2) improvements.
+- A sender-side planner SHOULD choose:
+  - the default Graphene block path when predicted mempool overlap is sufficient,
+  - Graphene Extended when predicted mempool overlap is predicted to be poor.
+- If the default Graphene block path is attempted and decode fails, the receiver SHOULD escalate to Graphene Extended automatically.
+- Graphene-based mempool synchronization is not part of normal block relay operation and remains optional repair-only behavior.
+
 Baseline interoperability:
 - All full nodes SHOULD support Compact-Block-style relay.
-- Compact-block relay is the universal fallback mechanism when a more
-  aggressive relay mode is unavailable, unsupported, or fails.
-
-Preferred relay mode:
-- Nodes SHOULD support Xthinner-style block relay for LTOR-ordered blocks.
-- Xthinner-style relay is the preferred high-efficiency block-propagation
-  mode for peers that both support it.
-- Xthinner-style relay is non-consensus:
-  - it does not affect block validity,
-  - it only affects how valid blocks are encoded and reconstructed
-    between peers.
+- Compact-block relay is the universal fallback mechanism when Graphene-family relay is unavailable, unsupported, or fails.
 
 Transaction relay:
 - Nodes SHOULD support Erlay-style transaction relay / set reconciliation
-  for efficient mempool synchronization and reduced transaction-gossip
-  bandwidth.
+  as the sole steady-state mempool dissemination mechanism.
+- Detailed recommended tx relay behavior is defined in `specs/tx_relay.md`.
 - Transaction relay mode is non-consensus.
 
-Optional advanced relay:
-- Nodes MAY implement Graphene / Graphene Extended-style probabilistic
-  block relay.
-- Graphene Extended-style relay is OPTIONAL and SHOULD be disabled by
-  default.
+Batch Schnorr verification:
+- Nodes SHOULD use BIP340-style batch Schnorr verification as a local validation accelerator when many signatures are checked together.
+- Batch verification is non-consensus only and MUST NOT change transaction or block validity.
+- If a probabilistic batch verifier is used, implementations SHOULD fall back to exact per-signature verification before treating a batch failure as final.
+
+Optional repair features:
+- Nodes MAY implement Graphene-based mempool synchronization as an optional repair primitive.
+- Graphene-based mempool synchronization SHOULD be disabled by default.
 - If enabled, it SHOULD be negotiated explicitly between capable peers.
-- Graphene Extended-style relay MAY be used in situations where peers
-  want to optimize bandwidth more aggressively despite higher protocol
-  complexity and probabilistic decode behavior.
+- It MAY be used only for peer catch-up, cold-start recovery, or severe desynchronization.
+- It MUST NOT become a second normal owner of mempool convergence beside Erlay.
 
 Failure handling:
 - Any advanced relay mode MUST degrade gracefully.
-- If Xthinner-style or Graphene-style block reconstruction fails, nodes
-  SHOULD fall back to:
+- If Graphene-family block reconstruction fails, nodes SHOULD fall back to:
   - Compact-block relay, or
   - direct recovery of missing transactions, or
   - full-block transfer.
+
+Status:
+- All relay modes in this section are non-consensus only.
+- They do not affect block validity.
+- They only affect how valid blocks are encoded and reconstructed between peers.
 
 
 ### Utreexo-Like Compact State and Proofs 
@@ -585,7 +596,7 @@ Validation requirement:
 - Fee estimation:
   - Use recent block fullness and mempool pressure.
 - Use CPFP for fee-bumping stuck txs.
-- Multi-party custody MAY be implemented off-chain via key/signature aggregation, but consensus remains unchanged: each input presents exactly one x-only public key and one Schnorr signature.
+- Multi-party custody MAY be implemented off-chain via key/signature aggregation, but consensus remains unchanged: each input presents exactly one Schnorr signature and spends exactly one x-only pubkey output.
 - Please find a non consensus spec for wallet multisig in specs/musig_wallet.md
 
 ### Block Filters for Lite Clients (BIP157/158-Style)
@@ -598,14 +609,14 @@ Mechanism:
 - For each block, full nodes SHOULD serve a compact filter (BPU-Filter)
   similar to BIP158.
 - The filter is built over:
-  - all output keyhashes created in the block,
-  - all spent-prevout keyhashes consumed by inputs in the block.
+  - all output pubkeys created in the block,
+  - all spent-prevout pubkeys consumed by inputs in the block.
 - Implemented as a Golomb-coded or similar probabilistic set.
 
 Meaning:
-- Output keyhash entries let a lite client detect newly received funds.
-- Spent-prevout keyhash entries let a lite client detect spends of coins
-  previously controlled by that keyhash.
+- Output pubkey entries let a lite client detect newly received funds.
+- Spent-prevout pubkey entries let a lite client detect spends of coins
+  previously controlled by that pubkey.
 - This is the scriptless-UTXO analogue of script-based compact block filters.
 
 Lite clients:
@@ -735,3 +746,19 @@ Consensus:
 ====================================
 END — Bitcoin Pure v1 (Consensus + UX)
 ====================================
+
+Appendix A — Design Rationale (Non-Normative)
+=============================================
+
+A.1 Direct Public-Key Outputs vs Hashed Public-Key Outputs
+----------------------------------------------------------
+
+BPU v1 commits outputs directly to 32-byte x-only public keys rather than to hashed public keys.
+
+Reasoning:
+- This removes the need to carry a 32-byte public key again in every spend.
+- The result is smaller inputs and better cash efficiency.
+- Hashed public-key outputs offer only a partial hedge against long-exposure quantum risk.
+- A serious post-quantum transition would require a future consensus decision regardless.
+- That future hard fork may introduce new output forms, spend typing, alternate signature schemes, and/or block-height-based migration rules.
+- BPU v1 therefore does not impose a permanent transaction-size penalty on every spend for a partial defense that would still require a later migration strategy.

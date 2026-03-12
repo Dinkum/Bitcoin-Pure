@@ -21,11 +21,13 @@ type PerformanceCounters struct {
 	RelayedTxItems        uint64 `json:"relayed_tx_items"`
 	RelayedBlockItems     uint64 `json:"relayed_block_items"`
 	BlocksAccepted        uint64 `json:"blocks_accepted"`
+	BlockSigChecks        uint64 `json:"block_sig_checks"`
+	BlockSigFallbacks     uint64 `json:"block_sig_fallbacks"`
 	TemplateRebuilds      uint64 `json:"template_rebuilds"`
 	TemplateInterruptions uint64 `json:"template_interruptions"`
 	ErlayRounds           uint64 `json:"erlay_rounds"`
 	ErlayRequestedTxs     uint64 `json:"erlay_requested_txs"`
-	GrapheneP1Plans       uint64 `json:"graphene_p1_plans"`
+	CompactBlockPlans     uint64 `json:"compact_block_plans"`
 	GrapheneExtendedPlans uint64 `json:"graphene_extended_plans"`
 	GrapheneDecodeFails   uint64 `json:"graphene_decode_failures"`
 	GrapheneExtRecoveries uint64 `json:"graphene_extended_recoveries"`
@@ -63,6 +65,7 @@ type PerformanceLatencyGroup struct {
 	Admission          DurationHistogramSummary `json:"admission"`
 	Template           DurationHistogramSummary `json:"template"`
 	BlockApply         DurationHistogramSummary `json:"block_apply"`
+	BlockSigVerify     DurationHistogramSummary `json:"block_sig_verify"`
 	BlockApplyLockWait DurationHistogramSummary `json:"block_apply_lock_wait"`
 	RelayFlush         DurationHistogramSummary `json:"relay_flush"`
 	SyncReq            DurationHistogramSummary `json:"sync_request"`
@@ -81,6 +84,7 @@ type performanceMetricsCollector struct {
 	admission          durationMetricWindow
 	template           durationMetricWindow
 	blockApply         durationMetricWindow
+	blockSigVerify     durationMetricWindow
 	blockApplyLockWait durationMetricWindow
 	relayFlush         durationMetricWindow
 	syncReq            durationMetricWindow
@@ -104,6 +108,10 @@ func (c *performanceMetricsCollector) noteTemplateDuration(d time.Duration) {
 
 func (c *performanceMetricsCollector) noteBlockApplyDuration(d time.Duration) {
 	c.record(&c.blockApply, d)
+}
+
+func (c *performanceMetricsCollector) noteBlockSigVerifyDuration(d time.Duration) {
+	c.record(&c.blockSigVerify, d)
 }
 
 func (c *performanceMetricsCollector) noteBlockApplyLockWaitDuration(d time.Duration) {
@@ -151,6 +159,7 @@ func (c *performanceMetricsCollector) snapshot() PerformanceLatencyGroup {
 		Admission:          c.admission.summary(),
 		Template:           c.template.summary(),
 		BlockApply:         c.blockApply.summary(),
+		BlockSigVerify:     c.blockSigVerify.summary(),
 		BlockApplyLockWait: c.blockApplyLockWait.summary(),
 		RelayFlush:         c.relayFlush.summary(),
 		SyncReq:            c.syncReq.summary(),
@@ -197,11 +206,13 @@ func (s *Service) PerformanceMetrics() PerformanceMetrics {
 			RelayedTxItems:        s.throughput.relayedTxItems.Load(),
 			RelayedBlockItems:     s.throughput.relayedBlockItems.Load(),
 			BlocksAccepted:        s.throughput.blocksAccepted.Load(),
+			BlockSigChecks:        s.throughput.blockSigChecks.Load(),
+			BlockSigFallbacks:     s.throughput.blockSigFallbacks.Load(),
 			TemplateRebuilds:      s.throughput.templateRebuilds.Load(),
 			TemplateInterruptions: s.throughput.templateInterruptions.Load(),
 			ErlayRounds:           s.throughput.erlayRounds.Load(),
 			ErlayRequestedTxs:     s.throughput.erlayRequestedTxs.Load(),
-			GrapheneP1Plans:       s.throughput.grapheneP1Plans.Load(),
+			CompactBlockPlans:     s.throughput.compactBlockPlans.Load(),
 			GrapheneExtendedPlans: s.throughput.grapheneExtPlans.Load(),
 			GrapheneDecodeFails:   s.throughput.grapheneDecodeFails.Load(),
 			GrapheneExtRecoveries: s.throughput.grapheneExtRecoveries.Load(),

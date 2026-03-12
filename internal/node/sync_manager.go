@@ -245,35 +245,13 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 		return err
 	}
 	if gapDetected {
-		m.svc.logger.Warn("active header height index gap detected while requesting blocks",
+		m.svc.logger.Debug("active header height index gap detected while requesting blocks; continuing with canonical header ancestry",
 			slog.String("addr", peer.addr),
 			slog.Uint64("tip_height", m.svc.blockHeight()),
 			slog.Uint64("header_height", m.svc.headerHeight()),
 			slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 			slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 		)
-		repaired, repairErr := m.svc.repairActiveHeightIndex()
-		if repairErr != nil {
-			m.svc.logger.Warn("failed to repair active header height index before requesting blocks",
-				slog.String("addr", peer.addr),
-				slog.Any("error", repairErr),
-				slog.Uint64("tip_height", m.svc.blockHeight()),
-				slog.Uint64("header_height", m.svc.headerHeight()),
-				slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
-			)
-		} else if repaired > 0 {
-			m.svc.logger.Warn("repaired active header height index before requesting blocks",
-				slog.String("addr", peer.addr),
-				slog.Int("entries", repaired),
-				slog.Uint64("tip_height", m.svc.blockHeight()),
-				slog.Uint64("header_height", m.svc.headerHeight()),
-				slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
-			)
-			hashes, gapDetected, err = m.svc.missingBlockHashesDetailed(blockRequestBatchSize)
-			if err != nil {
-				return err
-			}
-		}
 	}
 	hashes = m.scheduleBlockRequests(peer.addr, hashes, blockRequestBatchSize)
 	if len(hashes) == 0 {
@@ -601,7 +579,7 @@ func (m *syncManager) runSyncWatchdogStep() {
 			}
 		}
 	}
-	if gapDetected {
+	if gapDetected && len(hashes) == 0 {
 		repaired, repairErr := m.svc.repairActiveHeightIndex()
 		if repairErr != nil {
 			m.svc.logger.Warn("sync watchdog failed to repair active header height index",
@@ -621,6 +599,12 @@ func (m *syncManager) runSyncWatchdogStep() {
 				return
 			}
 		}
+	} else if gapDetected {
+		m.svc.logger.Debug("sync watchdog observed active header height index gap; canonical block requests already cover the active branch",
+			slog.Uint64("tip_height", blockHeight),
+			slog.Uint64("header_height", headerHeight),
+			slog.Int("missing_blocks", len(hashes)),
+		)
 	}
 
 	peers := m.svc.peerSnapshot()
@@ -648,7 +632,7 @@ func (m *syncManager) runSyncWatchdogStep() {
 		}
 		if progressUnix := peer.snapshotProgressUnix(); progressUnix == 0 || time.Unix(progressUnix, 0).Before(stallCutoff) {
 			needsKick = true
-			break
+			continue
 		}
 	}
 	if !needsKick {

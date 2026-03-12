@@ -144,14 +144,14 @@ profile = profile_override or keep("profile", "regtest")
 import secrets
 
 rpc_token = keep("rpc_auth_token", secrets.token_hex(32))
-miner_keyhash = str(keep("miner_keyhash_hex", "")).strip()
-has_miner_keyhash = bool(miner_keyhash)
+miner_pubkey = str(keep("miner_pubkey_hex", "")).strip()
+has_miner_pubkey = bool(miner_pubkey)
 if mining_override == "on":
     miner_enabled = True
 elif mining_override == "off":
     miner_enabled = False
 else:
-    miner_enabled = bool(keep("miner_enabled", has_miner_keyhash))
+    miner_enabled = bool(keep("miner_enabled", has_miner_pubkey))
 
 if peers_json:
     peers = json.loads(peers_json)
@@ -181,7 +181,7 @@ cfg = {
     "min_relay_fee_per_byte": keep("min_relay_fee_per_byte", 1),
     "miner_enabled": miner_enabled,
     "miner_workers": keep("miner_workers", 0),
-    "miner_keyhash_hex": miner_keyhash,
+    "miner_pubkey_hex": miner_pubkey,
     "genesis_fixture": os.path.join(stage_dir, "fixtures", "genesis", f"{profile}.json"),
 }
 
@@ -226,7 +226,7 @@ build_binary() {
 }
 
 ensure_mining_wallet() {
-	local artifacts_dir staged_config miner_state miner_keyhash wallet_dir wallet_output keyhash receive_address
+	local artifacts_dir staged_config miner_state miner_pubkey wallet_dir wallet_output pubkey receive_address
 	artifacts_dir="${STAGE_DIR}/.artifacts"
 	staged_config="${artifacts_dir}/config.json"
 	mapfile -t miner_state < <(python3 - "${staged_config}" <<'PY'
@@ -237,14 +237,14 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
     cfg = json.load(fh)
 
 print("on" if cfg.get("miner_enabled", False) else "off")
-print(str(cfg.get("miner_keyhash_hex", "")).strip())
+print(str(cfg.get("miner_pubkey_hex", "")).strip())
 PY
 )
 	if [[ "${miner_state[0]:-off}" != "on" ]]; then
 		return
 	fi
-	miner_keyhash="${miner_state[1]:-}"
-	if [[ -n "${miner_keyhash}" ]]; then
+	miner_pubkey="${miner_state[1]:-}"
+	if [[ -n "${miner_pubkey}" ]]; then
 		return
 	fi
 
@@ -258,10 +258,10 @@ PY
 			fail "failed to create miner wallet: ${wallet_output}"
 		fi
 	fi
-	keyhash="$(printf '%s\n' "${wallet_output}" | sed -n 's/^keyhash: //p' | tail -n 1)"
+	pubkey="$(printf '%s\n' "${wallet_output}" | sed -n 's/^pubkey: //p' | tail -n 1)"
 	receive_address="$(printf '%s\n' "${wallet_output}" | sed -n 's/^receive_address: //p' | tail -n 1)"
-	[[ -n "${keyhash}" ]] || fail "miner wallet provisioning did not return a keyhash"
-	python3 - "${staged_config}" "${keyhash}" <<'PY'
+	[[ -n "${pubkey}" ]] || fail "miner wallet provisioning did not return a pubkey"
+	python3 - "${staged_config}" "${pubkey}" <<'PY'
 import json
 import sys
 
@@ -269,7 +269,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
     cfg = json.load(fh)
 
 cfg["miner_enabled"] = True
-cfg["miner_keyhash_hex"] = sys.argv[2]
+cfg["miner_pubkey_hex"] = sys.argv[2]
 
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump(cfg, fh, indent=2)

@@ -11,9 +11,8 @@ import (
 	"bitcoin-pure/internal/types"
 )
 
-func signerKeyHash(seed byte) [32]byte {
-	pubKey, _ := crypto.SignSchnorrForTest([32]byte{seed}, &[32]byte{})
-	return crypto.KeyHash(&pubKey)
+func signerPubKey(seed byte) [32]byte {
+	return crypto.XOnlyPubKeyFromSecret([32]byte{seed})
 }
 
 func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
@@ -33,20 +32,20 @@ func spendTx(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint6
 	if fee >= value {
 		t.Fatalf("fee %d must be less than value %d", fee, value)
 	}
-	recipientKeyHash := signerKeyHash(recipientSeed)
+	recipientPubKey := signerPubKey(recipientSeed)
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: []types.TxOutput{{ValueAtoms: value - fee, KeyHash: recipientKeyHash}},
+			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: recipientPubKey}},
 		},
 	}
 	msg, err := consensus.Sighash(&tx, 0, []uint64{value})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubKey, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
-	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
 	return tx
 }
 
@@ -56,7 +55,7 @@ func orphanTx(t *testing.T, prevOut types.OutPoint, recipientSeed byte) types.Tr
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: []types.TxOutput{{ValueAtoms: 49, KeyHash: signerKeyHash(recipientSeed)}},
+			Outputs: []types.TxOutput{{ValueAtoms: 49, PubKey: signerPubKey(recipientSeed)}},
 		},
 		Auth: types.TxAuth{Entries: []types.TxAuthEntry{{}}},
 	}
@@ -85,7 +84,7 @@ func TestAcceptTxRejectsConflictingSpend(t *testing.T) {
 	prevOut := types.OutPoint{TxID: [32]byte{2}, Vout: 0}
 	first := spendTx(t, 7, prevOut, 50, 8, 1)
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(7)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(7)},
 	}
 	if _, err := pool.AcceptTx(first, utxos, consensus.DefaultConsensusRules()); err != nil {
 		t.Fatalf("accept first tx: %v", err)
@@ -107,7 +106,7 @@ func TestAcceptTxTracksAncestorsAndDescendants(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -145,7 +144,7 @@ func TestAcceptTxRejectsDescendantLimit(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{3}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent, child, parentTxID, childTxID := makeThreeStepChain(t, prevOut)
@@ -171,7 +170,7 @@ func TestAcceptTxStoresOrphanAndPromotesOnParent(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{4}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -214,7 +213,7 @@ func TestAcceptTxPromotesOrphanChainsThroughReadyQueue(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{6}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -260,8 +259,8 @@ func TestAcceptTxPromotesMultiInputOrphanOnlyWhenAllParentsReady(t *testing.T) {
 	leftPrev := types.OutPoint{TxID: [32]byte{7}, Vout: 0}
 	rightPrev := types.OutPoint{TxID: [32]byte{8}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		leftPrev:  {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		rightPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
+		leftPrev:  {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		rightPrev: {ValueAtoms: 50, PubKey: signerPubKey(2)},
 	}
 
 	left := spendTx(t, 1, leftPrev, 50, 3, 1)
@@ -273,7 +272,7 @@ func TestAcceptTxPromotesMultiInputOrphanOnlyWhenAllParentsReady(t *testing.T) {
 				{PrevOut: types.OutPoint{TxID: consensus.TxID(&left), Vout: 0}},
 				{PrevOut: types.OutPoint{TxID: consensus.TxID(&right), Vout: 0}},
 			},
-			Outputs: []types.TxOutput{{ValueAtoms: 97, KeyHash: signerKeyHash(5)}},
+			Outputs: []types.TxOutput{{ValueAtoms: 97, PubKey: signerPubKey(5)}},
 		},
 	}
 	authEntries := make([]types.TxAuthEntry, 0, 2)
@@ -282,8 +281,8 @@ func TestAcceptTxPromotesMultiInputOrphanOnlyWhenAllParentsReady(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sighash join input %d: %v", inputIndex, err)
 		}
-		pubKey, sig := crypto.SignSchnorrForTest([32]byte{byte(3 + inputIndex)}, &msg)
-		authEntries = append(authEntries, types.TxAuthEntry{PubKey: pubKey, Signature: sig})
+		_, sig := crypto.SignSchnorrForTest([32]byte{byte(3 + inputIndex)}, &msg)
+		authEntries = append(authEntries, types.TxAuthEntry{Signature: sig})
 	}
 	join.Auth = types.TxAuth{Entries: authEntries}
 
@@ -366,8 +365,8 @@ func TestSelectForBlockExcludesSameBlockDescendantsAndReturnsLTOR(t *testing.T) 
 		MaxOrphans:         8,
 	})
 	utxos := consensus.UtxoSet{
-		{TxID: [32]byte{11}, Vout: 0}: {ValueAtoms: 100, KeyHash: signerKeyHash(1)},
-		{TxID: [32]byte{12}, Vout: 0}: {ValueAtoms: 100, KeyHash: signerKeyHash(4)},
+		{TxID: [32]byte{11}, Vout: 0}: {ValueAtoms: 100, PubKey: signerPubKey(1)},
+		{TxID: [32]byte{12}, Vout: 0}: {ValueAtoms: 100, PubKey: signerPubKey(4)},
 	}
 
 	parent := spendTx(t, 1, types.OutPoint{TxID: [32]byte{11}, Vout: 0}, 100, 2, 1)
@@ -411,7 +410,7 @@ func TestRemoveConfirmedEvictsConflictsAndDescendants(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{13}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -427,7 +426,7 @@ func TestRemoveConfirmedEvictsConflictsAndDescendants(t *testing.T) {
 	confirmed := spendTx(t, 1, prevOut, 50, 9, 1)
 	block := &types.Block{
 		Txs: []types.Transaction{
-			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: signerKeyHash(9)}}),
+			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, PubKey: signerPubKey(9)}}),
 			confirmed,
 		},
 	}
@@ -448,8 +447,8 @@ func TestRemoveRecursiveUpdatesAncestorStatsIncrementally(t *testing.T) {
 	parentPrevOut := types.OutPoint{TxID: [32]byte{14}, Vout: 0}
 	unrelatedPrevOut := types.OutPoint{TxID: [32]byte{15}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		parentPrevOut:    {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		unrelatedPrevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(4)},
+		parentPrevOut:    {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		unrelatedPrevOut: {ValueAtoms: 50, PubKey: signerPubKey(4)},
 	}
 
 	parent := spendTx(t, 1, parentPrevOut, 50, 2, 1)
@@ -500,7 +499,7 @@ func TestPrepareAdmissionAndCommitPreparedHandleSameBatchParents(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{21}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -549,7 +548,7 @@ func TestAdvanceAdmissionSnapshotTracksSameBatchParents(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{23}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -587,7 +586,7 @@ func TestPrepareAdmissionSharedResolvesAgainstLiveParents(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{24}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -623,7 +622,7 @@ func TestPrepareAdmissionSharedRejectsForeignView(t *testing.T) {
 
 	tx := spendTx(t, 1, types.OutPoint{TxID: [32]byte{25}, Vout: 0}, 50, 2, 1)
 	_, err := pool.PrepareAdmissionShared(tx, view, consensus.UtxoSet{
-		{TxID: [32]byte{25}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		{TxID: [32]byte{25}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}, consensus.DefaultConsensusRules())
 	if err == nil || !strings.Contains(err.Error(), "different mempool") {
 		t.Fatalf("foreign shared view error = %v, want different mempool", err)
@@ -639,8 +638,8 @@ func TestShortIDMatchesOnlyScansWantedIDs(t *testing.T) {
 		MaxOrphans:         8,
 	})
 	utxos := consensus.UtxoSet{
-		{TxID: [32]byte{41}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		{TxID: [32]byte{42}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
+		{TxID: [32]byte{41}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		{TxID: [32]byte{42}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(2)},
 	}
 	first := spendTx(t, 1, types.OutPoint{TxID: [32]byte{41}, Vout: 0}, 50, 3, 1)
 	second := spendTx(t, 2, types.OutPoint{TxID: [32]byte{42}, Vout: 0}, 50, 4, 1)
@@ -683,8 +682,8 @@ func TestBatchLookupHelpersPreserveRequestedOrderAndMisses(t *testing.T) {
 		MaxOrphans:         8,
 	})
 	utxos := consensus.UtxoSet{
-		{TxID: [32]byte{51}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		{TxID: [32]byte{52}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
+		{TxID: [32]byte{51}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		{TxID: [32]byte{52}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(2)},
 	}
 	first := spendTx(t, 1, types.OutPoint{TxID: [32]byte{51}, Vout: 0}, 50, 3, 1)
 	second := spendTx(t, 2, types.OutPoint{TxID: [32]byte{52}, Vout: 0}, 50, 4, 1)
@@ -722,7 +721,7 @@ func TestSelectionCandidateCountTracksIncrementalUpdates(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{22}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, prevOut, 50, 2, 1)
@@ -754,9 +753,9 @@ func TestSelectionFrontierMaintainsOrderedSnapshotAcrossIncrementalUpdates(t *te
 		MaxOrphans:         8,
 	})
 	utxos := consensus.UtxoSet{
-		{TxID: [32]byte{31}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		{TxID: [32]byte{32}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
-		{TxID: [32]byte{33}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(3)},
+		{TxID: [32]byte{31}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		{TxID: [32]byte{32}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(2)},
+		{TxID: [32]byte{33}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(3)},
 	}
 
 	low := spendTx(t, 1, types.OutPoint{TxID: [32]byte{31}, Vout: 0}, 50, 4, 1)
@@ -820,8 +819,8 @@ func TestStatsTracksCountsFeesAndBytesIncrementally(t *testing.T) {
 	prevA := types.OutPoint{TxID: [32]byte{61}, Vout: 0}
 	prevB := types.OutPoint{TxID: [32]byte{62}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevA: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		prevB: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
+		prevA: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		prevB: {ValueAtoms: 50, PubKey: signerPubKey(2)},
 	}
 
 	first := spendTx(t, 1, prevA, 50, 3, 5)
@@ -851,7 +850,7 @@ func TestStatsTracksCountsFeesAndBytesIncrementally(t *testing.T) {
 
 	block := &types.Block{
 		Txs: []types.Transaction{
-			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: signerKeyHash(9)}}),
+			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, PubKey: signerPubKey(9)}}),
 			first,
 		},
 	}
@@ -871,9 +870,9 @@ func TestTopByFeeTracksBestEntriesAcrossInsertAndRemoval(t *testing.T) {
 		MaxOrphans:         8,
 	})
 	utxos := consensus.UtxoSet{
-		{TxID: [32]byte{71}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		{TxID: [32]byte{72}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(2)},
-		{TxID: [32]byte{73}, Vout: 0}: {ValueAtoms: 50, KeyHash: signerKeyHash(3)},
+		{TxID: [32]byte{71}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		{TxID: [32]byte{72}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(2)},
+		{TxID: [32]byte{73}, Vout: 0}: {ValueAtoms: 50, PubKey: signerPubKey(3)},
 	}
 
 	low := spendTx(t, 1, types.OutPoint{TxID: [32]byte{71}, Vout: 0}, 50, 4, 1)
@@ -902,7 +901,7 @@ func TestTopByFeeTracksBestEntriesAcrossInsertAndRemoval(t *testing.T) {
 
 	block := &types.Block{
 		Txs: []types.Transaction{
-			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: signerKeyHash(9)}}),
+			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, PubKey: signerPubKey(9)}}),
 			high,
 		},
 	}
@@ -927,8 +926,8 @@ func TestAppendForBlockOnlyReturnsNewSelections(t *testing.T) {
 	rootPrev := types.OutPoint{TxID: [32]byte{31}, Vout: 0}
 	otherPrev := types.OutPoint{TxID: [32]byte{32}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		rootPrev:  {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		otherPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(4)},
+		rootPrev:  {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		otherPrev: {ValueAtoms: 50, PubKey: signerPubKey(4)},
 	}
 
 	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
@@ -976,7 +975,7 @@ func TestSelectForBlockOverlayKeepsBaseUTXOMapImmutable(t *testing.T) {
 	})
 	rootPrev := types.OutPoint{TxID: [32]byte{33}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		rootPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		rootPrev: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 
 	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
@@ -1015,8 +1014,8 @@ func TestAppendForBlockOverlayExtendsTentativeSelectionWithoutMaterializingBase(
 	rootPrev := types.OutPoint{TxID: [32]byte{34}, Vout: 0}
 	otherPrev := types.OutPoint{TxID: [32]byte{35}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		rootPrev:  {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
-		otherPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(4)},
+		rootPrev:  {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		otherPrev: {ValueAtoms: 50, PubKey: signerPubKey(4)},
 	}
 
 	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
@@ -1068,7 +1067,7 @@ func TestSelectForBlockInPlaceAdvancesProvidedUTXOView(t *testing.T) {
 	})
 	rootPrev := types.OutPoint{TxID: [32]byte{41}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		rootPrev: {ValueAtoms: 50, KeyHash: signerKeyHash(1)},
+		rootPrev: {ValueAtoms: 50, PubKey: signerPubKey(1)},
 	}
 	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
 	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())

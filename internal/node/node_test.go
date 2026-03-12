@@ -56,9 +56,8 @@ func mineHeaderForNodeTest(header types.BlockHeader) types.BlockHeader {
 	panic("unable to mine header")
 }
 
-func nodeSignerKeyHash(seed byte) [32]byte {
-	pubKey, _ := crypto.SignSchnorrForTest([32]byte{seed}, &[32]byte{})
-	return crypto.KeyHash(&pubKey)
+func nodeSignerPubKey(seed byte) [32]byte {
+	return crypto.XOnlyPubKeyFromSecret([32]byte{seed})
 }
 
 func merkleLeafForNodeTest(item [32]byte) [32]byte {
@@ -116,25 +115,25 @@ func spendTxForNodeTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, 
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: []types.TxOutput{{ValueAtoms: value - fee, KeyHash: nodeSignerKeyHash(recipientSeed)}},
+			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: nodeSignerPubKey(recipientSeed)}},
 		},
 	}
 	msg, err := consensus.Sighash(&tx, 0, []uint64{value})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubKey, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
-	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
 	return tx
 }
 
 func genesisBlock() types.Block {
 	params := consensus.RegtestParams()
-	coinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}})
+	coinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, PubKey: nodeSignerPubKey(7)}})
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	utxos := consensus.UtxoSet{
-		types.OutPoint{TxID: txids[0], Vout: 0}: {ValueAtoms: 50, KeyHash: [32]byte{7}},
+		types.OutPoint{TxID: txids[0], Vout: 0}: {ValueAtoms: 50, PubKey: nodeSignerPubKey(7)},
 	}
 	return types.Block{
 		Header: types.BlockHeader{
@@ -149,13 +148,13 @@ func genesisBlock() types.Block {
 	}
 }
 
-func genesisBlockForKeyHash(keyHash [32]byte) types.Block {
+func genesisBlockForPubKey(pubKey [32]byte) types.Block {
 	params := consensus.RegtestParams()
-	coinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: keyHash}})
+	coinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, PubKey: pubKey}})
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	utxos := consensus.UtxoSet{
-		types.OutPoint{TxID: txids[0], Vout: 0}: {ValueAtoms: 50, KeyHash: keyHash},
+		types.OutPoint{TxID: txids[0], Vout: 0}: {ValueAtoms: 50, PubKey: pubKey},
 	}
 	return types.Block{
 		Header: types.BlockHeader{
@@ -170,13 +169,14 @@ func genesisBlockForKeyHash(keyHash [32]byte) types.Block {
 	}
 }
 
-func nextCoinbaseBlock(prevHeight uint64, prev types.BlockHeader, currentUTXOs consensus.UtxoSet, keyHashByte byte, timestamp uint64) types.Block {
+func nextCoinbaseBlock(prevHeight uint64, prev types.BlockHeader, currentUTXOs consensus.UtxoSet, pubKeySeed byte, timestamp uint64) types.Block {
 	params := consensus.RegtestParams()
-	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{keyHashByte}}})
+	pubKey := nodeSignerPubKey(pubKeySeed)
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: pubKey}})
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	nextUTXOs := cloneUtxos(currentUTXOs)
-	nextUTXOs[types.OutPoint{TxID: txids[0], Vout: 0}] = consensus.UtxoEntry{ValueAtoms: 1, KeyHash: [32]byte{keyHashByte}}
+	nextUTXOs[types.OutPoint{TxID: txids[0], Vout: 0}] = consensus.UtxoEntry{ValueAtoms: 1, PubKey: pubKey}
 	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: prevHeight, Header: prev}, params)
 	if err != nil {
 		panic(err)
@@ -234,7 +234,7 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 		for vout, output := range tx.Base.Outputs {
 			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
 				ValueAtoms: output.ValueAtoms,
-				KeyHash:    output.KeyHash,
+				PubKey:     output.PubKey,
 			}
 		}
 	}
@@ -249,7 +249,7 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 	for vout, output := range blockTxs[0].Base.Outputs {
 		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			KeyHash:    output.KeyHash,
+			PubKey:     output.PubKey,
 		}
 	}
 
@@ -564,6 +564,29 @@ func TestPersistentHeaderRoundtrip(t *testing.T) {
 	}
 }
 
+func TestHeaderReplayRejectsTimestampAtMedianTimePast(t *testing.T) {
+	chain := NewHeaderChain(types.Regtest)
+	genesis := genesisBlock()
+	if err := chain.InitializeFromGenesisHeader(genesis.Header); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := genesis.Header
+	for height := uint64(0); height < 11; height++ {
+		header := nextCoinbaseBlock(height, prev, consensus.UtxoSet{}, byte(height+1), genesis.Header.Timestamp+height+1).Header
+		if err := chain.ApplyHeader(&header); err != nil {
+			t.Fatalf("apply header %d: %v", height+1, err)
+		}
+		prev = header
+	}
+
+	bad := nextCoinbaseBlock(11, prev, consensus.UtxoSet{}, 42, genesis.Header.Timestamp+6).Header
+	err := chain.ApplyHeader(&bad)
+	if !errors.Is(err, consensus.ErrTimestampTooEarly) {
+		t.Fatalf("ApplyHeader error = %v, want %v", err, consensus.ErrTimestampTooEarly)
+	}
+}
+
 func TestReplayBlocksHeadersFirstInMemory(t *testing.T) {
 	genesis := genesisBlock()
 	state := NewChainState(types.Regtest)
@@ -712,11 +735,11 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	defer persistent.Close()
 
 	params := consensus.RegtestParams()
-	genesisCoinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)}})
+	genesisCoinbase := coinbaseTxForHeight(0, []types.TxOutput{{ValueAtoms: 50, PubKey: nodeSignerPubKey(7)}})
 	genesisTxID := consensus.TxID(&genesisCoinbase)
 	genesisAuthID := consensus.AuthID(&genesisCoinbase)
 	genesisUTXOs := consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, PubKey: nodeSignerPubKey(7)},
 	}
 	genesis := types.Block{
 		Header: types.BlockHeader{
@@ -754,7 +777,7 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	if !foundLTORPair {
 		t.Fatal("failed to construct LTOR-compliant same-block spend fixture")
 	}
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}})
+	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(10)}})
 	txs := []types.Transaction{coinbase, parent, child}
 	txids, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
 	nextUTXOs := cloneUtxos(persistent.ChainState().UTXOs())
@@ -764,12 +787,12 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	childTxID := txids[2]
 	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = consensus.UtxoEntry{
 		ValueAtoms: child.Base.Outputs[0].ValueAtoms,
-		KeyHash:    child.Base.Outputs[0].KeyHash,
+		PubKey:     child.Base.Outputs[0].PubKey,
 	}
 	coinbaseTxID := txids[0]
 	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
 		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
-		KeyHash:    coinbase.Base.Outputs[0].KeyHash,
+		PubKey:     coinbase.Base.Outputs[0].PubKey,
 	}
 	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: 0, Header: genesis.Header}, params)
 	if err != nil {
@@ -820,7 +843,7 @@ func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}
 	parent := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
@@ -835,7 +858,7 @@ func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 99},
 		Txs: []types.Transaction{
-			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}}),
 			parent,
 			child,
 		},
@@ -876,7 +899,7 @@ func TestReconstructCompactBlockFromMempoolOverlap(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{11}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}
 	parent := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
@@ -891,7 +914,7 @@ func TestReconstructCompactBlockFromMempoolOverlap(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 199},
 		Txs: []types.Transaction{
-			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}}),
 			parent,
 			child,
 		},
@@ -929,7 +952,7 @@ func TestOnXThinBlockRequestsMissingIndexes(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{2}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}
 	parent := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	if _, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules()); err != nil {
@@ -939,7 +962,7 @@ func TestOnXThinBlockRequestsMissingIndexes(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 100},
 		Txs: []types.Transaction{
-			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}}),
 			parent,
 			child,
 		},
@@ -983,14 +1006,14 @@ func TestOnXThinBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 101},
-		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})},
 	}
 	for i := 0; i < 8; i++ {
 		block.Txs = append(block.Txs, types.Transaction{
 			Base: types.TxBase{
 				Version: 1,
 				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 1)}, Vout: 0}}},
-				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1), PubKey: nodeSignerPubKey(byte(i + 1))}},
 			},
 		})
 	}
@@ -1019,7 +1042,7 @@ func TestOnCompactBlockRequestsMissingIndexes(t *testing.T) {
 	})
 	prevOut := types.OutPoint{TxID: [32]byte{12}, Vout: 0}
 	utxos := consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}
 	parent := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	if _, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules()); err != nil {
@@ -1029,7 +1052,7 @@ func TestOnCompactBlockRequestsMissingIndexes(t *testing.T) {
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 200},
 		Txs: []types.Transaction{
-			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}}),
+			coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}}),
 			parent,
 			child,
 		},
@@ -1069,14 +1092,14 @@ func TestOnCompactBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 	}
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 201},
-		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})},
 	}
 	for i := 0; i < 8; i++ {
 		block.Txs = append(block.Txs, types.Transaction{
 			Base: types.TxBase{
 				Version: 1,
 				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 1)}, Vout: 0}}},
-				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1), PubKey: nodeSignerPubKey(byte(i + 1))}},
 			},
 		})
 	}
@@ -1104,19 +1127,19 @@ func TestOnCompactBlockFallsBackToFullBlockWithoutExtendedSupport(t *testing.T) 
 		knownTx:     make(map[[32]byte]struct{}),
 		pendingThin: make(map[[32]byte]*pendingThinBlock),
 		version: p2p.VersionMessage{
-			Services: p2p.ServiceNodeNetwork | p2p.ServiceGrapheneBlockRelay,
+			Services: p2p.ServiceNodeNetwork | p2p.ServiceCompactBlockRelay,
 		},
 	}
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 202},
-		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})},
 	}
 	for i := 0; i < 8; i++ {
 		block.Txs = append(block.Txs, types.Transaction{
 			Base: types.TxBase{
 				Version: 1,
 				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 21)}, Vout: 0}}},
-				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1), PubKey: nodeSignerPubKey(byte(i + 1))}},
 			},
 		})
 	}
@@ -1155,7 +1178,7 @@ func TestOpenServiceDefaultsMinerWorkersWhenEnabled(t *testing.T) {
 		Profile:      types.Regtest,
 		DBPath:       t.TempDir(),
 		MinerEnabled: true,
-		MinerKeyHash: nodeSignerKeyHash(42),
+		MinerPubKey:  nodeSignerPubKey(42),
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -1217,15 +1240,15 @@ func TestOpenServiceRejectsWildcardRPCBindWithoutAuth(t *testing.T) {
 	}
 }
 
-func TestOpenServiceRejectsMiningWithoutKeyHash(t *testing.T) {
+func TestOpenServiceRejectsMiningWithoutPubKey(t *testing.T) {
 	genesis := genesisBlock()
 	_, err := OpenService(ServiceConfig{
 		Profile:      types.Regtest,
 		DBPath:       t.TempDir(),
 		MinerEnabled: true,
 	}, &genesis)
-	if err == nil || !strings.Contains(err.Error(), "miner keyhash is required") {
-		t.Fatalf("expected miner keyhash error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "miner pubkey is required") {
+		t.Fatalf("expected miner pubkey error, got %v", err)
 	}
 }
 
@@ -1276,12 +1299,12 @@ func TestApplyPeerHeadersBatchesPersistence(t *testing.T) {
 
 func TestSubmitPackedTxBatchRPC(t *testing.T) {
 	genesis := genesisBlock()
-	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
+	genesis.Txs[0].Base.Outputs[0].PubKey = nodeSignerPubKey(7)
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
 	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, PubKey: nodeSignerPubKey(7)},
 	})
 
 	svc, err := OpenService(ServiceConfig{
@@ -1316,18 +1339,18 @@ func TestSubmitPackedTxBatchRPC(t *testing.T) {
 	}
 }
 
-func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
+func TestGetUTXOsByPubKeysRPC(t *testing.T) {
 	genesis := genesisBlock()
 	genesis.Txs[0].Base.Outputs = []types.TxOutput{
-		{ValueAtoms: 30, KeyHash: nodeSignerKeyHash(7)},
-		{ValueAtoms: 20, KeyHash: nodeSignerKeyHash(8)},
+		{ValueAtoms: 30, PubKey: nodeSignerPubKey(7)},
+		{ValueAtoms: 20, PubKey: nodeSignerPubKey(8)},
 	}
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
 	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 30, KeyHash: nodeSignerKeyHash(7)},
-		types.OutPoint{TxID: genesisTxID, Vout: 1}: {ValueAtoms: 20, KeyHash: nodeSignerKeyHash(8)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 30, PubKey: nodeSignerPubKey(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 1}: {ValueAtoms: 20, PubKey: nodeSignerPubKey(8)},
 	})
 
 	svc, err := OpenService(ServiceConfig{
@@ -1339,15 +1362,15 @@ func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
 	}
 	defer svc.Close()
 
-	keyHash7 := nodeSignerKeyHash(7)
+	pubKey7 := nodeSignerPubKey(7)
 	params, err := json.Marshal(map[string][]string{
-		"keyhashes": []string{hex.EncodeToString(keyHash7[:])},
+		"pubkeys": []string{hex.EncodeToString(pubKey7[:])},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	result, err := svc.dispatchRPC(rpcRequest{
-		Method: "getutxosbykeyhashes",
+		Method: "getutxosbypubkeys",
 		Params: params,
 	})
 	if err != nil {
@@ -1377,6 +1400,128 @@ func TestGetUTXOsByKeyHashesRPC(t *testing.T) {
 	}
 }
 
+func TestGetUTXOProofRPC(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	txid := consensus.TxID(&genesis.Txs[0])
+	params, err := json.Marshal(map[string]any{
+		"txid": hex.EncodeToString(txid[:]),
+		"vout": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "getutxoproof",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	raw, ok := result.(RPCAnchoredUTXOProof)
+	if !ok {
+		t.Fatalf("result type = %T, want RPCAnchoredUTXOProof", result)
+	}
+	if !raw.Proof.Exists {
+		t.Fatal("expected membership proof")
+	}
+	proof, err := DecodeRPCUTXOProof(raw)
+	if err != nil {
+		t.Fatalf("DecodeRPCUTXOProof: %v", err)
+	}
+	if !VerifyAnchoredUTXOProof(proof) {
+		t.Fatal("expected proof to verify")
+	}
+}
+
+func TestVerifyUTXOProofRPCSupportsExclusion(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	proof, err := svc.UTXOProof(types.OutPoint{TxID: [32]byte{9}, Vout: 1})
+	if err != nil {
+		t.Fatalf("UTXOProof: %v", err)
+	}
+	raw := EncodeRPCUTXOProof(proof)
+	params, err := json.Marshal(map[string]any{
+		"proof": raw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "verifyutxoproof",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	if valid, ok := out["valid"].(bool); !ok || !valid {
+		t.Fatalf("valid = %v, want true", out["valid"])
+	}
+	if anchor, ok := out["anchor_matches_local"].(bool); !ok || !anchor {
+		t.Fatalf("anchor_matches_local = %v, want true", out["anchor_matches_local"])
+	}
+}
+
+func TestVerifyUTXOProofRPCRejectsTampering(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	txid := consensus.TxID(&genesis.Txs[0])
+	proof, err := svc.UTXOProof(types.OutPoint{TxID: txid, Vout: 0})
+	if err != nil {
+		t.Fatalf("UTXOProof: %v", err)
+	}
+	proof.Proof.ValueAtoms++
+	params, err := json.Marshal(map[string]any{
+		"proof": EncodeRPCUTXOProof(proof),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.dispatchRPC(rpcRequest{
+		Method: "verifyutxoproof",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("dispatchRPC: %v", err)
+	}
+	out, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map", result)
+	}
+	if valid, ok := out["valid"].(bool); !ok || valid {
+		t.Fatalf("valid = %v, want false", out["valid"])
+	}
+}
+
 func TestSeedStressLanesRPCAndInfo(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -1388,9 +1533,9 @@ func TestSeedStressLanesRPCAndInfo(t *testing.T) {
 	}
 	defer svc.Close()
 
-	keyHash := nodeSignerKeyHash(7)
+	pubKey := nodeSignerPubKey(7)
 	params, err := json.Marshal(map[string]any{
-		"keyhashes":             []string{hex.EncodeToString(keyHash[:]), hex.EncodeToString(keyHash[:])},
+		"pubkeys":               []string{hex.EncodeToString(pubKey[:]), hex.EncodeToString(pubKey[:])},
 		"wait_for_confirmation": false,
 		"reserve_top_up":        true,
 	})
@@ -1462,13 +1607,13 @@ func TestGetChainStateRPC(t *testing.T) {
 }
 
 func TestGetMempoolInfoRPC(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
 	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, PubKey: nodeSignerPubKey(7)},
 	})
 	svc, err := OpenService(ServiceConfig{
 		Profile:            types.Regtest,
@@ -1505,13 +1650,13 @@ func TestGetMempoolInfoRPC(t *testing.T) {
 
 func TestGetMiningInfoRPC(t *testing.T) {
 	genesis := genesisBlock()
-	keyHash := nodeSignerKeyHash(9)
+	pubKey := nodeSignerPubKey(9)
 	svc, err := OpenService(ServiceConfig{
 		Profile:      types.Regtest,
 		DBPath:       t.TempDir(),
 		MinerEnabled: true,
 		MinerWorkers: 2,
-		MinerKeyHash: keyHash,
+		MinerPubKey:  pubKey,
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -1532,8 +1677,8 @@ func TestGetMiningInfoRPC(t *testing.T) {
 	if out.Workers != 2 {
 		t.Fatalf("workers = %d, want 2", out.Workers)
 	}
-	if out.MinerKeyHash != hex.EncodeToString(keyHash[:]) {
-		t.Fatalf("miner keyhash = %q", out.MinerKeyHash)
+	if out.MinerPubKey != hex.EncodeToString(pubKey[:]) {
+		t.Fatalf("miner pubkey = %q", out.MinerPubKey)
 	}
 	if out.CurrentBits == 0 || out.NextBits == 0 {
 		t.Fatal("expected current and next bits")
@@ -1541,13 +1686,13 @@ func TestGetMiningInfoRPC(t *testing.T) {
 }
 
 func TestGetMetricsRPC(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
 	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 1_000, PubKey: nodeSignerPubKey(7)},
 	})
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
@@ -1564,6 +1709,11 @@ func TestGetMetricsRPC(t *testing.T) {
 	}
 	svc.noteRelaySent(relayMessageClass{txBatchItems: 4, blockInvItems: 1})
 	svc.noteBlockAccepted()
+	svc.noteBlockSignatureVerification(consensus.BlockValidationSummary{
+		SignatureChecks:        9,
+		SignatureBatchFallback: true,
+		SignatureVerifyTime:    11 * time.Millisecond,
+	})
 	svc.noteTemplateRebuild()
 	svc.noteTemplateInterruption()
 	svc.noteTxReconRetry(2)
@@ -1610,6 +1760,9 @@ func TestGetMetricsRPC(t *testing.T) {
 	if out.Counters.BlocksAccepted != 1 {
 		t.Fatalf("blocks accepted = %d, want 1", out.Counters.BlocksAccepted)
 	}
+	if out.Counters.BlockSigChecks != 9 || out.Counters.BlockSigFallbacks != 1 {
+		t.Fatalf("unexpected block signature counters: %+v", out.Counters)
+	}
 	if out.Counters.TemplateRebuilds != 1 || out.Counters.TemplateInterruptions != 1 {
 		t.Fatalf("unexpected template counters: %+v", out.Counters)
 	}
@@ -1631,7 +1784,7 @@ func TestGetMetricsRPC(t *testing.T) {
 	if out.Gauges.ControlQueueDepth != 1 || out.Gauges.PriorityQueueDepth != 1 || out.Gauges.SendQueueDepth != 1 || out.Gauges.PendingLocalRelayTxs != 1 {
 		t.Fatalf("unexpected relay gauges: %+v", out.Gauges)
 	}
-	if out.Latency.Admission.Count == 0 || out.Latency.Template.Count == 0 || out.Latency.BlockApply.Count == 0 || out.Latency.BlockApplyLockWait.Count == 0 || out.Latency.RelayFlush.Count == 0 || out.Latency.SyncReq.Count == 0 {
+	if out.Latency.Admission.Count == 0 || out.Latency.Template.Count == 0 || out.Latency.BlockApply.Count == 0 || out.Latency.BlockSigVerify.Count == 0 || out.Latency.BlockApplyLockWait.Count == 0 || out.Latency.RelayFlush.Count == 0 || out.Latency.SyncReq.Count == 0 {
 		t.Fatalf("expected latency samples in all metric groups: %+v", out.Latency)
 	}
 }
@@ -1672,8 +1825,8 @@ func TestGetBlockHashByHeightRPC(t *testing.T) {
 	}
 }
 
-func TestGetWalletActivityByKeyHashesRPC(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+func TestGetWalletActivityByPubKeysRPC(t *testing.T) {
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -1685,22 +1838,22 @@ func TestGetWalletActivityByKeyHashesRPC(t *testing.T) {
 
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	spend := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}})
+	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
 	block := blockWithTxsForNodeTest(t, 0, genesis.Header, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, spend}, genesis.Header.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(block); err != nil {
 		t.Fatalf("acceptMinedBlock: %v", err)
 	}
 
-	keyHash7 := nodeSignerKeyHash(7)
+	pubKey7 := nodeSignerPubKey(7)
 	params, err := json.Marshal(map[string]any{
-		"keyhashes": []string{hex.EncodeToString(keyHash7[:])},
-		"limit":     1,
+		"pubkeys": []string{hex.EncodeToString(pubKey7[:])},
+		"limit":   1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	result, err := svc.dispatchRPC(rpcRequest{
-		Method: "getwalletactivitybykeyhashes",
+		Method: "getwalletactivitybypubkeys",
 		Params: params,
 	})
 	if err != nil {
@@ -1730,13 +1883,13 @@ func TestGetWalletActivityByKeyHashesRPC(t *testing.T) {
 }
 
 func TestEstimateFeeRPC(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 5_000
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
 	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 5_000, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 5_000, PubKey: nodeSignerPubKey(7)},
 	})
 	svc, err := OpenService(ServiceConfig{
 		Profile:            types.Regtest,
@@ -1774,12 +1927,12 @@ func TestEstimateFeeRPC(t *testing.T) {
 
 func TestSubmitDecodedTxsAcceptsDependentChainBatch(t *testing.T) {
 	genesis := genesisBlock()
-	genesis.Txs[0].Base.Outputs[0].KeyHash = nodeSignerKeyHash(7)
+	genesis.Txs[0].Base.Outputs[0].PubKey = nodeSignerPubKey(7)
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
 	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
 	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(7)},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, PubKey: nodeSignerPubKey(7)},
 	})
 
 	svc, err := OpenService(ServiceConfig{
@@ -1862,7 +2015,7 @@ func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
 	}
 	defer svc.Close()
 
-	outputs, err := svc.MineFundingOutputs([][32]byte{nodeSignerKeyHash(7), nodeSignerKeyHash(8), nodeSignerKeyHash(9)})
+	outputs, err := svc.MineFundingOutputs([][32]byte{nodeSignerPubKey(7), nodeSignerPubKey(8), nodeSignerPubKey(9)})
 	if err != nil {
 		t.Fatalf("MineFundingOutputs: %v", err)
 	}
@@ -1878,13 +2031,13 @@ func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing funding outpoint %+v", output.OutPoint)
 		}
-		if entry.ValueAtoms != output.Value || entry.KeyHash != output.KeyHash {
+		if entry.ValueAtoms != output.Value || entry.PubKey != output.PubKey {
 			t.Fatalf("funding output mismatch for %+v", output.OutPoint)
 		}
 	}
 }
 
-func TestSeedStressLanesProducesConfirmedOutputs(t *testing.T) {
+func TestAcceptMinedBlockBroadcastsHeadersToPeers(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
@@ -1895,7 +2048,59 @@ func TestSeedStressLanesProducesConfirmedOutputs(t *testing.T) {
 	}
 	defer svc.Close()
 
-	requested := [][32]byte{nodeSignerKeyHash(7), nodeSignerKeyHash(8), nodeSignerKeyHash(9)}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	svc.peerMu.Lock()
+	svc.peers[peer.addr] = peer
+	svc.peerMu.Unlock()
+
+	block, _, err := svc.buildFundingBlock([][32]byte{nodeSignerPubKey(7)})
+	if err != nil {
+		t.Fatalf("buildFundingBlock: %v", err)
+	}
+	if _, _, err := svc.acceptMinedBlock(block); err != nil {
+		t.Fatalf("acceptMinedBlock: %v", err)
+	}
+
+	msgs := make([]p2p.Message, 0, 1)
+	timeout := time.After(time.Second)
+	for len(msgs) < 1 {
+		select {
+		case envelope := <-peer.sendQ:
+			msgs = append(msgs, envelope.msg)
+		case <-timeout:
+			t.Fatalf("timed out waiting for peer messages, got %d", len(msgs))
+		}
+	}
+
+	headerSeen := false
+	for _, msg := range msgs {
+		switch typed := msg.(type) {
+		case p2p.HeadersMessage:
+			if len(typed.Headers) != 1 || typed.Headers[0] != block.Header {
+				t.Fatalf("headers message = %+v, want block header", typed.Headers)
+			}
+			headerSeen = true
+		}
+	}
+	if !headerSeen {
+		t.Fatalf("expected headers message, got %T", msgs[0])
+	}
+}
+
+func TestSeedStressLanesProducesConfirmedOutputs(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		MinerPubKey:  nodeSignerPubKey(10),
+		MinerEnabled: true,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	requested := [][32]byte{nodeSignerPubKey(7), nodeSignerPubKey(8), nodeSignerPubKey(9)}
 	outputs, info, txid, err := svc.SeedStressLanes(requested, true, false)
 	if err != nil {
 		t.Fatalf("SeedStressLanes: %v", err)
@@ -1925,7 +2130,7 @@ func TestSeedStressLanesProducesConfirmedOutputs(t *testing.T) {
 		if !ok {
 			t.Fatalf("confirmed output %d missing from utxo set", i)
 		}
-		if entry.ValueAtoms != output.Value || entry.KeyHash != output.KeyHash {
+		if entry.ValueAtoms != output.Value || entry.PubKey != output.PubKey {
 			t.Fatalf("confirmed output %d mismatch", i)
 		}
 		if output.BlockHash == ([32]byte{}) {
@@ -1948,7 +2153,7 @@ func TestSeedStressLanesConfirmsViaPeerBlock(t *testing.T) {
 	}
 	defer svc.Close()
 
-	requested := [][32]byte{nodeSignerKeyHash(7), nodeSignerKeyHash(8)}
+	requested := [][32]byte{nodeSignerPubKey(7), nodeSignerPubKey(8)}
 	outputs, info, txid, err := svc.SeedStressLanes(requested, true, false)
 	if err != nil {
 		t.Fatalf("SeedStressLanes: %v", err)
@@ -1971,7 +2176,7 @@ func TestSeedStressLanesConfirmsViaPeerBlock(t *testing.T) {
 	}
 	prevHeight := svc.BlockHeight()
 	prevHeader := *svc.chainState.ChainState().TipHeader()
-	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(10)}})
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(10)}})
 	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, *fanout}, prevHeader.Timestamp+600)
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders: %v", err)
@@ -2000,7 +2205,7 @@ func TestMineBlocksProducesDistinctCoinbaseOutpoints(t *testing.T) {
 		Profile:      types.Regtest,
 		DBPath:       t.TempDir(),
 		MinerEnabled: true,
-		MinerKeyHash: nodeSignerKeyHash(9),
+		MinerPubKey:  nodeSignerPubKey(9),
 		MinerWorkers: 1,
 	}, &genesis)
 	if err != nil {
@@ -2032,9 +2237,9 @@ func TestMineBlocksProducesDistinctCoinbaseOutpoints(t *testing.T) {
 func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
-		Profile:      types.Regtest,
-		DBPath:       t.TempDir(),
-		MinerKeyHash: nodeSignerKeyHash(9),
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: nodeSignerPubKey(9),
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -2103,13 +2308,13 @@ func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
 }
 
 func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
-	minerKey := nodeSignerKeyHash(9)
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	minerKey := nodeSignerPubKey(9)
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	svc, err := OpenService(ServiceConfig{
-		Profile:      types.Regtest,
-		DBPath:       t.TempDir(),
-		MinerKeyHash: minerKey,
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: minerKey,
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -2149,13 +2354,13 @@ func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
 }
 
 func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
-	minerKey := nodeSignerKeyHash(9)
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	minerKey := nodeSignerPubKey(9)
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	svc, err := OpenService(ServiceConfig{
-		Profile:      types.Regtest,
-		DBPath:       t.TempDir(),
-		MinerKeyHash: minerKey,
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: minerKey,
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -2242,13 +2447,13 @@ func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
 }
 
 func TestMineOneBlockRefreshesInterruptedTemplate(t *testing.T) {
-	minerKey := nodeSignerKeyHash(9)
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	minerKey := nodeSignerPubKey(9)
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	svc, err := OpenService(ServiceConfig{
-		Profile:      types.Regtest,
-		DBPath:       t.TempDir(),
-		MinerKeyHash: minerKey,
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: minerKey,
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -2302,12 +2507,12 @@ func TestMineOneBlockRefreshesInterruptedTemplate(t *testing.T) {
 }
 
 func TestAcceptPeerBlockInvalidatesMinerTemplate(t *testing.T) {
-	minerKey := nodeSignerKeyHash(9)
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	minerKey := nodeSignerPubKey(9)
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
-		Profile:      types.Regtest,
-		DBPath:       t.TempDir(),
-		MinerKeyHash: minerKey,
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: minerKey,
 	}, &genesis)
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
@@ -2815,13 +3020,7 @@ func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
 	}
 	remoteWire := p2p.NewConn(remote, p2p.MagicForProfile(types.Regtest), 1_000_000)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		svc.peerWriteLoop(peer)
-	}()
-
-	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
 	peer.sendQ <- outboundMessage{
 		msg:        p2p.TxBatchMessage{Txs: []types.Transaction{tx}},
 		enqueuedAt: time.Now(),
@@ -2834,6 +3033,12 @@ func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
 		class:      classifyRelayMessage(p2p.InvMessage{Items: priorityItems}),
 		invItems:   priorityItems,
 	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.peerWriteLoop(peer)
+	}()
 
 	msgCh := make(chan p2p.Message, 1)
 	errCh := make(chan error, 1)
@@ -2895,7 +3100,7 @@ func TestPeerWriteLoopPrefersControlThenPriorityThenSend(t *testing.T) {
 	}
 	remoteWire := p2p.NewConn(remote, p2p.MagicForProfile(types.Regtest), 1_000_000)
 
-	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
 	peer.sendQ <- outboundMessage{
 		msg:        p2p.TxBatchMessage{Txs: []types.Transaction{tx}},
 		enqueuedAt: time.Now(),
@@ -2965,7 +3170,7 @@ func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 		msg:      p2p.InvMessage{Items: inv},
 		invItems: inv,
 	}
-	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
 	filteredTxs := peer.filterQueuedTxs([]types.Transaction{tx})
 	peer.sendQ <- outboundMessage{
 		msg: p2p.TxBatchMessage{Txs: filteredTxs},
@@ -3099,7 +3304,7 @@ func TestOnTxReconMessageRequestsOnlyMissingTxIDs(t *testing.T) {
 	prevOut := types.OutPoint{TxID: [32]byte{61}, Vout: 0}
 	tx := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	if _, err := pool.AcceptTx(tx, consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}, consensus.DefaultConsensusRules()); err != nil {
 		t.Fatalf("accept tx: %v", err)
 	}
@@ -3139,14 +3344,14 @@ func TestRunErlayReconcileRoundQueuesUnknownMempoolTxs(t *testing.T) {
 	prevOut := types.OutPoint{TxID: [32]byte{71}, Vout: 0}
 	first := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	firstAdmission, err := pool.AcceptTx(first, consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}, consensus.DefaultConsensusRules())
 	if err != nil {
 		t.Fatalf("accept first tx: %v", err)
 	}
 	second := spendTxForNodeTest(t, 2, types.OutPoint{TxID: firstAdmission.TxID, Vout: 0}, 49, 3, 1)
 	if _, err := pool.AcceptTx(second, consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}, consensus.DefaultConsensusRules()); err != nil {
 		t.Fatalf("accept second tx: %v", err)
 	}
@@ -3183,7 +3388,7 @@ func TestOnGetDataMessageBatchesTxLookupsAndReportsMisses(t *testing.T) {
 	prevOut := types.OutPoint{TxID: [32]byte{62}, Vout: 0}
 	tx := spendTxForNodeTest(t, 1, prevOut, 50, 2, 1)
 	if _, err := pool.AcceptTx(tx, consensus.UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		prevOut: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}, consensus.DefaultConsensusRules()); err != nil {
 		t.Fatalf("accept tx: %v", err)
 	}
@@ -4181,7 +4386,7 @@ func TestOpenServiceRestoresPromotedHigherWorkHeaderBranch(t *testing.T) {
 }
 
 func TestOnPeerTxBatchIgnoresDuplicateAdmissionError(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -4204,7 +4409,7 @@ func TestOnPeerTxBatchIgnoresDuplicateAdmissionError(t *testing.T) {
 }
 
 func TestSubmitTxTracksAndRebroadcastsLocalOriginTransactions(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -4254,8 +4459,137 @@ func TestSubmitTxTracksAndRebroadcastsLocalOriginTransactions(t *testing.T) {
 	}
 }
 
+func TestSubmitTxUsesSingleStemPeerBeforeFluff(t *testing.T) {
+	previousDelay := dandelionFluffDelay
+	dandelionFluffDelay = 30 * time.Millisecond
+	defer func() {
+		dandelionFluffDelay = previousDelay
+	}()
+
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile:          types.Regtest,
+		DBPath:           t.TempDir(),
+		DandelionEnabled: true,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	stemPeer := newPeerConnForTests("127.0.0.1:18444")
+	stemPeer.outbound = true
+	fluffPeer := newPeerConnForTests("127.0.0.1:18445")
+	fluffPeer.outbound = true
+	svc.peerMu.Lock()
+	svc.peers[stemPeer.addr] = stemPeer
+	svc.peers[fluffPeer.addr] = fluffPeer
+	svc.peerMu.Unlock()
+
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	txid := consensus.TxID(&tx)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+
+	recon := waitForTxReconMessage(t, stemPeer, 100*time.Millisecond)
+	if len(recon.TxIDs) != 1 || recon.TxIDs[0] != txid {
+		t.Fatalf("stem txids = %x, want [%x]", recon.TxIDs, txid)
+	}
+	assertNoPeerMessage(t, fluffPeer, 10*time.Millisecond)
+
+	fluff := waitForTxReconMessage(t, fluffPeer, 100*time.Millisecond)
+	if len(fluff.TxIDs) != 1 || fluff.TxIDs[0] != txid {
+		t.Fatalf("fluff txids = %x, want [%x]", fluff.TxIDs, txid)
+	}
+}
+
+func TestPeerOriginTxUsesStemRelayBeforeFluff(t *testing.T) {
+	previousDelay := dandelionFluffDelay
+	dandelionFluffDelay = 30 * time.Millisecond
+	defer func() {
+		dandelionFluffDelay = previousDelay
+	}()
+
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile:          types.Regtest,
+		DBPath:           t.TempDir(),
+		DandelionEnabled: true,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	stemPeer := newPeerConnForTests("127.0.0.1:18445")
+	stemPeer.outbound = true
+	fluffPeer := newPeerConnForTests("127.0.0.1:18446")
+	fluffPeer.outbound = true
+	svc.peerMu.Lock()
+	svc.peers[stemPeer.addr] = stemPeer
+	svc.peers[fluffPeer.addr] = fluffPeer
+	svc.peerMu.Unlock()
+
+	sourcePeer := newPeerConnForTests("127.0.0.1:18444")
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	txid := consensus.TxID(&tx)
+	if err := svc.onPeerMessage(sourcePeer, p2p.TxBatchMessage{Txs: []types.Transaction{tx}}); err != nil {
+		t.Fatalf("onPeerMessage: %v", err)
+	}
+
+	recon := waitForTxReconMessage(t, stemPeer, 100*time.Millisecond)
+	if len(recon.TxIDs) != 1 || recon.TxIDs[0] != txid {
+		t.Fatalf("stem txids = %x, want [%x]", recon.TxIDs, txid)
+	}
+	assertNoPeerMessage(t, fluffPeer, 10*time.Millisecond)
+	fluff := waitForTxReconMessage(t, fluffPeer, 100*time.Millisecond)
+	if len(fluff.TxIDs) != 1 || fluff.TxIDs[0] != txid {
+		t.Fatalf("fluff txids = %x, want [%x]", fluff.TxIDs, txid)
+	}
+}
+
+func TestSubmitTxDefaultsToImmediateNormalRelayWhenDandelionDisabled(t *testing.T) {
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	peerA := newPeerConnForTests("127.0.0.1:18444")
+	peerA.outbound = true
+	peerB := newPeerConnForTests("127.0.0.1:18445")
+	peerB.outbound = true
+	svc.peerMu.Lock()
+	svc.peers[peerA.addr] = peerA
+	svc.peers[peerB.addr] = peerB
+	svc.peerMu.Unlock()
+
+	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
+	txid := consensus.TxID(&tx)
+	if _, err := svc.SubmitTx(tx); err != nil {
+		t.Fatalf("SubmitTx: %v", err)
+	}
+
+	reconA := waitForTxReconMessage(t, peerA, 100*time.Millisecond)
+	reconB := waitForTxReconMessage(t, peerB, 100*time.Millisecond)
+	if len(reconA.TxIDs) != 1 || reconA.TxIDs[0] != txid {
+		t.Fatalf("peerA txids = %x, want [%x]", reconA.TxIDs, txid)
+	}
+	if len(reconB.TxIDs) != 1 || reconB.TxIDs[0] != txid {
+		t.Fatalf("peerB txids = %x, want [%x]", reconB.TxIDs, txid)
+	}
+}
+
 func TestRebroadcastLocalTxsRetriesPeersMarkedKnown(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -4299,13 +4633,42 @@ func TestRebroadcastLocalTxsRetriesPeersMarkedKnown(t *testing.T) {
 	}
 }
 
-func TestLocalVersionAdvertisesErlayAndGrapheneServices(t *testing.T) {
+func waitForTxReconMessage(t *testing.T, peer *peerConn, timeout time.Duration) p2p.TxReconMessage {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case envelope := <-peer.sendQ:
+			recon, ok := envelope.msg.(p2p.TxReconMessage)
+			if !ok {
+				continue
+			}
+			return recon
+		case <-timer.C:
+			t.Fatalf("timed out waiting for TxReconMessage on %s", peer.addr)
+		}
+	}
+}
+
+func assertNoPeerMessage(t *testing.T, peer *peerConn, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case envelope := <-peer.sendQ:
+		t.Fatalf("unexpected peer message on %s: %T", peer.addr, envelope.msg)
+	case <-timer.C:
+	}
+}
+
+func TestLocalVersionAdvertisesErlayCompactAndExtendedRelayServices(t *testing.T) {
 	svc := &Service{}
 	version := svc.localVersion()
 	for _, want := range []uint64{
 		p2p.ServiceNodeNetwork,
 		p2p.ServiceErlayTxRelay,
-		p2p.ServiceGrapheneBlockRelay,
+		p2p.ServiceCompactBlockRelay,
 		p2p.ServiceGrapheneExtended,
 	} {
 		if version.Services&want == 0 {
@@ -4318,14 +4681,14 @@ func TestSelectBlockRelayPlanChoosesExtendedForPoorOverlap(t *testing.T) {
 	peer := newPeerConnForTests("127.0.0.1:18444")
 	block := types.Block{
 		Header: types.BlockHeader{Version: 1, Timestamp: 203},
-		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})},
+		Txs:    []types.Transaction{coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})},
 	}
 	for i := 0; i < 16; i++ {
 		block.Txs = append(block.Txs, types.Transaction{
 			Base: types.TxBase{
 				Version: 1,
 				Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(i + 41)}, Vout: 0}}},
-				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1)}},
+				Outputs: []types.TxOutput{{ValueAtoms: uint64(i + 1), PubKey: nodeSignerPubKey(byte(i + 1))}},
 			},
 		})
 	}
@@ -4335,13 +4698,13 @@ func TestSelectBlockRelayPlanChoosesExtendedForPoorOverlap(t *testing.T) {
 	for _, tx := range block.Txs[1:] {
 		peer.noteKnownTxIDs([][32]byte{consensus.TxID(&tx)})
 	}
-	if plan := selectBlockRelayPlan(peer, block); plan != blockRelayPlanGrapheneP1 {
-		t.Fatalf("relay plan = %d, want protocol 1", plan)
+	if plan := selectBlockRelayPlan(peer, block); plan != blockRelayPlanCompactFallback {
+		t.Fatalf("relay plan = %d, want compact fallback", plan)
 	}
 }
 
 func TestPeerOriginTransactionsAreNotTrackedForLocalRebroadcast(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -4370,7 +4733,7 @@ func TestPeerOriginTransactionsAreNotTrackedForLocalRebroadcast(t *testing.T) {
 }
 
 func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -4408,12 +4771,12 @@ func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T
 	delete(utxos, prevOut)
 	utxos[types.OutPoint{TxID: txid, Vout: 0}] = consensus.UtxoEntry{
 		ValueAtoms: tx.Base.Outputs[0].ValueAtoms,
-		KeyHash:    tx.Base.Outputs[0].KeyHash,
+		PubKey:     tx.Base.Outputs[0].PubKey,
 	}
 	coinbaseTxID := consensus.TxID(&block.Txs[0])
 	utxos[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
 		ValueAtoms: block.Txs[0].Base.Outputs[0].ValueAtoms,
-		KeyHash:    block.Txs[0].Base.Outputs[0].KeyHash,
+		PubKey:     block.Txs[0].Base.Outputs[0].PubKey,
 	}
 	block.Header.UTXORoot = consensus.ComputedUTXORoot(utxos)
 	block.Header = mineHeaderForNodeTest(block.Header)
@@ -4421,7 +4784,7 @@ func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders: %v", err)
 	}
-	if applied, _, err := svc.applyPeerBlock(&block); err != nil || !applied {
+	if applied, _, _, err := svc.applyPeerBlock(&block); err != nil || !applied {
 		t.Fatalf("applyPeerBlock = (%v, %v), want (true, nil)", applied, err)
 	}
 
@@ -4433,7 +4796,7 @@ func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T
 }
 
 func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
 		DBPath:  t.TempDir(),
@@ -4447,10 +4810,10 @@ func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
 	chainUTXOs := consensus.UtxoSet{
 		types.OutPoint{TxID: genesisTxID, Vout: 0}: {
 			ValueAtoms: 50,
-			KeyHash:    nodeSignerKeyHash(7),
+			PubKey:     nodeSignerPubKey(7),
 		},
 	}
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: nodeSignerKeyHash(9)}})
+	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
 	block := blockWithTxsForNodeTest(t, 0, genesis.Header, chainUTXOs, []types.Transaction{coinbase}, genesis.Header.Timestamp+1)
 	orphanTx := spendTxForNodeTest(t, 9, types.OutPoint{TxID: consensus.TxID(&coinbase), Vout: 0}, 1, 8, 0)
 	peer := newPeerConnForTests("127.0.0.1:18444")
@@ -4482,6 +4845,80 @@ func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
 	}
 }
 
+func TestReorgEvictsMempoolConflictsConfirmedOnWinningBranch(t *testing.T) {
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	baseState := NewChainState(types.Regtest)
+	if _, err := baseState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	active := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders active: %v", err)
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: active}); err != nil {
+		t.Fatalf("onPeerMessage active block: %v", err)
+	}
+
+	genesisOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	mempoolTx := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
+	mempoolTxID := consensus.TxID(&mempoolTx)
+	if _, err := svc.SubmitTx(mempoolTx); err != nil {
+		t.Fatalf("SubmitTx mempool tx: %v", err)
+	}
+	if !svc.pool.Contains(mempoolTxID) {
+		t.Fatalf("expected mempool to contain %x before reorg", mempoolTxID)
+	}
+
+	altState := NewChainState(types.Regtest)
+	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	if _, err := altState.ApplyBlock(&alt1); err != nil {
+		t.Fatal(err)
+	}
+	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt2); err != nil {
+		t.Fatal(err)
+	}
+	conflict := spendTxForNodeTest(t, 7, genesisOut, 50, 9, 1)
+	alt3Coinbase := coinbaseTxForHeight(3, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(6)}})
+	alt3 := blockWithTxsForNodeTest(t, 2, alt2.Header, altState.UTXOs(), []types.Transaction{alt3Coinbase, conflict}, alt2.Header.Timestamp+600)
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{alt1.Header, alt2.Header, alt3.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders competing branch: %v", err)
+	}
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt1}); err != nil {
+		t.Fatalf("onPeerMessage alt1: %v", err)
+	}
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt2}); err != nil {
+		t.Fatalf("onPeerMessage alt2: %v", err)
+	}
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt3}); err != nil {
+		t.Fatalf("onPeerMessage alt3: %v", err)
+	}
+
+	if svc.pool.Contains(mempoolTxID) {
+		t.Fatalf("mempool conflict %x survived winning-branch confirmation", mempoolTxID)
+	}
+	if got := svc.pool.Count(); got != 0 {
+		t.Fatalf("mempool count after reorg = %d, want 0", got)
+	}
+	if got, want := consensus.HeaderHash(svc.chainState.ChainState().TipHeader()), consensus.HeaderHash(&alt3.Header); got != want {
+		t.Fatalf("tip hash = %x, want %x", got, want)
+	}
+}
+
 func TestApplyPeerBlockDoesNotRequireServiceStateMu(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -4505,7 +4942,7 @@ func TestApplyPeerBlockDoesNotRequireServiceStateMu(t *testing.T) {
 	done := make(chan error, 1)
 	svc.stateMu.RLock()
 	go func() {
-		applied, _, err := svc.applyPeerBlock(&block)
+		applied, _, _, err := svc.applyPeerBlock(&block)
 		if err != nil {
 			done <- err
 			return
@@ -4547,7 +4984,7 @@ func TestOnPeerBlockMessageIgnoresKnownBlock(t *testing.T) {
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders: %v", err)
 	}
-	if applied, _, err := svc.applyPeerBlock(&block); err != nil || !applied {
+	if applied, _, _, err := svc.applyPeerBlock(&block); err != nil || !applied {
 		t.Fatalf("applyPeerBlock = (%v, %v), want (true, nil)", applied, err)
 	}
 
@@ -4716,6 +5153,94 @@ func TestQueuedPeerBlocksDrainAfterParentArrives(t *testing.T) {
 	}
 }
 
+func TestQueuedPeerBlockChainDrainsAcrossReorgToHigherWorkTip(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	activeState := NewChainState(types.Regtest)
+	if _, err := activeState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	active := nextCoinbaseBlock(0, genesis.Header, activeState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders active: %v", err)
+	}
+	peer := newPeerConnForTests("127.0.0.1:18445")
+	peer.controlQ = make(chan outboundMessage, 16)
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: active}); err != nil {
+		t.Fatalf("onPeerMessage active block: %v", err)
+	}
+
+	altState := NewChainState(types.Regtest)
+	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	if _, err := altState.ApplyBlock(&alt1); err != nil {
+		t.Fatal(err)
+	}
+	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt2); err != nil {
+		t.Fatal(err)
+	}
+	alt3 := nextCoinbaseBlock(2, alt2.Header, altState.UTXOs(), 6, alt2.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt3); err != nil {
+		t.Fatal(err)
+	}
+	alt4 := nextCoinbaseBlock(3, alt3.Header, altState.UTXOs(), 7, alt3.Header.Timestamp+600)
+
+	if _, err := svc.applyPeerHeaders([]types.BlockHeader{alt1.Header, alt2.Header, alt3.Header, alt4.Header}); err != nil {
+		t.Fatalf("applyPeerHeaders competing branch: %v", err)
+	}
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt3}); err != nil {
+		t.Fatalf("onPeerMessage alt3 before ancestors: %v", err)
+	}
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt4}); err != nil {
+		t.Fatalf("onPeerMessage alt4 before ancestors: %v", err)
+	}
+	if got := svc.pendingPeerBlockCount(); got != 2 {
+		t.Fatalf("pending queued peer blocks before reorg parent arrival = %d, want 2", got)
+	}
+
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt1}); err != nil {
+		t.Fatalf("onPeerMessage alt1: %v", err)
+	}
+	if got := svc.blockHeight(); got != 1 {
+		t.Fatalf("block height after alt1 = %d, want 1", got)
+	}
+	if got := svc.pendingPeerBlockCount(); got != 2 {
+		t.Fatalf("pending queued peer blocks after alt1 = %d, want 2", got)
+	}
+
+	if err := svc.onPeerMessage(peer, p2p.BlockMessage{Block: alt2}); err != nil {
+		t.Fatalf("onPeerMessage alt2: %v", err)
+	}
+
+	if got := svc.pendingPeerBlockCount(); got != 0 {
+		t.Fatalf("pending queued peer blocks after queued chain drain = %d, want 0", got)
+	}
+	if got := svc.blockHeight(); got != 4 {
+		t.Fatalf("block height after queued chain reorg = %d, want 4", got)
+	}
+	if got := svc.headerHeight(); got != 4 {
+		t.Fatalf("header height after queued chain reorg = %d, want 4", got)
+	}
+	tip := svc.chainState.ChainState().TipHeader()
+	if tip == nil {
+		t.Fatal("missing tip header after queued chain reorg")
+	}
+	if got, want := consensus.HeaderHash(tip), consensus.HeaderHash(&alt4.Header); got != want {
+		t.Fatalf("tip hash = %x, want %x", got, want)
+	}
+}
+
 func TestCompetingBranchQueuedBlocksConvergeToHigherWorkTip(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -4842,8 +5367,11 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	if !gapDetected {
 		t.Fatal("expected active height gap to be detected")
 	}
-	if len(hashes) != 0 {
-		t.Fatalf("hashes before repair = %d, want 0", len(hashes))
+	if len(hashes) != 1 {
+		t.Fatalf("hashes before repair = %d, want 1", len(hashes))
+	}
+	if hashes[0] != consensus.HeaderHash(&block.Header) {
+		t.Fatalf("missing block hash before repair = %x, want %x", hashes[0], consensus.HeaderHash(&block.Header))
 	}
 
 	repaired, err := svc.repairActiveHeightIndex()
@@ -4891,7 +5419,7 @@ func TestMissingBlockHashesIncludeForkPointForPromotedBranch(t *testing.T) {
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active1.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders active: %v", err)
 	}
-	if _, _, err := svc.applyPeerBlock(&active1); err != nil {
+	if _, _, _, err := svc.applyPeerBlock(&active1); err != nil {
 		t.Fatalf("applyPeerBlock active: %v", err)
 	}
 
@@ -4911,6 +5439,12 @@ func TestMissingBlockHashesIncludeForkPointForPromotedBranch(t *testing.T) {
 
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{branch1.Header, branch2.Header, branch3.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders branch: %v", err)
+	}
+	// Header promotion updates the derived active-height index asynchronously.
+	// Wait for that replay so this assertion checks fork-point handling rather
+	// than racing the background index repair path.
+	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
+		t.Fatalf("WaitForDerivedIndexes branch: %v", err)
 	}
 
 	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
@@ -5163,7 +5697,7 @@ func newPeerConnForTests(addr string) *peerConn {
 		pendingThin:   make(map[[32]byte]*pendingThinBlock),
 		version: p2p.VersionMessage{
 			Height:    0,
-			Services:  p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceGrapheneBlockRelay | p2p.ServiceGrapheneExtended | p2p.ServiceAvalancheOverlay,
+			Services:  p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceCompactBlockRelay | p2p.ServiceGrapheneExtended | p2p.ServiceAvalancheOverlay,
 			UserAgent: "bpu/go",
 		},
 	}
@@ -5176,8 +5710,8 @@ func TestPeerConnCoalescesTxBatches(t *testing.T) {
 		queuedTx: make(map[[32]byte]int),
 		knownTx:  make(map[[32]byte]struct{}),
 	}
-	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
-	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2}})
+	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
+	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2, PubKey: nodeSignerPubKey(10)}})
 
 	if err := peer.enqueueTxBatch(p2p.TxBatchMessage{Txs: []types.Transaction{first}}); err != nil {
 		t.Fatalf("enqueue first tx: %v", err)
@@ -5207,7 +5741,7 @@ func TestPeerConnCoalescesTxBatches(t *testing.T) {
 }
 
 func TestAvalanchePollRespondsWithPreferredTx(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	svc, err := OpenService(ServiceConfig{
 		Profile: types.Regtest,
@@ -5255,7 +5789,7 @@ func TestAvalanchePollRespondsWithPreferredTx(t *testing.T) {
 }
 
 func TestAvalancheFinalizesAndRejectsConflicts(t *testing.T) {
-	genesis := genesisBlockForKeyHash(nodeSignerKeyHash(7))
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	svc, err := OpenService(ServiceConfig{
 		Profile:                   types.Regtest,
@@ -5331,8 +5865,8 @@ func TestPeerConnPendingTxStoreMaterializesRelayBatchOnce(t *testing.T) {
 		queuedTx: make(map[[32]byte]int),
 		knownTx:  make(map[[32]byte]struct{}),
 	}
-	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1}})
-	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2}})
+	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
+	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2, PubKey: nodeSignerPubKey(10)}})
 
 	ready, armFlush := peer.stagePendingTxs([]types.Transaction{first, second})
 	if len(ready) != 0 {
@@ -5404,7 +5938,7 @@ func TestEmitThroughputSummaryLogsExpectedFields(t *testing.T) {
 		MaxOrphans:         8,
 	})
 	utxos := consensus.UtxoSet{
-		{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 50, KeyHash: nodeSignerKeyHash(1)},
+		{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 50, PubKey: nodeSignerPubKey(1)},
 	}
 	tx := spendTxForNodeTest(t, 1, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, 50, 2, 1)
 	if _, err := pool.AcceptTx(tx, utxos, consensus.DefaultConsensusRules()); err != nil {
@@ -5442,6 +5976,11 @@ func TestEmitThroughputSummaryLogsExpectedFields(t *testing.T) {
 	}})
 	svc.noteRelaySent(relayMessageClass{txBatchItems: 6, blockInvItems: 1})
 	svc.noteBlockAccepted()
+	svc.noteBlockSignatureVerification(consensus.BlockValidationSummary{
+		SignatureChecks:        12,
+		SignatureBatchFallback: true,
+		SignatureVerifyTime:    9 * time.Millisecond,
+	})
 	svc.noteTemplateRebuild()
 	svc.noteTemplateInterruption()
 
@@ -5468,6 +6007,12 @@ func TestEmitThroughputSummaryLogsExpectedFields(t *testing.T) {
 	}
 	if got := int(entry["blocks_accepted"].(float64)); got != 1 {
 		t.Fatalf("blocks_accepted = %d, want 1", got)
+	}
+	if got := int(entry["block_sig_checks"].(float64)); got != 12 {
+		t.Fatalf("block_sig_checks = %d, want 12", got)
+	}
+	if got := int(entry["block_sig_fallbacks"].(float64)); got != 1 {
+		t.Fatalf("block_sig_fallbacks = %d, want 1", got)
 	}
 	if got := int(entry["template_rebuilds"].(float64)); got != 1 {
 		t.Fatalf("template_rebuilds = %d, want 1", got)

@@ -44,7 +44,7 @@ For Bitcoin Pure v1, the canonical coin record committed by `utxo_root`
 contains exactly:
 
 1. `value_atoms` as `uint64`
-2. `keyhash` as `bytes32`
+2. `pubkey` as `bytes32`
 
 Coinbase maturity and other chain semantics may depend on data maintained by
 the validating node, but they are not part of the committed `utxo_root` leaf
@@ -77,12 +77,12 @@ Tagged-hash domain separators:
 
 For one live UTXO leaf:
 
-- `LeafHash(utxo) = TaggedHash(UTXOLeafTag, key(outpoint) || value_atoms || keyhash)`
+- `LeafHash(utxo) = TaggedHash(UTXOLeafTag, key(outpoint) || value_atoms || pubkey)`
 
 where:
 
 - `value_atoms` is the canonical 8-byte little-endian `uint64`
-- `keyhash` is the canonical 32-byte raw keyhash
+- `pubkey` is the canonical 32-byte raw x-only public key
 
 For a binary branch:
 
@@ -123,7 +123,7 @@ Duplicate-key rule:
 
 Input:
 
-- the current live UTXO set as a set of `(outpoint, value_atoms, keyhash)`
+- the current live UTXO set as a set of `(outpoint, value_atoms, pubkey)`
   tuples
 
 Algorithm:

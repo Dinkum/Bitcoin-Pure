@@ -9,7 +9,7 @@ import (
 const (
 	AddressPrefix      = "bpu"
 	cashAddrSeparator  = ':'
-	cashAddrTypeP2PKH  = 0
+	cashAddrTypeP2PK   = 0
 	cashAddrChecksumSz = 8
 )
 
@@ -23,8 +23,8 @@ var (
 	cashAddrPolymodGen    = [5]uint64{0x98f2bc8e61, 0x79b76d99e2, 0xf33e5fb3c4, 0xae2eabe2a8, 0x1e4f43e470}
 )
 
-func EncodeAddress(keyHash [32]byte) string {
-	encoded, err := encodeCashAddress(AddressPrefix, cashAddrTypeP2PKH, keyHash[:])
+func EncodeAddress(pubKey [32]byte) string {
+	encoded, err := encodeCashAddress(AddressPrefix, cashAddrTypeP2PK, pubKey[:])
 	if err != nil {
 		panic(fmt.Sprintf("encode wallet address: %v", err))
 	}
@@ -32,16 +32,16 @@ func EncodeAddress(keyHash [32]byte) string {
 }
 
 func ParseAddress(raw string) ([32]byte, error) {
-	var keyHash [32]byte
+	var pubKey [32]byte
 	_, addrType, payload, err := decodeCashAddress(raw, AddressPrefix)
 	if err != nil {
-		return keyHash, ErrInvalidAddress
+		return pubKey, ErrInvalidAddress
 	}
-	if addrType != cashAddrTypeP2PKH || len(payload) != len(keyHash) {
-		return keyHash, ErrInvalidAddress
+	if addrType != cashAddrTypeP2PK || len(payload) != len(pubKey) {
+		return pubKey, ErrInvalidAddress
 	}
-	copy(keyHash[:], payload)
-	return keyHash, nil
+	copy(pubKey[:], payload)
+	return pubKey, nil
 }
 
 func encodeCashAddress(prefix string, addrType byte, payload []byte) (string, error) {

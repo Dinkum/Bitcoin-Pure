@@ -1,11 +1,14 @@
 package p2p
 
 import (
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
 
+	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
 )
 
@@ -18,6 +21,24 @@ func testCoinbaseTx(height uint64, value uint64) types.Transaction {
 			CoinbaseExtraNonce: &extraNonce,
 			Outputs:            []types.TxOutput{{ValueAtoms: value}},
 		},
+	}
+}
+
+func writeRawMessageForTest(t *testing.T, conn net.Conn, magic uint32, cmd Command, payload []byte, checksum []byte) {
+	t.Helper()
+	header := make([]byte, headerSize)
+	binary.LittleEndian.PutUint32(header[:4], magic)
+	header[4] = byte(cmd)
+	binary.LittleEndian.PutUint32(header[8:12], uint32(len(payload)))
+	copy(header[12:16], checksum)
+	if _, err := conn.Write(header); err != nil {
+		t.Fatalf("write raw header: %v", err)
+	}
+	if len(payload) == 0 {
+		return
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write raw payload: %v", err)
 	}
 }
 
@@ -310,6 +331,83 @@ func TestConnXBlockTxRoundTrip(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("write message: %v", err)
+	}
+}
+
+func TestConnReadMessageRejectsBadChecksum(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
+	errCh := make(chan error, 1)
+	go func() {
+		payload := []byte{1, 2, 3, 4}
+		writeRawMessageForTest(t, right, MagicForProfile(types.Regtest), CmdPing, payload, []byte{0, 0, 0, 0})
+		right.Close()
+		errCh <- nil
+	}()
+
+	_, err := conn.ReadMessage()
+	if !errors.Is(err, ErrBadChecksum) {
+		t.Fatalf("read message error = %v, want ErrBadChecksum", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnReadMessageRejectsPayloadOverLimit(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn := NewConn(left, MagicForProfile(types.Regtest), 3)
+	errCh := make(chan error, 1)
+	go func() {
+		payload := []byte{1, 2, 3, 4}
+		header := make([]byte, headerSize)
+		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
+		header[4] = byte(CmdPing)
+		binary.LittleEndian.PutUint32(header[8:12], uint32(len(payload)))
+		checksum := crypto.Sha256d(payload)
+		copy(header[12:16], checksum[:4])
+		if _, err := right.Write(header); err != nil {
+			t.Fatalf("write raw header: %v", err)
+		}
+		right.Close()
+		errCh <- nil
+	}()
+
+	_, err := conn.ReadMessage()
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("read message error = %v, want ErrPayloadTooLarge", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecodeMessageRejectsUnknownCommand(t *testing.T) {
+	_, err := decodeMessage(Command(0xff), nil, types.DefaultCodecLimits())
+	if !errors.Is(err, ErrBadCommand) {
+		t.Fatalf("decodeMessage error = %v, want ErrBadCommand", err)
+	}
+}
+
+func TestDecodeMessageRejectsOversizedTxReconPayload(t *testing.T) {
+	payload := make([]byte, 4)
+	binary.LittleEndian.PutUint32(payload, maxInvPerMessage+1)
+	_, err := decodeMessage(CmdTxRecon, payload, types.DefaultCodecLimits())
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("decodeMessage error = %v, want ErrPayloadTooLarge", err)
+	}
+}
+
+func TestDecodeMessageRejectsTruncatedVersionPayload(t *testing.T) {
+	_, err := decodeMessage(CmdVersion, make([]byte, 27), types.DefaultCodecLimits())
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("decodeMessage error = %v, want unexpected EOF", err)
 	}
 }
 

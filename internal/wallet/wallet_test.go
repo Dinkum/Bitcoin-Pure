@@ -18,7 +18,7 @@ func TestCashAddrReferenceExample(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeString: %v", err)
 	}
-	addr, err := encodeCashAddress("bitcoincash", cashAddrTypeP2PKH, payload)
+	addr, err := encodeCashAddress("bitcoincash", cashAddrTypeP2PK, payload)
 	if err != nil {
 		t.Fatalf("encodeCashAddress: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestOpenNormalizesLegacyStoredAddressStrings(t *testing.T) {
 		t.Fatalf("CreateWallet: %v", err)
 	}
 	legacy := created
-	legacy.Addresses[0].Address = "bpu1" + legacy.Addresses[0].KeyHashHex
+	legacy.Addresses[0].Address = "bpu1" + legacy.Addresses[0].PubKeyHex
 	buf, err := json.Marshal([]Wallet{legacy})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -136,12 +136,12 @@ func TestBuildSendCreatesSignedTransactionAndChange(t *testing.T) {
 		{
 			OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 			Value:    50,
-			KeyHash:  keyHash,
+			PubKey:  keyHash,
 		},
 		{
 			OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1},
 			Value:    30,
-			KeyHash:  keyHash,
+			PubKey:  keyHash,
 		},
 	})
 	if err != nil {
@@ -157,8 +157,8 @@ func TestBuildSendCreatesSignedTransactionAndChange(t *testing.T) {
 		t.Fatalf("outputs = %d, want 2", len(plan.Transaction.Base.Outputs))
 	}
 	view := consensus.UtxoSet{
-		plan.Inputs[0].OutPoint: {ValueAtoms: plan.Inputs[0].Value, KeyHash: mustParseKeyHash(plan.Inputs[0].Address.KeyHashHex)},
-		plan.Inputs[1].OutPoint: {ValueAtoms: plan.Inputs[1].Value, KeyHash: mustParseKeyHash(plan.Inputs[1].Address.KeyHashHex)},
+		plan.Inputs[0].OutPoint: {ValueAtoms: plan.Inputs[0].Value, PubKey: mustParsePubKey(plan.Inputs[0].Address.PubKeyHex)},
+		plan.Inputs[1].OutPoint: {ValueAtoms: plan.Inputs[1].Value, PubKey: mustParsePubKey(plan.Inputs[1].Address.PubKeyHex)},
 	}
 	if _, err := consensus.ValidateTx(&plan.Transaction, view, consensus.DefaultConsensusRules()); err != nil {
 		t.Fatalf("ValidateTx: %v", err)
@@ -191,7 +191,7 @@ func TestReconcilePendingDropsMissingMempoolTransactions(t *testing.T) {
 	plan, err := store.BuildSend("alice", first.Address, 10, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    50,
-		KeyHash:  keyHash,
+		PubKey:  keyHash,
 	}})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
@@ -231,7 +231,7 @@ func TestBuildSendRejectsInsufficientFunds(t *testing.T) {
 	_, err = store.BuildSend("alice", first.Address, 100, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    50,
-		KeyHash:  keyHash,
+		PubKey:  keyHash,
 	}})
 	if !errors.Is(err, ErrInsufficientFunds) {
 		t.Fatalf("BuildSend err = %v, want ErrInsufficientFunds", err)
@@ -252,8 +252,8 @@ func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 		t.Fatalf("ParseAddress: %v", err)
 	}
 	plan, err := store.BuildSend("alice", first.Address, 10, 1, []SpendableUTXO{
-		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, KeyHash: keyHash},
-		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1}, Value: 25, KeyHash: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, PubKey: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1}, Value: 25, PubKey: keyHash},
 	})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
@@ -262,8 +262,8 @@ func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	summary, err := store.Balance("alice", []SpendableUTXO{
-		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, KeyHash: keyHash},
-		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1}, Value: 25, KeyHash: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, PubKey: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1}, Value: 25, PubKey: keyHash},
 	})
 	if err != nil {
 		t.Fatalf("Balance: %v", err)
@@ -300,7 +300,7 @@ func TestBuildSendAutoChoosesFeeFromEstimatedSize(t *testing.T) {
 		t.Fatalf("NewReceiveAddress: %v", err)
 	}
 	plan, err := store.BuildSendAuto("alice", dest.Address, 60, 2, []SpendableUTXO{
-		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 2_000, KeyHash: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 2_000, PubKey: keyHash},
 	})
 	if err != nil {
 		t.Fatalf("BuildSendAuto: %v", err)
@@ -339,7 +339,7 @@ func TestMarkSubmittedTracksWalletOwnedOutputsForCPFP(t *testing.T) {
 	plan, err := store.BuildSend("alice", dest.Address, 10, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    50,
-		KeyHash:  keyHash,
+		PubKey:  keyHash,
 	}})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
@@ -376,7 +376,7 @@ func TestBuildCPFPUsesPendingWalletOutput(t *testing.T) {
 	parent, err := store.BuildSend("alice", dest.Address, 10, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    1_000,
-		KeyHash:  keyHash,
+		PubKey:  keyHash,
 	}})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)

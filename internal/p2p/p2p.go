@@ -36,8 +36,9 @@ const (
 	ServiceNodeNetwork uint64 = 1 << iota
 	// ServiceErlayTxRelay enables Erlay-style steady-state tx relay.
 	ServiceErlayTxRelay
-	// ServiceGrapheneBlockRelay enables the compact block relay planner path.
-	ServiceGrapheneBlockRelay
+	// ServiceCompactBlockRelay enables compact-block relay as the conservative
+	// compatibility fallback block-propagation mode.
+	ServiceCompactBlockRelay
 	// ServiceGrapheneExtended enables the poor-overlap block recovery path.
 	ServiceGrapheneExtended
 	// ServiceGrapheneMempoolRepair enables optional repair-only mempool sync.
@@ -45,6 +46,10 @@ const (
 	// ServiceAvalancheOverlay enables the non-consensus Avalanche poll/vote path.
 	ServiceAvalancheOverlay
 )
+
+// ServiceGrapheneBlockRelay is kept as a compatibility alias for the compact
+// block relay capability bit.
+const ServiceGrapheneBlockRelay = ServiceCompactBlockRelay
 
 type Command uint8
 

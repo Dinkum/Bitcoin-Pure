@@ -103,7 +103,7 @@ A node considers an Avalanche Proof valid if:
   - The UTXO height equals `height`.
   - The UTXO coinbase flag equals `is_coinbase`.
   - The UTXO is of a supported single-key spend type.
-  - `stake_pubkey` hashes to the keyhash committed in the UTXO under the
+  - `stake_pubkey` equals the pubkey committed in the UTXO under the
     normal spend rule.
   - `stake_sig` verifies under `stake_pubkey` over `stake_hash`.
   - The UTXO has at least `STAKE_CONFIRMATIONS` confirmations

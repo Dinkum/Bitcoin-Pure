@@ -1183,7 +1183,7 @@ func decodeOutPoint(buf []byte) (types.OutPoint, error) {
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
 	buf := make([]byte, 8, 40)
 	binary.LittleEndian.PutUint64(buf, entry.ValueAtoms)
-	buf = append(buf, entry.KeyHash[:]...)
+	buf = append(buf, entry.PubKey[:]...)
 	return buf
 }
 
@@ -1278,11 +1278,11 @@ func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {
 	if len(buf) != 40 {
 		return consensus.UtxoEntry{}, errors.New("invalid utxo entry encoding")
 	}
-	var keyHash [32]byte
-	copy(keyHash[:], buf[8:])
+	var pubKey [32]byte
+	copy(pubKey[:], buf[8:])
 	return consensus.UtxoEntry{
 		ValueAtoms: binary.LittleEndian.Uint64(buf[:8]),
-		KeyHash:    keyHash,
+		PubKey:     pubKey,
 	}, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/mempool"
 )
 
@@ -18,11 +19,13 @@ type throughputSummaryTelemetry struct {
 	relayedTxItems        atomic.Uint64
 	relayedBlockItems     atomic.Uint64
 	blocksAccepted        atomic.Uint64
+	blockSigChecks        atomic.Uint64
+	blockSigFallbacks     atomic.Uint64
 	templateRebuilds      atomic.Uint64
 	templateInterruptions atomic.Uint64
 	erlayRounds           atomic.Uint64
 	erlayRequestedTxs     atomic.Uint64
-	grapheneP1Plans       atomic.Uint64
+	compactBlockPlans     atomic.Uint64
 	grapheneExtPlans      atomic.Uint64
 	grapheneDecodeFails   atomic.Uint64
 	grapheneExtRecoveries atomic.Uint64
@@ -48,6 +51,8 @@ type throughputCounterSnapshot struct {
 	relayedTxItems        uint64
 	relayedBlockItems     uint64
 	blocksAccepted        uint64
+	blockSigChecks        uint64
+	blockSigFallbacks     uint64
 	templateRebuilds      uint64
 	templateInterruptions uint64
 }
@@ -107,10 +112,10 @@ func (s *Service) noteErlayRound(requested int) {
 	}
 }
 
-func (s *Service) noteGraphenePlan(plan blockRelayPlan) {
+func (s *Service) noteBlockRelayPlan(plan blockRelayPlan) {
 	switch plan {
-	case blockRelayPlanGrapheneP1:
-		s.throughput.grapheneP1Plans.Add(1)
+	case blockRelayPlanCompactFallback:
+		s.throughput.compactBlockPlans.Add(1)
 	case blockRelayPlanGrapheneExtended:
 		s.throughput.grapheneExtPlans.Add(1)
 	default:
@@ -175,6 +180,16 @@ func (s *Service) noteBlockAccepted() {
 	s.throughput.blocksAccepted.Add(1)
 }
 
+func (s *Service) noteBlockSignatureVerification(summary consensus.BlockValidationSummary) {
+	if summary.SignatureChecks > 0 {
+		s.throughput.blockSigChecks.Add(uint64(summary.SignatureChecks))
+	}
+	if summary.SignatureBatchFallback {
+		s.throughput.blockSigFallbacks.Add(1)
+	}
+	s.perf.noteBlockSigVerifyDuration(summary.SignatureVerifyTime)
+}
+
 func (s *Service) noteTemplateRebuild() {
 	s.throughput.templateRebuilds.Add(1)
 }
@@ -209,6 +224,8 @@ func (s *Service) emitThroughputSummary(now time.Time) {
 		slog.Float64("relayed_block_items_per_sec", ratePerSecond(current.relayedBlockItems-previous.relayedBlockItems, window)),
 		slog.Int("blocks_accepted", int(current.blocksAccepted-previous.blocksAccepted)),
 		slog.Float64("blocks_accepted_per_sec", ratePerSecond(current.blocksAccepted-previous.blocksAccepted, window)),
+		slog.Int("block_sig_checks", int(current.blockSigChecks-previous.blockSigChecks)),
+		slog.Int("block_sig_fallbacks", int(current.blockSigFallbacks-previous.blockSigFallbacks)),
 		slog.Int("template_rebuilds", int(current.templateRebuilds-previous.templateRebuilds)),
 		slog.Int("template_interruptions", int(current.templateInterruptions-previous.templateInterruptions)),
 		slog.Int("orphan_promotions", int(current.orphanPromotions-previous.orphanPromotions)),
@@ -237,6 +254,8 @@ func (s *Service) snapshotThroughputCounters(now time.Time) (throughputCounterSn
 		relayedTxItems:        s.throughput.relayedTxItems.Load(),
 		relayedBlockItems:     s.throughput.relayedBlockItems.Load(),
 		blocksAccepted:        s.throughput.blocksAccepted.Load(),
+		blockSigChecks:        s.throughput.blockSigChecks.Load(),
+		blockSigFallbacks:     s.throughput.blockSigFallbacks.Load(),
 		templateRebuilds:      s.throughput.templateRebuilds.Load(),
 		templateInterruptions: s.throughput.templateInterruptions.Load(),
 	}

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "profile": "regtest",
+  "genesis_fixture": "../genesis/regtest.json",
+  "height": 0,
+  "expected_header_hash_hex": "247e1480f0e927374265f554424fef494a4a0472b7d9f39bcf4da1c9c82ef29f",
+  "expected_utxo_root_hex": "992b3dab77dfdc37b3631a6bfad27294616af838a21014bb19b851a265a74e38",
+  "expected_utxo_count": 1,
+  "utxos": [
+    {
+      "txid_hex": "66b55727392f16cbed91f9cfbee0ea184bb011dda4fe29bbbbd1c51f1745f2da",
+      "vout": 0,
+      "value_atoms": 1000000000000,
+      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

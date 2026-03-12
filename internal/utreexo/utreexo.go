@@ -26,12 +26,13 @@ const (
 type UtxoLeaf struct {
 	OutPoint   types.OutPoint
 	ValueAtoms uint64
-	KeyHash    [32]byte
+	PubKey     [32]byte
 }
 
 type keyedLeaf struct {
 	key  [outPointBytes]byte
 	hash [32]byte
+	utxo UtxoLeaf
 }
 
 type Accumulator struct {
@@ -47,6 +48,19 @@ type accNode struct {
 	count int
 }
 
+type OutPointProof struct {
+	OutPoint   types.OutPoint
+	Exists     bool
+	ValueAtoms uint64
+	PubKey     [32]byte
+	Steps      []ProofStep
+}
+
+type ProofStep struct {
+	HasSibling  bool
+	SiblingHash [32]byte
+}
+
 func LeafHash(leaf UtxoLeaf) [32]byte {
 	buf := make([]byte, 0, outPointBytes+8+32)
 	key := leafKey(leaf.OutPoint)
@@ -54,7 +68,7 @@ func LeafHash(leaf UtxoLeaf) [32]byte {
 	value := make([]byte, 8)
 	binary.LittleEndian.PutUint64(value, leaf.ValueAtoms)
 	buf = append(buf, value...)
-	buf = append(buf, leaf.KeyHash[:]...)
+	buf = append(buf, leaf.PubKey[:]...)
 	return crypto.TaggedHash(UTXOLeafTag, buf)
 }
 
@@ -129,6 +143,7 @@ func (a *Accumulator) Add(leaf UtxoLeaf) (*Accumulator, error) {
 	keyed := keyedLeaf{
 		key:  leafKey(leaf.OutPoint),
 		hash: LeafHash(leaf),
+		utxo: leaf,
 	}
 	root, err := insertLeaf(a.root, keyed, 0)
 	if err != nil {
@@ -172,6 +187,89 @@ func (a *Accumulator) Apply(spent []types.OutPoint, created []UtxoLeaf) (*Accumu
 	return next, nil
 }
 
+// Prove returns a single-outpoint Merklix proof over the current accumulator
+// root. Exclusion proofs terminate at the first missing branch on the queried
+// path; membership proofs carry the committed leaf payload.
+func (a *Accumulator) Prove(outPoint types.OutPoint) (OutPointProof, error) {
+	proof := OutPointProof{OutPoint: outPoint}
+	if a == nil || a.root == nil {
+		return proof, nil
+	}
+	key := leafKey(outPoint)
+	steps := make([]ProofStep, 0, keyBits)
+	node := a.root
+	for bitIndex := 0; bitIndex < keyBits; bitIndex++ {
+		if node == nil {
+			return OutPointProof{}, fmt.Errorf("invalid accumulator state while proving %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		queryBit := bitSet(key, bitIndex)
+		var next, sibling *accNode
+		if queryBit {
+			next = node.right
+			sibling = node.left
+		} else {
+			next = node.left
+			sibling = node.right
+		}
+		step := ProofStep{}
+		if sibling != nil {
+			step.HasSibling = true
+			step.SiblingHash = sibling.hash
+		}
+		steps = append(steps, step)
+		if next == nil {
+			proof.Steps = steps
+			return proof, nil
+		}
+		node = next
+	}
+	if node.leaf == nil || node.leaf.key != key {
+		return OutPointProof{}, fmt.Errorf("invalid accumulator leaf for %x:%d", outPoint.TxID, outPoint.Vout)
+	}
+	proof.Exists = true
+	proof.ValueAtoms = node.leaf.utxo.ValueAtoms
+	proof.PubKey = node.leaf.utxo.PubKey
+	proof.Steps = steps
+	return proof, nil
+}
+
+// VerifyProof checks a membership or exclusion proof against a committed
+// `utxo_root` without requiring access to the full UTXO set.
+func VerifyProof(root [32]byte, proof OutPointProof) bool {
+	if len(proof.Steps) == 0 {
+		return !proof.Exists && root == crypto.TaggedHash(UTXORootTag, nil)
+	}
+	key := leafKey(proof.OutPoint)
+	last := len(proof.Steps) - 1
+	var current [32]byte
+	if proof.Exists {
+		current = LeafHash(UtxoLeaf{
+			OutPoint:   proof.OutPoint,
+			ValueAtoms: proof.ValueAtoms,
+			PubKey:     proof.PubKey,
+		})
+	} else {
+		bottom := proof.Steps[last]
+		if !bottom.HasSibling {
+			return false
+		}
+		current = bottom.SiblingHash
+		last--
+	}
+	for bitIndex := last; bitIndex >= 0; bitIndex-- {
+		step := proof.Steps[bitIndex]
+		if !step.HasSibling {
+			continue
+		}
+		if bitSet(key, bitIndex) {
+			current = BranchHash(step.SiblingHash, current)
+		} else {
+			current = BranchHash(current, step.SiblingHash)
+		}
+	}
+	return root == crypto.TaggedHash(UTXORootTag, current[:])
+}
+
 func sortedKeyedLeaves(leaves []UtxoLeaf) []keyedLeaf {
 	sorted := make([]keyedLeaf, len(leaves))
 	workers := runtime.GOMAXPROCS(0)
@@ -180,6 +278,7 @@ func sortedKeyedLeaves(leaves []UtxoLeaf) []keyedLeaf {
 			sorted[i] = keyedLeaf{
 				key:  leafKey(leaf.OutPoint),
 				hash: LeafHash(leaf),
+				utxo: leaf,
 			}
 		}
 	} else {
@@ -204,6 +303,7 @@ func sortedKeyedLeaves(leaves []UtxoLeaf) []keyedLeaf {
 					sorted[i] = keyedLeaf{
 						key:  leafKey(leaves[i].OutPoint),
 						hash: LeafHash(leaves[i]),
+						utxo: leaves[i],
 					}
 				}
 			}(start, end)

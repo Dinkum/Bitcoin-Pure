@@ -12,9 +12,8 @@ import (
 	"bitcoin-pure/internal/types"
 )
 
-func consensusTestKeyHash(seed byte) [32]byte {
-	pubKey, _ := crypto.SignSchnorrForTest([32]byte{seed}, &[32]byte{})
-	return crypto.KeyHash(&pubKey)
+func consensusTestPubKey(seed byte) [32]byte {
+	return crypto.XOnlyPubKeyFromSecret([32]byte{seed})
 }
 
 func coinbaseTxForConsensusTest(height uint64, outputs []types.TxOutput) types.Transaction {
@@ -38,15 +37,15 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: []types.TxOutput{{ValueAtoms: value - fee, KeyHash: consensusTestKeyHash(recipientSeed)}},
+			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: consensusTestPubKey(recipientSeed)}},
 		},
 	}
 	msg, err := Sighash(&tx, 0, []uint64{value})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubKey, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
-	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
 	return tx
 }
 
@@ -59,12 +58,11 @@ func TestTxIDAndAuthIDAreStable(t *testing.T) {
 			}},
 			Outputs: []types.TxOutput{{
 				ValueAtoms: 10,
-				KeyHash:    [32]byte{9},
+				PubKey:     consensusTestPubKey(9),
 			}},
 		},
 		Auth: types.TxAuth{
 			Entries: []types.TxAuthEntry{{
-				PubKey:    [32]byte{3},
 				Signature: [64]byte{4},
 			}},
 		},
@@ -203,12 +201,11 @@ func TestBuildBlockRootsMatchesDirectComputation(t *testing.T) {
 				}},
 				Outputs: []types.TxOutput{{
 					ValueAtoms: uint64(i + 10),
-					KeyHash:    [32]byte{byte(i + 2)},
+					PubKey:     consensusTestPubKey(byte(i + 2)),
 				}},
 			},
 			Auth: types.TxAuth{
 				Entries: []types.TxAuthEntry{{
-					PubKey:    [32]byte{byte(i + 3)},
 					Signature: [64]byte{byte(i + 4)},
 				}},
 			},
@@ -241,13 +238,20 @@ func TestBuildBlockRootsMatchesDirectComputation(t *testing.T) {
 	}
 }
 
+func TestMedianTimePastUsesMedianOfLastElevenTimestamps(t *testing.T) {
+	timestamps := []uint64{100, 70, 90, 110, 80, 60, 120, 50, 130, 40, 140}
+	if got, want := MedianTimePast(timestamps), uint64(90); got != want {
+		t.Fatalf("median time past = %d, want %d", got, want)
+	}
+}
+
 func TestValidateSignedSpend(t *testing.T) {
 	seed := [32]byte{7}
 	msgPub, _ := crypto.SignSchnorrForTest(seed, &[32]byte{})
 	utxos := UtxoSet{
 		types.OutPoint{TxID: [32]byte{2}, Vout: 0}: {
 			ValueAtoms: 50,
-			KeyHash:    crypto.KeyHash(&msgPub),
+			PubKey:     msgPub,
 		},
 	}
 	tx := types.Transaction{
@@ -258,7 +262,7 @@ func TestValidateSignedSpend(t *testing.T) {
 			}},
 			Outputs: []types.TxOutput{{
 				ValueAtoms: 40,
-				KeyHash:    [32]byte{8},
+				PubKey:     consensusTestPubKey(8),
 			}},
 		},
 	}
@@ -266,8 +270,8 @@ func TestValidateSignedSpend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubKey, sig := crypto.SignSchnorrForTest(seed, &msg)
-	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{PubKey: pubKey, Signature: sig}}}
+	_, sig := crypto.SignSchnorrForTest(seed, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
 	summary, err := ValidateTx(&tx, utxos, DefaultConsensusRules())
 	if err != nil {
 		t.Fatalf("validate tx: %v", err)
@@ -315,12 +319,12 @@ func TestComputedUTXORootOrderInvariant(t *testing.T) {
 	a := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
 	b := types.OutPoint{TxID: [32]byte{2}, Vout: 1}
 	left := UtxoSet{
-		a: {ValueAtoms: 10, KeyHash: [32]byte{1}},
-		b: {ValueAtoms: 20, KeyHash: [32]byte{2}},
+		a: {ValueAtoms: 10, PubKey: consensusTestPubKey(1)},
+		b: {ValueAtoms: 20, PubKey: consensusTestPubKey(2)},
 	}
 	right := UtxoSet{
-		b: {ValueAtoms: 20, KeyHash: [32]byte{2}},
-		a: {ValueAtoms: 10, KeyHash: [32]byte{1}},
+		b: {ValueAtoms: 20, PubKey: consensusTestPubKey(2)},
+		a: {ValueAtoms: 10, PubKey: consensusTestPubKey(1)},
 	}
 	if ComputedUTXORoot(left) != ComputedUTXORoot(right) {
 		t.Fatal("utxo root should be order-invariant")
@@ -329,9 +333,9 @@ func TestComputedUTXORootOrderInvariant(t *testing.T) {
 
 func TestComputedUTXORootMatchesAccumulatorRoot(t *testing.T) {
 	utxos := UtxoSet{
-		types.OutPoint{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 10, KeyHash: [32]byte{1}},
-		types.OutPoint{TxID: [32]byte{2}, Vout: 1}: {ValueAtoms: 20, KeyHash: [32]byte{2}},
-		types.OutPoint{TxID: [32]byte{3}, Vout: 2}: {ValueAtoms: 30, KeyHash: [32]byte{3}},
+		types.OutPoint{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 10, PubKey: consensusTestPubKey(1)},
+		types.OutPoint{TxID: [32]byte{2}, Vout: 1}: {ValueAtoms: 20, PubKey: consensusTestPubKey(2)},
+		types.OutPoint{TxID: [32]byte{3}, Vout: 2}: {ValueAtoms: 30, PubKey: consensusTestPubKey(3)},
 	}
 	acc, err := UtxoAccumulator(utxos)
 	if err != nil {
@@ -425,11 +429,11 @@ func mineHeaderForTest(header types.BlockHeader) types.BlockHeader {
 func TestCoinbaseOnlyBlockValidatesOnRegtest(t *testing.T) {
 	params := RegtestParams()
 	genesisTx := types.Transaction{
-		Base: coinbaseTxForConsensusTest(0, []types.TxOutput{{ValueAtoms: 50, KeyHash: [32]byte{7}}}).Base,
+		Base: coinbaseTxForConsensusTest(0, []types.TxOutput{{ValueAtoms: 50, PubKey: consensusTestPubKey(7)}}).Base,
 	}
 	genesisTxID := TxID(&genesisTx)
 	genesisUTXOs := UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, KeyHash: [32]byte{7}},
+		types.OutPoint{TxID: genesisTxID, Vout: 0}: {ValueAtoms: 50, PubKey: consensusTestPubKey(7)},
 	}
 	genesisHeader := types.BlockHeader{
 		Version:        1,
@@ -441,10 +445,10 @@ func TestCoinbaseOnlyBlockValidatesOnRegtest(t *testing.T) {
 	}
 	prev := PrevBlockContext{Height: 0, Header: genesisHeader}
 
-	blockTx := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{3}}})
+	blockTx := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(3)}})
 	nextUTXOs := cloneUtxos(genesisUTXOs)
 	blockTxID := TxID(&blockTx)
-	nextUTXOs[types.OutPoint{TxID: blockTxID, Vout: 0}] = UtxoEntry{ValueAtoms: 1, KeyHash: [32]byte{3}}
+	nextUTXOs[types.OutPoint{TxID: blockTxID, Vout: 0}] = UtxoEntry{ValueAtoms: 1, PubKey: consensusTestPubKey(3)}
 
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
@@ -480,7 +484,7 @@ func TestUTXORootMismatchRejects(t *testing.T) {
 			NBits:         params.GenesisBits,
 		},
 		Txs: []types.Transaction{{
-			Base: coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{1}}}).Base,
+			Base: coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(1)}}).Base,
 		}},
 	}
 	txid := TxID(&block.Txs[0])
@@ -493,13 +497,127 @@ func TestUTXORootMismatchRejects(t *testing.T) {
 	}
 }
 
+func TestValidateAndApplyBlockRejectsMerkleTxIDMismatch(t *testing.T) {
+	params := RegtestParams()
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(3)}})
+	coinbaseTxID := TxID(&coinbase)
+	utxos := UtxoSet{
+		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: 1, PubKey: consensusTestPubKey(3)},
+	}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: [32]byte{0xaa},
+			MerkleAuthRoot: specMerkleRootForTest([][32]byte{AuthID(&coinbase)}),
+			UTXORoot:       ComputedUTXORoot(utxos),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: []types.Transaction{coinbase},
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
+	if !errors.Is(err, ErrMerkleTxIDMismatch) {
+		t.Fatalf("expected merkle txid mismatch, got %v", err)
+	}
+}
+
+func TestValidateAndApplyBlockRejectsMerkleAuthMismatch(t *testing.T) {
+	params := RegtestParams()
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(4)}})
+	coinbaseTxID := TxID(&coinbase)
+	utxos := UtxoSet{
+		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: 1, PubKey: consensusTestPubKey(4)},
+	}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: specMerkleRootForTest([][32]byte{coinbaseTxID}),
+			MerkleAuthRoot: [32]byte{0xbb},
+			UTXORoot:       ComputedUTXORoot(utxos),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: []types.Transaction{coinbase},
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
+	if !errors.Is(err, ErrMerkleAuthMismatch) {
+		t.Fatalf("expected merkle auth mismatch, got %v", err)
+	}
+}
+
+func TestValidateAndApplyBlockRejectsCoinbaseOverpay(t *testing.T) {
+	params := RegtestParams()
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{
+		ValueAtoms: params.InitialSubsidyAtoms + 1,
+		PubKey:     consensusTestPubKey(5),
+	}})
+	coinbaseTxID := TxID(&coinbase)
+	utxos := UtxoSet{
+		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: params.InitialSubsidyAtoms + 1, PubKey: consensusTestPubKey(5)},
+	}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: specMerkleRootForTest([][32]byte{coinbaseTxID}),
+			MerkleAuthRoot: specMerkleRootForTest([][32]byte{AuthID(&coinbase)}),
+			UTXORoot:       ComputedUTXORoot(utxos),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: []types.Transaction{coinbase},
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
+	if !errors.Is(err, ErrCoinbaseOverpay) {
+		t.Fatalf("expected coinbase overpay, got %v", err)
+	}
+}
+
 func TestValidateAndApplyBlockRejectsNonLTOROrder(t *testing.T) {
 	params := RegtestParams()
 	firstPrev := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
 	secondPrev := types.OutPoint{TxID: [32]byte{2}, Vout: 0}
 	utxos := UtxoSet{
-		firstPrev:  {ValueAtoms: 50, KeyHash: consensusTestKeyHash(1)},
-		secondPrev: {ValueAtoms: 50, KeyHash: consensusTestKeyHash(2)},
+		firstPrev:  {ValueAtoms: 50, PubKey: consensusTestPubKey(1)},
+		secondPrev: {ValueAtoms: 50, PubKey: consensusTestPubKey(2)},
 	}
 	prevHeader := types.BlockHeader{
 		Version:   1,
@@ -515,7 +633,7 @@ func TestValidateAndApplyBlockRejectsNonLTOROrder(t *testing.T) {
 	if bytes.Compare(txAID[:], txBID[:]) < 0 {
 		ordered = []types.Transaction{txB, txA}
 	}
-	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{9}}})
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(9)}})
 	txs := append([]types.Transaction{coinbase}, ordered...)
 	_, _, txRoot, authRoot := BuildBlockRoots(txs)
 
@@ -526,13 +644,13 @@ func TestValidateAndApplyBlockRejectsNonLTOROrder(t *testing.T) {
 		txid := TxID(&tx)
 		nextUTXOs[types.OutPoint{TxID: txid, Vout: 0}] = UtxoEntry{
 			ValueAtoms: tx.Base.Outputs[0].ValueAtoms,
-			KeyHash:    tx.Base.Outputs[0].KeyHash,
+			PubKey:     tx.Base.Outputs[0].PubKey,
 		}
 	}
 	coinbaseTxID := TxID(&coinbase)
 	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntry{
 		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
-		KeyHash:    coinbase.Base.Outputs[0].KeyHash,
+		PubKey:     coinbase.Base.Outputs[0].PubKey,
 	}
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
@@ -562,7 +680,7 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	params := RegtestParams()
 	prevOut := types.OutPoint{TxID: [32]byte{5}, Vout: 0}
 	utxos := UtxoSet{
-		prevOut: {ValueAtoms: 50, KeyHash: consensusTestKeyHash(5)},
+		prevOut: {ValueAtoms: 50, PubKey: consensusTestPubKey(5)},
 	}
 	prevHeader := types.BlockHeader{
 		Version:   1,
@@ -592,7 +710,7 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	if !foundLTORPair {
 		t.Fatal("failed to construct LTOR-compliant same-block spend fixture")
 	}
-	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{8}}})
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(8)}})
 	txs := []types.Transaction{coinbase, parent, child}
 	txids, _, txRoot, authRoot := BuildBlockRoots(txs)
 
@@ -602,12 +720,12 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	childTxID := txids[2]
 	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntry{
 		ValueAtoms: child.Base.Outputs[0].ValueAtoms,
-		KeyHash:    child.Base.Outputs[0].KeyHash,
+		PubKey:     child.Base.Outputs[0].PubKey,
 	}
 	coinbaseTxID := txids[0]
 	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntry{
 		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
-		KeyHash:    coinbase.Base.Outputs[0].KeyHash,
+		PubKey:     coinbase.Base.Outputs[0].PubKey,
 	}
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
@@ -643,6 +761,73 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	}
 }
 
+func TestValidateAndApplyBlockRejectsInvalidSignatureAcrossBatch(t *testing.T) {
+	params := RegtestParams()
+	firstPrev := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
+	secondPrev := types.OutPoint{TxID: [32]byte{2}, Vout: 0}
+	utxos := UtxoSet{
+		firstPrev:  {ValueAtoms: 50, PubKey: consensusTestPubKey(1)},
+		secondPrev: {ValueAtoms: 50, PubKey: consensusTestPubKey(2)},
+	}
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	txA := signedSpendTxForConsensusTest(t, 1, firstPrev, 50, 3, 1)
+	txB := signedSpendTxForConsensusTest(t, 2, secondPrev, 50, 4, 1)
+	txAID := TxID(&txA)
+	txBID := TxID(&txB)
+	ordered := []types.Transaction{txA, txB}
+	if bytes.Compare(txAID[:], txBID[:]) >= 0 {
+		ordered = []types.Transaction{txB, txA}
+	}
+	ordered[1].Auth.Entries[0].Signature[0] ^= 0xff
+
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 2, PubKey: consensusTestPubKey(9)}})
+	txs := append([]types.Transaction{coinbase}, ordered...)
+	txids, _, txRoot, authRoot := BuildBlockRoots(txs)
+
+	nextUTXOs := cloneUtxos(utxos)
+	delete(nextUTXOs, firstPrev)
+	delete(nextUTXOs, secondPrev)
+	for i := 1; i < len(txs); i++ {
+		txid := txids[i]
+		nextUTXOs[types.OutPoint{TxID: txid, Vout: 0}] = UtxoEntry{
+			ValueAtoms: txs[i].Base.Outputs[0].ValueAtoms,
+			PubKey:     txs[i].Base.Outputs[0].PubKey,
+		}
+	}
+	coinbaseTxID := txids[0]
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntry{
+		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
+		PubKey:     coinbase.Base.Outputs[0].PubKey,
+	}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: txRoot,
+			MerkleAuthRoot: authRoot,
+			UTXORoot:       ComputedUTXORoot(nextUTXOs),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: txs,
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), cloneUtxos(utxos), params, DefaultConsensusRules())
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("expected invalid signature, got %v", err)
+	}
+}
+
 func TestValidateAndApplyBlockRejectsCoinbaseHeightMismatch(t *testing.T) {
 	params := RegtestParams()
 	prevHeader := types.BlockHeader{
@@ -651,10 +836,10 @@ func TestValidateAndApplyBlockRejectsCoinbaseHeightMismatch(t *testing.T) {
 		NBits:     params.GenesisBits,
 	}
 	prev := PrevBlockContext{Height: 0, Header: prevHeader}
-	blockTx := coinbaseTxForConsensusTest(2, []types.TxOutput{{ValueAtoms: 1, KeyHash: [32]byte{3}}})
+	blockTx := coinbaseTxForConsensusTest(2, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(3)}})
 	blockTxID := TxID(&blockTx)
 	nextUTXOs := UtxoSet{
-		types.OutPoint{TxID: blockTxID, Vout: 0}: {ValueAtoms: 1, KeyHash: [32]byte{3}},
+		types.OutPoint{TxID: blockTxID, Vout: 0}: {ValueAtoms: 1, PubKey: consensusTestPubKey(3)},
 	}
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
@@ -677,6 +862,30 @@ func TestValidateAndApplyBlockRejectsCoinbaseHeightMismatch(t *testing.T) {
 	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
 	if !errors.Is(err, ErrCoinbaseHeightInvalid) {
 		t.Fatalf("expected coinbase height error, got %v", err)
+	}
+}
+
+func TestValidateTxRejectsDuplicateInputs(t *testing.T) {
+	prevOut := types.OutPoint{TxID: [32]byte{7}, Vout: 0}
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs: []types.TxInput{
+				{PrevOut: prevOut},
+				{PrevOut: prevOut},
+			},
+			Outputs: []types.TxOutput{{ValueAtoms: 10, PubKey: consensusTestPubKey(9)}},
+		},
+		Auth: types.TxAuth{Entries: []types.TxAuthEntry{
+			{Signature: [64]byte{1}},
+			{Signature: [64]byte{2}},
+		}},
+	}
+	_, err := ValidateTx(&tx, UtxoSet{
+		prevOut: {ValueAtoms: 20, PubKey: consensusTestPubKey(7)},
+	}, DefaultConsensusRules())
+	if !errors.Is(err, ErrDuplicateInput) {
+		t.Fatalf("expected duplicate input error, got %v", err)
 	}
 }
 
@@ -720,6 +929,52 @@ func TestValidateHeaderRejectsPrevHashMismatch(t *testing.T) {
 	err := ValidateHeader(&header, PrevBlockContext{Height: 0, Header: prev}, params)
 	if !errors.Is(err, ErrPrevHashMismatch) {
 		t.Fatalf("expected prev hash mismatch, got %v", err)
+	}
+}
+
+func TestValidateHeaderRejectsTimestampAtOrBelowMedianTimePast(t *testing.T) {
+	params := RegtestParams()
+	prev := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	header := types.BlockHeader{
+		Version:       1,
+		PrevBlockHash: HeaderHash(&prev),
+		Timestamp:     100,
+		NBits:         params.GenesisBits,
+	}
+	err := ValidateHeader(&header, PrevBlockContext{
+		Height:         0,
+		Header:         prev,
+		MedianTimePast: 100,
+	}, params)
+	if !errors.Is(err, ErrTimestampTooEarly) {
+		t.Fatalf("expected timestamp-too-early error, got %v", err)
+	}
+}
+
+func TestValidateHeaderAcceptsTimestampAboveMedianTimePast(t *testing.T) {
+	params := RegtestParams()
+	prev := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	header := types.BlockHeader{
+		Version:       1,
+		PrevBlockHash: HeaderHash(&prev),
+		Timestamp:     101,
+		NBits:         params.GenesisBits,
+	}
+	header = mineHeaderForTest(header)
+	if err := ValidateHeader(&header, PrevBlockContext{
+		Height:         0,
+		Header:         prev,
+		MedianTimePast: 100,
+	}, params); err != nil {
+		t.Fatalf("ValidateHeader: %v", err)
 	}
 }
 

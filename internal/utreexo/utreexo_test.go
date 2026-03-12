@@ -16,7 +16,7 @@ func testLeaf(txidByte byte, vout uint32, value uint64, keyHashByte byte) UtxoLe
 			Vout: vout,
 		},
 		ValueAtoms: value,
-		KeyHash:    [32]byte{keyHashByte},
+		PubKey:     [32]byte{keyHashByte},
 	}
 }
 
@@ -168,5 +168,69 @@ func TestAccumulatorRejectsDuplicateOutPointInBulkBuild(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected duplicate outpoint error")
+	}
+}
+
+func TestAccumulatorProofVerifiesMembership(t *testing.T) {
+	leaves := []UtxoLeaf{
+		testLeaf(1, 0, 10, 11),
+		testLeaf(2, 1, 20, 22),
+		testLeaf(3, 2, 30, 33),
+	}
+	acc, err := NewAccumulatorFromLeaves(leaves)
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	proof, err := acc.Prove(leaves[1].OutPoint)
+	if err != nil {
+		t.Fatalf("Prove: %v", err)
+	}
+	if !proof.Exists {
+		t.Fatal("expected membership proof")
+	}
+	if proof.ValueAtoms != leaves[1].ValueAtoms || proof.PubKey != leaves[1].PubKey {
+		t.Fatal("membership proof leaf data mismatch")
+	}
+	if !VerifyProof(acc.Root(), proof) {
+		t.Fatal("expected membership proof to verify")
+	}
+}
+
+func TestAccumulatorProofVerifiesExclusion(t *testing.T) {
+	leaves := []UtxoLeaf{
+		testLeaf(1, 0, 10, 11),
+		testLeaf(2, 1, 20, 22),
+	}
+	acc, err := NewAccumulatorFromLeaves(leaves)
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	proof, err := acc.Prove(types.OutPoint{TxID: [32]byte{9}, Vout: 0})
+	if err != nil {
+		t.Fatalf("Prove: %v", err)
+	}
+	if proof.Exists {
+		t.Fatal("expected exclusion proof")
+	}
+	if !VerifyProof(acc.Root(), proof) {
+		t.Fatal("expected exclusion proof to verify")
+	}
+}
+
+func TestAccumulatorProofRejectsTampering(t *testing.T) {
+	acc, err := NewAccumulatorFromLeaves([]UtxoLeaf{
+		testLeaf(1, 0, 10, 11),
+		testLeaf(2, 1, 20, 22),
+	})
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	proof, err := acc.Prove(types.OutPoint{TxID: [32]byte{1}, Vout: 0})
+	if err != nil {
+		t.Fatalf("Prove: %v", err)
+	}
+	proof.ValueAtoms++
+	if VerifyProof(acc.Root(), proof) {
+		t.Fatal("expected tampered proof to fail")
 	}
 }
