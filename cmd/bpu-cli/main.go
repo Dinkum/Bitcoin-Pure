@@ -82,9 +82,46 @@ func run(args []string) error {
 		return runChain(args[1:])
 	case "snapshot":
 		return runSnapshot(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	default:
 		return usageError()
 	}
+}
+
+func runConfig(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing config subcommand")
+	}
+	switch args[0] {
+	case "normalize":
+		return runConfigNormalize(args[1:])
+	default:
+		return errors.New("unknown config subcommand")
+	}
+}
+
+func runConfigNormalize(args []string) error {
+	fs := flag.NewFlagSet("config normalize", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	inPath := fs.String("in", "", "")
+	outPath := fs.String("out", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*outPath) == "" {
+		return errors.New("usage: bpu-cli config normalize --out PATH [--in PATH]")
+	}
+
+	cfg := config.Default()
+	if strings.TrimSpace(*inPath) != "" {
+		loaded, err := config.Load(strings.TrimSpace(*inPath))
+		if err != nil {
+			return err
+		}
+		cfg = loaded
+	}
+	return config.Save(strings.TrimSpace(*outPath), cfg)
 }
 
 func runBench(args []string) error {
@@ -92,34 +129,31 @@ func runBench(args []string) error {
 		return errors.New("missing bench subcommand")
 	}
 	switch args[0] {
-	case "list":
-		for _, scenario := range benchmarks.AvailableScenarios() {
-			fmt.Println(string(scenario))
-		}
-		return nil
-	case "run":
-		return runBenchRun(args[1:])
-	case "suite":
-		return runBenchSuite(args[1:])
+	case "e2e":
+		return runBenchE2E(args[1:])
+	case "micro":
+		return runBenchMicro(args[1:])
 	case "sim":
-		return runBenchSimulation(args[1:])
+		return runBenchSim(args[1:])
 	default:
-		return errors.New("unknown bench subcommand")
+		return errors.New("unknown bench subcommand (supported: e2e, micro, sim; use `go test ./benchmarks -run '^$' -bench ...` for the raw in-process throughput loop)")
 	}
 }
 
-func runBenchRun(args []string) error {
-	fs := flag.NewFlagSet("bench run", flag.ContinueOnError)
+func runBenchE2E(args []string) error {
+	defaults := benchmarks.DefaultE2EOptions()
+	fs := flag.NewFlagSet("bench e2e", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	scenarioRaw := fs.String("scenario", string(benchmarks.DefaultRunOptions().Scenario), "")
-	profileRaw := fs.String("profile", string(benchmarks.DefaultRunOptions().Profile), "")
-	nodes := fs.Int("nodes", benchmarks.DefaultRunOptions().NodeCount, "")
-	topologyRaw := fs.String("topology", string(benchmarks.DefaultRunOptions().Topology), "")
-	txs := fs.Int("txs", benchmarks.DefaultRunOptions().TxCount, "")
-	batchSize := fs.Int("batch-size", benchmarks.DefaultRunOptions().BatchSize, "")
-	txsPerBlock := fs.Int("txs-per-block", benchmarks.DefaultRunOptions().TxsPerBlock, "")
-	txOrigin := fs.String("tx-origin", string(benchmarks.DefaultRunOptions().TxOriginSpread), "")
-	timeout := fs.Duration("timeout", benchmarks.DefaultRunOptions().Timeout, "")
+	profileRaw := fs.String("profile", string(defaults.Profile), "")
+	nodes := fs.Int("nodes", defaults.NodeCount, "")
+	topologyRaw := fs.String("topology", string(defaults.Topology), "")
+	batchSize := fs.Int("batch-size", defaults.BatchSize, "")
+	txsPerBlock := fs.Int("txs-per-block", defaults.TxsPerBlock, "")
+	blocks := fs.Int("blocks", defaults.BlockCount, "")
+	blockInterval := fs.Duration("block-interval", defaults.BlockInterval, "")
+	miningRaw := fs.String("mining", string(defaults.MiningMode), "")
+	txOrigin := fs.String("tx-origin", string(defaults.TxOriginSpread), "")
+	timeout := fs.Duration("timeout", defaults.Timeout, "")
 	reportPath := fs.String("report", "", "")
 	markdownPath := fs.String("markdown", "", "")
 	dbRoot := fs.String("db-root", "", "")
@@ -134,26 +168,28 @@ func runBenchRun(args []string) error {
 		return err
 	}
 	opts := benchmarks.RunOptions{
-		Scenario:       benchmarks.Scenario(*scenarioRaw),
 		Profile:        profile,
 		NodeCount:      *nodes,
 		Topology:       benchmarks.Topology(*topologyRaw),
-		TxCount:        *txs,
 		BatchSize:      *batchSize,
 		TxsPerBlock:    *txsPerBlock,
+		BlockCount:     *blocks,
+		BlockInterval:  *blockInterval,
+		MiningMode:     benchmarks.MiningMode(*miningRaw),
 		TxOriginSpread: benchmarks.TxOriginSpread(*txOrigin),
 		Timeout:        *timeout,
 		DBRoot:         *dbRoot,
 		ProfileDir:     *profileDir,
 		SuppressLogs:   *suppressLogs,
+		ProgressWriter: os.Stderr,
 	}
 
-	report, err := benchmarks.Run(context.Background(), opts)
+	report, err := benchmarks.RunE2E(context.Background(), opts)
 	if err != nil {
 		return err
 	}
 	if *reportPath == "" || *markdownPath == "" {
-		base := filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-"+string(opts.Scenario))
+		base := filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-e2e-"+*miningRaw)
 		if *reportPath == "" {
 			*reportPath = base + ".json"
 		}
@@ -165,7 +201,115 @@ func runBenchRun(args []string) error {
 		return err
 	}
 
-	fmt.Printf("scenario: %s\n", report.Scenario)
+	printBenchmarkReport(report, *reportPath, *markdownPath)
+	return nil
+}
+
+func runBenchMicro(args []string) error {
+	defaults := benchmarks.DefaultMicroBenchOptions()
+	fs := flag.NewFlagSet("bench micro", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	benchRE := fs.String("bench", defaults.Bench, "")
+	count := fs.Int("count", defaults.Count, "")
+	benchtime := fs.String("benchtime", "", "")
+	reportPath := fs.String("report", "", "")
+	markdownPath := fs.String("markdown", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	report, err := benchmarks.RunMicroBenchmarks(context.Background(), benchmarks.MicroBenchOptions{
+		Package:   defaults.Package,
+		Bench:     *benchRE,
+		Count:     *count,
+		Benchtime: *benchtime,
+	})
+	if err != nil {
+		return err
+	}
+	if *reportPath == "" || *markdownPath == "" {
+		defaultJSON, defaultMarkdown := benchmarks.DefaultMicroReportPaths(time.Now().UTC())
+		if *reportPath == "" {
+			*reportPath = defaultJSON
+		}
+		if *markdownPath == "" {
+			*markdownPath = defaultMarkdown
+		}
+	}
+	if err := benchmarks.WriteMicroReportFiles(report, *reportPath, *markdownPath); err != nil {
+		return err
+	}
+	printMicroBenchReport(report, *reportPath, *markdownPath)
+	return nil
+}
+
+func runBenchSim(args []string) error {
+	defaults := benchmarks.DefaultSimulationOptions()
+	fs := flag.NewFlagSet("bench sim", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	nodes := fs.Int("nodes", defaults.NodeCount, "")
+	topology := fs.String("topology", string(defaults.Topology), "")
+	seed := fs.Int64("seed", defaults.Seed, "")
+	txs := fs.Int("txs", defaults.TxCount, "")
+	blocks := fs.Int("blocks", defaults.BlockCount, "")
+	baseLatency := fs.Duration("base-latency", defaults.BaseLatency, "")
+	latencyJitter := fs.Duration("latency-jitter", defaults.LatencyJitter, "")
+	txProcessingDelay := fs.Duration("tx-processing-delay", defaults.TxProcessingDelay, "")
+	blockProcessingDelay := fs.Duration("block-processing-delay", defaults.BlockProcessingDelay, "")
+	txSpacing := fs.Duration("tx-spacing", defaults.TxSpacing, "")
+	blockSpacing := fs.Duration("block-spacing", defaults.BlockSpacing, "")
+	churnEvents := fs.Int("churn-events", defaults.ChurnEvents, "")
+	churnDuration := fs.Duration("churn-duration", defaults.ChurnDuration, "")
+	smallWorldDegree := fs.Int("small-world-degree", defaults.SmallWorldDegree, "")
+	reportPath := fs.String("report", "", "")
+	markdownPath := fs.String("markdown", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	report, err := benchmarks.RunSimulation(context.Background(), benchmarks.SimulationOptions{
+		NodeCount:            *nodes,
+		Topology:             benchmarks.SimulationTopology(*topology),
+		Seed:                 *seed,
+		TxCount:              *txs,
+		BlockCount:           *blocks,
+		BaseLatency:          *baseLatency,
+		LatencyJitter:        *latencyJitter,
+		TxProcessingDelay:    *txProcessingDelay,
+		BlockProcessingDelay: *blockProcessingDelay,
+		TxSpacing:            *txSpacing,
+		BlockSpacing:         *blockSpacing,
+		ChurnEvents:          *churnEvents,
+		ChurnDuration:        *churnDuration,
+		SmallWorldDegree:     *smallWorldDegree,
+	})
+	if err != nil {
+		return err
+	}
+	if *reportPath == "" || *markdownPath == "" {
+		base := filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-sim")
+		if *reportPath == "" {
+			*reportPath = base + ".json"
+		}
+		if *markdownPath == "" {
+			*markdownPath = base + ".md"
+		}
+	}
+	if err := benchmarks.WriteSimulationReportFiles(report, *reportPath, *markdownPath); err != nil {
+		return err
+	}
+	printSimulationReport(report, *reportPath, *markdownPath)
+	return nil
+}
+
+func printBenchmarkReport(report *benchmarks.Report, reportPath, markdownPath string) {
+	fmt.Printf("benchmark: %s\n", report.Benchmark)
+	if report.Mode != "" {
+		fmt.Printf("mode: %s\n", report.Mode)
+	}
+	if report.Mining != "" {
+		fmt.Printf("mining: %s\n", report.Mining)
+	}
 	fmt.Printf("profile: %s\n", report.Profile)
 	fmt.Printf("nodes: %d\n", report.NodeCount)
 	if report.Topology != "" {
@@ -178,150 +322,74 @@ func runBenchRun(args []string) error {
 	if report.TxsPerBlock > 0 {
 		fmt.Printf("txs_per_block: %d\n", report.TxsPerBlock)
 	}
-	if report.TxOriginSpread != "" {
-		fmt.Printf("tx_origin: %s\n", report.TxOriginSpread)
+	if report.Benchmark == string(benchmarks.BenchmarkE2E) && report.TargetBlocks > 0 {
+		fmt.Printf("blocks: %d\n", report.TargetBlocks)
+	}
+	if report.Benchmark == string(benchmarks.BenchmarkE2E) && report.BlockIntervalMS > 0 {
+		fmt.Printf("block_interval_ms: %.2f\n", report.BlockIntervalMS)
+	}
+	if report.Benchmark == string(benchmarks.BenchmarkThroughput) && report.RequestedDurationMS > 0 {
+		fmt.Printf("requested_duration_ms: %.2f\n", report.RequestedDurationMS)
 	}
 	fmt.Printf("admission_tps: %.2f\n", report.AdmissionTPS)
 	fmt.Printf("completion_tps: %.2f\n", report.CompletionTPS)
-	if report.ConfirmedTPS > 0 {
-		fmt.Printf("confirmed_tps: %.2f\n", report.ConfirmedTPS)
+	if report.ConfirmedProcessingTPS > 0 {
+		fmt.Printf("confirmed_processing_tps: %.2f\n", report.ConfirmedProcessingTPS)
+	}
+	if report.ConfirmedWallTPS > 0 {
+		fmt.Printf("confirmed_wall_tps: %.2f\n", report.ConfirmedWallTPS)
+	}
+	if report.SyntheticIntervalTPS > 0 {
+		fmt.Printf("synthetic_interval_tps: %.2f\n", report.SyntheticIntervalTPS)
 	}
 	fmt.Printf("admission_duration_ms: %.2f\n", report.AdmissionDurationMS)
 	fmt.Printf("completion_duration_ms: %.2f\n", report.CompletionDurationMS)
 	if len(report.Profiling.Artifacts) != 0 {
 		fmt.Printf("profile_dir: %s\n", filepath.Dir(report.Profiling.Artifacts[0].Path))
 	}
-	fmt.Printf("report_json: %s\n", *reportPath)
-	fmt.Printf("report_markdown: %s\n", *markdownPath)
+	fmt.Printf("report_json: %s\n", reportPath)
+	fmt.Printf("report_markdown: %s\n", markdownPath)
 	fmt.Println()
 	fmt.Println(benchmarks.RenderASCIISummary(report))
-	return nil
 }
 
-func runBenchSuite(args []string) error {
-	fs := flag.NewFlagSet("bench suite", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	profileRaw := fs.String("profile", string(benchmarks.DefaultSuiteOptions().Profile), "")
-	nodes := fs.Int("nodes", benchmarks.DefaultSuiteOptions().NodeCount, "")
-	txs := fs.Int("txs", benchmarks.DefaultSuiteOptions().TxCount, "")
-	batchSize := fs.Int("batch-size", benchmarks.DefaultSuiteOptions().BatchSize, "")
-	txsPerBlock := fs.Int("txs-per-block", benchmarks.DefaultSuiteOptions().TxsPerBlock, "")
-	txOrigin := fs.String("tx-origin", string(benchmarks.DefaultSuiteOptions().TxOriginSpread), "")
-	timeout := fs.Duration("timeout", benchmarks.DefaultSuiteOptions().Timeout, "")
-	reportDir := fs.String("out", "", "")
-	dbRoot := fs.String("db-root", "", "")
-	profileDir := fs.String("profile-dir", "", "")
-	suppressLogs := fs.Bool("suppress-logs", true, "")
-	if err := fs.Parse(args); err != nil {
-		return err
+func printMicroBenchReport(report *benchmarks.MicroBenchReport, reportPath, markdownPath string) {
+	fmt.Printf("benchmark: micro\n")
+	fmt.Printf("package: %s\n", report.Package)
+	fmt.Printf("bench_regex: %s\n", report.Bench)
+	if report.Count > 0 {
+		fmt.Printf("count: %d\n", report.Count)
 	}
-
-	profile, err := types.ParseChainProfile(*profileRaw)
-	if err != nil {
-		return err
+	if report.Benchtime != "" {
+		fmt.Printf("benchtime: %s\n", report.Benchtime)
 	}
-	opts := benchmarks.SuiteOptions{
-		Profile:        profile,
-		NodeCount:      *nodes,
-		TxCount:        *txs,
-		BatchSize:      *batchSize,
-		TxsPerBlock:    *txsPerBlock,
-		TxOriginSpread: benchmarks.TxOriginSpread(*txOrigin),
-		Timeout:        *timeout,
-		DBRoot:         *dbRoot,
-		ProfileDir:     *profileDir,
-		SuppressLogs:   *suppressLogs,
-	}
-	report, err := benchmarks.RunSuite(context.Background(), opts)
-	if err != nil {
-		return err
-	}
-	if *reportDir == "" {
-		*reportDir = filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-suite")
-	}
-	if err := benchmarks.WriteSuiteReportFiles(report, *reportDir); err != nil {
-		return err
-	}
-
-	fmt.Printf("profile: %s\n", report.Profile)
-	fmt.Printf("cases: %d\n", len(report.Cases))
-	if *profileDir != "" {
-		fmt.Printf("profile_dir: %s\n", *profileDir)
-	}
-	fmt.Printf("report_dir: %s\n", *reportDir)
-	for _, suiteCase := range report.Cases {
-		slug := strings.ReplaceAll(suiteCase.Name, "-", "_")
-		fmt.Printf("%s_admission_tps: %.2f\n", slug, suiteCase.Report.AdmissionTPS)
-		fmt.Printf("%s_completion_tps: %.2f\n", slug, suiteCase.Report.CompletionTPS)
-		if suiteCase.Report.ConfirmedTPS > 0 {
-			fmt.Printf("%s_confirmed_tps: %.2f\n", slug, suiteCase.Report.ConfirmedTPS)
-		}
-	}
+	fmt.Printf("duration_ms: %.2f\n", report.DurationMS)
+	fmt.Printf("report_json: %s\n", reportPath)
+	fmt.Printf("report_markdown: %s\n", markdownPath)
 	fmt.Println()
-	fmt.Println(benchmarks.RenderSuiteASCIISummary(report))
-	return nil
+	fmt.Println("microbenchmarks:")
+	for _, bench := range report.Benchmarks {
+		name := bench.Name
+		if bench.Procs > 0 {
+			name = fmt.Sprintf("%s (P=%d)", name, bench.Procs)
+		}
+		fmt.Printf("  - %s: %.0f ns/op, %.0f B/op, %.0f allocs/op\n", name, bench.NsPerOp, bench.BytesPerOp, bench.AllocsPerOp)
+	}
 }
 
-func runBenchSimulation(args []string) error {
-	fs := flag.NewFlagSet("bench sim", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	topologyRaw := fs.String("topology", string(benchmarks.DefaultSimulationOptions().Topology), "")
-	nodes := fs.Int("nodes", benchmarks.DefaultSimulationOptions().NodeCount, "")
-	seed := fs.Int64("seed", benchmarks.DefaultSimulationOptions().Seed, "")
-	txs := fs.Int("txs", benchmarks.DefaultSimulationOptions().TxCount, "")
-	blocks := fs.Int("blocks", benchmarks.DefaultSimulationOptions().BlockCount, "")
-	baseLatency := fs.Duration("base-latency", benchmarks.DefaultSimulationOptions().BaseLatency, "")
-	latencyJitter := fs.Duration("latency-jitter", benchmarks.DefaultSimulationOptions().LatencyJitter, "")
-	txProcessing := fs.Duration("tx-processing", benchmarks.DefaultSimulationOptions().TxProcessingDelay, "")
-	blockProcessing := fs.Duration("block-processing", benchmarks.DefaultSimulationOptions().BlockProcessingDelay, "")
-	txSpacing := fs.Duration("tx-spacing", benchmarks.DefaultSimulationOptions().TxSpacing, "")
-	blockSpacing := fs.Duration("block-spacing", benchmarks.DefaultSimulationOptions().BlockSpacing, "")
-	churnEvents := fs.Int("churn-events", benchmarks.DefaultSimulationOptions().ChurnEvents, "")
-	churnDuration := fs.Duration("churn-duration", benchmarks.DefaultSimulationOptions().ChurnDuration, "")
-	smallWorldDegree := fs.Int("small-world-degree", benchmarks.DefaultSimulationOptions().SmallWorldDegree, "")
-	reportDir := fs.String("out", "", "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	report, err := benchmarks.RunSimulation(context.Background(), benchmarks.SimulationOptions{
-		NodeCount:            *nodes,
-		Topology:             benchmarks.SimulationTopology(*topologyRaw),
-		Seed:                 *seed,
-		TxCount:              *txs,
-		BlockCount:           *blocks,
-		BaseLatency:          *baseLatency,
-		LatencyJitter:        *latencyJitter,
-		TxProcessingDelay:    *txProcessing,
-		BlockProcessingDelay: *blockProcessing,
-		TxSpacing:            *txSpacing,
-		BlockSpacing:         *blockSpacing,
-		ChurnEvents:          *churnEvents,
-		ChurnDuration:        *churnDuration,
-		SmallWorldDegree:     *smallWorldDegree,
-	})
-	if err != nil {
-		return err
-	}
-	if *reportDir == "" {
-		*reportDir = filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-simulation")
-	}
-	if err := benchmarks.WriteSimulationReportDir(report, *reportDir); err != nil {
-		return err
-	}
-
-	fmt.Printf("topology: %s\n", report.Config.Topology)
+func printSimulationReport(report *benchmarks.SimulationReport, reportPath, markdownPath string) {
+	fmt.Printf("benchmark: sim\n")
 	fmt.Printf("nodes: %d\n", report.Config.NodeCount)
+	fmt.Printf("topology: %s\n", report.Config.Topology)
 	fmt.Printf("seed: %d\n", report.Config.Seed)
-	fmt.Printf("tx_items: %d\n", report.Config.TxCount)
-	fmt.Printf("block_items: %d\n", report.Config.BlockCount)
-	fmt.Printf("tx_p95_to_90pct_ms: %.2f\n", report.Summary.Tx.P95TargetMS)
-	fmt.Printf("block_p95_to_90pct_ms: %.2f\n", report.Summary.Block.P95TargetMS)
-	fmt.Printf("message_drops: %d\n", report.Summary.Messages.Dropped)
-	fmt.Printf("report_dir: %s\n", *reportDir)
+	fmt.Printf("tx_count: %d\n", report.Config.TxCount)
+	fmt.Printf("block_count: %d\n", report.Config.BlockCount)
+	fmt.Printf("base_latency_ms: %.2f\n", report.Config.BaseLatencyMS)
+	fmt.Printf("latency_jitter_ms: %.2f\n", report.Config.LatencyJitterMS)
+	fmt.Printf("report_json: %s\n", reportPath)
+	fmt.Printf("report_markdown: %s\n", markdownPath)
 	fmt.Println()
 	fmt.Println(benchmarks.RenderSimulationASCIISummary(report))
-	return nil
 }
 
 func runServe(args []string) error {
@@ -350,6 +418,7 @@ func runServe(args []string) error {
 	stallTimeout := fs.Duration("stall-timeout", 0, "")
 	maxMessageBytes := fs.Int("max-message-bytes", 0, "")
 	minRelayFeePerByte := fs.Uint64("min-relay-fee-per-byte", 0, "")
+	maxMempoolBytes := fs.Int("max-mempool-bytes", 0, "")
 	avalancheMode := fs.String("avalanche", "", "")
 	dandelionMode := fs.String("dandelion", "", "")
 	avalancheK := fs.Int("avalanche-k", 0, "")
@@ -367,8 +436,13 @@ func runServe(args []string) error {
 
 	cfg := config.Default()
 	resolvedConfigPath := strings.TrimSpace(*configPath)
-	if resolvedConfigPath == "" && fileExists("/etc/bitcoin-pure/config.json") {
-		resolvedConfigPath = "/etc/bitcoin-pure/config.json"
+	if resolvedConfigPath == "" {
+		for _, candidate := range config.DefaultPathCandidates() {
+			if fileExists(candidate) {
+				resolvedConfigPath = candidate
+				break
+			}
+		}
 	}
 	if resolvedConfigPath != "" {
 		loaded, err := config.Load(resolvedConfigPath)
@@ -443,6 +517,9 @@ func runServe(args []string) error {
 	if *minRelayFeePerByte > 0 {
 		cfg.MinRelayFeePerByte = *minRelayFeePerByte
 	}
+	if *maxMempoolBytes > 0 {
+		cfg.MaxMempoolBytes = *maxMempoolBytes
+	}
 	if *avalancheMode != "" {
 		switch strings.ToLower(strings.TrimSpace(*avalancheMode)) {
 		case "on", "off":
@@ -500,6 +577,9 @@ func runServe(args []string) error {
 	profile, err := types.ParseChainProfile(cfg.Profile)
 	if err != nil {
 		return err
+	}
+	if profile == types.BenchNet {
+		return errors.New("benchnet is benchmark-only; use `bpu-cli bench ...` instead of `serve`")
 	}
 	if cfg.GenesisFixture == "" {
 		cfg.GenesisFixture = defaultGenesisFixture(profile)
@@ -564,6 +644,7 @@ func runServe(args []string) error {
 		StallTimeout:              time.Duration(cfg.StallTimeoutMS) * time.Millisecond,
 		MaxMessageBytes:           cfg.MaxMessageBytes,
 		MinRelayFeePerByte:        cfg.MinRelayFeePerByte,
+		MaxMempoolBytes:           cfg.MaxMempoolBytes,
 		MaxAncestors:              cfg.MaxAncestors,
 		MaxDescendants:            cfg.MaxDescendants,
 		MaxOrphans:                cfg.MaxOrphans,
@@ -593,6 +674,7 @@ func runServe(args []string) error {
 		slog.Int("max_outbound_peers", cfg.MaxOutboundPeers),
 		slog.Int("max_ancestors", cfg.MaxAncestors),
 		slog.Int("max_descendants", cfg.MaxDescendants),
+		slog.Int("max_mempool_bytes", cfg.MaxMempoolBytes),
 		slog.Int("max_orphans", cfg.MaxOrphans),
 		slog.String("avalanche_mode", cfg.AvalancheMode),
 		slog.Bool("dandelion_enabled", cfg.DandelionEnabled),
@@ -1539,6 +1621,8 @@ func loadGenesisFixture(profile types.ChainProfile) (*loadedGenesisFixture, erro
 		return loadGenesisFixtureFromPath("fixtures/genesis/regtest_medium.json")
 	case types.RegtestHard:
 		return loadGenesisFixtureFromPath("fixtures/genesis/regtest_hard.json")
+	case types.BenchNet:
+		return nil, errors.New("benchnet genesis is generated by the benchmark harness")
 	default:
 		return nil, fmt.Errorf("unsupported profile: %s", profile)
 	}
@@ -1702,8 +1786,13 @@ func (c *cliRPCClient) Call(method string, params any, out any) error {
 func resolveCLIConfig(configPath string) (config.Config, string, error) {
 	cfg := config.Default()
 	resolved := strings.TrimSpace(configPath)
-	if resolved == "" && fileExists("/etc/bitcoin-pure/config.json") {
-		resolved = "/etc/bitcoin-pure/config.json"
+	if resolved == "" {
+		for _, candidate := range config.DefaultPathCandidates() {
+			if fileExists(candidate) {
+				resolved = candidate
+				break
+			}
+		}
 	}
 	if resolved == "" {
 		return cfg, "", nil
@@ -1999,7 +2088,7 @@ func fileExists(path string) bool {
 }
 
 func usageError() error {
-	return errors.New("usage: bpu-cli <serve|bench|wallet|validate-tx|validate-block|chain|snapshot>")
+	return errors.New("usage: bpu-cli <serve|bench|wallet|validate-tx|validate-block|chain|snapshot|config>")
 }
 
 func defaultGenesisFixture(profile types.ChainProfile) string {
@@ -2012,6 +2101,8 @@ func defaultGenesisFixture(profile types.ChainProfile) string {
 		return "fixtures/genesis/regtest_medium.json"
 	case types.RegtestHard:
 		return "fixtures/genesis/regtest_hard.json"
+	case types.BenchNet:
+		return ""
 	default:
 		return ""
 	}

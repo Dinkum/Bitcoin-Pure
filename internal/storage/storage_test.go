@@ -131,6 +131,9 @@ func TestWriteAndLoadChainStateRoundtrip(t *testing.T) {
 	if loaded == nil || loaded.Profile != types.Regtest || loaded.Height != 0 || len(loaded.UTXOs) != 1 {
 		t.Fatal("loaded state mismatch")
 	}
+	if loaded.UTXOChecksum == ([32]byte{}) {
+		t.Fatal("expected stored utxo checksum")
+	}
 	hash := consensus.HeaderHash(&block.Header)
 	gotBlock, err := store.GetBlock(&hash)
 	if err != nil {
@@ -145,6 +148,160 @@ func TestWriteAndLoadChainStateRoundtrip(t *testing.T) {
 	}
 	if index == nil || index.Height != 0 {
 		t.Fatal("block index mismatch")
+	}
+}
+
+func TestFastSyncStateRoundtripAndClear(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, utxos := sampleBlockAndUTXOs()
+	state := &FastSyncState{
+		SnapshotHeight:     3,
+		SnapshotHeaderHash: consensus.HeaderHash(&block.Header),
+		SnapshotUTXORoot:   consensus.ComputedUTXORoot(utxos),
+		SnapshotUTXOCount:  len(utxos),
+	}
+	if err := store.WriteFastSyncState(state, utxos); err != nil {
+		t.Fatalf("WriteFastSyncState: %v", err)
+	}
+
+	loadedState, err := store.LoadFastSyncState()
+	if err != nil {
+		t.Fatalf("LoadFastSyncState: %v", err)
+	}
+	if loadedState == nil || *loadedState != *state {
+		t.Fatalf("loaded fast sync state = %+v, want %+v", loadedState, state)
+	}
+	loadedUTXOs, err := store.LoadFastSyncSnapshotUTXOs()
+	if err != nil {
+		t.Fatalf("LoadFastSyncSnapshotUTXOs: %v", err)
+	}
+	if len(loadedUTXOs) != len(utxos) {
+		t.Fatalf("loaded snapshot utxo count = %d, want %d", len(loadedUTXOs), len(utxos))
+	}
+	if err := store.ClearFastSyncState(); err != nil {
+		t.Fatalf("ClearFastSyncState: %v", err)
+	}
+	loadedState, err = store.LoadFastSyncState()
+	if err != nil {
+		t.Fatalf("LoadFastSyncState after clear: %v", err)
+	}
+	if loadedState != nil {
+		t.Fatalf("expected fast sync state to be cleared, got %+v", loadedState)
+	}
+	loadedUTXOs, err = store.LoadFastSyncSnapshotUTXOs()
+	if err != nil {
+		t.Fatalf("LoadFastSyncSnapshotUTXOs after clear: %v", err)
+	}
+	if loadedUTXOs != nil {
+		t.Fatalf("expected retained snapshot utxos to be cleared, got %d entries", len(loadedUTXOs))
+	}
+}
+
+func TestLocalityIndexTracksAppendAndRewrite(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	genesis, utxos := sampleBlockAndUTXOs()
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesisOutPoint := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	initialState := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      genesis.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}
+	if err := store.WriteFullState(initialState); err != nil {
+		t.Fatalf("WriteFullState: %v", err)
+	}
+
+	secondCoinbase := testCoinbase(1, []types.TxOutput{{ValueAtoms: 25, PubKey: [32]byte{9}}})
+	secondTxID := consensus.TxID(&secondCoinbase)
+	secondOutPoint := types.OutPoint{TxID: secondTxID, Vout: 0}
+	secondBlock := types.Block{
+		Header: types.BlockHeader{
+			PrevBlockHash:  genesis.Header.PrevBlockHash,
+			MerkleTxIDRoot: consensus.MerkleRoot([][32]byte{secondTxID}),
+			MerkleAuthRoot: consensus.MerkleRoot([][32]byte{consensus.AuthID(&secondCoinbase)}),
+			Timestamp:      2,
+			NBits:          genesis.Header.NBits,
+		},
+		Txs: []types.Transaction{secondCoinbase},
+	}
+	work, err := consensus.BlockWork(secondBlock.Header.NBits)
+	if err != nil {
+		t.Fatalf("BlockWork: %v", err)
+	}
+	if err := store.AppendValidatedBlock(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         1,
+		TipHeader:      secondBlock.Header,
+		BlockSizeState: sampleBlockSizeState(),
+	}, &secondBlock, &BlockIndexEntry{
+		Height:         1,
+		ParentHash:     genesis.Header.PrevBlockHash,
+		Header:         secondBlock.Header,
+		ChainWork:      work,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}, nil, nil, map[types.OutPoint]consensus.UtxoEntry{
+		secondOutPoint: {ValueAtoms: 25, PubKey: [32]byte{9}},
+	}); err != nil {
+		t.Fatalf("AppendValidatedBlock: %v", err)
+	}
+
+	ordered, err := store.LoadLocalityOrderedUTXOs(0)
+	if err != nil {
+		t.Fatalf("LoadLocalityOrderedUTXOs: %v", err)
+	}
+	if len(ordered) != 2 {
+		t.Fatalf("locality count = %d, want 2", len(ordered))
+	}
+	if ordered[0].OutPoint != genesisOutPoint || ordered[1].OutPoint != secondOutPoint {
+		t.Fatalf("unexpected locality order after append: %+v", ordered)
+	}
+
+	rewritten := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         1,
+		TipHeader:      secondBlock.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs: consensus.UtxoSet{
+			secondOutPoint: {ValueAtoms: 25, PubKey: [32]byte{9}},
+			types.OutPoint{TxID: [32]byte{33}, Vout: 1}: {ValueAtoms: 10, PubKey: [32]byte{7}},
+		},
+	}
+	if err := store.RewriteFullStateDelta(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         1,
+		TipHeader:      secondBlock.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs: consensus.UtxoSet{
+			genesisOutPoint: utxos[genesisOutPoint],
+			secondOutPoint:  {ValueAtoms: 25, PubKey: [32]byte{9}},
+		},
+	}, rewritten); err != nil {
+		t.Fatalf("RewriteFullStateDelta: %v", err)
+	}
+	ordered, err = store.LoadLocalityOrderedUTXOs(0)
+	if err != nil {
+		t.Fatalf("LoadLocalityOrderedUTXOs after rewrite: %v", err)
+	}
+	if len(ordered) != 2 {
+		t.Fatalf("locality count after rewrite = %d, want 2", len(ordered))
+	}
+	if ordered[0].OutPoint != secondOutPoint {
+		t.Fatalf("expected surviving output to keep earliest locality rank, got %+v", ordered)
 	}
 }
 

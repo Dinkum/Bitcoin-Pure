@@ -1,11 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
   "profile": "regtest",
   "genesis_fixture": "../genesis/regtest.json",
   "chain_fixture": "../chains/regtest_bootstrap.json",
   "height": 2,
   "expected_header_hash_hex": "7b1c19b47fda73a8f1257201b465b8f253627b54d6679ea7a7237d648faebb48",
   "expected_utxo_root_hex": "89937c242d821c308952134a0822e1f5ddc94cb5022ad49f8f35448e09a45b16",
+  "expected_utxo_checksum_hex": "4977f782656d4092e6b47122db4ae985a402445a2daea761b50e08df4575f863",
   "expected_utxo_count": 3,
   "utxos": [
     {

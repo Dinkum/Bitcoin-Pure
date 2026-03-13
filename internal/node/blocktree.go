@@ -22,7 +22,7 @@ type branchStep struct {
 }
 
 func (c *ChainState) Clone() *ChainState {
-	out := NewChainState(c.params.Profile).WithRules(c.rules)
+	out := NewChainState(c.params.Profile).WithRules(c.rules).WithLogger(c.logger)
 	if c.height != nil && c.tipHeader != nil {
 		height := *c.height
 		header := *c.tipHeader
@@ -195,6 +195,9 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 	if err != nil {
 		return consensus.BlockValidationSummary{}, err
 	}
+	if err := p.rejectDeepReorgWhileFastSyncPending(forkHeight); err != nil {
+		return consensus.BlockValidationSummary{}, err
+	}
 	tempState, connectedEntries, undoByHash, createdByHash, summary, err := p.evaluateBranch(steps, forkHeight)
 	if err != nil {
 		return consensus.BlockValidationSummary{}, err
@@ -262,6 +265,17 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 	}
 	p.state = tempState
 	return summary, nil
+}
+
+func (p *PersistentChainState) rejectDeepReorgWhileFastSyncPending(forkHeight uint64) error {
+	fastSyncState, err := p.store.LoadFastSyncState()
+	if err != nil {
+		return err
+	}
+	if fastSyncState != nil && forkHeight < fastSyncState.SnapshotHeight {
+		return fmt.Errorf("%w: fork height %d is below imported snapshot height %d", ErrHistoricalSnapshotVerificationPending, forkHeight, fastSyncState.SnapshotHeight)
+	}
+	return nil
 }
 
 func oldTipHeightForState(state *ChainState) uint64 {

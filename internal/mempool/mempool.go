@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"container/heap"
 	"errors"
+	"math/bits"
 	"sort"
 	"sync"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 )
 
 var (
@@ -18,6 +20,7 @@ var (
 	ErrCoinbaseTx         = errors.New("coinbase transactions are not admitted to mempool")
 	ErrTxTooLarge         = errors.New("transaction exceeds mempool policy size limit")
 	ErrRelayFeeTooLow     = errors.New("transaction fee below relay policy floor")
+	ErrMempoolFull        = errors.New("transaction fee too low to enter full mempool")
 	ErrTooManyAncestors   = errors.New("transaction exceeds mempool ancestor limit")
 	ErrTooManyDescendants = errors.New("transaction exceeds mempool descendant limit")
 )
@@ -25,6 +28,7 @@ var (
 type PoolConfig struct {
 	MinRelayFeePerByte uint64
 	MaxTxSize          int
+	MaxMempoolBytes    int
 	MaxAncestors       int
 	MaxDescendants     int
 	MaxOrphans         int
@@ -34,6 +38,7 @@ func DefaultConfig() PoolConfig {
 	return PoolConfig{
 		MinRelayFeePerByte: 1,
 		MaxTxSize:          1_000_000,
+		MaxMempoolBytes:    64 << 20,
 		MaxAncestors:       256,
 		MaxDescendants:     256,
 		MaxOrphans:         128,
@@ -41,9 +46,20 @@ func DefaultConfig() PoolConfig {
 }
 
 type Entry struct {
-	Tx              types.Transaction
-	TxID            [32]byte
-	Summary         consensus.TxValidationSummary
+	Tx      types.Transaction
+	TxID    [32]byte
+	AuthID  [32]byte
+	Summary consensus.TxValidationSummary
+	// SignatureChecks are prepared once at mempool admission and retained on the
+	// entry for future local reuse, but template selection itself now trusts
+	// admission-validated mempool entries and does not re-run them on every
+	// block build.
+	SignatureChecks []crypto.SchnorrBatchItem
+	// SpentOutPoints and CreatedLeaves are the per-tx accumulator delta. They
+	// are prepared once at admission and copied only into block-selection
+	// snapshots so template assembly can reuse them without rewalking raw tx IO.
+	SpentOutPoints  []types.OutPoint
+	CreatedLeaves   []utreexo.UtxoLeaf
 	Fee             uint64
 	Size            int
 	AddedAt         uint64
@@ -60,6 +76,7 @@ type Entry struct {
 type SnapshotEntry struct {
 	Tx              types.Transaction
 	TxID            [32]byte
+	AuthID          [32]byte
 	Summary         consensus.TxValidationSummary
 	Fee             uint64
 	Size            int
@@ -70,6 +87,12 @@ type SnapshotEntry struct {
 	DescendantCount int
 	DescendantSize  int
 	DescendantFees  uint64
+	// SignatureChecks stay empty in snapshots. Template selection trusts
+	// admission-validated mempool entries and full block validation still
+	// performs real signature verification before acceptance.
+	SignatureChecks []crypto.SchnorrBatchItem
+	SpentOutPoints  []types.OutPoint
+	CreatedLeaves   []utreexo.UtxoLeaf
 }
 
 type AcceptedTx struct {
@@ -96,14 +119,17 @@ type SharedAdmissionView struct {
 }
 
 type PreparedAdmission struct {
-	Tx            types.Transaction
-	TxID          [32]byte
-	Size          int
-	Summary       consensus.TxValidationSummary
-	Parents       map[[32]byte]struct{}
-	Missing       map[types.OutPoint]struct{}
-	View          consensus.UtxoSet
-	SnapshotEpoch uint64
+	Tx              types.Transaction
+	TxID            [32]byte
+	Size            int
+	Summary         consensus.TxValidationSummary
+	SignatureChecks []crypto.SchnorrBatchItem
+	Parents         map[[32]byte]struct{}
+	Missing         map[types.OutPoint]struct{}
+	View            consensus.UtxoSet
+	SnapshotEpoch   uint64
+	PreparedTip     [32]byte
+	HasPreparedTip  bool
 }
 
 type Admission struct {
@@ -137,6 +163,7 @@ type Pool struct {
 	stats      poolStats
 	topByFee   []SnapshotEntry
 	topDirty   bool
+	snapshot   []SnapshotEntry
 }
 
 type orphanEntry struct {
@@ -165,9 +192,33 @@ type packageCandidate struct {
 	Size    int
 }
 
+type evictionPackage struct {
+	Root  [32]byte
+	TxIDs map[[32]byte]struct{}
+	Fee   uint64
+	Size  int
+}
+
+// packageCandidateView freezes a frontier candidate into immutable snapshots so
+// block-template assembly can run outside the mempool lock. The entire view is
+// cached per mempool epoch, so repeated selections do not keep rebuilding it.
+type packageCandidateView struct {
+	TxID    [32]byte
+	Entries []SnapshotEntry
+	Fee     uint64
+	Size    int
+}
+
+type selectionSnapshot struct {
+	candidates       []packageCandidateView
+	wakeByEntry      map[[32]byte][]int
+	hasSharedEntries bool
+}
+
 type selectionCache struct {
 	epoch    uint64
 	frontier candidateHeap
+	snapshot *selectionSnapshot
 }
 
 // candidateHeap keeps the package frontier incrementally ordered without
@@ -267,28 +318,39 @@ func (p *Pool) OrphanCount() int {
 
 func (p *Pool) Snapshot() []SnapshotEntry {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-	entries := make([]SnapshotEntry, 0, len(p.entries))
-	for _, entry := range p.entries {
-		entries = append(entries, SnapshotEntry{
-			Tx:              entry.Tx,
-			TxID:            entry.TxID,
-			Summary:         entry.Summary,
-			Fee:             entry.Fee,
-			Size:            entry.Size,
-			AddedAt:         entry.AddedAt,
-			AncestorCount:   entry.AncestorCount,
-			AncestorSize:    entry.AncestorSize,
-			AncestorFees:    entry.AncestorFees,
-			DescendantCount: entry.DescendantCount,
-			DescendantSize:  entry.DescendantSize,
-			DescendantFees:  entry.DescendantFees,
-		})
+	if p.snapshot != nil {
+		cached := append([]SnapshotEntry(nil), p.snapshot...)
+		p.mu.RUnlock()
+		return cached
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return bytes.Compare(entries[i].TxID[:], entries[j].TxID[:]) < 0
-	})
-	return entries
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snapshot == nil {
+		p.snapshot = p.snapshotLocked()
+	}
+	return append([]SnapshotEntry(nil), p.snapshot...)
+}
+
+// SnapshotShared returns the current mempool snapshot in deterministic txid
+// order without copying the cached slice again. Callers must treat the result
+// as immutable.
+func (p *Pool) SnapshotShared() []SnapshotEntry {
+	p.mu.RLock()
+	if p.snapshot != nil {
+		cached := p.snapshot
+		p.mu.RUnlock()
+		return cached
+	}
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snapshot == nil {
+		p.snapshot = p.snapshotLocked()
+	}
+	return p.snapshot
 }
 
 func (p *Pool) Stats() Stats {
@@ -467,7 +529,11 @@ func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmission
 		return prepared, nil
 	}
 
-	summary, err := consensus.ValidateTx(&tx, liveView, rules)
+	txValidation, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(liveView), rules)
+	if err != nil {
+		return PreparedAdmission{}, err
+	}
+	summary, err := consensus.ValidatePreparedTx(txValidation)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -489,6 +555,7 @@ func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmission
 	}
 
 	prepared.Summary = summary
+	prepared.SignatureChecks = append([]crypto.SchnorrBatchItem(nil), txValidation.SignatureChecks...)
 	return prepared, nil
 }
 
@@ -526,7 +593,11 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 		return prepared, nil
 	}
 
-	summary, err := consensus.ValidateTx(&tx, view, rules)
+	txValidation, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(view), rules)
+	if err != nil {
+		return PreparedAdmission{}, err
+	}
+	summary, err := consensus.ValidatePreparedTx(txValidation)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -548,10 +619,11 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 	}
 
 	prepared.Summary = summary
+	prepared.SignatureChecks = append([]crypto.SchnorrBatchItem(nil), txValidation.SignatureChecks...)
 	return prepared, nil
 }
 
-func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (Admission, error) {
+func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.UtxoSet, chainTipHash [32]byte, rules consensus.ConsensusRules) (Admission, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.entries[prepared.TxID]; ok {
@@ -565,6 +637,26 @@ func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.U
 	}
 	if p.cfg.MaxTxSize > 0 && prepared.Size > p.cfg.MaxTxSize {
 		return Admission{}, ErrTxTooLarge
+	}
+
+	if prepared.SnapshotEpoch == p.epoch && prepared.HasPreparedTip && prepared.PreparedTip == chainTipHash {
+		if len(prepared.Missing) != 0 {
+			evicted := p.storeOrphan(prepared.Tx, prepared.TxID, prepared.Size, prepared.Missing)
+			p.bumpEpochLocked()
+			return Admission{TxID: prepared.TxID, Orphaned: true, EvictedOrphans: evicted}, nil
+		}
+		accepted, err := p.insertValidatedLocked(prepared.Tx, prepared.TxID, prepared.Size, prepared.Summary, prepared.SignatureChecks, prepared.Parents)
+		if err != nil {
+			return Admission{}, err
+		}
+		admission := Admission{
+			TxID:     accepted.TxID,
+			Summary:  accepted.Summary,
+			Accepted: []AcceptedTx{accepted},
+		}
+		admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), consensus.LookupFromSet(chainUtxos), rules)...)
+		p.bumpEpochLocked()
+		return admission, nil
 	}
 
 	view, parents, missing, err := p.resolveInputs(prepared.Tx, consensus.LookupFromSet(chainUtxos))
@@ -645,8 +737,9 @@ func (p *Pool) SelectForBlock(chainUtxos consensus.UtxoSet, rules consensus.Cons
 // tentative block state without materializing the full live set.
 func (p *Pool) SelectForBlockOverlay(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.selectForBlockLocked(baseUtxos, rules, maxTxBytes)
+	snapshot := p.selectionSnapshotLocked()
+	p.mu.Unlock()
+	return p.selectForBlock(baseUtxos, rules, maxTxBytes, snapshot)
 }
 
 // SelectForBlockFromBase builds block candidates against an immutable base UTXO
@@ -672,52 +765,33 @@ func (p *Pool) SelectForBlockInPlace(currentUtxos consensus.UtxoSet, rules conse
 	return selected, totalFees
 }
 
-func (p *Pool) selectForBlockLocked(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
+func (p *Pool) selectForBlock(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, snapshot selectionSnapshot) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
 	preBlockUtxos := consensus.LookupFromSet(baseUtxos)
 	overlay := consensus.NewUtxoOverlay(baseUtxos)
-	selected := make([]SnapshotEntry, 0, len(p.entries))
-	included := make(map[[32]byte]struct{}, len(p.entries))
+	selected := make([]SnapshotEntry, 0, len(snapshot.candidates))
+	included := make(map[[32]byte]struct{}, len(snapshot.candidates))
 	claimed := make(map[types.OutPoint]struct{})
 	usedBytes := 0
 	var totalFees uint64
-
-	pending := append([]packageCandidate(nil), p.cachedPackageCandidatesLocked()...)
-	for len(pending) > 0 {
-		next := make([]packageCandidate, 0, len(pending))
-		progress := false
-		for _, candidate := range pending {
-			filtered := filterCandidateEntries(candidate.Entries, included)
-			if len(filtered) == 0 {
-				continue
-			}
-			filteredSize, filteredFee := packageStats(filtered)
-			if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
-				next = append(next, candidate)
-				continue
-			}
-			if !p.meetsRelayFloor(filteredFee, filteredSize) {
-				continue
-			}
-
-			packageFees, ok := applyCandidatePackage(preBlockUtxos, overlay, claimed, filtered, rules)
-			if !ok {
-				next = append(next, candidate)
-				continue
-			}
-
-			usedBytes += filteredSize
-			totalFees += packageFees
-			for _, entry := range filtered {
-				included[entry.TxID] = struct{}{}
-				selected = append(selected, snapshotForEntry(entry))
-			}
-			progress = true
+	p.runSelectionSnapshot(snapshot, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+		if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
+			return false
 		}
-		if !progress {
-			break
+		if !p.meetsRelayFloor(filteredFee, filteredSize) {
+			return false
 		}
-		pending = next
-	}
+		packageFees, ok := applyCandidatePackageSnapshot(preBlockUtxos, overlay, claimed, filtered, rules)
+		if !ok {
+			return false
+		}
+		usedBytes += filteredSize
+		totalFees += packageFees
+		for _, entry := range filtered {
+			included[entry.TxID] = struct{}{}
+			selected = append(selected, entry)
+		}
+		return true
+	})
 
 	sortSnapshotEntriesByTxID(selected)
 	return selected, totalFees, overlay
@@ -727,9 +801,10 @@ func (p *Pool) selectForBlockLocked(baseUtxos consensus.UtxoSet, rules consensus
 // without forcing the caller to materialize a full post-selection UTXO map.
 func (p *Pool) AppendForBlockOverlay(preBlockUtxos consensus.UtxoSet, currentUtxos *consensus.UtxoOverlay, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	snapshot := p.selectionSnapshotLocked()
+	p.mu.Unlock()
 	preBlockLookup := consensus.LookupFromSet(preBlockUtxos)
-	appendOnly := make([]SnapshotEntry, 0, len(p.entries))
+	appendOnly := make([]SnapshotEntry, 0, len(snapshot.candidates))
 	included := make(map[[32]byte]struct{}, len(selected))
 	claimed := claimedOutPointsForSnapshots(selected)
 	usedBytes := 0
@@ -739,43 +814,25 @@ func (p *Pool) AppendForBlockOverlay(preBlockUtxos consensus.UtxoSet, currentUtx
 	}
 	var totalFees uint64
 
-	pending := append([]packageCandidate(nil), p.cachedPackageCandidatesLocked()...)
-	for len(pending) > 0 {
-		next := make([]packageCandidate, 0, len(pending))
-		progress := false
-		for _, candidate := range pending {
-			filtered := filterCandidateEntries(candidate.Entries, included)
-			if len(filtered) == 0 {
-				continue
-			}
-			filteredSize, filteredFee := packageStats(filtered)
-			if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
-				next = append(next, candidate)
-				continue
-			}
-			if !p.meetsRelayFloor(filteredFee, filteredSize) {
-				continue
-			}
-
-			packageFees, ok := applyCandidatePackage(preBlockLookup, currentUtxos, claimed, filtered, rules)
-			if !ok {
-				next = append(next, candidate)
-				continue
-			}
-
-			usedBytes += filteredSize
-			totalFees += packageFees
-			for _, entry := range filtered {
-				included[entry.TxID] = struct{}{}
-				appendOnly = append(appendOnly, snapshotForEntry(entry))
-			}
-			progress = true
+	p.runSelectionSnapshot(snapshot, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+		if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
+			return false
 		}
-		if !progress {
-			break
+		if !p.meetsRelayFloor(filteredFee, filteredSize) {
+			return false
 		}
-		pending = next
-	}
+		packageFees, ok := applyCandidatePackageSnapshot(preBlockLookup, currentUtxos, claimed, filtered, rules)
+		if !ok {
+			return false
+		}
+		usedBytes += filteredSize
+		totalFees += packageFees
+		for _, entry := range filtered {
+			included[entry.TxID] = struct{}{}
+			appendOnly = append(appendOnly, entry)
+		}
+		return true
+	})
 
 	sortSnapshotEntriesByTxID(appendOnly)
 	return appendOnly, totalFees
@@ -859,28 +916,40 @@ func (p *Pool) PromoteReadyOrphansForBlock(block *types.Block, chainUtxos consen
 }
 
 func (p *Pool) insertResolved(tx types.Transaction, txid [32]byte, size int, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, rules consensus.ConsensusRules) (AcceptedTx, error) {
-	summary, err := consensus.ValidateTx(&tx, utxos, rules)
+	txValidation, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(utxos), rules)
 	if err != nil {
 		return AcceptedTx{}, err
 	}
-	return p.insertValidatedLocked(tx, txid, size, summary, parents)
+	summary, err := consensus.ValidatePreparedTx(txValidation)
+	if err != nil {
+		return AcceptedTx{}, err
+	}
+	return p.insertValidatedLocked(tx, txid, size, summary, append([]crypto.SchnorrBatchItem(nil), txValidation.SignatureChecks...), parents)
 }
 
 func (p *Pool) insertPreparedLocked(prepared PreparedAdmission, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, rules consensus.ConsensusRules) (AcceptedTx, error) {
 	summary := prepared.Summary
-	if len(prepared.Missing) != 0 || !sameTxIDSets(prepared.Parents, parents) || !sameUtxoSets(prepared.View, utxos) {
-		validated, err := consensus.ValidateTx(&prepared.Tx, utxos, rules)
+	signatureChecks := prepared.SignatureChecks
+	if len(prepared.Missing) != 0 || !sameTxIDSets(prepared.Parents, parents) || !sameUtxoSets(prepared.View, utxos) || len(signatureChecks) == 0 {
+		validated, err := consensus.PrepareTxValidationWithLookup(&prepared.Tx, consensus.LookupFromSet(utxos), rules)
 		if err != nil {
 			return AcceptedTx{}, err
 		}
-		summary = validated
+		summary, err = consensus.ValidatePreparedTx(validated)
+		if err != nil {
+			return AcceptedTx{}, err
+		}
+		signatureChecks = append([]crypto.SchnorrBatchItem(nil), validated.SignatureChecks...)
 	}
-	return p.insertValidatedLocked(prepared.Tx, prepared.TxID, prepared.Size, summary, parents)
+	return p.insertValidatedLocked(prepared.Tx, prepared.TxID, prepared.Size, summary, signatureChecks, parents)
 }
 
-func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size int, summary consensus.TxValidationSummary, parents map[[32]byte]struct{}) (AcceptedTx, error) {
+func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size int, summary consensus.TxValidationSummary, signatureChecks []crypto.SchnorrBatchItem, parents map[[32]byte]struct{}) (AcceptedTx, error) {
 	if !p.meetsRelayFloor(summary.Fee, size) {
 		return AcceptedTx{}, ErrRelayFeeTooLow
+	}
+	if err := p.ensureMempoolCapacityLocked(summary.Fee, size, parents); err != nil {
+		return AcceptedTx{}, err
 	}
 
 	ancestorIDs := p.gatherAncestors(parents)
@@ -911,7 +980,11 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 	entry := &Entry{
 		Tx:              tx,
 		TxID:            txid,
+		AuthID:          consensus.AuthID(&tx),
 		Summary:         summary,
+		SignatureChecks: append([]crypto.SchnorrBatchItem(nil), signatureChecks...),
+		SpentOutPoints:  spentOutPointsForInputs(tx.Base.Inputs),
+		CreatedLeaves:   createdLeavesForOutputs(txid, tx.Base.Outputs),
 		Fee:             summary.Fee,
 		Size:            size,
 		AddedAt:         p.sequence,
@@ -1039,7 +1112,7 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLoo
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			PubKey:    output.PubKey,
+			PubKey:     output.PubKey,
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1074,7 +1147,7 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			PubKey:    output.PubKey,
+			PubKey:     output.PubKey,
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1109,7 +1182,7 @@ func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup co
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			PubKey:    output.PubKey,
+			PubKey:     output.PubKey,
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1238,6 +1311,123 @@ func (p *Pool) removeRecursive(roots map[[32]byte]struct{}) {
 	p.removeSelectionCandidatesLocked(remove)
 }
 
+// ensureMempoolCapacityLocked keeps the admitted transaction set within the
+// configured byte cap by evicting the worst-fee descendant packages first. Any
+// mempool parents required by the incoming transaction are protected so package
+// admission cannot evict the chain the newcomer depends on.
+func (p *Pool) ensureMempoolCapacityLocked(incomingFee uint64, incomingSize int, parents map[[32]byte]struct{}) error {
+	maxBytes := p.cfg.MaxMempoolBytes
+	if maxBytes <= 0 {
+		return nil
+	}
+	if incomingSize > maxBytes {
+		return ErrMempoolFull
+	}
+	usedBytes := p.stats.bytes
+	if usedBytes+incomingSize <= maxBytes {
+		return nil
+	}
+
+	protected := p.gatherAncestors(parents)
+	for parentID := range parents {
+		protected[parentID] = struct{}{}
+	}
+
+	bytesNeeded := usedBytes + incomingSize - maxBytes
+	evict, freedBytes, freedFees, ok := p.planEvictionsLocked(bytesNeeded, protected)
+	if !ok {
+		return ErrMempoolFull
+	}
+	if compareFeeRates(incomingFee, incomingSize, freedFees, freedBytes) <= 0 {
+		return ErrMempoolFull
+	}
+	p.removeRecursive(evict)
+	return nil
+}
+
+func (p *Pool) planEvictionsLocked(bytesNeeded int, protected map[[32]byte]struct{}) (map[[32]byte]struct{}, int, uint64, bool) {
+	evict := make(map[[32]byte]struct{})
+	freedBytes := 0
+	var freedFees uint64
+	for freedBytes < bytesNeeded {
+		candidate, ok := p.lowestFeeEvictionPackageLocked(evict, protected)
+		if !ok {
+			return nil, 0, 0, false
+		}
+		for txid := range candidate.TxIDs {
+			evict[txid] = struct{}{}
+		}
+		freedBytes += candidate.Size
+		freedFees += candidate.Fee
+	}
+	return evict, freedBytes, freedFees, true
+}
+
+func (p *Pool) lowestFeeEvictionPackageLocked(excluded, protected map[[32]byte]struct{}) (evictionPackage, bool) {
+	var worst evictionPackage
+	found := false
+	for txid := range p.entries {
+		if _, skip := excluded[txid]; skip {
+			continue
+		}
+		candidate, ok := p.evictionPackageLocked(txid, excluded, protected)
+		if !ok {
+			continue
+		}
+		if !found || evictionPackageLess(candidate, worst) {
+			worst = candidate
+			found = true
+		}
+	}
+	return worst, found
+}
+
+func (p *Pool) evictionPackageLocked(root [32]byte, excluded, protected map[[32]byte]struct{}) (evictionPackage, bool) {
+	if _, skip := excluded[root]; skip {
+		return evictionPackage{}, false
+	}
+	if _, keep := protected[root]; keep {
+		return evictionPackage{}, false
+	}
+	entry := p.entries[root]
+	if entry == nil {
+		return evictionPackage{}, false
+	}
+
+	pkg := evictionPackage{
+		Root:  root,
+		TxIDs: make(map[[32]byte]struct{}),
+	}
+	stack := [][32]byte{root}
+	for len(stack) != 0 {
+		txid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, seen := pkg.TxIDs[txid]; seen {
+			continue
+		}
+		if _, skip := excluded[txid]; skip {
+			continue
+		}
+		if _, keep := protected[txid]; keep {
+			return evictionPackage{}, false
+		}
+		entry := p.entries[txid]
+		if entry == nil {
+			continue
+		}
+		pkg.TxIDs[txid] = struct{}{}
+		pkg.Size += entry.Size
+		pkg.Fee += entry.Fee
+		for child := range entry.Children {
+			stack = append(stack, child)
+		}
+	}
+	if pkg.Size <= 0 {
+		return evictionPackage{}, false
+	}
+	return pkg, true
+}
+
 func (p *Pool) Epoch() uint64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1256,6 +1446,41 @@ func (p *Pool) SelectionCandidateCount() int {
 func (p *Pool) cachedPackageCandidatesLocked() []packageCandidate {
 	p.ensureSelectionLocked()
 	return p.selection.frontier.ordered()
+}
+
+func (p *Pool) selectionSnapshotLocked() selectionSnapshot {
+	if p.selection != nil && p.selection.snapshot != nil {
+		return *p.selection.snapshot
+	}
+	live := p.cachedPackageCandidatesLocked()
+	snapshot := selectionSnapshot{
+		candidates:  make([]packageCandidateView, 0, len(live)),
+		wakeByEntry: make(map[[32]byte][]int, len(p.entries)),
+	}
+	for _, candidate := range live {
+		view := packageCandidateView{
+			TxID:    candidate.TxID,
+			Entries: make([]SnapshotEntry, 0, len(candidate.Entries)),
+			Fee:     candidate.Fee,
+			Size:    candidate.Size,
+		}
+		for _, entry := range candidate.Entries {
+			view.Entries = append(view.Entries, selectionSnapshotForEntry(entry))
+		}
+		idx := len(snapshot.candidates)
+		snapshot.candidates = append(snapshot.candidates, view)
+		for _, entry := range view.Entries {
+			wake := append(snapshot.wakeByEntry[entry.TxID], idx)
+			snapshot.wakeByEntry[entry.TxID] = wake
+			if len(wake) > 1 {
+				snapshot.hasSharedEntries = true
+			}
+		}
+	}
+	if p.selection != nil {
+		p.selection.snapshot = &snapshot
+	}
+	return snapshot
 }
 
 func (p *Pool) packageForSelection(txid [32]byte) []*Entry {
@@ -1284,9 +1509,21 @@ func (p *Pool) packageForSelection(txid [32]byte) []*Entry {
 
 func (p *Pool) bumpEpochLocked() {
 	p.epoch++
+	p.snapshot = nil
 	if p.selection != nil {
 		p.selection.epoch = p.epoch
 	}
+}
+
+func (p *Pool) snapshotLocked() []SnapshotEntry {
+	entries := make([]SnapshotEntry, 0, len(p.entries))
+	for _, entry := range p.entries {
+		entries = append(entries, snapshotForEntry(entry))
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return bytes.Compare(entries[i].TxID[:], entries[j].TxID[:]) < 0
+	})
+	return entries
 }
 
 func (p *Pool) ensureSelectionLocked() {
@@ -1377,6 +1614,7 @@ func (p *Pool) noteEntryRemovedLocked(entry *Entry) {
 
 func (p *Pool) upsertSelectionCandidateLocked(txid [32]byte) {
 	p.ensureSelectionLocked()
+	p.selection.snapshot = nil
 	candidate := p.candidateForTxLocked(txid)
 	if len(candidate.Entries) == 0 {
 		p.selection.frontier.remove(txid)
@@ -1389,6 +1627,7 @@ func (p *Pool) removeSelectionCandidatesLocked(remove map[[32]byte]struct{}) {
 	if p.selection == nil || len(remove) == 0 {
 		return
 	}
+	p.selection.snapshot = nil
 	for txid := range remove {
 		p.selection.frontier.remove(txid)
 	}
@@ -1407,112 +1646,61 @@ func (p *Pool) candidateForTxLocked(txid [32]byte) packageCandidate {
 	return candidate
 }
 
-func filterCandidateEntries(entries []*Entry, included map[[32]byte]struct{}) []*Entry {
-	filtered := make([]*Entry, 0, len(entries))
-	for _, entry := range entries {
+func filterCandidateEntries(candidate packageCandidateView, included map[[32]byte]struct{}) ([]SnapshotEntry, int, uint64) {
+	filtered := make([]SnapshotEntry, 0, len(candidate.Entries))
+	size := 0
+	var fee uint64
+	for _, entry := range candidate.Entries {
 		if _, ok := included[entry.TxID]; ok {
 			continue
 		}
 		filtered = append(filtered, entry)
-	}
-	return filtered
-}
-
-func packageStats(entries []*Entry) (int, uint64) {
-	size := 0
-	var fee uint64
-	for _, entry := range entries {
 		size += entry.Size
 		fee += entry.Fee
 	}
-	return size, fee
+	return filtered, size, fee
 }
 
-type appliedTxUndo struct {
-	spent   map[types.OutPoint]consensus.UtxoEntry
-	created []types.OutPoint
-}
-
-func applyCandidatePackage(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []*Entry, rules consensus.ConsensusRules) (uint64, bool) {
-	undos := make([]appliedTxUndo, 0, len(entries))
-	newlyClaimed := make([]types.OutPoint, 0, len(entries))
-	pendingClaims := make([]types.OutPoint, 0, len(entries))
-	prepared := make([]consensus.PreparedTxValidation, 0, len(entries))
-	signatureChecks := make([]crypto.SchnorrBatchItem, 0, len(entries))
+func applyCandidatePackageSnapshot(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []SnapshotEntry, _ consensus.ConsensusRules) (uint64, bool) {
 	seenPackageClaims := make(map[types.OutPoint]struct{}, len(entries))
 	for _, entry := range entries {
-		for _, input := range entry.Tx.Base.Inputs {
-			if _, ok := claimed[input.PrevOut]; ok {
+		for _, spent := range entry.SpentOutPoints {
+			if _, ok := claimed[spent]; ok {
 				return 0, false
 			}
-			if _, ok := seenPackageClaims[input.PrevOut]; ok {
+			if _, ok := seenPackageClaims[spent]; ok {
 				return 0, false
 			}
-			seenPackageClaims[input.PrevOut] = struct{}{}
-			pendingClaims = append(pendingClaims, input.PrevOut)
+			seenPackageClaims[spent] = struct{}{}
+			if _, ok := preBlockUtxos(spent); !ok {
+				return 0, false
+			}
 		}
-		txValidation, err := consensus.PrepareTxValidationWithLookup(&entry.Tx, preBlockUtxos, rules)
-		if err != nil {
-			return 0, false
-		}
-		prepared = append(prepared, txValidation)
-		signatureChecks = append(signatureChecks, txValidation.SignatureChecks...)
 	}
-	// Batch Schnorr verification is a non-consensus accelerator here: if the
-	// probabilistic batch pass does not clear, fall back to exact verification so
-	// template selection preserves identical acceptance behavior.
-	if !crypto.VerifySchnorrBatchXOnlyWithFallback(signatureChecks) {
-		return 0, false
-	}
+	// Selection runs only over mempool entries that already passed admission
+	// validation. Rechecking signatures here made template build crypto-bound,
+	// while full block validation still performs the authoritative verification
+	// before any locally mined block can be accepted.
 	var totalFees uint64
-	for i, entry := range entries {
-		totalFees += prepared[i].Summary.Fee
-		for _, input := range entry.Tx.Base.Inputs {
-			claimed[input.PrevOut] = struct{}{}
-			newlyClaimed = append(newlyClaimed, input.PrevOut)
+	for _, entry := range entries {
+		totalFees += entry.Summary.Fee
+		for _, spent := range entry.SpentOutPoints {
+			claimed[spent] = struct{}{}
 		}
-		undos = append(undos, applyTxWithUndo(currentUtxos, entry.Tx, entry.TxID))
+		applyTxNoUndo(currentUtxos, entry.SpentOutPoints, entry.CreatedLeaves)
 	}
 	return totalFees, true
 }
 
-func applyTxWithUndo(utxos *consensus.UtxoOverlay, tx types.Transaction, txid [32]byte) appliedTxUndo {
-	undo := appliedTxUndo{
-		spent:   make(map[types.OutPoint]consensus.UtxoEntry, len(tx.Base.Inputs)),
-		created: make([]types.OutPoint, 0, len(tx.Base.Outputs)),
+func applyTxNoUndo(utxos *consensus.UtxoOverlay, spent []types.OutPoint, created []utreexo.UtxoLeaf) {
+	for _, outPoint := range spent {
+		utxos.Spend(outPoint)
 	}
-	for _, input := range tx.Base.Inputs {
-		if entry, ok := utxos.Lookup(input.PrevOut); ok {
-			undo.spent[input.PrevOut] = entry
-		}
-		utxos.Spend(input.PrevOut)
-	}
-	for vout, output := range tx.Base.Outputs {
-		out := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-		utxos.Set(out, consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:    output.PubKey,
+	for _, leaf := range created {
+		utxos.Set(leaf.OutPoint, consensus.UtxoEntry{
+			ValueAtoms: leaf.ValueAtoms,
+			PubKey:     leaf.PubKey,
 		})
-		undo.created = append(undo.created, out)
-	}
-	return undo
-}
-
-func rollbackAppliedPackage(utxos *consensus.UtxoOverlay, undos []appliedTxUndo) {
-	for i := len(undos) - 1; i >= 0; i-- {
-		undo := undos[i]
-		for _, out := range undo.created {
-			utxos.Spend(out)
-		}
-		for out, entry := range undo.spent {
-			utxos.Restore(out, entry)
-		}
-	}
-}
-
-func rollbackClaimedInputs(claimed map[types.OutPoint]struct{}, inputs []types.OutPoint) {
-	for i := len(inputs) - 1; i >= 0; i-- {
-		delete(claimed, inputs[i])
 	}
 }
 
@@ -1686,6 +1874,7 @@ func snapshotForEntry(entry *Entry) SnapshotEntry {
 	return SnapshotEntry{
 		Tx:              entry.Tx,
 		TxID:            entry.TxID,
+		AuthID:          entry.AuthID,
 		Summary:         entry.Summary,
 		Fee:             entry.Fee,
 		Size:            entry.Size,
@@ -1696,6 +1885,64 @@ func snapshotForEntry(entry *Entry) SnapshotEntry {
 		DescendantCount: entry.DescendantCount,
 		DescendantSize:  entry.DescendantSize,
 		DescendantFees:  entry.DescendantFees,
+	}
+}
+
+func selectionSnapshotForEntry(entry *Entry) SnapshotEntry {
+	snapshot := snapshotForEntry(entry)
+	snapshot.SpentOutPoints = append([]types.OutPoint(nil), entry.SpentOutPoints...)
+	snapshot.CreatedLeaves = append([]utreexo.UtxoLeaf(nil), entry.CreatedLeaves...)
+	return snapshot
+}
+
+func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, included map[[32]byte]struct{}, tryInclude func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool) {
+	if len(snapshot.candidates) == 0 {
+		return
+	}
+	if !snapshot.hasSharedEntries {
+		for _, candidate := range snapshot.candidates {
+			filtered, filteredSize, filteredFee := filterCandidateEntries(candidate, included)
+			if len(filtered) == 0 {
+				continue
+			}
+			if !tryInclude(filtered, filteredSize, filteredFee) {
+				continue
+			}
+		}
+		return
+	}
+	queued := make([]bool, len(snapshot.candidates))
+	completed := make([]bool, len(snapshot.candidates))
+	queue := make([]int, 0, len(snapshot.candidates))
+	for idx := range snapshot.candidates {
+		queue = append(queue, idx)
+		queued[idx] = true
+	}
+	for head := 0; head < len(queue); head++ {
+		idx := queue[head]
+		queued[idx] = false
+		if completed[idx] {
+			continue
+		}
+		candidate := snapshot.candidates[idx]
+		filtered, filteredSize, filteredFee := filterCandidateEntries(candidate, included)
+		if len(filtered) == 0 {
+			completed[idx] = true
+			continue
+		}
+		if !tryInclude(filtered, filteredSize, filteredFee) {
+			continue
+		}
+		completed[idx] = true
+		for _, entry := range filtered {
+			for _, wakeIdx := range snapshot.wakeByEntry[entry.TxID] {
+				if completed[wakeIdx] || queued[wakeIdx] {
+					continue
+				}
+				queue = append(queue, wakeIdx)
+				queued[wakeIdx] = true
+			}
+		}
 	}
 }
 
@@ -1782,7 +2029,7 @@ func applyTx(utxos consensus.UtxoSet, tx types.Transaction, txid [32]byte) {
 	for vout, output := range tx.Base.Outputs {
 		utxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
-			PubKey:    output.PubKey,
+			PubKey:     output.PubKey,
 		}
 	}
 }
@@ -1804,11 +2051,37 @@ func cloneUtxos(utxos consensus.UtxoSet) consensus.UtxoSet {
 func claimedOutPointsForSnapshots(entries []SnapshotEntry) map[types.OutPoint]struct{} {
 	claimed := make(map[types.OutPoint]struct{}, len(entries))
 	for _, entry := range entries {
-		for _, input := range entry.Tx.Base.Inputs {
-			claimed[input.PrevOut] = struct{}{}
+		for _, spent := range entry.SpentOutPoints {
+			claimed[spent] = struct{}{}
 		}
 	}
 	return claimed
+}
+
+func spentOutPointsForInputs(inputs []types.TxInput) []types.OutPoint {
+	if len(inputs) == 0 {
+		return nil
+	}
+	spent := make([]types.OutPoint, 0, len(inputs))
+	for _, input := range inputs {
+		spent = append(spent, input.PrevOut)
+	}
+	return spent
+}
+
+func createdLeavesForOutputs(txid [32]byte, outputs []types.TxOutput) []utreexo.UtxoLeaf {
+	if len(outputs) == 0 {
+		return nil
+	}
+	created := make([]utreexo.UtxoLeaf, 0, len(outputs))
+	for vout, output := range outputs {
+		created = append(created, utreexo.UtxoLeaf{
+			OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
+			ValueAtoms: output.ValueAtoms,
+			PubKey:     output.PubKey,
+		})
+	}
+	return created
 }
 
 func copyOutPointSet(in map[types.OutPoint]struct{}) map[types.OutPoint]struct{} {
@@ -1878,6 +2151,52 @@ func topByFeeLess(left, right SnapshotEntry) bool {
 		return false
 	default:
 		return bytes.Compare(left.TxID[:], right.TxID[:]) < 0
+	}
+}
+
+func evictionPackageLess(left, right evictionPackage) bool {
+	switch compareFeeRates(left.Fee, left.Size, right.Fee, right.Size) {
+	case -1:
+		return true
+	case 1:
+		return false
+	}
+	switch {
+	case left.Fee < right.Fee:
+		return true
+	case left.Fee > right.Fee:
+		return false
+	case left.Size < right.Size:
+		return true
+	case left.Size > right.Size:
+		return false
+	default:
+		return bytes.Compare(left.Root[:], right.Root[:]) < 0
+	}
+}
+
+func compareFeeRates(leftFee uint64, leftSize int, rightFee uint64, rightSize int) int {
+	switch {
+	case leftSize <= 0 && rightSize <= 0:
+		return 0
+	case leftSize <= 0:
+		return -1
+	case rightSize <= 0:
+		return 1
+	}
+	leftHi, leftLo := bits.Mul64(leftFee, uint64(rightSize))
+	rightHi, rightLo := bits.Mul64(rightFee, uint64(leftSize))
+	switch {
+	case leftHi < rightHi:
+		return -1
+	case leftHi > rightHi:
+		return 1
+	case leftLo < rightLo:
+		return -1
+	case leftLo > rightLo:
+		return 1
+	default:
+		return 0
 	}
 }
 

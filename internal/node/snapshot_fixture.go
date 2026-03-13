@@ -10,9 +10,10 @@ import (
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utxochecksum"
 )
 
-const UTXOSnapshotFixtureVersion = 1
+const UTXOSnapshotFixtureVersion = 2
 
 type UTXOSnapshotFixture struct {
 	Version               uint32                     `json:"version"`
@@ -22,6 +23,7 @@ type UTXOSnapshotFixture struct {
 	Height                uint64                     `json:"height"`
 	ExpectedHeaderHashHex string                     `json:"expected_header_hash_hex"`
 	ExpectedUTXORootHex   string                     `json:"expected_utxo_root_hex"`
+	ExpectedChecksumHex   string                     `json:"expected_utxo_checksum_hex"`
 	ExpectedUTXOCount     int                        `json:"expected_utxo_count"`
 	UTXOs                 []UTXOSnapshotFixtureEntry `json:"utxos"`
 }
@@ -38,14 +40,17 @@ type LoadedUTXOSnapshotFixture struct {
 	Fixture            UTXOSnapshotFixture
 	ExpectedHeaderHash [32]byte
 	ExpectedUTXORoot   [32]byte
+	ExpectedChecksum   [32]byte
 	UTXOs              consensus.UtxoSet
 	ComputedUTXORoot   [32]byte
+	ComputedChecksum   [32]byte
 }
 
 type SnapshotVerificationSummary struct {
 	Height     uint64
 	HeaderHash [32]byte
 	UTXORoot   [32]byte
+	Checksum   [32]byte
 	UTXOCount  int
 }
 
@@ -69,6 +74,10 @@ func LoadUTXOSnapshotFixture(path string) (*LoadedUTXOSnapshotFixture, error) {
 	if err != nil {
 		return nil, err
 	}
+	expectedChecksum, err := decodeSnapshotHex32(fixture.ExpectedChecksumHex, "expected_utxo_checksum_hex")
+	if err != nil {
+		return nil, err
+	}
 	utxos, err := decodeSnapshotUTXOs(fixture.UTXOs)
 	if err != nil {
 		return nil, err
@@ -78,8 +87,10 @@ func LoadUTXOSnapshotFixture(path string) (*LoadedUTXOSnapshotFixture, error) {
 		Fixture:            fixture,
 		ExpectedHeaderHash: expectedHeaderHash,
 		ExpectedUTXORoot:   expectedUTXORoot,
+		ExpectedChecksum:   expectedChecksum,
 		UTXOs:              utxos,
 		ComputedUTXORoot:   consensus.ComputedUTXORoot(utxos),
+		ComputedChecksum:   utxochecksum.Compute(utxos),
 	}, nil
 }
 
@@ -107,6 +118,9 @@ func VerifyUTXOSnapshotFixture(loaded *LoadedUTXOSnapshotFixture, genesis *types
 	}
 	if summary.UTXORoot != loaded.ExpectedUTXORoot {
 		return SnapshotVerificationSummary{}, fmt.Errorf("snapshot utxo_root mismatch: expected %x, got %x", loaded.ExpectedUTXORoot, summary.UTXORoot)
+	}
+	if summary.Checksum != loaded.ExpectedChecksum {
+		return SnapshotVerificationSummary{}, fmt.Errorf("snapshot utxo checksum mismatch: expected %x, got %x", loaded.ExpectedChecksum, summary.Checksum)
 	}
 	if summary.UTXOCount != loaded.Fixture.ExpectedUTXOCount {
 		return SnapshotVerificationSummary{}, fmt.Errorf("snapshot utxo count mismatch: expected %d, got %d", loaded.Fixture.ExpectedUTXOCount, summary.UTXOCount)
@@ -145,10 +159,15 @@ func VerifyUTXOSnapshotAtHeight(profile types.ChainProfile, genesis *types.Block
 	if liveRoot := state.UTXORoot(); liveRoot != snapshotRoot {
 		return SnapshotVerificationSummary{}, fmt.Errorf("chainstate utxo_root mismatch at height %d: expected %x, got %x", height, snapshotRoot, liveRoot)
 	}
+	snapshotChecksum := utxochecksum.Compute(snapshot)
+	if liveChecksum := state.UTXOChecksum(); liveChecksum != snapshotChecksum {
+		return SnapshotVerificationSummary{}, fmt.Errorf("chainstate utxo checksum mismatch at height %d: expected %x, got %x", height, snapshotChecksum, liveChecksum)
+	}
 	return SnapshotVerificationSummary{
 		Height:     height,
 		HeaderHash: consensus.HeaderHash(&header),
 		UTXORoot:   snapshotRoot,
+		Checksum:   snapshotChecksum,
 		UTXOCount:  len(snapshot),
 	}, nil
 }

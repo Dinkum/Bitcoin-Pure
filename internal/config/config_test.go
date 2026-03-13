@@ -32,11 +32,12 @@ func TestDefaultRPCWriteTimeoutAllowsLongAdminCalls(t *testing.T) {
 }
 
 func TestSaveRoundTripPersistsConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
+	path := filepath.Join(t.TempDir(), "config.yaml")
 	cfg := Default()
 	cfg.MinerEnabled = true
 	cfg.DandelionEnabled = true
 	cfg.MinerPubKeyHex = "abcd"
+	cfg.MaxMempoolBytes = 123456
 	if err := Save(path, cfg); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -52,5 +53,38 @@ func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	}
 	if !loaded.DandelionEnabled {
 		t.Fatal("expected dandelion_enabled to round-trip")
+	}
+	if loaded.MaxMempoolBytes != cfg.MaxMempoolBytes {
+		t.Fatalf("max mempool bytes = %d, want %d", loaded.MaxMempoolBytes, cfg.MaxMempoolBytes)
+	}
+	if _, err := Load(filepath.Join(filepath.Dir(path), "config.json")); err != nil {
+		t.Fatalf("Load sidecar json: %v", err)
+	}
+}
+
+func TestLoadLegacyJSONConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := Default()
+	cfg.MinerEnabled = true
+	cfg.MinerPubKeyHex = "abcd"
+	cfg.MaxMempoolBytes = 654321
+	if err := Save(path, cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !loaded.MinerEnabled {
+		t.Fatal("expected miner_enabled to round-trip from json")
+	}
+	if loaded.MinerPubKeyHex != cfg.MinerPubKeyHex {
+		t.Fatalf("miner pubkey = %q, want %q", loaded.MinerPubKeyHex, cfg.MinerPubKeyHex)
+	}
+	if loaded.MaxMempoolBytes != cfg.MaxMempoolBytes {
+		t.Fatalf("max mempool bytes = %d, want %d", loaded.MaxMempoolBytes, cfg.MaxMempoolBytes)
+	}
+	if _, err := Load(filepath.Join(filepath.Dir(path), "config.yaml")); err != nil {
+		t.Fatalf("Load canonical yaml: %v", err)
 	}
 }

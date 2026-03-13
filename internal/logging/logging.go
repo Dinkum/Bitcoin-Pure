@@ -55,6 +55,13 @@ func Component(name string) *slog.Logger {
 	return slog.Default().With("component", name)
 }
 
+func ComponentWith(base *slog.Logger, name string) *slog.Logger {
+	if base == nil {
+		base = slog.Default()
+	}
+	return base.With("component", name)
+}
+
 func NewLogger(dst io.Writer, cfg Config) (*slog.Logger, error) {
 	handler, err := NewHandler(dst, Config{
 		Level:  cfg.Level,

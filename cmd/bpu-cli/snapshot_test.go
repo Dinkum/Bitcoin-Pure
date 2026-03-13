@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"bitcoin-pure/internal/consensus"
+	"bitcoin-pure/internal/node"
+	"bitcoin-pure/internal/storage"
 )
 
 func TestRunSnapshotRoot(t *testing.T) {
@@ -17,6 +21,9 @@ func TestRunSnapshotRoot(t *testing.T) {
 	})
 	if !strings.Contains(output, "utxo_root: 89937c242d821c308952134a0822e1f5ddc94cb5022ad49f8f35448e09a45b16") {
 		t.Fatalf("snapshot root output missing expected root:\n%s", output)
+	}
+	if !strings.Contains(output, "utxo_checksum: 4977f782656d4092e6b47122db4ae985a402445a2daea761b50e08df4575f863") {
+		t.Fatalf("snapshot root output missing expected checksum:\n%s", output)
 	}
 }
 
@@ -33,6 +40,9 @@ func TestRunSnapshotVerify(t *testing.T) {
 	if !strings.Contains(output, "utxo_count: 3") {
 		t.Fatalf("snapshot verify output missing utxo count:\n%s", output)
 	}
+	if !strings.Contains(output, "utxo_checksum: 4977f782656d4092e6b47122db4ae985a402445a2daea761b50e08df4575f863") {
+		t.Fatalf("snapshot verify output missing checksum:\n%s", output)
+	}
 }
 
 func TestRunSnapshotVerifyRejectsMismatchedExpectation(t *testing.T) {
@@ -48,6 +58,78 @@ func TestRunSnapshotVerifyRejectsMismatchedExpectation(t *testing.T) {
 	}
 	if err := runSnapshot([]string{"verify", "--file", path}); err == nil {
 		t.Fatal("expected mismatched snapshot verify to fail")
+	}
+}
+
+func TestRunSnapshotExport(t *testing.T) {
+	fixturePath := filepath.Join("..", "..", "fixtures", "snapshots", "regtest_bootstrap_tip.json")
+	loaded, err := node.LoadUTXOSnapshotFixture(fixturePath)
+	if err != nil {
+		t.Fatalf("LoadUTXOSnapshotFixture: %v", err)
+	}
+	genesisPath := loaded.ResolveReferencePath(loaded.Fixture.GenesisFixture)
+	loadedGenesis, err := loadGenesisFixtureFromPath(genesisPath)
+	if err != nil {
+		t.Fatalf("loadGenesisFixtureFromPath: %v", err)
+	}
+	chainPath := loaded.ResolveReferencePath(loaded.Fixture.ChainFixture)
+	blocks, err := loadValidatedChainFixtureBlocks(chainPath)
+	if err != nil {
+		t.Fatalf("loadValidatedChainFixtureBlocks: %v", err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "chain")
+	if _, err := node.ImportUTXOSnapshotFastSync(dbPath, loaded, &loadedGenesis.Block, blocks, nil); err != nil {
+		t.Fatalf("ImportUTXOSnapshotFastSync: %v", err)
+	}
+	outPath := filepath.Join(t.TempDir(), "exported.json")
+	output := captureStdout(t, func() {
+		if err := runSnapshot([]string{"export", "--db", dbPath, "--out", outPath}); err != nil {
+			t.Fatalf("runSnapshot export: %v", err)
+		}
+	})
+	if !strings.Contains(output, "utxo_count: 3") {
+		t.Fatalf("snapshot export output missing utxo count:\n%s", output)
+	}
+	exported, err := node.LoadUTXOSnapshotFixture(outPath)
+	if err != nil {
+		t.Fatalf("LoadUTXOSnapshotFixture(exported): %v", err)
+	}
+	if exported.ExpectedUTXORoot != loaded.ExpectedUTXORoot {
+		t.Fatalf("exported root = %x, want %x", exported.ExpectedUTXORoot, loaded.ExpectedUTXORoot)
+	}
+	if exported.ExpectedChecksum != loaded.ExpectedChecksum {
+		t.Fatalf("exported checksum = %x, want %x", exported.ExpectedChecksum, loaded.ExpectedChecksum)
+	}
+}
+
+func TestRunSnapshotImport(t *testing.T) {
+	fixturePath := filepath.Join("..", "..", "fixtures", "snapshots", "regtest_bootstrap_tip.json")
+	dbPath := filepath.Join(t.TempDir(), "imported-chain")
+	output := captureStdout(t, func() {
+		if err := runSnapshot([]string{"import", "--db", dbPath, "--file", fixturePath}); err != nil {
+			t.Fatalf("runSnapshot import: %v", err)
+		}
+	})
+	if !strings.Contains(output, "height: 2") {
+		t.Fatalf("snapshot import output missing height:\n%s", output)
+	}
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	stored, err := store.LoadChainState()
+	if err != nil {
+		t.Fatalf("LoadChainState: %v", err)
+	}
+	if stored == nil || stored.Height != 2 {
+		t.Fatalf("stored chain state = %+v, want height 2", stored)
+	}
+	if got := consensus.ComputedUTXORoot(stored.UTXOs); got == ([32]byte{}) {
+		t.Fatal("expected imported utxo root")
+	}
+	if stored.UTXOChecksum == ([32]byte{}) {
+		t.Fatal("expected imported utxo checksum")
 	}
 }
 

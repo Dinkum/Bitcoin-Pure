@@ -1,17 +1,21 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utxochecksum"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -22,6 +26,9 @@ var (
 	metaTipHeightKey         = []byte("meta/tip_height")
 	metaTipHeaderKey         = []byte("meta/tip_header")
 	metaBlockSizeStateKey    = []byte("meta/block_size_state")
+	metaUTXOChecksumKey      = []byte("meta/utxo_checksum")
+	metaFastSyncStateKey     = []byte("meta/fast_sync_state")
+	metaLocalityNextSeqKey   = []byte("meta/locality_next_seq")
 	metaJournalNextSeqKey    = []byte("meta/journal_next_seq")
 	metaDerivedJournalSeqKey = []byte("meta/derived_journal_seq")
 	blockPrefix              = []byte("blocks/")
@@ -32,11 +39,17 @@ var (
 	knownPeerPrefix          = []byte("known_peer/")
 	journalPrefix            = []byte("journal/")
 	utxoPrefix               = []byte("utxo/")
+	snapshotUTXOPrefix       = []byte("snapshot_utxo/")
+	localitySeqPrefix        = []byte("locality_seq/")
+	localityMetaPrefix       = []byte("locality_meta/")
 )
 
 var (
-	knownPeerPrefixEnd = prefixUpperBound(knownPeerPrefix)
-	utxoPrefixEnd      = prefixUpperBound(utxoPrefix)
+	knownPeerPrefixEnd    = prefixUpperBound(knownPeerPrefix)
+	utxoPrefixEnd         = prefixUpperBound(utxoPrefix)
+	snapshotUTXOPrefixEnd = prefixUpperBound(snapshotUTXOPrefix)
+	localitySeqPrefixEnd  = prefixUpperBound(localitySeqPrefix)
+	localityMetaPrefixEnd = prefixUpperBound(localityMetaPrefix)
 )
 
 var (
@@ -53,7 +66,25 @@ type StoredChainState struct {
 	Height         uint64
 	TipHeader      types.BlockHeader
 	BlockSizeState consensus.BlockSizeState
+	UTXOChecksum   [32]byte
 	UTXOs          consensus.UtxoSet
+}
+
+// FastSyncState persists the trust boundary for an imported snapshot until a
+// background replay from genesis reconstructs the same state locally.
+type FastSyncState struct {
+	SnapshotHeight     uint64   `json:"snapshot_height"`
+	SnapshotHeaderHash [32]byte `json:"snapshot_header_hash"`
+	SnapshotUTXORoot   [32]byte `json:"snapshot_utxo_root"`
+	SnapshotChecksum   [32]byte `json:"snapshot_utxo_checksum"`
+	SnapshotUTXOCount  int      `json:"snapshot_utxo_count"`
+	LastError          string   `json:"last_error,omitempty"`
+}
+
+type LocalityIndexedUTXO struct {
+	Sequence uint64
+	OutPoint types.OutPoint
+	Entry    consensus.UtxoEntry
 }
 
 type KnownPeerRecord struct {
@@ -91,7 +122,8 @@ type HeaderBatchEntry struct {
 }
 
 type ChainStore struct {
-	db *pebble.DB
+	db     *pebble.DB
+	logger *slog.Logger
 
 	deriveNotify chan struct{}
 	stopCh       chan struct{}
@@ -125,7 +157,14 @@ func (noopLogger) Infof(string, ...interface{})  {}
 func (noopLogger) Fatalf(string, ...interface{}) {}
 
 func Open(path string) (*ChainStore, error) {
-	logging.Component("storage").Info("opening pebble chain store", slog.String("path", path))
+	return OpenWithLogger(path, logging.Component("storage"))
+}
+
+func OpenWithLogger(path string, logger *slog.Logger) (*ChainStore, error) {
+	if logger == nil {
+		logger = logging.Component("storage")
+	}
+	logger.Info("opening pebble chain store", slog.String("path", path))
 	db, err := pebble.Open(filepath.Clean(path), &pebble.Options{
 		Logger: noopLogger{},
 	})
@@ -133,6 +172,7 @@ func Open(path string) (*ChainStore, error) {
 		return nil, err
 	}
 	store := &ChainStore{
+		logger:       logger,
 		db:           db,
 		deriveNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
@@ -150,7 +190,7 @@ func (s *ChainStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	logging.Component("storage").Info("closing pebble chain store")
+	s.logger.Info("closing pebble chain store")
 	if s.stopCh != nil {
 		close(s.stopCh)
 	}
@@ -175,6 +215,10 @@ func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
 		return nil, err
 	}
 	blockSizeBytes, err := s.get(metaBlockSizeStateKey)
+	if err != nil {
+		return nil, err
+	}
+	checksumBytes, err := s.get(metaUTXOChecksumKey)
 	if err != nil {
 		return nil, err
 	}
@@ -225,14 +269,121 @@ func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
 	if err := iter.Error(); err != nil {
 		return nil, err
 	}
+	var checksum [32]byte
+	switch {
+	case checksumBytes == nil:
+		checksum = utxochecksum.Compute(utxos)
+	case len(checksumBytes) != len(checksum):
+		return nil, errors.New("invalid data: bad utxo checksum metadata")
+	default:
+		copy(checksum[:], checksumBytes)
+	}
 
 	return &StoredChainState{
 		Profile:        profile,
 		Height:         height,
 		TipHeader:      header,
 		BlockSizeState: blockSizeState,
+		UTXOChecksum:   checksum,
 		UTXOs:          utxos,
 	}, nil
+}
+
+func (s *ChainStore) LoadFastSyncState() (*FastSyncState, error) {
+	buf, err := s.get(metaFastSyncStateKey)
+	if err != nil {
+		return nil, err
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	var state FastSyncState
+	if err := json.Unmarshal(buf, &state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func (s *ChainStore) LoadFastSyncSnapshotUTXOs() (consensus.UtxoSet, error) {
+	utxos := make(consensus.UtxoSet)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: snapshotUTXOPrefix,
+		UpperBound: snapshotUTXOPrefixEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		outpoint, err := decodeOutPoint(iter.Key()[len(snapshotUTXOPrefix):])
+		if err != nil {
+			return nil, err
+		}
+		entry, err := decodeUTXOEntry(iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		utxos[outpoint] = entry
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	if len(utxos) == 0 {
+		return nil, nil
+	}
+	return utxos, nil
+}
+
+func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO, error) {
+	items := make([]LocalityIndexedUTXO, 0)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: localitySeqPrefix,
+		UpperBound: localitySeqPrefixEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if limit > 0 && len(items) >= limit {
+			break
+		}
+		seq, err := decodeLocalitySeqFromKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		outPoint, err := decodeOutPoint(iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		entryBuf, err := s.get(utxoKey(outPoint))
+		if err != nil {
+			return nil, err
+		}
+		if entryBuf == nil {
+			// The locality index is non-consensus metadata. If a stale row slips
+			// through during recovery, skip it instead of poisoning canonical UTXO
+			// reads.
+			continue
+		}
+		entry, err := decodeUTXOEntry(entryBuf)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, LocalityIndexedUTXO{
+			Sequence: seq,
+			OutPoint: outPoint,
+			Entry:    entry,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *ChainStore) LocalitySequence(outPoint types.OutPoint) (uint64, bool, error) {
+	return s.localitySeqForOutPoint(outPoint)
 }
 
 func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
@@ -344,7 +495,7 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 	if err := batch.Commit(bestEffortWriteOptions); err != nil {
 		return err
 	}
-	logging.Component("storage").Info("wrote known peers", slog.Int("count", len(peers)))
+	s.logger.Debug("wrote known peers", slog.Int("count", len(peers)))
 	return nil
 }
 
@@ -375,14 +526,101 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 			return err
 		}
 	}
+	if err := s.rebuildLocalityIndexBatch(batch, state.UTXOs); err != nil {
+		return err
+	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
-	logging.Component("storage").Info("wrote full chain state",
+	s.logger.Info("wrote full chain state",
 		slog.Uint64("height", state.Height),
 		slog.Int("utxo_count", len(state.UTXOs)),
 	)
+	return nil
+}
+
+func (s *ChainStore) WriteFastSyncState(state *FastSyncState, snapshot consensus.UtxoSet) error {
+	if state == nil {
+		return errors.New("fast sync state is required")
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(metaFastSyncStateKey, encoded, nil); err != nil {
+		return err
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: snapshotUTXOPrefix,
+		UpperBound: snapshotUTXOPrefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	for outPoint, entry := range snapshot {
+		if err := batch.Set(snapshotUTXOKey(outPoint), encodeUTXOEntry(entry), nil); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		return err
+	}
+	s.logger.Info("wrote fast-sync snapshot state",
+		slog.Uint64("height", state.SnapshotHeight),
+		slog.Int("utxo_count", len(snapshot)),
+	)
+	return nil
+}
+
+func (s *ChainStore) UpdateFastSyncState(state *FastSyncState) error {
+	if state == nil {
+		return errors.New("fast sync state is required")
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(metaFastSyncStateKey, encoded, consensusCriticalWriteOptions)
+}
+
+func (s *ChainStore) ClearFastSyncState() error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Delete(metaFastSyncStateKey, nil); err != nil {
+		return err
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: snapshotUTXOPrefix,
+		UpperBound: snapshotUTXOPrefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		return err
+	}
+	s.logger.Info("cleared fast-sync snapshot state")
 	return nil
 }
 
@@ -431,11 +669,14 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 		}
 		written++
 	}
+	if err := s.applyLocalityRewriteBatch(batch, previous.UTXOs, next.UTXOs); err != nil {
+		return err
+	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
 	s.notifyDerivedReplay()
-	logging.Component("storage").Info("rewrote chain state via utxo delta",
+	s.logger.Info("rewrote chain state via utxo delta",
 		slog.Uint64("height", next.Height),
 		slog.Int("deleted_utxos", deleted),
 		slog.Int("written_utxos", written),
@@ -461,7 +702,7 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 		return err
 	}
 	s.notifyDerivedReplay()
-	logging.Component("storage").Info("wrote header state", slog.Uint64("height", state.Height))
+	s.logger.Debug("wrote header state", slog.Uint64("height", state.Height))
 	return nil
 }
 
@@ -504,7 +745,7 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 		return err
 	}
 	s.notifyDerivedReplay()
-	logging.Component("storage").Info("wrote header batch",
+	s.logger.Debug("wrote header batch",
 		slog.Uint64("height", state.Height),
 		slog.Int("count", len(entries)),
 	)
@@ -532,7 +773,7 @@ func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 	}
 	s.notifyDerivedReplay()
 	hash := consensus.HeaderHash(&block.Header)
-	logging.Component("storage").Info("stored block",
+	s.logger.Debug("stored block",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
 	)
@@ -564,7 +805,7 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 		return err
 	}
 	s.notifyDerivedReplay()
-	logging.Component("storage").Info("stored header",
+	s.logger.Debug("stored header",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
 	)
@@ -602,6 +843,9 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 			return err
 		}
 	}
+	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
+		return err
+	}
 	if err := s.appendJournalEntriesBatch(batch,
 		chainJournalEntry{
 			Kind:  journalSetBlockHeight,
@@ -618,7 +862,7 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 		return err
 	}
 	s.notifyDerivedReplay()
-	logging.Component("storage").Info("appended block delta",
+	s.logger.Debug("appended block delta",
 		slog.Uint64("height", state.Height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
 		slog.Int("spent_utxos", len(spent)),
@@ -956,7 +1200,7 @@ func (s *ChainStore) notifyDerivedReplay() {
 func (s *ChainStore) derivedIndexLoop() {
 	for {
 		if err := s.replayDerivedIndexes(); err != nil {
-			logging.Component("storage").Warn("derived index replay failed", slog.Any("error", err))
+			s.logger.Warn("derived index replay failed", slog.Any("error", err))
 			select {
 			case <-time.After(50 * time.Millisecond):
 			case <-s.stopCh:
@@ -1051,6 +1295,151 @@ func (s *ChainStore) WaitForDerivedIndexes(timeout time.Duration) error {
 	}
 }
 
+func (s *ChainStore) rebuildLocalityIndexBatch(batch *pebble.Batch, utxos consensus.UtxoSet) error {
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: localitySeqPrefix,
+		UpperBound: localitySeqPrefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	iter, err = s.db.NewIter(&pebble.IterOptions{
+		LowerBound: localityMetaPrefix,
+		UpperBound: localityMetaPrefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	ordered := make([]types.OutPoint, 0, len(utxos))
+	for outPoint := range utxos {
+		ordered = append(ordered, outPoint)
+	}
+	sortOutPointsCanonical(ordered)
+	for seq, outPoint := range ordered {
+		if err := batch.Set(localitySeqKey(uint64(seq)), encodeOutPoint(outPoint), nil); err != nil {
+			return err
+		}
+		if err := batch.Set(localityMetaKey(outPoint), encodeU64(uint64(seq)), nil); err != nil {
+			return err
+		}
+	}
+	return batch.Set(metaLocalityNextSeqKey, encodeU64(uint64(len(ordered))), nil)
+}
+
+func (s *ChainStore) applyLocalityDeltaBatch(batch *pebble.Batch, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	nextSeq, err := s.localityNextSeq()
+	if err != nil {
+		return err
+	}
+	for _, outPoint := range spent {
+		seq, ok, err := s.localitySeqForOutPoint(outPoint)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := batch.Delete(localitySeqKey(seq), nil); err != nil {
+			return err
+		}
+		if err := batch.Delete(localityMetaKey(outPoint), nil); err != nil {
+			return err
+		}
+	}
+	orderedCreated := make([]types.OutPoint, 0, len(created))
+	for outPoint := range created {
+		orderedCreated = append(orderedCreated, outPoint)
+	}
+	sortOutPointsCanonical(orderedCreated)
+	for _, outPoint := range orderedCreated {
+		if err := batch.Set(localitySeqKey(nextSeq), encodeOutPoint(outPoint), nil); err != nil {
+			return err
+		}
+		if err := batch.Set(localityMetaKey(outPoint), encodeU64(nextSeq), nil); err != nil {
+			return err
+		}
+		nextSeq++
+	}
+	return batch.Set(metaLocalityNextSeqKey, encodeU64(nextSeq), nil)
+}
+
+func (s *ChainStore) applyLocalityRewriteBatch(batch *pebble.Batch, previous consensus.UtxoSet, next consensus.UtxoSet) error {
+	spent := make([]types.OutPoint, 0)
+	created := make(map[types.OutPoint]consensus.UtxoEntry)
+	for outPoint := range previous {
+		if _, ok := next[outPoint]; !ok {
+			spent = append(spent, outPoint)
+		}
+	}
+	for outPoint, entry := range next {
+		if _, ok := previous[outPoint]; !ok {
+			created[outPoint] = entry
+		}
+	}
+	return s.applyLocalityDeltaBatch(batch, spent, created)
+}
+
+func (s *ChainStore) localityNextSeq() (uint64, error) {
+	buf, err := s.get(metaLocalityNextSeqKey)
+	if err != nil {
+		return 0, err
+	}
+	if buf == nil {
+		return 0, nil
+	}
+	return decodeU64(buf)
+}
+
+func (s *ChainStore) localitySeqForOutPoint(outPoint types.OutPoint) (uint64, bool, error) {
+	buf, err := s.get(localityMetaKey(outPoint))
+	if err != nil {
+		return 0, false, err
+	}
+	if buf == nil {
+		return 0, false, nil
+	}
+	seq, err := decodeU64(buf)
+	if err != nil {
+		return 0, false, err
+	}
+	return seq, true, nil
+}
+
+func sortOutPointsCanonical(outPoints []types.OutPoint) {
+	slices.SortFunc(outPoints, func(a, b types.OutPoint) int {
+		switch cmp := bytes.Compare(a.TxID[:], b.TxID[:]); {
+		case cmp < 0:
+			return -1
+		case cmp > 0:
+			return 1
+		case a.Vout < b.Vout:
+			return -1
+		case a.Vout > b.Vout:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
+
 func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
 	if err := writeHeaderMeta(batch, &StoredHeaderState{
 		Profile:   state.Profile,
@@ -1065,7 +1454,14 @@ func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
 	if err := batch.Set(metaTipHeaderKey, state.TipHeader.Encode(), nil); err != nil {
 		return err
 	}
-	return batch.Set(metaBlockSizeStateKey, encodeBlockSizeState(state.BlockSizeState), nil)
+	if err := batch.Set(metaBlockSizeStateKey, encodeBlockSizeState(state.BlockSizeState), nil); err != nil {
+		return err
+	}
+	checksum := state.UTXOChecksum
+	if checksum == ([32]byte{}) {
+		checksum = utxochecksum.Compute(state.UTXOs)
+	}
+	return batch.Set(metaUTXOChecksumKey, checksum[:], nil)
 }
 
 func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry, active bool) error {
@@ -1164,8 +1560,24 @@ func knownPeerKey(addr string) []byte {
 	return append(append([]byte(nil), knownPeerPrefix...), []byte(addr)...)
 }
 
+func localitySeqKey(seq uint64) []byte {
+	return append(append([]byte(nil), localitySeqPrefix...), encodeU64(seq)...)
+}
+
+func localityMetaKey(outPoint types.OutPoint) []byte {
+	buf := append([]byte(nil), localityMetaPrefix...)
+	outPoint.Encode(&buf)
+	return buf
+}
+
 func utxoKey(outPoint types.OutPoint) []byte {
 	buf := append([]byte(nil), utxoPrefix...)
+	outPoint.Encode(&buf)
+	return buf
+}
+
+func snapshotUTXOKey(outPoint types.OutPoint) []byte {
+	buf := append([]byte(nil), snapshotUTXOPrefix...)
 	outPoint.Encode(&buf)
 	return buf
 }
@@ -1178,6 +1590,19 @@ func decodeOutPoint(buf []byte) (types.OutPoint, error) {
 	copy(outPoint.TxID[:], buf[:32])
 	outPoint.Vout = binary.LittleEndian.Uint32(buf[32:36])
 	return outPoint, nil
+}
+
+func encodeOutPoint(outPoint types.OutPoint) []byte {
+	buf := make([]byte, 0, 36)
+	outPoint.Encode(&buf)
+	return buf
+}
+
+func decodeLocalitySeqFromKey(key []byte) (uint64, error) {
+	if len(key) != len(localitySeqPrefix)+8 {
+		return 0, errors.New("invalid locality sequence key")
+	}
+	return decodeU64(key[len(localitySeqPrefix):])
 }
 
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {

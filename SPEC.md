@@ -1,4 +1,4 @@
-# Bitcoin Pure v1 (BPU) — Protocol + Node Behavior Spec
+# Bitcoin Pure (BPU) — Protocol + Node Behavior Spec
 ======================================================
 
 Note - Additional, more technical specs can be found in /specs/:
@@ -744,7 +744,7 @@ Consensus:
 
 
 ====================================
-END — Bitcoin Pure v1 (Consensus + UX)
+END — Bitcoin Pure (Consensus + UX)
 ====================================
 
 Appendix A — Design Rationale (Non-Normative)

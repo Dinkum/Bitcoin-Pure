@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/cockroachdb/pebble v1.1.5
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

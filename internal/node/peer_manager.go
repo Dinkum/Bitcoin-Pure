@@ -275,7 +275,7 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 			continue
 		}
 
-		m.svc.logger.Info("connecting peer", slog.String("addr", addr))
+		m.svc.logger.Debug("connecting peer", slog.String("addr", addr))
 		conn, err := dialer.Dial("tcp", addr)
 		if err != nil {
 			consecutiveFailures++
@@ -319,7 +319,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		if outbound {
 			m.recordKnownPeerFailure(addr, time.Now())
 		}
-		m.svc.logger.Warn("peer handshake failed",
+		logPeerHandshakeFailure(m.svc.logger, outbound, err, "peer handshake failed",
 			slog.String("addr", addr),
 			slog.String("remote_addr", remoteAddr),
 			slog.Bool("outbound", outbound),
@@ -358,7 +358,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 	m.svc.peerMu.Lock()
 	m.svc.peers[addr] = peer
 	m.svc.peerMu.Unlock()
-	m.svc.logger.Info("peer connected",
+	m.svc.logger.Debug("peer connected",
 		slog.String("addr", addr),
 		slog.String("remote_addr", remoteAddr),
 		slog.Bool("outbound", outbound),
@@ -379,7 +379,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		m.svc.peerMu.Unlock()
 		_ = wire.Close()
 		stats := peer.syncSnapshot()
-		m.svc.logger.Info("peer disconnected",
+		m.svc.logger.Debug("peer disconnected",
 			slog.String("addr", addr),
 			slog.String("remote_addr", remoteAddr),
 			slog.Bool("outbound", outbound),
@@ -415,7 +415,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		msg, err := wire.ReadMessage()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				m.svc.logger.Warn("peer read loop failed",
+				logPeerReadFailure(m.svc, err, "peer read loop failed",
 					slog.String("addr", addr),
 					slog.String("remote_addr", remoteAddr),
 					slog.Any("error", err),
@@ -1070,7 +1070,7 @@ func (m *peerManager) shouldMaintainOutboundPeer(addr string) bool {
 }
 
 func (m *peerManager) rememberKnownPeers(addrs []string) {
-	if len(addrs) == 0 {
+	if m.svc.cfg.StaticPeerTopology || len(addrs) == 0 {
 		return
 	}
 	m.svc.peerMu.Lock()
@@ -1096,6 +1096,9 @@ func (m *peerManager) rememberKnownPeers(addrs []string) {
 }
 
 func (m *peerManager) restartKnownPeers() {
+	if m.svc.cfg.StaticPeerTopology {
+		return
+	}
 	for _, addr := range m.knownPeerAddrs() {
 		addr = normalizePeerAddr(addr)
 		if addr == "" || m.isSelfPeerAddr(addr) {
@@ -1317,6 +1320,38 @@ func (m *peerManager) isSelfPeerAddr(addr string) bool {
 		return false
 	}
 	return localInterfaceIPsContain(peerIP)
+}
+
+func logPeerHandshakeFailure(logger *slog.Logger, outbound bool, err error, msg string, attrs ...any) {
+	if outbound || !isExpectedPeerCloseError(err) {
+		logger.Warn(msg, attrs...)
+		return
+	}
+	logger.Debug(msg, attrs...)
+}
+
+func logPeerReadFailure(svc *Service, err error, msg string, attrs ...any) {
+	if svc == nil {
+		return
+	}
+	if svc.isStopping() || isExpectedPeerCloseError(err) {
+		svc.logger.Debug(msg, attrs...)
+		return
+	}
+	svc.logger.Warn(msg, attrs...)
+}
+
+func isExpectedPeerCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "use of closed network connection") ||
+		strings.Contains(text, "connection reset by peer") ||
+		strings.Contains(text, "broken pipe")
 }
 
 func isWildcardOrLoopbackHost(host string) bool {
