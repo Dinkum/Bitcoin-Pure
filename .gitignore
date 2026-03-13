@@ -29,7 +29,9 @@
 /bpu-cli
 /.*-tmp/
 /benchmarks/reports/
+/benchmarks/reports/micro/
 /node.test
+/*.test
 
 # cargo default target dir
 target/

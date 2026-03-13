@@ -1,0 +1,200 @@
+# Bitcoin Pure example configuration.
+# This file mirrors the built-in defaults with labeled operator sections.
+# Copy values from here into your live config as needed.
+
+# ==============================================================================
+# CORE NODE
+# ==============================================================================
+# Chain profile selection and bootstrap fixture wiring.
+
+# Selects the chain profile and its network rules.
+# Default: regtest
+profile: regtest
+
+# Points at the genesis fixture used to bootstrap the selected profile.
+# Default: fixtures/genesis/regtest.json
+genesis_fixture: fixtures/genesis/regtest.json
+
+# ==============================================================================
+# STORAGE PATHS
+# ==============================================================================
+# On-disk locations for durable chain state.
+
+# Sets the chain database directory.
+# Default: data/chain
+db_path: data/chain
+
+# ==============================================================================
+# LOGGING AND PROFILING
+# ==============================================================================
+# Operator-visible logs, summaries, and optional local profiling endpoints.
+
+# Writes daemon logs to a file when set; leave empty to log to stderr only.
+# Default: ""
+log_path: ""
+
+# Controls log verbosity.
+# Default: info
+log_level: info
+
+# Chooses structured json logs or human-readable text logs.
+# Default: text
+log_format: text
+
+# Emits periodic throughput summaries on this interval in milliseconds.
+# Default: 60000
+throughput_summary_interval_ms: 60000
+
+# Exposes the local pprof server when set to a loopback listen address.
+# Default: ""
+pprof_addr: ""
+
+# ==============================================================================
+# RPC SERVER
+# ==============================================================================
+# Operator RPC listen address, authentication, and HTTP safety limits.
+
+# Listens for JSON-RPC requests on this address.
+# Default: 127.0.0.1:18443
+rpc_addr: 127.0.0.1:18443
+
+# Requires this bearer token for non-loopback RPC access; leave empty to disable token auth on loopback-only setups.
+# Default: ""
+rpc_auth_token: ""
+
+# Bounds RPC request body reads in milliseconds.
+# Default: 5000
+rpc_read_timeout_ms: 5000
+
+# Bounds RPC response writes in milliseconds.
+# Default: 900000
+rpc_write_timeout_ms: 900000
+
+# Bounds RPC header reads in milliseconds.
+# Default: 2000
+rpc_header_timeout_ms: 2000
+
+# Closes idle RPC keepalive connections after this many milliseconds.
+# Default: 30000
+rpc_idle_timeout_ms: 30000
+
+# Rejects RPC requests with larger HTTP headers than this byte limit.
+# Default: 8192
+rpc_max_header_bytes: 8192
+
+# Rejects RPC request bodies larger than this byte limit.
+# Default: 1048576
+rpc_max_body_bytes: 1048576
+
+# ==============================================================================
+# P2P NETWORKING
+# ==============================================================================
+# Peer listen settings, outbound seeds, and message-level guardrails.
+
+# Listens for P2P traffic on this address.
+# Default: 0.0.0.0:18444
+p2p_addr: 0.0.0.0:18444
+
+# Pins outbound peers when you want explicit static connections; leave empty for normal discovery.
+# Default: []
+peers: []
+
+# Caps inbound peer slots.
+# Default: 32
+max_inbound_peers: 32
+
+# Caps outbound peer slots.
+# Default: 8
+max_outbound_peers: 8
+
+# Drops peers that do not finish the handshake within this many milliseconds.
+# Default: 5000
+handshake_timeout_ms: 5000
+
+# Drops peers that stop making forward progress for this many milliseconds.
+# Default: 15000
+stall_timeout_ms: 15000
+
+# Rejects P2P messages larger than this byte limit.
+# Default: 64000000
+max_message_bytes: 64000000
+
+# ==============================================================================
+# MEMPOOL SETTINGS
+# ==============================================================================
+# Admission policy for relayed transactions and dependency tracking limits.
+
+# Rejects transactions whose fee rate falls below this minimum satoshi-per-byte policy floor.
+# Default: 1
+min_relay_fee_per_byte: 1
+
+# Caps total admitted mempool bytes; when full, lower-fee packages are evicted before higher-fee arrivals are admitted.
+# Default: 67108864
+max_mempool_bytes: 67108864
+
+# Caps in-mempool ancestors per transaction.
+# Default: 256
+max_ancestors: 256
+
+# Caps in-mempool descendants per transaction.
+# Default: 256
+max_descendants: 256
+
+# Bounds the orphan pool for missing-input transactions.
+# Default: 128
+max_orphans: 128
+
+# ==============================================================================
+# AVALANCHE
+# ==============================================================================
+# Fast-finality polling and vote-threshold tuning.
+
+# Turns Avalanche polling on or off.
+# Default: on
+avalanche_mode: on
+
+# Sets the Avalanche poll sample size.
+# Default: 16
+avalanche_k_sample: 16
+
+# Sets the accepted-vote threshold numerator.
+# Default: 3
+avalanche_alpha_numerator: 3
+
+# Sets the accepted-vote threshold denominator.
+# Default: 4
+avalanche_alpha_denominator: 4
+
+# Sets the consecutive successful poll threshold before finalization.
+# Default: 15
+avalanche_beta: 15
+
+# Schedules Avalanche polls on this millisecond interval.
+# Default: 200
+avalanche_poll_interval_ms: 200
+
+# ==============================================================================
+# BETA FEATURES
+# ==============================================================================
+# Optional relay behavior that is useful for experimentation but not required for normal operation.
+
+# Enables Dandelion transaction relay behavior.
+# Default: false
+dandelion_enabled: false
+
+# ==============================================================================
+# MINING
+# ==============================================================================
+# Local block production and payout destination settings.
+
+# Enables local mining workers.
+# Default: false
+miner_enabled: false
+
+# Sets the number of local mining workers; zero uses the node default.
+# Default: 0
+miner_workers: 0
+
+# Pays coinbase rewards to this compressed public key; leave empty to let wallet auto-provisioning fill it in.
+# Default: ""
+miner_pubkey_hex: ""

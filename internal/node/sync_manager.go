@@ -199,7 +199,9 @@ func (m *syncManager) requestSync(peer *peerConn) {
 		slog.Uint64("header_height", m.svc.headerHeight()),
 		slog.Uint64("peer_best_height", peer.snapshotHeight()),
 	)
-	_ = peer.send(p2p.GetAddrMessage{})
+	if !m.svc.cfg.StaticPeerTopology {
+		_ = peer.send(p2p.GetAddrMessage{})
+	}
 	_ = m.requestHeaders(peer, [32]byte{})
 }
 
@@ -285,7 +287,7 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 		}
 		return err
 	}
-	m.svc.logger.Info("requesting missing blocks",
+	m.svc.logger.Debug("requesting missing blocks",
 		slog.String("addr", peer.addr),
 		slog.Int("count", len(hashes)),
 		slog.String("first_hash", shortHexBytes(hashes[0], 16)),
@@ -387,6 +389,9 @@ func (m *syncManager) scheduleTxInvRequests(peerAddr string, items []p2p.InvVect
 	selected := make([]p2p.InvVector, 0, min(limit, len(items)))
 	m.svc.downloadMu.Lock()
 	defer m.svc.downloadMu.Unlock()
+	if m.svc.txRequests == nil {
+		m.svc.txRequests = make(map[[32]byte]blockDownloadRequest)
+	}
 	for _, item := range items {
 		if len(selected) >= limit {
 			break
@@ -409,6 +414,59 @@ func (m *syncManager) scheduleTxInvRequests(peerAddr string, items []p2p.InvVect
 			slog.String("addr", peerAddr),
 			slog.Int("selected", len(selected)),
 			slog.Int("candidates", len(items)),
+			slog.Duration("request_duration", time.Since(startedAt)),
+		)
+	}
+	if len(selected) > 0 {
+		m.svc.perf.noteSyncRequestDuration(time.Since(startedAt))
+	}
+	return selected
+}
+
+// scheduleTxReconRequests reuses the same in-flight request ownership tracking
+// as inv/getdata so Erlay announcements do not fan out duplicate TxRequest
+// traffic across multiple peers while a missing tx is already being fetched.
+func (m *syncManager) scheduleTxReconRequests(peerAddr string, txids [][32]byte, limit int) [][32]byte {
+	startedAt := time.Now()
+	if len(txids) == 0 || limit <= 0 {
+		return nil
+	}
+	now := time.Now()
+	timeout := m.txRequestTimeout()
+	// Erlay overlap happens in tight bursts, so dedupe duplicate TxRequest
+	// ownership only across a short grace window instead of monopolizing the
+	// tx for the full sync stall timeout.
+	if timeout > 500*time.Millisecond {
+		timeout = 500 * time.Millisecond
+	}
+	selected := make([][32]byte, 0, min(limit, len(txids)))
+	m.svc.downloadMu.Lock()
+	defer m.svc.downloadMu.Unlock()
+	if m.svc.txRequests == nil {
+		m.svc.txRequests = make(map[[32]byte]blockDownloadRequest)
+	}
+	for _, txid := range txids {
+		if len(selected) >= limit {
+			break
+		}
+		req, ok := m.svc.txRequests[txid]
+		if ok && now.Sub(req.requestedAt) < timeout && req.peerAddr != "" && req.peerAddr != peerAddr {
+			continue
+		}
+		if ok && now.Sub(req.requestedAt) < timeout && req.peerAddr == peerAddr {
+			continue
+		}
+		req.peerAddr = peerAddr
+		req.requestedAt = now
+		req.attempts++
+		m.svc.txRequests[txid] = req
+		selected = append(selected, txid)
+	}
+	if len(selected) > 0 && m.svc.logger != nil {
+		m.svc.logger.Debug("scheduled tx reconciliation requests",
+			slog.String("addr", peerAddr),
+			slog.Int("selected", len(selected)),
+			slog.Int("candidates", len(txids)),
 			slog.Duration("request_duration", time.Since(startedAt)),
 		)
 	}

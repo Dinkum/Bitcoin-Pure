@@ -390,6 +390,8 @@ func MagicForProfile(profile types.ChainProfile) uint32 {
 		return 0x42505553
 	case types.RegtestHard:
 		return 0x42505548
+	case types.BenchNet:
+		return 0x42505542
 	default:
 		return 0
 	}

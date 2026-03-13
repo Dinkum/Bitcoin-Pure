@@ -4,10 +4,12 @@ import (
 	"context"
 	"math"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
 )
 
@@ -37,6 +39,27 @@ func TestRunP2PRelaySmoke(t *testing.T) {
 		}
 		if node.CompletionMS == nil {
 			t.Fatalf("%s missing completion time", node.Name)
+		}
+	}
+}
+
+func TestRunP2PRelayMeshKeepsExpectedPeerCounts(t *testing.T) {
+	report, err := Run(context.Background(), RunOptions{
+		Scenario:     ScenarioP2PRelay,
+		Profile:      types.Regtest,
+		NodeCount:    3,
+		Topology:     TopologyMesh,
+		TxCount:      12,
+		BatchSize:    6,
+		Timeout:      20 * time.Second,
+		SuppressLogs: true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, node := range report.Nodes {
+		if node.PeerCount != 2 {
+			t.Fatalf("%s peer_count = %d, want 2", node.Name, node.PeerCount)
 		}
 	}
 }
@@ -95,34 +118,161 @@ func TestRunP2PRelayEvenOriginSpreadTracksSubmittedTxs(t *testing.T) {
 	}
 }
 
-func TestRunConfirmedBlocksSmoke(t *testing.T) {
+func TestRunP2PRelayMeshShowsErlayTraffic(t *testing.T) {
 	report, err := Run(context.Background(), RunOptions{
-		Scenario:     ScenarioConfirmedBlocks,
-		Profile:      types.Regtest,
-		NodeCount:    2,
-		Topology:     TopologyLine,
-		TxCount:      24,
-		BatchSize:    8,
-		TxsPerBlock:  8,
-		Timeout:      20 * time.Second,
-		SuppressLogs: true,
+		Scenario:       ScenarioP2PRelay,
+		Profile:        types.Regtest,
+		NodeCount:      3,
+		Topology:       TopologyMesh,
+		TxCount:        48,
+		BatchSize:      12,
+		TxOriginSpread: TxOriginEven,
+		Timeout:        20 * time.Second,
+		SuppressLogs:   true,
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if report.ConfirmedTPS <= 0 {
-		t.Fatalf("confirmed_tps = %.2f, want > 0", report.ConfirmedTPS)
+	if report.Metrics.TxReconMessages == 0 {
+		t.Fatal("expected erlay tx reconciliation traffic in relay report")
+	}
+	if report.Metrics.TxReconItems == 0 {
+		t.Fatal("expected erlay tx reconciliation items in relay report")
+	}
+	if report.Metrics.TxRequestMessages == 0 {
+		t.Fatal("expected tx requests after erlay announcements")
+	}
+}
+
+func TestRunConfirmedBlocksSmoke(t *testing.T) {
+	report, err := RunE2E(context.Background(), RunOptions{
+		Profile:       types.Regtest,
+		NodeCount:     2,
+		Topology:      TopologyLine,
+		TxCount:       24,
+		BatchSize:     8,
+		TxsPerBlock:   8,
+		BlockCount:    3,
+		BlockInterval: 100 * time.Millisecond,
+		MiningMode:    MiningModeSynthetic,
+		Timeout:       20 * time.Second,
+		SuppressLogs:  true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if report.ConfirmedProcessingTPS <= 0 {
+		t.Fatalf("confirmed_processing_tps = %.2f, want > 0", report.ConfirmedProcessingTPS)
+	}
+	if report.ConfirmedWallTPS <= 0 {
+		t.Fatalf("confirmed_wall_tps = %.2f, want > 0", report.ConfirmedWallTPS)
 	}
 	if report.Metrics.ConfirmedBlocks != 3 {
 		t.Fatalf("confirmed_blocks = %d, want 3", report.Metrics.ConfirmedBlocks)
 	}
+	if report.Nodes[0].BlockHeight < 4 {
+		t.Fatalf("submitter block_height = %d, want at least 4", report.Nodes[0].BlockHeight)
+	}
+	if report.Metrics.FinalBlockLag > 1 {
+		t.Fatalf("final_block_lag = %d, want <= 1", report.Metrics.FinalBlockLag)
+	}
+	if report.Metrics.FinalMempoolTxs > 8 {
+		t.Fatalf("final_mempool_txs = %d, want <= 8", report.Metrics.FinalMempoolTxs)
+	}
+}
+
+func TestRunConfirmedBlocksMeshKeepsExpectedPeerCounts(t *testing.T) {
+	report, err := RunE2E(context.Background(), RunOptions{
+		Profile:        types.Regtest,
+		NodeCount:      5,
+		Topology:       TopologyMesh,
+		TxCount:        20,
+		BatchSize:      5,
+		TxsPerBlock:    5,
+		BlockCount:     4,
+		BlockInterval:  100 * time.Millisecond,
+		MiningMode:     MiningModeSynthetic,
+		TxOriginSpread: TxOriginEven,
+		Timeout:        30 * time.Second,
+		SuppressLogs:   true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
 	for _, node := range report.Nodes {
-		if node.BlockHeight < 4 {
-			t.Fatalf("%s block_height = %d, want at least 4", node.Name, node.BlockHeight)
+		if node.PeerCount != 4 {
+			t.Fatalf("%s peer_count = %d, want 4", node.Name, node.PeerCount)
 		}
-		if node.MempoolCount != 0 {
-			t.Fatalf("%s mempool_count = %d, want 0", node.Name, node.MempoolCount)
-		}
+	}
+}
+
+func TestRunConfirmedBlocksSyntheticMiningReportsFixedCadenceTPS(t *testing.T) {
+	report, err := Run(context.Background(), RunOptions{
+		Scenario:               ScenarioConfirmedBlocks,
+		Profile:                types.Regtest,
+		NodeCount:              3,
+		Topology:               TopologyMesh,
+		TxCount:                12,
+		BatchSize:              4,
+		TxsPerBlock:            4,
+		BlockCount:             3,
+		BlockInterval:          100 * time.Millisecond,
+		TxOriginSpread:         TxOriginEven,
+		Timeout:                10 * time.Second,
+		SuppressLogs:           true,
+		SyntheticMining:        true,
+		SyntheticBlockInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := float64(12) / (3 * 100 * time.Millisecond).Seconds()
+	if diff := math.Abs(report.SyntheticIntervalTPS - want); diff > want*0.001 {
+		t.Fatalf("synthetic_interval_tps = %.6f, want %.6f", report.SyntheticIntervalTPS, want)
+	}
+	if !report.SyntheticMining {
+		t.Fatal("expected synthetic mining flag in report")
+	}
+}
+
+func TestRunConfirmedBlocksSyntheticMiningFindsMaxWithoutRestartingCluster(t *testing.T) {
+	report, err := Run(context.Background(), RunOptions{
+		Scenario:               ScenarioConfirmedBlocks,
+		Profile:                types.Regtest,
+		NodeCount:              2,
+		Topology:               TopologyLine,
+		TxCount:                32,
+		BatchSize:              8,
+		TxsPerBlock:            8,
+		TxOriginSpread:         TxOriginOneNode,
+		Timeout:                20 * time.Second,
+		SuppressLogs:           true,
+		SyntheticMining:        true,
+		SyntheticBlockInterval: 250 * time.Millisecond,
+		FindMaxTPS:             true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if report.Metrics.RampSteps == 0 {
+		t.Fatal("expected at least one ramp step")
+	}
+	if report.Metrics.MaxSustainableTxsPerBlock == 0 && report.Metrics.FirstUnsustainedTxsPerBlock == 0 {
+		t.Fatal("expected either a sustainable or unsustained synthetic target")
+	}
+	expectedTarget := report.Metrics.MaxSustainableTxsPerBlock
+	if expectedTarget == 0 {
+		expectedTarget = report.Metrics.FirstUnsustainedTxsPerBlock
+	}
+	if report.TxsPerBlock != expectedTarget {
+		t.Fatalf("report txs_per_block = %d, want %d", report.TxsPerBlock, expectedTarget)
+	}
+	want := float64(report.Metrics.MaxSustainableTxsPerBlock) / (250 * time.Millisecond).Seconds()
+	if report.Metrics.MaxSustainableTxsPerBlock == 0 {
+		want = float64(report.Metrics.ConfirmedTxs) / (float64(report.Metrics.ConfirmedBlocks) * (250 * time.Millisecond).Seconds())
+	}
+	if diff := math.Abs(report.SyntheticIntervalTPS - want); diff > max(0.001, want*0.001) {
+		t.Fatalf("synthetic_interval_tps = %.6f, want %.6f", report.SyntheticIntervalTPS, want)
 	}
 }
 
@@ -143,6 +293,29 @@ func TestRunConfirmedBlocksTimeoutReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("timeout error = %v, want context deadline exceeded", err)
+	}
+}
+
+func TestFundingBatchCounts(t *testing.T) {
+	tests := []struct {
+		name     string
+		total    int
+		batch    int
+		expected []int
+	}{
+		{name: "empty", total: 0, batch: 8, expected: nil},
+		{name: "single batch", total: 8, batch: 8, expected: []int{8}},
+		{name: "multiple full batches", total: 24, batch: 8, expected: []int{8, 8, 8}},
+		{name: "trailing partial batch", total: 25, batch: 8, expected: []int{8, 8, 8, 1}},
+		{name: "invalid batch size", total: 25, batch: 0, expected: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := fundingBatchCounts(tt.total, tt.batch)
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Fatalf("fundingBatchCounts(%d, %d) = %v, want %v", tt.total, tt.batch, got, tt.expected)
+			}
+		})
 	}
 }
 
@@ -223,34 +396,30 @@ func TestRunOrphanStormSmoke(t *testing.T) {
 func TestRenderMarkdownIncludesSummary(t *testing.T) {
 	propagation := 12.5
 	text := RenderMarkdown(&Report{
-		Scenario:             string(ScenarioP2PRelay),
+		Benchmark:            string(BenchmarkThroughput),
+		Mode:                 string(ThroughputModeTx),
+		Scenario:             string(ScenarioDirectSubmit),
 		Profile:              "regtest",
-		NodeCount:            2,
-		Topology:             string(TopologyMesh),
+		NodeCount:            1,
 		TxCount:              64,
 		BatchSize:            32,
-		TxsPerBlock:          16,
-		TxOriginSpread:       string(TxOriginEven),
+		RequestedDurationMS:  60_000,
 		AdmissionDurationMS:  10,
 		CompletionDurationMS: 20,
 		AdmissionTPS:         6400,
 		CompletionTPS:        3200,
-		ConfirmedTPS:         1600,
 		Phases: PhaseReport{
 			DecodeMS:        1.5,
 			ValidateAdmitMS: 10,
-			RelayFanoutMS:   18,
+			RelayFanoutMS:   0,
 			ConvergenceMS:   20,
-		},
-		Metrics: ScenarioMetrics{
-			DirectRelayPeerCount: 1,
 		},
 		Nodes: []NodeReport{{
 			Name:                "node-0",
-			PeerCount:           1,
-			SubmittedTxs:        32,
-			BlockHeight:         2,
-			HeaderHeight:        2,
+			PeerCount:           0,
+			SubmittedTxs:        64,
+			BlockHeight:         1,
+			HeaderHeight:        1,
 			MempoolCount:        64,
 			BlockSigChecks:      64,
 			BlockSigFallbacks:   1,
@@ -258,23 +427,20 @@ func TestRenderMarkdownIncludesSummary(t *testing.T) {
 			CompletionMS:        &propagation,
 		}},
 	})
-	if !strings.Contains(text, "# Benchmark Report") {
+	if !strings.Contains(text, "# BPU Throughput Benchmark") {
 		t.Fatalf("markdown missing title: %q", text)
 	}
-	if !strings.Contains(text, "`p2p-relay`") {
-		t.Fatalf("markdown missing scenario: %q", text)
+	if !strings.Contains(text, "`throughput`") {
+		t.Fatalf("markdown missing benchmark: %q", text)
 	}
 	if !strings.Contains(text, "node-0") {
 		t.Fatalf("markdown missing node row: %q", text)
 	}
-	if !strings.Contains(text, "`even`") {
-		t.Fatalf("markdown missing tx origin: %q", text)
-	}
 	if !strings.Contains(text, "| Name | Peers | Submitted |") {
 		t.Fatalf("markdown missing submitted column: %q", text)
 	}
-	if !strings.Contains(text, "Phase Timings") {
-		t.Fatalf("markdown missing phases: %q", text)
+	if !strings.Contains(text, "## Timings") {
+		t.Fatalf("markdown missing timings section: %q", text)
 	}
 	if !strings.Contains(text, "Block Signature Verification") {
 		t.Fatalf("markdown missing signature section: %q", text)
@@ -283,21 +449,24 @@ func TestRenderMarkdownIncludesSummary(t *testing.T) {
 
 func TestRunSuiteSmoke(t *testing.T) {
 	report, err := RunSuite(context.Background(), SuiteOptions{
-		Profile:      types.Regtest,
-		NodeCount:    3,
-		TxCount:      16,
-		BatchSize:    8,
-		TxsPerBlock:  8,
-		Timeout:      40 * time.Second,
-		SuppressLogs: true,
+		Profile:       types.Regtest,
+		NodeCount:     3,
+		TxCount:       16,
+		BatchSize:     8,
+		TxsPerBlock:   8,
+		BlockCount:    2,
+		BlockInterval: 100 * time.Millisecond,
+		Duration:      time.Second,
+		Timeout:       20 * time.Second,
+		SuppressLogs:  true,
 	})
 	if err != nil {
 		t.Fatalf("RunSuite() error = %v", err)
 	}
-	if len(report.Cases) != 10 {
-		t.Fatalf("len(cases) = %d, want 10", len(report.Cases))
+	if len(report.Cases) != 4 {
+		t.Fatalf("len(cases) = %d, want 4", len(report.Cases))
 	}
-	if !strings.Contains(RenderSuiteMarkdown(report), "Benchmark Suite Report") {
+	if !strings.Contains(RenderSuiteMarkdown(report), "BPU Benchmark Suite") {
 		t.Fatalf("suite markdown missing title")
 	}
 	if !strings.Contains(RenderSuiteASCIISummary(report), "BPU Benchmark Suite") {
@@ -305,32 +474,73 @@ func TestRunSuiteSmoke(t *testing.T) {
 	}
 }
 
-func TestAvailableScenariosIncludesExpandedCoverage(t *testing.T) {
-	got := AvailableScenarios()
-	want := []Scenario{
-		ScenarioDirectSubmit,
-		ScenarioRPCBatch,
-		ScenarioP2PRelay,
-		ScenarioConfirmedBlocks,
-		ScenarioUserMix,
-		ScenarioChainedPackages,
-		ScenarioOrphanStorm,
-		ScenarioBlockTemplateBuild,
+func TestRunE2EUsesBenchmarkMetadata(t *testing.T) {
+	report, err := RunE2E(context.Background(), RunOptions{
+		Profile:       types.Regtest,
+		NodeCount:     2,
+		Topology:      TopologyLine,
+		BatchSize:     4,
+		TxsPerBlock:   4,
+		BlockCount:    2,
+		BlockInterval: 100 * time.Millisecond,
+		MiningMode:    MiningModeSynthetic,
+		Timeout:       20 * time.Second,
+		SuppressLogs:  true,
+	})
+	if err != nil {
+		t.Fatalf("RunE2E() error = %v", err)
 	}
-	for _, scenario := range want {
-		if !containsScenario(got, scenario) {
-			t.Fatalf("missing scenario %q in %v", scenario, got)
-		}
+	if report.Benchmark != string(BenchmarkE2E) {
+		t.Fatalf("benchmark = %q, want %q", report.Benchmark, BenchmarkE2E)
+	}
+	if report.Mining != string(MiningModeSynthetic) {
+		t.Fatalf("mining = %q, want %q", report.Mining, MiningModeSynthetic)
+	}
+	if report.TargetBlocks != 2 {
+		t.Fatalf("target_blocks = %d, want 2", report.TargetBlocks)
+	}
+	if report.Profile != string(types.BenchNet) {
+		t.Fatalf("profile = %q, want %q", report.Profile, types.BenchNet)
 	}
 }
 
-func containsScenario(list []Scenario, want Scenario) bool {
-	for _, scenario := range list {
-		if scenario == want {
-			return true
-		}
+func TestBenchNetDifficultyPresetForInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+		expected uint32
+	}{
+		{name: "short cadence", interval: 2 * time.Second, expected: consensus.RegtestParams().GenesisBits},
+		{name: "medium cadence", interval: 20 * time.Second, expected: consensus.RegtestMediumParams().GenesisBits},
+		{name: "long cadence", interval: 90 * time.Second, expected: consensus.RegtestHardParams().GenesisBits},
 	}
-	return false
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := benchNetDifficultyPreset(tt.interval).GenesisBits; got != tt.expected {
+				t.Fatalf("benchNetDifficultyPreset(%s) = 0x%08x, want 0x%08x", tt.interval, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRunThroughputUsesModeMetadata(t *testing.T) {
+	report, err := RunThroughput(context.Background(), RunOptions{
+		Profile:        types.Regtest,
+		ThroughputMode: ThroughputModeTx,
+		TxCount:        16,
+		Duration:       time.Second,
+		Timeout:        10 * time.Second,
+		SuppressLogs:   true,
+	})
+	if err != nil {
+		t.Fatalf("RunThroughput() error = %v", err)
+	}
+	if report.Benchmark != string(BenchmarkThroughput) {
+		t.Fatalf("benchmark = %q, want %q", report.Benchmark, BenchmarkThroughput)
+	}
+	if report.Mode != string(ThroughputModeTx) {
+		t.Fatalf("mode = %q, want %q", report.Mode, ThroughputModeTx)
+	}
 }
 
 func submittedCountsByNode(nodes []NodeReport) map[string]int {

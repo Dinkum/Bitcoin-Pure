@@ -422,4 +422,9 @@ func TestMagicForProfileDistinguishesRegtestProfiles(t *testing.T) {
 	} else if got == MagicForProfile(types.Regtest) || got == MagicForProfile(types.RegtestMedium) {
 		t.Fatal("regtest_hard should use distinct network magic")
 	}
+	if got := MagicForProfile(types.BenchNet); got == 0 {
+		t.Fatal("benchnet magic should be non-zero")
+	} else if got == MagicForProfile(types.Regtest) || got == MagicForProfile(types.RegtestMedium) || got == MagicForProfile(types.RegtestHard) {
+		t.Fatal("benchnet should use distinct network magic")
+	}
 }

@@ -26,24 +26,30 @@ type minerManager struct {
 }
 
 type blockTemplateCache struct {
-	tipHash       [32]byte
-	mempoolEpoch  uint64
-	generation    uint64
-	builtAt       time.Time
-	block         types.Block
-	selected      []mempool.SnapshotEntry
-	totalFees     uint64
-	usedTxBytes   int
-	baseUtxos     consensus.UtxoSet
-	selectionView *consensus.UtxoOverlay
-	baseAcc       *utreexo.Accumulator
-	selectionAcc  *utreexo.Accumulator
+	tipHash         [32]byte
+	mempoolEpoch    uint64
+	generation      uint64
+	builtAt         time.Time
+	block           types.Block
+	selected        []mempool.SnapshotEntry
+	selectedTxs     []types.Transaction
+	selectedTxIDs   [][32]byte
+	selectedAuthIDs [][32]byte
+	totalFees       uint64
+	usedTxBytes     int
+	baseUtxos       consensus.UtxoSet
+	selectionView   *consensus.UtxoOverlay
+	baseAcc         *utreexo.Accumulator
+	selectionAcc    *utreexo.Accumulator
 }
 
 type templateBuildTelemetry struct {
 	mu                 sync.Mutex
 	cacheHits          int
 	rebuilds           int
+	fullBuilds         int
+	appendExtends      int
+	noChangeRefreshes  int
 	frontierCandidates int
 	invalidations      int
 	interruptions      int
@@ -111,7 +117,7 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	if block, generation, ok, err := m.extendBlockTemplate(ctx, mempoolEpoch); err != nil {
 		return types.Block{}, 0, err
 	} else if ok {
-		m.templateStats.noteRebuild(m.svc.pool.SelectionCandidateCount())
+		m.templateStats.noteAppendExtend(m.svc.pool.SelectionCandidateCount())
 		m.svc.noteTemplateRebuild()
 		m.svc.perf.noteTemplateDuration(time.Since(startedAt))
 		m.svc.logger.Debug("template ready",
@@ -127,12 +133,12 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot)
+	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot)
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	generation := m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, snapshot.utxoAcc, selectionAcc)
-	m.templateStats.noteRebuild(m.svc.pool.SelectionCandidateCount())
+	generation := m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseUtxos, selectionView, snapshot.utxoAcc, selectionAcc)
+	m.templateStats.noteFullBuild(m.svc.pool.SelectionCandidateCount())
 	m.svc.noteTemplateRebuild()
 	m.svc.perf.noteTemplateDuration(time.Since(startedAt))
 	m.svc.logger.Debug("template ready",
@@ -199,26 +205,34 @@ func (m *minerManager) mineOneBlock() ([32]byte, error) {
 	}
 }
 
-func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, uint64, int, consensus.UtxoSet, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
+func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, []types.Transaction, [][32]byte, [][32]byte, uint64, int, consensus.UtxoSet, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
 	startedAt := time.Now()
 	baseUtxos := snapshot.utxos
 	maxTemplateBytes := int(consensus.NextBlockSizeLimit(snapshot.blockSizeState, consensus.ParamsForProfile(m.svc.cfg.Profile)))
 	if maxTemplateBytes > 1024 {
 		maxTemplateBytes -= 1024
 	}
+	selectStartedAt := time.Now()
 	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlay(baseUtxos, consensus.DefaultConsensusRules(), maxTemplateBytes)
-	selectionAcc, err := snapshot.utxoAcc.Apply(selectedEntrySpends(selectedEntries), selectedEntryLeaves(selectedEntries))
+	m.svc.perf.noteTemplateSelectDuration(time.Since(selectStartedAt))
+	selectedTxs, selectedTxIDs, selectedAuthIDs, usedTxBytes := buildSelectedTemplateVectors(selectedEntries)
+	selectedSpends, selectedLeaves := selectedEntryAccumulatorDeltas(selectedEntries)
+	accStartedAt := time.Now()
+	selectionAcc, err := snapshot.utxoAcc.Apply(selectedSpends, selectedLeaves)
+	m.svc.perf.noteTemplateAccumulateDuration(time.Since(accStartedAt))
 	if err != nil {
-		return types.Block{}, nil, 0, 0, nil, nil, nil, err
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, err
 	}
-	block, usedTxBytes, err := m.assembleBlockTemplate(chainTemplateContext{
+	assembleStartedAt := time.Now()
+	block, err := m.assembleBlockTemplate(chainTemplateContext{
 		tipHash:        snapshot.tipHash,
 		height:         snapshot.height,
 		tipHeader:      snapshot.tipHeader,
 		blockSizeState: snapshot.blockSizeState,
-	}, selectedEntries, totalFees, selectionAcc)
+	}, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, selectionAcc)
+	m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
 	if err != nil {
-		return types.Block{}, nil, 0, 0, nil, nil, nil, err
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, err
 	}
 	m.svc.logger.Debug("building block candidate",
 		slog.Uint64("next_height", snapshot.height+1),
@@ -226,10 +240,10 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (typ
 		slog.Uint64("total_fees", totalFees),
 		slog.Duration("template_duration", time.Since(startedAt)),
 	)
-	return block, selectedEntries, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, nil
+	return block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, nil
 }
 
-func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedEntries []mempool.SnapshotEntry, totalFees uint64, selectionAcc *utreexo.Accumulator) (types.Block, int, error) {
+func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, selectionAcc *utreexo.Accumulator) (types.Block, error) {
 	params := consensus.ParamsForProfile(m.svc.cfg.Profile)
 	nextTimestamp := ctx.tipHeader.Timestamp + uint64(params.TargetSpacingSecs)
 	if nextTimestamp <= ctx.tipHeader.Timestamp {
@@ -237,29 +251,29 @@ func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedE
 	}
 	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: ctx.height, Header: ctx.tipHeader}, params)
 	if err != nil {
-		return types.Block{}, 0, err
-	}
-
-	selected := make([]types.Transaction, 0, len(selectedEntries))
-	usedTxBytes := 0
-	for _, entry := range selectedEntries {
-		selected = append(selected, entry.Tx)
-		usedTxBytes += entry.Size
+		return types.Block{}, err
 	}
 
 	coinbase := coinbaseTxForHeight(ctx.height+1, []types.TxOutput{{
 		ValueAtoms: consensus.SubsidyAtoms(ctx.height+1, params) + totalFees,
-		PubKey:    m.svc.cfg.MinerPubKey,
+		PubKey:     m.svc.cfg.MinerPubKey,
 	}})
 	coinbaseTxID := consensus.TxID(&coinbase)
+	coinbaseAuthID := consensus.AuthID(&coinbase)
 
-	txs := make([]types.Transaction, 0, len(selected)+1)
+	txs := make([]types.Transaction, 0, len(selectedTxs)+1)
+	txids := make([][32]byte, 0, len(selectedTxIDs)+1)
+	authids := make([][32]byte, 0, len(selectedAuthIDs)+1)
 	txs = append(txs, coinbase)
-	txs = append(txs, selected...)
-	_, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
+	txids = append(txids, coinbaseTxID)
+	authids = append(authids, coinbaseAuthID)
+	txs = append(txs, selectedTxs...)
+	txids = append(txids, selectedTxIDs...)
+	authids = append(authids, selectedAuthIDs...)
+	txRoot, authRoot := consensus.BuildBlockRootsFromIDs(txids, authids)
 	finalAcc, err := selectionAcc.Apply(nil, coinbaseLeaves(coinbaseTxID, coinbase.Base.Outputs))
 	if err != nil {
-		return types.Block{}, 0, err
+		return types.Block{}, err
 	}
 	header := types.BlockHeader{
 		Version:        1,
@@ -270,13 +284,13 @@ func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedE
 		Timestamp:      nextTimestamp,
 		NBits:          nbits,
 	}
-	return types.Block{Header: header, Txs: txs}, usedTxBytes, nil
+	return types.Block{Header: header, Txs: txs}, nil
 }
 
 func (m *minerManager) chainTemplateContext() (chainTemplateContext, error) {
 	m.svc.stateMu.RLock()
 	defer m.svc.stateMu.RUnlock()
-	view, ok := m.svc.chainState.CommittedView()
+	view, ok := m.svc.chainState.sharedCommittedView()
 	if !ok {
 		return chainTemplateContext{}, ErrNoTip
 	}
@@ -291,7 +305,7 @@ func (m *minerManager) chainTemplateContext() (chainTemplateContext, error) {
 func (m *minerManager) chainSelectionSnapshot() (chainSelectionSnapshot, error) {
 	m.svc.stateMu.RLock()
 	defer m.svc.stateMu.RUnlock()
-	view, ok := m.svc.chainState.CommittedView()
+	view, ok := m.svc.chainState.sharedCommittedView()
 	if !ok {
 		return chainSelectionSnapshot{}, ErrNoTip
 	}
@@ -331,41 +345,53 @@ func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoc
 		return types.Block{}, 0, false, nil
 	}
 
+	appendSelectStartedAt := time.Now()
 	added, addedFees := m.svc.pool.AppendForBlockOverlay(m.template.baseUtxos, m.template.selectionView, consensus.DefaultConsensusRules(), maxTemplateBytes, m.template.selected)
+	m.svc.perf.noteTemplateSelectDuration(time.Since(appendSelectStartedAt))
 	if len(added) == 0 {
 		m.template.mempoolEpoch = mempoolEpoch
-		block, _, err := m.assembleBlockTemplate(ctx, m.template.selected, m.template.totalFees, m.template.selectionAcc)
+		assembleStartedAt := time.Now()
+		block, err := m.assembleBlockTemplate(ctx, m.template.selectedTxs, m.template.selectedTxIDs, m.template.selectedAuthIDs, m.template.totalFees, m.template.selectionAcc)
+		m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
 		if err != nil {
 			return types.Block{}, 0, false, err
 		}
 		m.template.block = cloneBlock(block)
 		m.template.builtAt = time.Now()
+		m.templateStats.noteNoChangeRefresh(m.svc.pool.SelectionCandidateCount())
 		m.templateStats.noteBuildTime(m.template.builtAt)
 		return cloneBlock(m.template.block), m.template.generation, true, nil
 	}
 
 	m.template.selected = mergeSnapshotEntriesByTxID(m.template.selected, added)
+	m.template.selectedTxs, m.template.selectedTxIDs, m.template.selectedAuthIDs = mergeSelectedTemplateVectors(m.template.selectedTxs, m.template.selectedTxIDs, m.template.selectedAuthIDs, added)
 	m.template.totalFees += addedFees
 	for _, entry := range added {
 		m.template.usedTxBytes += entry.Size
 	}
-	nextAcc, err := m.template.selectionAcc.Apply(selectedEntrySpends(added), selectedEntryLeaves(added))
+	addedSpends, addedLeaves := selectedEntryAccumulatorDeltas(added)
+	accStartedAt := time.Now()
+	nextAcc, err := m.template.selectionAcc.Apply(addedSpends, addedLeaves)
+	m.svc.perf.noteTemplateAccumulateDuration(time.Since(accStartedAt))
 	if err != nil {
 		return types.Block{}, 0, false, err
 	}
 	m.template.selectionAcc = nextAcc
-	block, _, err := m.assembleBlockTemplate(ctx, m.template.selected, m.template.totalFees, m.template.selectionAcc)
+	assembleStartedAt := time.Now()
+	block, err := m.assembleBlockTemplate(ctx, m.template.selectedTxs, m.template.selectedTxIDs, m.template.selectedAuthIDs, m.template.totalFees, m.template.selectionAcc)
+	m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
 	if err != nil {
 		return types.Block{}, 0, false, err
 	}
 	m.template.block = cloneBlock(block)
 	m.template.mempoolEpoch = mempoolEpoch
 	m.template.builtAt = time.Now()
+	m.templateStats.noteAppendExtend(m.svc.pool.SelectionCandidateCount())
 	m.templateStats.noteBuildTime(m.template.builtAt)
 	return cloneBlock(m.template.block), m.template.generation, true, nil
 }
 
-func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, totalFees uint64, usedTxBytes int, baseUtxos consensus.UtxoSet, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
+func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, usedTxBytes int, baseUtxos consensus.UtxoSet, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
 	m.templateMu.Lock()
 	defer m.templateMu.Unlock()
 	if m.templateGeneration == 0 {
@@ -373,18 +399,21 @@ func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64,
 	}
 	generation := m.templateGeneration
 	m.template = &blockTemplateCache{
-		tipHash:       tipHash,
-		mempoolEpoch:  mempoolEpoch,
-		generation:    generation,
-		builtAt:       time.Now(),
-		block:         cloneBlock(block),
-		selected:      append([]mempool.SnapshotEntry(nil), selected...),
-		totalFees:     totalFees,
-		usedTxBytes:   usedTxBytes,
-		baseUtxos:     baseUtxos,
-		selectionView: selectionView,
-		baseAcc:       baseAcc,
-		selectionAcc:  selectionAcc,
+		tipHash:         tipHash,
+		mempoolEpoch:    mempoolEpoch,
+		generation:      generation,
+		builtAt:         time.Now(),
+		block:           cloneBlock(block),
+		selected:        append([]mempool.SnapshotEntry(nil), selected...),
+		selectedTxs:     append([]types.Transaction(nil), selectedTxs...),
+		selectedTxIDs:   append([][32]byte(nil), selectedTxIDs...),
+		selectedAuthIDs: append([][32]byte(nil), selectedAuthIDs...),
+		totalFees:       totalFees,
+		usedTxBytes:     usedTxBytes,
+		baseUtxos:       baseUtxos,
+		selectionView:   selectionView,
+		baseAcc:         baseAcc,
+		selectionAcc:    selectionAcc,
 	}
 	m.templateStats.noteBuildTime(m.template.builtAt)
 	return generation
@@ -440,10 +469,30 @@ func (t *templateBuildTelemetry) noteCacheHit(frontierCandidates int) {
 	}
 }
 
-func (t *templateBuildTelemetry) noteRebuild(frontierCandidates int) {
+func (t *templateBuildTelemetry) noteFullBuild(frontierCandidates int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.rebuilds++
+	t.fullBuilds++
+	if frontierCandidates > t.frontierCandidates {
+		t.frontierCandidates = frontierCandidates
+	}
+}
+
+func (t *templateBuildTelemetry) noteAppendExtend(frontierCandidates int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rebuilds++
+	t.appendExtends++
+	if frontierCandidates > t.frontierCandidates {
+		t.frontierCandidates = frontierCandidates
+	}
+}
+
+func (t *templateBuildTelemetry) noteNoChangeRefresh(frontierCandidates int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.noChangeRefreshes++
 	if frontierCandidates > t.frontierCandidates {
 		t.frontierCandidates = frontierCandidates
 	}
@@ -479,6 +528,9 @@ func (t *templateBuildTelemetry) snapshot() BlockTemplateStats {
 	return BlockTemplateStats{
 		CacheHits:          t.cacheHits,
 		Rebuilds:           t.rebuilds,
+		FullBuilds:         t.fullBuilds,
+		AppendExtends:      t.appendExtends,
+		NoChangeRefreshes:  t.noChangeRefreshes,
 		FrontierCandidates: t.frontierCandidates,
 		Invalidations:      t.invalidations,
 		Interruptions:      t.interruptions,
@@ -518,26 +570,71 @@ func mergeSnapshotEntriesByTxID(left, right []mempool.SnapshotEntry) []mempool.S
 	return merged
 }
 
-func selectedEntrySpends(entries []mempool.SnapshotEntry) []types.OutPoint {
-	spent := make([]types.OutPoint, 0)
+func selectedEntryAccumulatorDeltas(entries []mempool.SnapshotEntry) ([]types.OutPoint, []utreexo.UtxoLeaf) {
+	totalSpent := 0
+	totalCreated := 0
 	for _, entry := range entries {
-		for _, input := range entry.Tx.Base.Inputs {
-			spent = append(spent, input.PrevOut)
-		}
+		totalSpent += len(entry.SpentOutPoints)
+		totalCreated += len(entry.CreatedLeaves)
 	}
-	return spent
+	spent := make([]types.OutPoint, 0, totalSpent)
+	created := make([]utreexo.UtxoLeaf, 0, totalCreated)
+	for _, entry := range entries {
+		spent = append(spent, entry.SpentOutPoints...)
+		created = append(created, entry.CreatedLeaves...)
+	}
+	return spent, created
 }
 
-func selectedEntryLeaves(entries []mempool.SnapshotEntry) []utreexo.UtxoLeaf {
-	created := make([]utreexo.UtxoLeaf, 0)
-	for _, entry := range entries {
-		for vout, output := range entry.Tx.Base.Outputs {
-			created = append(created, utreexo.UtxoLeaf{
-				OutPoint:   types.OutPoint{TxID: entry.TxID, Vout: uint32(vout)},
-				ValueAtoms: output.ValueAtoms,
-				PubKey:    output.PubKey,
-			})
-		}
+func buildSelectedTemplateVectors(entries []mempool.SnapshotEntry) ([]types.Transaction, [][32]byte, [][32]byte, int) {
+	if len(entries) == 0 {
+		return nil, nil, nil, 0
 	}
-	return created
+	txs := make([]types.Transaction, 0, len(entries))
+	txids := make([][32]byte, 0, len(entries))
+	authids := make([][32]byte, 0, len(entries))
+	usedTxBytes := 0
+	for _, entry := range entries {
+		txs = append(txs, entry.Tx)
+		txids = append(txids, entry.TxID)
+		authids = append(authids, entry.AuthID)
+		usedTxBytes += entry.Size
+	}
+	return txs, txids, authids, usedTxBytes
+}
+
+func mergeSelectedTemplateVectors(leftTxs []types.Transaction, leftTxIDs [][32]byte, leftAuthIDs [][32]byte, right []mempool.SnapshotEntry) ([]types.Transaction, [][32]byte, [][32]byte) {
+	if len(leftTxs) == 0 {
+		txs, txids, authids, _ := buildSelectedTemplateVectors(right)
+		return txs, txids, authids
+	}
+	if len(right) == 0 {
+		return leftTxs, leftTxIDs, leftAuthIDs
+	}
+	mergedTxs := make([]types.Transaction, 0, len(leftTxs)+len(right))
+	mergedTxIDs := make([][32]byte, 0, len(leftTxIDs)+len(right))
+	mergedAuthIDs := make([][32]byte, 0, len(leftAuthIDs)+len(right))
+	i, j := 0, 0
+	for i < len(leftTxIDs) && j < len(right) {
+		if bytes.Compare(leftTxIDs[i][:], right[j].TxID[:]) <= 0 {
+			mergedTxs = append(mergedTxs, leftTxs[i])
+			mergedTxIDs = append(mergedTxIDs, leftTxIDs[i])
+			mergedAuthIDs = append(mergedAuthIDs, leftAuthIDs[i])
+			i++
+			continue
+		}
+		mergedTxs = append(mergedTxs, right[j].Tx)
+		mergedTxIDs = append(mergedTxIDs, right[j].TxID)
+		mergedAuthIDs = append(mergedAuthIDs, right[j].AuthID)
+		j++
+	}
+	mergedTxs = append(mergedTxs, leftTxs[i:]...)
+	mergedTxIDs = append(mergedTxIDs, leftTxIDs[i:]...)
+	mergedAuthIDs = append(mergedAuthIDs, leftAuthIDs[i:]...)
+	for ; j < len(right); j++ {
+		mergedTxs = append(mergedTxs, right[j].Tx)
+		mergedTxIDs = append(mergedTxIDs, right[j].TxID)
+		mergedAuthIDs = append(mergedAuthIDs, right[j].AuthID)
+	}
+	return mergedTxs, mergedTxIDs, mergedAuthIDs
 }

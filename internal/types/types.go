@@ -64,6 +64,7 @@ const (
 	Regtest       ChainProfile = "regtest"
 	RegtestMedium ChainProfile = "regtest_medium"
 	RegtestHard   ChainProfile = "regtest_hard"
+	BenchNet      ChainProfile = "benchnet"
 )
 
 const (
@@ -81,6 +82,8 @@ func ParseChainProfile(raw string) (ChainProfile, error) {
 		return RegtestMedium, nil
 	case RegtestHard:
 		return RegtestHard, nil
+	case BenchNet:
+		return BenchNet, nil
 	default:
 		return "", fmt.Errorf("unknown chain profile: %s", raw)
 	}
@@ -91,7 +94,7 @@ func (p ChainProfile) String() string {
 }
 
 func (p ChainProfile) IsRegtestLike() bool {
-	return p == Regtest || p == RegtestMedium || p == RegtestHard
+	return p == Regtest || p == RegtestMedium || p == RegtestHard || p == BenchNet
 }
 
 type CodecLimits struct {

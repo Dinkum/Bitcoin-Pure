@@ -1,5 +1,34 @@
 # Release Notes
 
+## v0.1.15
+Major
+- Added full snapshot import/export fast-sync with retained trust anchors and background historical replay. `bpu-cli snapshot export` can now write deterministic tip snapshots, `bpu-cli snapshot import` can seed a fresh node from one of those snapshots, and the node keeps replaying stored history from genesis in the background until the imported chainstate is locally re-verified.
+- Added a full lite-client state and proof surface on top of the Utreexo chainstate:
+  - batched UTXO proof RPCs for multi-outpoint membership and exclusion checks
+  - compact-state packages ordered by the node’s locality index for bridge and lite sync consumers
+  - compact filter RPCs (`getblockfilter`, `getfilterheaders`, `getfiltercheckpoint`) for lightweight block scanning
+  - an optional MuHash-style `utxo_checksum` exposed through chainstate and snapshot flows for fast cross-checks
+- Reworked operator config and deployment around human-edited YAML. The node now prefers `config.yaml`, ships a commented top-level template plus `example.config.yaml`, keeps a JSON sidecar for automation compatibility, and the installer/update scripts derive a default `max_mempool_bytes` from host RAM.
+- Added a real mempool memory ceiling with fee-based eviction. Nodes now enforce `max_mempool_bytes`, evict lower-value transactions when full, and expose the configured cap in mempool/chainstate surfaces instead of letting valid relay-fee floods grow memory without bound.
+- Simplified and hardened the benchmark story around two real paths:
+  - fast in-process `go test -bench` microbenches for tx admission, validation, signature verification, mempool selection, block build, and block apply
+  - one thin `bench e2e` cluster benchmark with fixed-cadence synthetic mining, cleaner Markdown/JSON reports, and benchnet fresh-genesis runs tuned for benchmarking instead of long-lived regtest state
+- Landed a major measured throughput pass on the hot tx/block path:
+  - Erlay reconciliation now coalesces distributed-origin tx announcements more effectively before they fan out
+  - block template selection no longer re-verifies signatures that already passed mempool admission, while full block validation still performs authoritative verification before acceptance
+  - on the tracked 5-node synthetic `bench e2e` workload (`1024 tx/block`, `1s` cadence, `20` blocks, `mesh`), sustained even-origin throughput improved from `908.36 tx/s` to `998.35 tx/s`, a `9.91%` increase
+  - on that same workload, block build time dropped from about `216.30 ms` to `34.61 ms`, an `84.00%` reduction
+
+Minor
+- Added a benchnet benchmark chain that always starts from fresh genesis, tunes real-mining difficulty from the requested benchmark cadence, and keeps benchmark runs isolated from persistent manual regtest history.
+- Added archived microbenchmark reports under `benchmarks/reports/micro/YYYYMMDD/HHMMSS/` with matching Markdown and JSON outputs for saved before/after performance comparisons.
+- Refined node logging around state instead of chatter. Operators now get stable `node=` tagging, periodic node-health snapshots, explicit sync/mempool state transitions, and far less noisy peer/known-peer/shutdown logging at `INFO` and `WARN`.
+- Added snapshot-protected reorg guards for imported fast-sync state so the node refuses deep pre-import disconnects until background historical verification has backfilled and checked that history locally.
+- Added a non-consensus locality-preserving UTXO index so proof serving and future snapshot packing can use recently-touched / locality-ordered coins without changing the canonical outpoint-keyed commitment.
+- Upgraded relay diagnostics and benchmark observability with template-phase timing, relay batching ratios, Erlay/Graphene counters, node-runtime status snapshots, and clearer progress output during long synthetic benchmark runs.
+- Raised the per-peer exact `knownTx` window and tightened relay duplicate suppression so high-TPS nodes churn less relay state under heavy mempool traffic.
+- Added commented YAML config rendering and example files while keeping legacy JSON load support, so existing automation can keep working during the cutover.
+
 ## v0.1.14
 Major
 - Added deterministic UTXO snapshot verification tooling. The repo now ships fixed-height snapshot fixtures plus `bpu-cli snapshot root` and `bpu-cli snapshot verify` so canonical snapshot state can be reconstructed and checked against the committed header `utxo_root`.

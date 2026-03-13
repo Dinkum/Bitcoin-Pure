@@ -5,6 +5,7 @@ MODE=""
 STAGE_DIR=""
 CURRENT_LINK=""
 CONFIG_PATH=""
+LEGACY_CONFIG_PATH=""
 DATA_DIR=""
 LOG_DIR=""
 SERVICE_NAME=""
@@ -115,8 +116,12 @@ PY
 }
 
 render_config() {
-	local artifacts_dir peers_json mining_override profile_override
+	local artifacts_dir current_legacy_config_path peers_json mining_override profile_override
 	artifacts_dir="${STAGE_DIR}/.artifacts"
+	current_legacy_config_path="${LEGACY_CONFIG_PATH}"
+	if [[ -z "${current_legacy_config_path}" ]]; then
+		current_legacy_config_path="$(dirname "${CONFIG_PATH}")/config.json"
+	fi
 	mkdir -p "${artifacts_dir}"
 	if [[ "${#PEERS[@]}" -gt 0 ]]; then
 		peers_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${PEERS[@]}")"
@@ -126,9 +131,10 @@ render_config() {
 	mining_override="${MINING_MODE}"
 	profile_override="${PROFILE}"
 
-	python3 - "${CONFIG_PATH}" "${artifacts_dir}/config.json" "${DATA_DIR}" "${LOG_DIR}" "${STAGE_DIR}" "${profile_override}" "${mining_override}" "${peers_json}" <<'PY'
+	python3 - "${current_legacy_config_path}" "${artifacts_dir}/config.json" "${DATA_DIR}" "${LOG_DIR}" "${STAGE_DIR}" "${profile_override}" "${mining_override}" "${peers_json}" <<'PY'
 import json
 import os
+import secrets
 import sys
 
 config_path, out_path, data_dir, log_dir, stage_dir, profile_override, mining_override, peers_json = sys.argv[1:9]
@@ -141,7 +147,23 @@ def keep(key, default):
     return current.get(key, default)
 
 profile = profile_override or keep("profile", "regtest")
-import secrets
+
+def default_mempool_bytes():
+    mem_total_bytes = 0
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    mem_total_bytes = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        mem_total_bytes = 0
+    if mem_total_bytes <= 0:
+        return 64 << 20
+    derived = mem_total_bytes // 10
+    derived = max(64 << 20, derived)
+    derived = min(4 << 30, derived)
+    return derived
 
 rpc_token = keep("rpc_auth_token", secrets.token_hex(32))
 miner_pubkey = str(keep("miner_pubkey_hex", "")).strip()
@@ -179,6 +201,7 @@ cfg = {
     "stall_timeout_ms": keep("stall_timeout_ms", 15000),
     "max_message_bytes": keep("max_message_bytes", 64000000),
     "min_relay_fee_per_byte": keep("min_relay_fee_per_byte", 1),
+    "max_mempool_bytes": keep("max_mempool_bytes", default_mempool_bytes()),
     "miner_enabled": miner_enabled,
     "miner_workers": keep("miner_workers", 0),
     "miner_pubkey_hex": miner_pubkey,
@@ -191,6 +214,16 @@ with open(out_path, "w", encoding="utf-8") as fh:
     fh.write("\n")
 PY
 	chmod 600 "${artifacts_dir}/config.json"
+}
+
+normalize_config() {
+	local artifacts_dir raw_config canonical_config
+	artifacts_dir="${STAGE_DIR}/.artifacts"
+	raw_config="${artifacts_dir}/config.json"
+	canonical_config="${artifacts_dir}/config.yaml"
+	log "rendering canonical config.yaml and compatibility config.json"
+	"${STAGE_DIR}/bin/bpu-cli" config normalize --in "${raw_config}" --out "${canonical_config}"
+	chmod 600 "${canonical_config}" "${raw_config}"
 }
 
 render_unit() {
@@ -226,10 +259,11 @@ build_binary() {
 }
 
 ensure_mining_wallet() {
-	local artifacts_dir staged_config miner_state miner_pubkey wallet_dir wallet_output pubkey receive_address
+	local artifacts_dir staged_config staged_legacy_config miner_state miner_pubkey wallet_dir wallet_output pubkey receive_address
 	artifacts_dir="${STAGE_DIR}/.artifacts"
-	staged_config="${artifacts_dir}/config.json"
-	mapfile -t miner_state < <(python3 - "${staged_config}" <<'PY'
+	staged_config="${artifacts_dir}/config.yaml"
+	staged_legacy_config="${artifacts_dir}/config.json"
+	mapfile -t miner_state < <(python3 - "${staged_legacy_config}" <<'PY'
 import json
 import sys
 
@@ -261,7 +295,7 @@ PY
 	pubkey="$(printf '%s\n' "${wallet_output}" | sed -n 's/^pubkey: //p' | tail -n 1)"
 	receive_address="$(printf '%s\n' "${wallet_output}" | sed -n 's/^receive_address: //p' | tail -n 1)"
 	[[ -n "${pubkey}" ]] || fail "miner wallet provisioning did not return a pubkey"
-	python3 - "${staged_config}" "${pubkey}" <<'PY'
+	python3 - "${staged_legacy_config}" "${pubkey}" <<'PY'
 import json
 import sys
 
@@ -275,7 +309,8 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump(cfg, fh, indent=2)
     fh.write("\n")
 PY
-	chmod 600 "${staged_config}"
+	"${STAGE_DIR}/bin/bpu-cli" config normalize --in "${staged_legacy_config}" --out "${staged_config}"
+	chmod 600 "${staged_config}" "${staged_legacy_config}"
 	log "miner wallet ready at ${wallet_dir} (${receive_address:-address unavailable})"
 }
 
@@ -303,6 +338,10 @@ parse_args() {
 			;;
 		--config-path)
 			CONFIG_PATH="$2"
+			shift 2
+			;;
+		--legacy-config-path)
+			LEGACY_CONFIG_PATH="$2"
 			shift 2
 			;;
 		--data-dir)
@@ -361,6 +400,7 @@ main() {
 	render_config
 	render_unit
 	build_binary
+	normalize_config
 	ensure_mining_wallet
 	render_metadata
 	log "stage prepared successfully"

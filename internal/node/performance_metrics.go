@@ -64,6 +64,9 @@ type PerformanceGauges struct {
 type PerformanceLatencyGroup struct {
 	Admission          DurationHistogramSummary `json:"admission"`
 	Template           DurationHistogramSummary `json:"template"`
+	TemplateSelect     DurationHistogramSummary `json:"template_select"`
+	TemplateAccumulate DurationHistogramSummary `json:"template_accumulate"`
+	TemplateAssemble   DurationHistogramSummary `json:"template_assemble"`
 	BlockApply         DurationHistogramSummary `json:"block_apply"`
 	BlockSigVerify     DurationHistogramSummary `json:"block_sig_verify"`
 	BlockApplyLockWait DurationHistogramSummary `json:"block_apply_lock_wait"`
@@ -83,6 +86,9 @@ type performanceMetricsCollector struct {
 	mu                 sync.Mutex
 	admission          durationMetricWindow
 	template           durationMetricWindow
+	templateSelect     durationMetricWindow
+	templateAccumulate durationMetricWindow
+	templateAssemble   durationMetricWindow
 	blockApply         durationMetricWindow
 	blockSigVerify     durationMetricWindow
 	blockApplyLockWait durationMetricWindow
@@ -104,6 +110,18 @@ func (c *performanceMetricsCollector) noteAdmissionDuration(d time.Duration) {
 
 func (c *performanceMetricsCollector) noteTemplateDuration(d time.Duration) {
 	c.record(&c.template, d)
+}
+
+func (c *performanceMetricsCollector) noteTemplateSelectDuration(d time.Duration) {
+	c.record(&c.templateSelect, d)
+}
+
+func (c *performanceMetricsCollector) noteTemplateAccumulateDuration(d time.Duration) {
+	c.record(&c.templateAccumulate, d)
+}
+
+func (c *performanceMetricsCollector) noteTemplateAssembleDuration(d time.Duration) {
+	c.record(&c.templateAssemble, d)
 }
 
 func (c *performanceMetricsCollector) noteBlockApplyDuration(d time.Duration) {
@@ -158,6 +176,9 @@ func (c *performanceMetricsCollector) snapshot() PerformanceLatencyGroup {
 	return PerformanceLatencyGroup{
 		Admission:          c.admission.summary(),
 		Template:           c.template.summary(),
+		TemplateSelect:     c.templateSelect.summary(),
+		TemplateAccumulate: c.templateAccumulate.summary(),
+		TemplateAssemble:   c.templateAssemble.summary(),
 		BlockApply:         c.blockApply.summary(),
 		BlockSigVerify:     c.blockSigVerify.summary(),
 		BlockApplyLockWait: c.blockApplyLockWait.summary(),

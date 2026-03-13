@@ -79,6 +79,35 @@ func RegtestHardParams() ChainParams {
 	return params
 }
 
+var (
+	benchNetParamsMu sync.RWMutex
+	benchNetParams   = defaultBenchNetParams()
+)
+
+func defaultBenchNetParams() ChainParams {
+	params := RegtestParams()
+	params.Profile = types.BenchNet
+	return params
+}
+
+// SetBenchNetParams installs the benchmark-local chain params used by the
+// benchnet profile. Benchmarks start from genesis on every run, so they can
+// safely retune the initial difficulty without dragging operator-facing
+// regtest profiles into the benchmark UX.
+func SetBenchNetParams(params ChainParams) {
+	params.Profile = types.BenchNet
+	benchNetParamsMu.Lock()
+	benchNetParams = params
+	benchNetParamsMu.Unlock()
+}
+
+func BenchNetParams() ChainParams {
+	benchNetParamsMu.RLock()
+	params := benchNetParams
+	benchNetParamsMu.RUnlock()
+	return params
+}
+
 func ParamsForProfile(profile types.ChainProfile) ChainParams {
 	switch profile {
 	case types.Mainnet:
@@ -89,6 +118,8 @@ func ParamsForProfile(profile types.ChainProfile) ChainParams {
 		return RegtestMediumParams()
 	case types.RegtestHard:
 		return RegtestHardParams()
+	case types.BenchNet:
+		return BenchNetParams()
 	default:
 		panic("unknown chain profile")
 	}
@@ -97,12 +128,16 @@ func ParamsForProfile(profile types.ChainProfile) ChainParams {
 type ConsensusRules struct {
 	CodecLimits     types.CodecLimits
 	EnforceUTXORoot bool
+	// SkipPow is benchmark/testing-only. It must stay off for real consensus
+	// validation so header acceptance continues to depend on actual work.
+	SkipPow bool
 }
 
 func DefaultConsensusRules() ConsensusRules {
 	return ConsensusRules{
 		CodecLimits:     types.DefaultCodecLimits(),
 		EnforceUTXORoot: true,
+		SkipPow:         false,
 	}
 }
 
@@ -479,7 +514,15 @@ func BuildBlockRoots(txs []types.Transaction) ([][32]byte, [][32]byte, [32]byte,
 			authids[i] = AuthID(&txs[i])
 		}
 	}
-	return txids, authids, MerkleRootParallel(txids), MerkleRootParallel(authids)
+	txRoot, authRoot := BuildBlockRootsFromIDs(txids, authids)
+	return txids, authids, txRoot, authRoot
+}
+
+// BuildBlockRootsFromIDs reuses precomputed txid/authid vectors when callers
+// already have them, which avoids a full re-hash pass during block template
+// assembly and other hot paths that carry immutable tx snapshots around.
+func BuildBlockRootsFromIDs(txids, authids [][32]byte) ([32]byte, [32]byte) {
+	return MerkleRootParallel(txids), MerkleRootParallel(authids)
 }
 
 func shouldParallelMerkleLayer(layerLen int) bool {
@@ -535,12 +578,19 @@ func writeVarInt(out *[]byte, v uint64) {
 	}
 }
 
-func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]byte, error) {
-	if inputIndex < 0 || inputIndex >= len(tx.Base.Inputs) {
-		return [32]byte{}, fmt.Errorf("invalid sighash: input index out of range")
-	}
+type sighashContext struct {
+	version      uint32
+	prevoutsHash [32]byte
+	outputsHash  [32]byte
+	amountsHash  [32]byte
+}
+
+// newSighashContext precomputes the tx-wide hashes shared by every input so
+// multi-input validation does not rebuild identical prevout/output/amount
+// commitments for each signature check.
+func newSighashContext(tx *types.Transaction, inputAmounts []uint64) (sighashContext, error) {
 	if len(inputAmounts) != len(tx.Base.Inputs) {
-		return [32]byte{}, fmt.Errorf("invalid sighash: input amounts length mismatch")
+		return sighashContext{}, fmt.Errorf("invalid sighash: input amounts length mismatch")
 	}
 
 	prevouts := make([]byte, 0)
@@ -554,7 +604,6 @@ func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]
 			byte(input.PrevOut.Vout>>24),
 		)
 	}
-	prevoutsHash := crypto.Sha256d(prevouts)
 
 	outputs := make([]byte, 0)
 	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
@@ -571,7 +620,6 @@ func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]
 		)
 		outputs = append(outputs, output.PubKey[:]...)
 	}
-	outputsHash := crypto.Sha256d(outputs)
 
 	amounts := make([]byte, 0)
 	writeVarInt(&amounts, uint64(len(inputAmounts)))
@@ -587,14 +635,25 @@ func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]
 			byte(amount>>56),
 		)
 	}
-	amountsHash := crypto.Sha256d(amounts)
 
+	return sighashContext{
+		version:      tx.Base.Version,
+		prevoutsHash: crypto.Sha256d(prevouts),
+		outputsHash:  crypto.Sha256d(outputs),
+		amountsHash:  crypto.Sha256d(amounts),
+	}, nil
+}
+
+func (ctx sighashContext) hash(inputIndex int, inputCount int) ([32]byte, error) {
+	if inputIndex < 0 || inputIndex >= inputCount {
+		return [32]byte{}, fmt.Errorf("invalid sighash: input index out of range")
+	}
 	preimage := make([]byte, 0, 108)
 	preimage = append(preimage,
-		byte(tx.Base.Version),
-		byte(tx.Base.Version>>8),
-		byte(tx.Base.Version>>16),
-		byte(tx.Base.Version>>24),
+		byte(ctx.version),
+		byte(ctx.version>>8),
+		byte(ctx.version>>16),
+		byte(ctx.version>>24),
 	)
 	index := uint64(inputIndex)
 	preimage = append(preimage,
@@ -607,10 +666,18 @@ func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]
 		byte(index>>48),
 		byte(index>>56),
 	)
-	preimage = append(preimage, prevoutsHash[:]...)
-	preimage = append(preimage, outputsHash[:]...)
-	preimage = append(preimage, amountsHash[:]...)
+	preimage = append(preimage, ctx.prevoutsHash[:]...)
+	preimage = append(preimage, ctx.outputsHash[:]...)
+	preimage = append(preimage, ctx.amountsHash[:]...)
 	return crypto.TaggedHash(SighashTag, preimage), nil
+}
+
+func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]byte, error) {
+	ctx, err := newSighashContext(tx, inputAmounts)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return ctx.hash(inputIndex, len(tx.Base.Inputs))
 }
 
 func ValidateTx(tx *types.Transaction, utxos UtxoSet, rules ConsensusRules) (TxValidationSummary, error) {
@@ -674,10 +741,14 @@ func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, _ C
 		return PreparedTxValidation{}, ErrInputsLessThanOutputs
 	}
 
+	sighashCtx, err := newSighashContext(tx, inputAmounts)
+	if err != nil {
+		return PreparedTxValidation{}, err
+	}
 	for i := range tx.Base.Inputs {
 		utxo := resolvedInputs[i]
 		auth := tx.Auth.Entries[i]
-		msg, err := Sighash(tx, i, inputAmounts)
+		msg, err := sighashCtx.hash(i, len(tx.Base.Inputs))
 		if err != nil {
 			return PreparedTxValidation{}, err
 		}
@@ -698,18 +769,21 @@ func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, _ C
 	}, nil
 }
 
+// ValidatePreparedTx reuses a previously prepared validation bundle and only
+// executes the exact Schnorr verification step.
+func ValidatePreparedTx(prepared PreparedTxValidation) (TxValidationSummary, error) {
+	if !crypto.VerifySchnorrBatchXOnlyWithFallback(prepared.SignatureChecks) {
+		return TxValidationSummary{}, ErrInvalidSignature
+	}
+	return prepared.Summary, nil
+}
+
 func ValidateTxWithLookup(tx *types.Transaction, lookup UtxoLookup, rules ConsensusRules) (TxValidationSummary, error) {
 	prepared, err := PrepareTxValidationWithLookup(tx, lookup, rules)
 	if err != nil {
 		return TxValidationSummary{}, err
 	}
-	for i := range prepared.SignatureChecks {
-		check := prepared.SignatureChecks[i]
-		if !crypto.VerifySchnorrXOnly(&check.PubKey, &check.Signature, &check.Msg) {
-			return TxValidationSummary{}, ErrInvalidSignature
-		}
-	}
-	return prepared.Summary, nil
+	return ValidatePreparedTx(prepared)
 }
 
 func ComputedUTXORoot(utxos UtxoSet) [32]byte {
@@ -1062,7 +1136,7 @@ func MedianTimePast(timestamps []uint64) uint64 {
 	return sorted[len(sorted)/2]
 }
 
-func ValidateHeader(header *types.BlockHeader, prev PrevBlockContext, params ChainParams) error {
+func validateHeaderWithRules(header *types.BlockHeader, prev PrevBlockContext, params ChainParams, rules ConsensusRules) error {
 	if header.PrevBlockHash != HeaderHash(&prev.Header) {
 		return ErrPrevHashMismatch
 	}
@@ -1080,10 +1154,23 @@ func ValidateHeader(header *types.BlockHeader, prev PrevBlockContext, params Cha
 	if header.NBits != expectedNBits {
 		return ErrInvalidNBits
 	}
-	if err := checkPow(header, params); err != nil {
+	if !rules.SkipPow {
+		if err := checkPow(header, params); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ValidateHeaderWithRules(header *types.BlockHeader, prev PrevBlockContext, params ChainParams, rules ConsensusRules) error {
+	if err := validateHeaderWithRules(header, prev, params, rules); err != nil {
 		return err
 	}
 	return nil
+}
+
+func ValidateHeader(header *types.BlockHeader, prev PrevBlockContext, params ChainParams) error {
+	return ValidateHeaderWithRules(header, prev, params, DefaultConsensusRules())
 }
 
 func MineHeader(header types.BlockHeader, params ChainParams) (types.BlockHeader, error) {
@@ -1237,7 +1324,7 @@ func validateAndApplyBlockOverlay(block *types.Block, prev PrevBlockContext, blo
 		return BlockValidationSummary{}, nil, nil, ErrMerkleAuthMismatch
 	}
 
-	if err := ValidateHeader(&block.Header, prev, params); err != nil {
+	if err := ValidateHeaderWithRules(&block.Header, prev, params, rules); err != nil {
 		return BlockValidationSummary{}, nil, nil, err
 	}
 

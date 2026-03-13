@@ -2,7 +2,9 @@ package main
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"bitcoin-pure/internal/config"
@@ -10,9 +12,81 @@ import (
 	"bitcoin-pure/internal/wallet"
 )
 
+func TestBenchMicroWritesReports(t *testing.T) {
+	root := t.TempDir()
+	jsonPath := filepath.Join(root, "micro.json")
+	markdownPath := filepath.Join(root, "micro.md")
+
+	if err := run([]string{
+		"bench", "micro",
+		"--bench", "^BenchmarkTxAdmission$",
+		"--count", "1",
+		"--benchtime", "1x",
+		"--report", jsonPath,
+		"--markdown", markdownPath,
+	}); err != nil {
+		t.Fatalf("run bench micro: %v", err)
+	}
+
+	jsonData, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read json: %v", err)
+	}
+	if !strings.Contains(string(jsonData), "\"BenchmarkTxAdmission\"") {
+		t.Fatalf("json report missing benchmark row: %s", jsonData)
+	}
+
+	markdownData, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatalf("read markdown: %v", err)
+	}
+	if !strings.Contains(string(markdownData), "MICRO BENCHMARKS") {
+		t.Fatalf("markdown report missing banner")
+	}
+}
+
+func TestBenchSimWritesReports(t *testing.T) {
+	root := t.TempDir()
+	jsonPath := filepath.Join(root, "sim.json")
+	markdownPath := filepath.Join(root, "sim.md")
+
+	if err := run([]string{
+		"bench", "sim",
+		"--nodes", "8",
+		"--topology", "small-world",
+		"--seed", "7",
+		"--txs", "16",
+		"--blocks", "4",
+		"--base-latency", "5ms",
+		"--latency-jitter", "15ms",
+		"--churn-events", "2",
+		"--churn-duration", "20ms",
+		"--report", jsonPath,
+		"--markdown", markdownPath,
+	}); err != nil {
+		t.Fatalf("run bench sim: %v", err)
+	}
+
+	jsonData, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read json: %v", err)
+	}
+	if !strings.Contains(string(jsonData), "\"topology\": \"small-world\"") {
+		t.Fatalf("json report missing topology: %s", jsonData)
+	}
+
+	markdownData, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatalf("read markdown: %v", err)
+	}
+	if !strings.Contains(string(markdownData), "Network Simulation Report") {
+		t.Fatalf("markdown report missing simulation title")
+	}
+}
+
 func TestEnsureMiningWalletProvisionedCreatesWalletAndPersistsPubKey(t *testing.T) {
 	root := t.TempDir()
-	configPath := filepath.Join(root, "config.json")
+	configPath := filepath.Join(root, "config.yaml")
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(root, "chain")
 	cfg.MinerEnabled = true
@@ -64,7 +138,7 @@ func TestEnsureMiningWalletProvisionedRequiresConfigPathForPersistence(t *testin
 
 func TestEnsureMiningWalletProvisionedReusesExistingMinerWallet(t *testing.T) {
 	root := t.TempDir()
-	configPath := filepath.Join(root, "config.json")
+	configPath := filepath.Join(root, "config.yaml")
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(root, "chain")
 	cfg.MinerEnabled = true
@@ -122,12 +196,50 @@ func TestEnsureMiningWalletProvisionedNoopsWhenMiningDisabled(t *testing.T) {
 	}
 }
 
+func TestConfigNormalizeWritesCanonicalYAMLAndLegacyJSONSidecar(t *testing.T) {
+	root := t.TempDir()
+	inPath := filepath.Join(root, "input.json")
+	outPath := filepath.Join(root, "config.yaml")
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	cfg.MaxMempoolBytes = 77 << 20
+	if err := config.Save(inPath, cfg); err != nil {
+		t.Fatalf("Save input: %v", err)
+	}
+
+	if err := run([]string{"config", "normalize", "--in", inPath, "--out", outPath}); err != nil {
+		t.Fatalf("run config normalize: %v", err)
+	}
+
+	loadedYAML, err := config.Load(outPath)
+	if err != nil {
+		t.Fatalf("Load yaml: %v", err)
+	}
+	if loadedYAML.MaxMempoolBytes != cfg.MaxMempoolBytes {
+		t.Fatalf("yaml max mempool bytes = %d, want %d", loadedYAML.MaxMempoolBytes, cfg.MaxMempoolBytes)
+	}
+	sidecarPath := filepath.Join(root, "config.json")
+	if _, err := os.Stat(sidecarPath); err != nil {
+		t.Fatalf("legacy sidecar missing: %v", err)
+	}
+	loadedJSON, err := config.Load(sidecarPath)
+	if err != nil {
+		t.Fatalf("Load json sidecar: %v", err)
+	}
+	if loadedJSON.MaxMempoolBytes != cfg.MaxMempoolBytes {
+		t.Fatalf("json max mempool bytes = %d, want %d", loadedJSON.MaxMempoolBytes, cfg.MaxMempoolBytes)
+	}
+}
+
 func TestDefaultGenesisFixtureSupportsRegtestMediumAndHard(t *testing.T) {
 	if got := defaultGenesisFixture(types.RegtestMedium); got != "fixtures/genesis/regtest_medium.json" {
 		t.Fatalf("default medium genesis fixture = %q", got)
 	}
 	if got := defaultGenesisFixture(types.RegtestHard); got != "fixtures/genesis/regtest_hard.json" {
 		t.Fatalf("default hard genesis fixture = %q", got)
+	}
+	if got := defaultGenesisFixture(types.BenchNet); got != "" {
+		t.Fatalf("default benchnet genesis fixture = %q, want empty", got)
 	}
 }
 
@@ -156,6 +268,12 @@ func TestLoadGenesisFixtureSupportsMainnet(t *testing.T) {
 	}
 	if loaded.Fixture.Profile != string(types.Mainnet) {
 		t.Fatalf("fixture profile = %q, want %q", loaded.Fixture.Profile, types.Mainnet)
+	}
+}
+
+func TestLoadGenesisFixtureRejectsBenchNet(t *testing.T) {
+	if _, err := loadGenesisFixture(types.BenchNet); err == nil {
+		t.Fatal("expected benchnet load to fail")
 	}
 }
 

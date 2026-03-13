@@ -19,11 +19,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/logging"
+	"bitcoin-pure/internal/mempool"
 	"bitcoin-pure/internal/node"
 	"bitcoin-pure/internal/profiling"
 	"bitcoin-pure/internal/types"
@@ -40,6 +42,27 @@ const (
 	ScenarioChainedPackages    Scenario = "chained-packages"
 	ScenarioOrphanStorm        Scenario = "orphan-storm"
 	ScenarioBlockTemplateBuild Scenario = "block-template-rebuild"
+)
+
+type Benchmark string
+
+const (
+	BenchmarkE2E        Benchmark = "e2e"
+	BenchmarkThroughput Benchmark = "throughput"
+)
+
+type ThroughputMode string
+
+const (
+	ThroughputModeTx    ThroughputMode = "tx"
+	ThroughputModeBlock ThroughputMode = "block"
+)
+
+type MiningMode string
+
+const (
+	MiningModeSynthetic MiningMode = "synthetic"
+	MiningModeReal      MiningMode = "real"
 )
 
 type Topology string
@@ -61,31 +84,48 @@ const (
 )
 
 type RunOptions struct {
-	Scenario       Scenario
-	Profile        types.ChainProfile
-	NodeCount      int
-	Topology       Topology
-	TxCount        int
-	BatchSize      int
-	TxsPerBlock    int
-	TxOriginSpread TxOriginSpread
-	Timeout        time.Duration
-	DBRoot         string
-	ProfileDir     string
-	SuppressLogs   bool
+	Benchmark              Benchmark
+	ThroughputMode         ThroughputMode
+	MiningMode             MiningMode
+	Scenario               Scenario
+	Profile                types.ChainProfile
+	NodeCount              int
+	Topology               Topology
+	TxCount                int
+	BatchSize              int
+	TxsPerBlock            int
+	BlockCount             int
+	Duration               time.Duration
+	BlockInterval          time.Duration
+	TxOriginSpread         TxOriginSpread
+	Timeout                time.Duration
+	DBRoot                 string
+	ProfileDir             string
+	SuppressLogs           bool
+	SyntheticMining        bool
+	SyntheticBlockInterval time.Duration
+	FindMaxTPS             bool
+	RelayConfirmedBlocks   bool
+	ProgressWriter         io.Writer
+	ProgressInterval       time.Duration
 }
 
 type SuiteOptions struct {
-	Profile        types.ChainProfile
-	NodeCount      int
-	TxCount        int
-	BatchSize      int
-	TxsPerBlock    int
-	TxOriginSpread TxOriginSpread
-	Timeout        time.Duration
-	DBRoot         string
-	ProfileDir     string
-	SuppressLogs   bool
+	Profile                types.ChainProfile
+	NodeCount              int
+	TxCount                int
+	BatchSize              int
+	TxsPerBlock            int
+	BlockCount             int
+	Duration               time.Duration
+	BlockInterval          time.Duration
+	TxOriginSpread         TxOriginSpread
+	Timeout                time.Duration
+	DBRoot                 string
+	ProfileDir             string
+	SuppressLogs           bool
+	SyntheticMining        bool
+	SyntheticBlockInterval time.Duration
 }
 
 type ProfilingReport struct {
@@ -93,27 +133,39 @@ type ProfilingReport struct {
 }
 
 type Report struct {
-	Scenario             string          `json:"scenario"`
-	Profile              string          `json:"profile"`
-	NodeCount            int             `json:"node_count"`
-	Topology             string          `json:"topology,omitempty"`
-	TxCount              int             `json:"tx_count"`
-	BatchSize            int             `json:"batch_size,omitempty"`
-	TxsPerBlock          int             `json:"txs_per_block,omitempty"`
-	TxOriginSpread       string          `json:"tx_origin,omitempty"`
-	StartedAt            time.Time       `json:"started_at"`
-	CompletedAt          time.Time       `json:"completed_at"`
-	AdmissionDurationMS  float64         `json:"admission_duration_ms"`
-	CompletionDurationMS float64         `json:"completion_duration_ms"`
-	AdmissionTPS         float64         `json:"admission_tps"`
-	CompletionTPS        float64         `json:"completion_tps"`
-	ConfirmedTPS         float64         `json:"confirmed_tps,omitempty"`
-	Phases               PhaseReport     `json:"phases"`
-	Metrics              ScenarioMetrics `json:"metrics,omitempty"`
-	Profiling            ProfilingReport `json:"profiling,omitempty"`
-	Environment          Environment     `json:"environment"`
-	Nodes                []NodeReport    `json:"nodes"`
-	Notes                []string        `json:"notes,omitempty"`
+	Benchmark                     string          `json:"benchmark"`
+	Mode                          string          `json:"mode,omitempty"`
+	Mining                        string          `json:"mining,omitempty"`
+	Scenario                      string          `json:"scenario"`
+	Profile                       string          `json:"profile"`
+	NodeCount                     int             `json:"node_count"`
+	Topology                      string          `json:"topology,omitempty"`
+	TxCount                       int             `json:"tx_count"`
+	BatchSize                     int             `json:"batch_size,omitempty"`
+	TxsPerBlock                   int             `json:"txs_per_block,omitempty"`
+	TargetBlocks                  int             `json:"target_blocks,omitempty"`
+	RequestedDurationMS           float64         `json:"requested_duration_ms,omitempty"`
+	BlockIntervalMS               float64         `json:"block_interval_ms,omitempty"`
+	TxOriginSpread                string          `json:"tx_origin,omitempty"`
+	SyntheticMining               bool            `json:"synthetic_mining,omitempty"`
+	SyntheticBlockIntervalMS      float64         `json:"synthetic_block_interval_ms,omitempty"`
+	StartedAt                     time.Time       `json:"started_at"`
+	CompletedAt                   time.Time       `json:"completed_at"`
+	AdmissionDurationMS           float64         `json:"admission_duration_ms"`
+	CompletionDurationMS          float64         `json:"completion_duration_ms"`
+	AdmissionTPS                  float64         `json:"admission_tps"`
+	CompletionTPS                 float64         `json:"completion_tps"`
+	ConfirmedProcessingDurationMS float64         `json:"confirmed_processing_duration_ms,omitempty"`
+	ConfirmedProcessingTPS        float64         `json:"confirmed_processing_tps,omitempty"`
+	ConfirmedWallDurationMS       float64         `json:"confirmed_wall_duration_ms,omitempty"`
+	ConfirmedWallTPS              float64         `json:"confirmed_wall_tps,omitempty"`
+	SyntheticIntervalTPS          float64         `json:"synthetic_interval_tps,omitempty"`
+	Phases                        PhaseReport     `json:"phases"`
+	Metrics                       ScenarioMetrics `json:"metrics,omitempty"`
+	Profiling                     ProfilingReport `json:"profiling,omitempty"`
+	Environment                   Environment     `json:"environment"`
+	Nodes                         []NodeReport    `json:"nodes"`
+	Notes                         []string        `json:"notes,omitempty"`
 }
 
 type SuiteReport struct {
@@ -138,19 +190,28 @@ type Environment struct {
 }
 
 type NodeReport struct {
-	Name                string            `json:"name"`
-	RPCAddr             string            `json:"rpc_addr,omitempty"`
-	P2PAddr             string            `json:"p2p_addr,omitempty"`
-	PeerCount           int               `json:"peer_count"`
-	BlockHeight         uint64            `json:"block_height"`
-	HeaderHeight        uint64            `json:"header_height"`
-	MempoolCount        int               `json:"mempool_count"`
-	SubmittedTxs        int               `json:"submitted_txs,omitempty"`
-	BlockSigChecks      uint64            `json:"block_sig_checks,omitempty"`
-	BlockSigFallbacks   uint64            `json:"block_sig_fallbacks,omitempty"`
-	BlockSigVerifyAvgMS float64           `json:"block_sig_verify_avg_ms,omitempty"`
-	CompletionMS        *float64          `json:"completion_ms,omitempty"`
-	RelayPeers          []PeerRelayReport `json:"relay_peers,omitempty"`
+	Name                  string            `json:"name"`
+	RPCAddr               string            `json:"rpc_addr,omitempty"`
+	P2PAddr               string            `json:"p2p_addr,omitempty"`
+	PeerCount             int               `json:"peer_count"`
+	BlockHeight           uint64            `json:"block_height"`
+	HeaderHeight          uint64            `json:"header_height"`
+	MempoolCount          int               `json:"mempool_count"`
+	SubmittedTxs          int               `json:"submitted_txs,omitempty"`
+	BlockSigChecks        uint64            `json:"block_sig_checks,omitempty"`
+	BlockSigFallbacks     uint64            `json:"block_sig_fallbacks,omitempty"`
+	BlockSigVerifyAvgMS   float64           `json:"block_sig_verify_avg_ms,omitempty"`
+	ErlayRounds           uint64            `json:"erlay_rounds,omitempty"`
+	ErlayRequestedTxs     uint64            `json:"erlay_requested_txs,omitempty"`
+	CompactBlockPlans     uint64            `json:"compact_block_plans,omitempty"`
+	GraphenePlans         uint64            `json:"graphene_extended_plans,omitempty"`
+	GrapheneDecodeFails   uint64            `json:"graphene_decode_failures,omitempty"`
+	GrapheneRecoveries    uint64            `json:"graphene_extended_recoveries,omitempty"`
+	TemplateSelectAvgMS   float64           `json:"template_select_avg_ms,omitempty"`
+	TemplateAccAvgMS      float64           `json:"template_accumulate_avg_ms,omitempty"`
+	TemplateAssembleAvgMS float64           `json:"template_assemble_avg_ms,omitempty"`
+	CompletionMS          *float64          `json:"completion_ms,omitempty"`
+	RelayPeers            []PeerRelayReport `json:"relay_peers,omitempty"`
 }
 
 type PhaseReport struct {
@@ -161,56 +222,100 @@ type PhaseReport struct {
 }
 
 type ScenarioMetrics struct {
-	AcceptedTxs          int     `json:"accepted_txs,omitempty"`
-	ConfirmedTxs         int     `json:"confirmed_txs,omitempty"`
-	ConfirmedBlocks      int     `json:"confirmed_blocks,omitempty"`
-	TargetTxsPerBlock    int     `json:"target_txs_per_block,omitempty"`
-	BlockConvergeAvgMS   float64 `json:"block_converge_avg_ms,omitempty"`
-	BlockConvergeP95MS   float64 `json:"block_converge_p95_ms,omitempty"`
-	BlockConvergeMaxMS   float64 `json:"block_converge_max_ms,omitempty"`
-	OrphanedTxs          int     `json:"orphaned_txs,omitempty"`
-	PromotedOrphans      int     `json:"promoted_orphans,omitempty"`
-	MaxOrphanCount       int     `json:"max_orphan_count,omitempty"`
-	PackageDepth         int     `json:"package_depth,omitempty"`
-	PackageCount         int     `json:"package_count,omitempty"`
-	TemplateRebuilds     int     `json:"template_rebuilds,omitempty"`
-	TemplateCacheHits    int     `json:"template_cache_hits,omitempty"`
-	TemplateFrontier     int     `json:"template_frontier_candidates,omitempty"`
-	TemplateRebuildAvgMS float64 `json:"template_rebuild_avg_ms,omitempty"`
-	TemplateRebuildP95MS float64 `json:"template_rebuild_p95_ms,omitempty"`
-	TemplateRebuildMaxMS float64 `json:"template_rebuild_max_ms,omitempty"`
-	TemplateSelectedTxs  int     `json:"template_selected_txs,omitempty"`
-	DirectRelayPeerCount int     `json:"direct_relay_peer_count,omitempty"`
-	TxBatchMessages      int     `json:"tx_batch_messages,omitempty"`
-	TxBatchItems         int     `json:"tx_batch_items,omitempty"`
-	TxReconMessages      int     `json:"tx_recon_messages,omitempty"`
-	TxReconItems         int     `json:"tx_recon_items,omitempty"`
-	TxRequestMessages    int     `json:"tx_request_messages,omitempty"`
-	TxRequestItems       int     `json:"tx_request_items,omitempty"`
-	UserCount            int     `json:"user_count,omitempty"`
-	ShortChainTxs        int     `json:"short_chain_txs,omitempty"`
-	MultiOutputTxs       int     `json:"multi_output_txs,omitempty"`
+	AcceptedTxs                 int     `json:"accepted_txs,omitempty"`
+	ConfirmedTxs                int     `json:"confirmed_txs,omitempty"`
+	ConfirmedBlocks             int     `json:"confirmed_blocks,omitempty"`
+	TargetTxsPerBlock           int     `json:"target_txs_per_block,omitempty"`
+	MaxSustainableTxsPerBlock   int     `json:"max_sustainable_txs_per_block,omitempty"`
+	FirstUnsustainedTxsPerBlock int     `json:"first_unsustained_txs_per_block,omitempty"`
+	RampSteps                   int     `json:"ramp_steps,omitempty"`
+	BlockConvergeAvgMS          float64 `json:"block_converge_avg_ms,omitempty"`
+	BlockConvergeP95MS          float64 `json:"block_converge_p95_ms,omitempty"`
+	BlockConvergeMaxMS          float64 `json:"block_converge_max_ms,omitempty"`
+	BlockRoundAvgMS             float64 `json:"block_round_avg_ms,omitempty"`
+	BlockRoundP95MS             float64 `json:"block_round_p95_ms,omitempty"`
+	BlockRoundMaxMS             float64 `json:"block_round_max_ms,omitempty"`
+	BlockBuildAvgMS             float64 `json:"block_build_avg_ms,omitempty"`
+	BlockBuildP95MS             float64 `json:"block_build_p95_ms,omitempty"`
+	BlockBuildMaxMS             float64 `json:"block_build_max_ms,omitempty"`
+	BlockSealAvgMS              float64 `json:"block_seal_avg_ms,omitempty"`
+	BlockSealP95MS              float64 `json:"block_seal_p95_ms,omitempty"`
+	BlockSealMaxMS              float64 `json:"block_seal_max_ms,omitempty"`
+	MissedIntervals             int     `json:"missed_intervals,omitempty"`
+	ScheduleLagAvgMS            float64 `json:"schedule_lag_avg_ms,omitempty"`
+	ScheduleLagP95MS            float64 `json:"schedule_lag_p95_ms,omitempty"`
+	ScheduleLagMaxMS            float64 `json:"schedule_lag_max_ms,omitempty"`
+	FinalMempoolTxs             int     `json:"final_mempool_txs,omitempty"`
+	FinalBlockLag               uint64  `json:"final_block_lag,omitempty"`
+	FinalHeaderLag              uint64  `json:"final_header_lag,omitempty"`
+	OrphanedTxs                 int     `json:"orphaned_txs,omitempty"`
+	PromotedOrphans             int     `json:"promoted_orphans,omitempty"`
+	MaxOrphanCount              int     `json:"max_orphan_count,omitempty"`
+	PackageDepth                int     `json:"package_depth,omitempty"`
+	PackageCount                int     `json:"package_count,omitempty"`
+	TemplateRebuilds            int     `json:"template_rebuilds,omitempty"`
+	TemplateCacheHits           int     `json:"template_cache_hits,omitempty"`
+	TemplateFrontier            int     `json:"template_frontier_candidates,omitempty"`
+	TemplateRebuildAvgMS        float64 `json:"template_rebuild_avg_ms,omitempty"`
+	TemplateRebuildP95MS        float64 `json:"template_rebuild_p95_ms,omitempty"`
+	TemplateRebuildMaxMS        float64 `json:"template_rebuild_max_ms,omitempty"`
+	TemplateSelectedTxs         int     `json:"template_selected_txs,omitempty"`
+	TemplateFullBuilds          int     `json:"template_full_builds,omitempty"`
+	TemplateAppendExtends       int     `json:"template_append_extends,omitempty"`
+	TemplateNoChangeRefreshes   int     `json:"template_no_change_refreshes,omitempty"`
+	TemplateSelectAvgMS         float64 `json:"template_select_avg_ms,omitempty"`
+	TemplateSelectP95MS         float64 `json:"template_select_p95_ms,omitempty"`
+	TemplateSelectMaxMS         float64 `json:"template_select_max_ms,omitempty"`
+	TemplateAccumulateAvgMS     float64 `json:"template_accumulate_avg_ms,omitempty"`
+	TemplateAccumulateP95MS     float64 `json:"template_accumulate_p95_ms,omitempty"`
+	TemplateAccumulateMaxMS     float64 `json:"template_accumulate_max_ms,omitempty"`
+	TemplateAssembleAvgMS       float64 `json:"template_assemble_avg_ms,omitempty"`
+	TemplateAssembleP95MS       float64 `json:"template_assemble_p95_ms,omitempty"`
+	TemplateAssembleMaxMS       float64 `json:"template_assemble_max_ms,omitempty"`
+	DirectRelayPeerCount        int     `json:"direct_relay_peer_count,omitempty"`
+	TxBatchMessages             int     `json:"tx_batch_messages,omitempty"`
+	TxBatchItems                int     `json:"tx_batch_items,omitempty"`
+	TxReconMessages             int     `json:"tx_recon_messages,omitempty"`
+	TxReconItems                int     `json:"tx_recon_items,omitempty"`
+	TxRequestMessages           int     `json:"tx_request_messages,omitempty"`
+	TxRequestItems              int     `json:"tx_request_items,omitempty"`
+	TxBatchItemsPerMessage      float64 `json:"tx_batch_items_per_message,omitempty"`
+	TxReconItemsPerMessage      float64 `json:"tx_recon_items_per_message,omitempty"`
+	TxRequestItemsPerMessage    float64 `json:"tx_request_items_per_message,omitempty"`
+	DuplicateTxSuppressed       int     `json:"duplicate_tx_suppressed,omitempty"`
+	KnownTxSuppressed           int     `json:"known_tx_suppressed,omitempty"`
+	CoalescedTxItems            int     `json:"coalesced_tx_items,omitempty"`
+	CoalescedReconItems         int     `json:"coalesced_recon_items,omitempty"`
+	WriterStarvationEvents      int     `json:"writer_starvation_events,omitempty"`
+	UserCount                   int     `json:"user_count,omitempty"`
+	ShortChainTxs               int     `json:"short_chain_txs,omitempty"`
+	MultiOutputTxs              int     `json:"multi_output_txs,omitempty"`
 }
 
 type PeerRelayReport struct {
-	Addr          string  `json:"addr"`
-	Outbound      bool    `json:"outbound"`
-	QueueDepth    int     `json:"queue_depth"`
-	MaxQueueDepth int     `json:"max_queue_depth"`
-	SentMessages  int     `json:"sent_messages"`
-	TxInvItems    int     `json:"tx_inv_items"`
-	BlockInvItems int     `json:"block_inv_items"`
-	TxBatchMsgs   int     `json:"tx_batch_messages,omitempty"`
-	TxBatchItems  int     `json:"tx_batch_items,omitempty"`
-	TxReconMsgs   int     `json:"tx_recon_messages,omitempty"`
-	TxReconItems  int     `json:"tx_recon_items,omitempty"`
-	TxReqMsgs     int     `json:"tx_request_messages,omitempty"`
-	TxReqItems    int     `json:"tx_request_items,omitempty"`
-	DroppedTxs    int     `json:"dropped_tx_items,omitempty"`
-	RelayEvents   int     `json:"relay_events"`
-	RelayAvgMS    float64 `json:"relay_avg_ms,omitempty"`
-	RelayP95MS    float64 `json:"relay_p95_ms,omitempty"`
-	RelayMaxMS    float64 `json:"relay_max_ms,omitempty"`
+	Addr                   string  `json:"addr"`
+	Outbound               bool    `json:"outbound"`
+	QueueDepth             int     `json:"queue_depth"`
+	MaxQueueDepth          int     `json:"max_queue_depth"`
+	SentMessages           int     `json:"sent_messages"`
+	TxInvItems             int     `json:"tx_inv_items"`
+	BlockInvItems          int     `json:"block_inv_items"`
+	TxBatchMsgs            int     `json:"tx_batch_messages,omitempty"`
+	TxBatchItems           int     `json:"tx_batch_items,omitempty"`
+	TxReconMsgs            int     `json:"tx_recon_messages,omitempty"`
+	TxReconItems           int     `json:"tx_recon_items,omitempty"`
+	TxReqMsgs              int     `json:"tx_request_messages,omitempty"`
+	TxReqItems             int     `json:"tx_request_items,omitempty"`
+	DuplicateTxSuppressed  int     `json:"duplicate_tx_suppressed,omitempty"`
+	KnownTxSuppressed      int     `json:"known_tx_suppressed,omitempty"`
+	CoalescedTxItems       int     `json:"coalesced_tx_items,omitempty"`
+	CoalescedReconItems    int     `json:"coalesced_recon_items,omitempty"`
+	DroppedTxs             int     `json:"dropped_tx_items,omitempty"`
+	WriterStarvationEvents int     `json:"writer_starvation_events,omitempty"`
+	RelayEvents            int     `json:"relay_events"`
+	RelayAvgMS             float64 `json:"relay_avg_ms,omitempty"`
+	RelayP95MS             float64 `json:"relay_p95_ms,omitempty"`
+	RelayMaxMS             float64 `json:"relay_max_ms,omitempty"`
 }
 
 type rpcRequest struct {
@@ -241,15 +346,26 @@ type mempoolBenchConfig struct {
 }
 
 type workloadOutcome struct {
-	submitStarted   time.Time
-	submitDone      time.Time
-	admissionTime   time.Duration
-	completed       time.Time
-	propagation     map[string]time.Duration
-	submittedByNode map[string]int
-	phases          PhaseReport
-	metrics         ScenarioMetrics
-	extraNotes      []string
+	submitStarted       time.Time
+	submitDone          time.Time
+	admissionTime       time.Duration
+	completed           time.Time
+	propagation         map[string]time.Duration
+	submittedByNode     map[string]int
+	confirmedProcessing time.Duration
+	phases              PhaseReport
+	metrics             ScenarioMetrics
+	extraNotes          []string
+}
+
+type progressContextKey struct{}
+
+type progressReporter struct {
+	writer       io.Writer
+	interval     time.Duration
+	started      time.Time
+	mu           sync.Mutex
+	lastProgress time.Time
 }
 
 type submissionOutcome struct {
@@ -262,44 +378,235 @@ type submissionOutcome struct {
 
 func DefaultRunOptions() RunOptions {
 	return RunOptions{
-		Scenario:       ScenarioP2PRelay,
-		Profile:        types.Regtest,
-		NodeCount:      5,
-		Topology:       TopologyMesh,
-		TxCount:        4_096,
-		BatchSize:      64,
-		TxsPerBlock:    256,
-		TxOriginSpread: TxOriginOneNode,
-		Timeout:        30 * time.Second,
-		SuppressLogs:   true,
+		Benchmark:              BenchmarkThroughput,
+		ThroughputMode:         ThroughputModeTx,
+		MiningMode:             MiningModeSynthetic,
+		Scenario:               ScenarioP2PRelay,
+		Profile:                types.Regtest,
+		NodeCount:              5,
+		Topology:               TopologyMesh,
+		TxCount:                4_096,
+		BatchSize:              64,
+		TxsPerBlock:            256,
+		BlockCount:             20,
+		Duration:               60 * time.Second,
+		BlockInterval:          15 * time.Second,
+		TxOriginSpread:         TxOriginOneNode,
+		Timeout:                30 * time.Second,
+		SuppressLogs:           true,
+		SyntheticBlockInterval: time.Minute,
+		ProgressInterval:       5 * time.Second,
 	}
 }
 
-func AvailableScenarios() []Scenario {
-	return []Scenario{
-		ScenarioDirectSubmit,
-		ScenarioRPCBatch,
-		ScenarioP2PRelay,
-		ScenarioConfirmedBlocks,
-		ScenarioUserMix,
-		ScenarioChainedPackages,
-		ScenarioOrphanStorm,
-		ScenarioBlockTemplateBuild,
+func newProgressReporter(w io.Writer, interval time.Duration) *progressReporter {
+	if w == nil || interval <= 0 {
+		return nil
 	}
+	return &progressReporter{
+		writer:   w,
+		interval: interval,
+		started:  time.Now(),
+	}
+}
+
+func withProgressReporter(ctx context.Context, reporter *progressReporter) context.Context {
+	if reporter == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, progressContextKey{}, reporter)
+}
+
+func progressFromContext(ctx context.Context) *progressReporter {
+	reporter, _ := ctx.Value(progressContextKey{}).(*progressReporter)
+	return reporter
+}
+
+func progressEventf(ctx context.Context, format string, args ...interface{}) {
+	reporter := progressFromContext(ctx)
+	if reporter == nil {
+		return
+	}
+	reporter.eventf(format, args...)
+}
+
+func progressHeartbeat(ctx context.Context, phase string, status func() string) {
+	reporter := progressFromContext(ctx)
+	if reporter == nil || status == nil {
+		return
+	}
+	reporter.heartbeat(phase, status)
+}
+
+func (p *progressReporter) eventf(format string, args ...interface{}) {
+	p.emit("event", fmt.Sprintf(format, args...), true)
+}
+
+func (p *progressReporter) heartbeat(phase string, status func() string) {
+	p.emit(phase, status(), false)
+}
+
+func (p *progressReporter) emit(phase, message string, force bool) {
+	if p == nil || p.writer == nil {
+		return
+	}
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !force && !p.lastProgress.IsZero() && now.Sub(p.lastProgress) < p.interval {
+		return
+	}
+	p.lastProgress = now
+	elapsed := now.Sub(p.started).Round(time.Second)
+	fmt.Fprintf(p.writer, "bench progress elapsed=%s phase=%s %s\n", elapsed, phase, message)
+}
+
+func DefaultE2EOptions() RunOptions {
+	defaults := DefaultRunOptions()
+	defaults.Benchmark = BenchmarkE2E
+	defaults.Scenario = ScenarioConfirmedBlocks
+	defaults.NodeCount = 5
+	defaults.Topology = TopologyMesh
+	defaults.TxsPerBlock = 1_024
+	defaults.BlockCount = 5
+	defaults.TxCount = defaults.TxsPerBlock * defaults.BlockCount
+	defaults.MiningMode = MiningModeSynthetic
+	defaults.BlockInterval = 30 * time.Second
+	defaults.SyntheticMining = true
+	defaults.SyntheticBlockInterval = defaults.BlockInterval
+	defaults.TxOriginSpread = TxOriginEven
+	defaults.RelayConfirmedBlocks = true
+	defaults.Timeout = 5 * time.Minute
+	return defaults
+}
+
+func DefaultThroughputOptions() RunOptions {
+	defaults := DefaultRunOptions()
+	defaults.Benchmark = BenchmarkThroughput
+	defaults.ThroughputMode = ThroughputModeTx
+	defaults.Scenario = ScenarioDirectSubmit
+	defaults.NodeCount = 1
+	defaults.TxCount = 32_768
+	defaults.Duration = 60 * time.Second
+	defaults.TxsPerBlock = 256
+	defaults.BlockCount = 0
+	defaults.SyntheticMining = false
+	defaults.RelayConfirmedBlocks = false
+	defaults.Timeout = 90 * time.Second
+	return defaults
 }
 
 func DefaultSuiteOptions() SuiteOptions {
-	defaults := DefaultRunOptions()
+	defaults := DefaultE2EOptions()
 	return SuiteOptions{
-		Profile:        defaults.Profile,
-		NodeCount:      defaults.NodeCount,
-		TxCount:        defaults.TxCount,
-		BatchSize:      defaults.BatchSize,
-		TxsPerBlock:    defaults.TxsPerBlock,
-		TxOriginSpread: defaults.TxOriginSpread,
-		Timeout:        defaults.Timeout,
-		SuppressLogs:   defaults.SuppressLogs,
+		Profile:                defaults.Profile,
+		NodeCount:              defaults.NodeCount,
+		TxCount:                defaults.TxCount,
+		BatchSize:              defaults.BatchSize,
+		TxsPerBlock:            defaults.TxsPerBlock,
+		BlockCount:             defaults.BlockCount,
+		Duration:               60 * time.Second,
+		BlockInterval:          defaults.BlockInterval,
+		TxOriginSpread:         defaults.TxOriginSpread,
+		Timeout:                8 * time.Minute,
+		SuppressLogs:           defaults.SuppressLogs,
+		SyntheticMining:        defaults.SyntheticMining,
+		SyntheticBlockInterval: defaults.BlockInterval,
 	}
+}
+
+func RunE2E(ctx context.Context, opts RunOptions) (*Report, error) {
+	defaults := DefaultE2EOptions()
+	if opts.Benchmark == "" {
+		opts.Benchmark = BenchmarkE2E
+	}
+	if opts.Scenario == "" {
+		opts.Scenario = ScenarioConfirmedBlocks
+	}
+	if opts.NodeCount <= 0 {
+		opts.NodeCount = defaults.NodeCount
+	}
+	if opts.Topology == "" {
+		opts.Topology = defaults.Topology
+	}
+	if opts.TxsPerBlock <= 0 {
+		opts.TxsPerBlock = defaults.TxsPerBlock
+	}
+	if opts.BlockCount <= 0 {
+		opts.BlockCount = defaults.BlockCount
+	}
+	if opts.TxCount <= 0 {
+		opts.TxCount = opts.TxsPerBlock * opts.BlockCount
+	}
+	if opts.BlockInterval <= 0 {
+		opts.BlockInterval = defaults.BlockInterval
+	}
+	if opts.MiningMode == "" {
+		opts.MiningMode = defaults.MiningMode
+	}
+	opts.RelayConfirmedBlocks = true
+	opts.SyntheticMining = opts.MiningMode == MiningModeSynthetic
+	opts.SyntheticBlockInterval = opts.BlockInterval
+	if opts.Timeout <= 0 {
+		opts.Timeout = defaults.Timeout
+	}
+	return Run(ctx, opts)
+}
+
+func durationAbs(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+func RunThroughput(ctx context.Context, opts RunOptions) (*Report, error) {
+	defaults := DefaultThroughputOptions()
+	if opts.Benchmark == "" {
+		opts.Benchmark = BenchmarkThroughput
+	}
+	if opts.ThroughputMode == "" {
+		opts.ThroughputMode = defaults.ThroughputMode
+	}
+	if opts.Duration <= 0 {
+		opts.Duration = defaults.Duration
+	}
+	switch opts.ThroughputMode {
+	case ThroughputModeBlock:
+		if opts.Scenario == "" {
+			opts.Scenario = ScenarioConfirmedBlocks
+		}
+		if opts.NodeCount <= 0 {
+			opts.NodeCount = 1
+		}
+		if opts.TxsPerBlock <= 0 {
+			opts.TxsPerBlock = defaults.TxsPerBlock
+		}
+		if opts.TxCount <= 0 {
+			opts.TxCount = max(opts.TxsPerBlock*8, defaults.TxCount)
+		}
+		opts.BlockCount = max(1, (opts.TxCount+opts.TxsPerBlock-1)/opts.TxsPerBlock)
+		opts.MiningMode = MiningModeSynthetic
+		opts.SyntheticMining = true
+		opts.BlockInterval = defaults.BlockInterval
+		opts.SyntheticBlockInterval = opts.BlockInterval
+		opts.RelayConfirmedBlocks = false
+	default:
+		if opts.Scenario == "" {
+			opts.Scenario = ScenarioDirectSubmit
+		}
+		if opts.NodeCount <= 0 {
+			opts.NodeCount = 1
+		}
+		if opts.TxCount <= 0 {
+			opts.TxCount = defaults.TxCount
+		}
+		opts.RelayConfirmedBlocks = false
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = defaults.Timeout
+	}
+	return Run(ctx, opts)
 }
 
 func Run(ctx context.Context, opts RunOptions) (*Report, error) {
@@ -307,6 +614,8 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 	if err := validateOptions(opts); err != nil {
 		return nil, err
 	}
+	progress := newProgressReporter(opts.ProgressWriter, opts.ProgressInterval)
+	ctx = withProgressReporter(ctx, progress)
 
 	restoreLogs := func() {}
 	if opts.SuppressLogs {
@@ -326,15 +635,18 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		return nil, err
 	}
 	defer cleanup()
+	progressEventf(ctx, "cluster opened benchmark=%s mode=%s mining=%s nodes=%d txs=%d blocks=%d interval=%s",
+		reportBenchmark(opts), reportMode(opts), reportMining(opts), opts.NodeCount, opts.TxCount, opts.BlockCount, opts.BlockInterval)
 
 	if err := connectCluster(runCtx, cluster, opts.Topology); err != nil {
 		return nil, err
 	}
+	progressEventf(ctx, "cluster connected topology=%s", opts.Topology)
 	started := time.Now()
 	var outcome workloadOutcome
 	var profilingReport ProfilingReport
 	if opts.ProfileDir != "" {
-		capture, err := profiling.StartCapture(profiling.DefaultCaptureConfig(opts.ProfileDir, slugify(string(opts.Scenario))+"-"))
+		capture, err := profiling.StartCapture(profiling.DefaultCaptureConfig(opts.ProfileDir, slugify(reportFileStem(opts))+"-"))
 		if err != nil {
 			return nil, err
 		}
@@ -365,23 +677,44 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 	if admissionElapsed <= 0 {
 		admissionElapsed = outcome.submitDone.Sub(submitStarted)
 	}
+	reportTxCount := opts.TxCount
+	if opts.Benchmark == BenchmarkThroughput {
+		switch reportMode(opts) {
+		case string(ThroughputModeBlock):
+			if outcome.metrics.ConfirmedTxs > 0 {
+				reportTxCount = outcome.metrics.ConfirmedTxs
+			}
+		default:
+			if outcome.metrics.AcceptedTxs > 0 {
+				reportTxCount = outcome.metrics.AcceptedTxs
+			}
+		}
+	}
+	if opts.FindMaxTPS && outcome.metrics.AcceptedTxs > 0 {
+		reportTxCount = outcome.metrics.AcceptedTxs
+	}
 	report := &Report{
-		Scenario:             string(opts.Scenario),
-		Profile:              opts.Profile.String(),
-		NodeCount:            opts.NodeCount,
-		Topology:             reportTopology(opts),
-		TxCount:              opts.TxCount,
-		BatchSize:            opts.BatchSize,
-		TxOriginSpread:       string(opts.TxOriginSpread),
-		StartedAt:            started,
-		CompletedAt:          outcome.completed,
-		AdmissionDurationMS:  durationMS(admissionElapsed),
-		CompletionDurationMS: outcome.phases.ConvergenceMS,
-		AdmissionTPS:         ratePerSecond(opts.TxCount, admissionElapsed),
-		CompletionTPS:        ratePerSecond(opts.TxCount, outcome.completed.Sub(submitStarted)),
-		Phases:               outcome.phases,
-		Metrics:              outcome.metrics,
-		Profiling:            profilingReport,
+		Benchmark:                string(reportBenchmark(opts)),
+		Mode:                     reportMode(opts),
+		Mining:                   reportMining(opts),
+		Scenario:                 string(opts.Scenario),
+		Profile:                  benchmarkClusterProfile(opts).String(),
+		NodeCount:                opts.NodeCount,
+		Topology:                 reportTopology(opts),
+		TxCount:                  reportTxCount,
+		BatchSize:                opts.BatchSize,
+		TxOriginSpread:           string(opts.TxOriginSpread),
+		SyntheticMining:          opts.SyntheticMining,
+		SyntheticBlockIntervalMS: durationMS(opts.SyntheticBlockInterval),
+		StartedAt:                started,
+		CompletedAt:              outcome.completed,
+		AdmissionDurationMS:      durationMS(admissionElapsed),
+		CompletionDurationMS:     durationMS(outcome.completed.Sub(submitStarted)),
+		AdmissionTPS:             ratePerSecond(reportTxCount, admissionElapsed),
+		CompletionTPS:            ratePerSecond(reportTxCount, outcome.completed.Sub(submitStarted)),
+		Phases:                   outcome.phases,
+		Metrics:                  outcome.metrics,
+		Profiling:                profilingReport,
 		Environment: Environment{
 			GoOS:      runtime.GOOS,
 			GoArch:    runtime.GOARCH,
@@ -391,13 +724,57 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		Nodes: buildNodeReports(cluster, outcome.propagation, outcome.submittedByNode),
 		Notes: buildNotes(opts, outcome.extraNotes),
 	}
+	if report.Benchmark == string(BenchmarkE2E) {
+		report.TargetBlocks = opts.BlockCount
+		report.BlockIntervalMS = durationMS(opts.BlockInterval)
+	}
+	if report.Benchmark == string(BenchmarkThroughput) {
+		report.RequestedDurationMS = durationMS(opts.Duration)
+	}
 	if opts.Scenario == ScenarioConfirmedBlocks {
-		report.TxsPerBlock = opts.TxsPerBlock
+		report.TxsPerBlock = outcome.metrics.TargetTxsPerBlock
+		if report.TxsPerBlock == 0 {
+			report.TxsPerBlock = opts.TxsPerBlock
+		}
+		if opts.FindMaxTPS && report.Metrics.MaxSustainableTxsPerBlock > 0 {
+			report.TxsPerBlock = report.Metrics.MaxSustainableTxsPerBlock
+		} else if opts.FindMaxTPS && report.Metrics.FirstUnsustainedTxsPerBlock > 0 {
+			report.TxsPerBlock = report.Metrics.FirstUnsustainedTxsPerBlock
+		}
 	}
 	if report.Metrics.ConfirmedTxs > 0 {
-		report.ConfirmedTPS = ratePerSecond(report.Metrics.ConfirmedTxs, outcome.completed.Sub(submitStarted))
+		report.ConfirmedProcessingDurationMS = durationMS(outcome.confirmedProcessing)
+		report.ConfirmedProcessingTPS = ratePerSecond(report.Metrics.ConfirmedTxs, outcome.confirmedProcessing)
+		report.ConfirmedWallDurationMS = durationMS(outcome.completed.Sub(submitStarted))
+		report.ConfirmedWallTPS = ratePerSecond(report.Metrics.ConfirmedTxs, outcome.completed.Sub(submitStarted))
+		if opts.SyntheticMining && report.Metrics.ConfirmedBlocks > 0 {
+			syntheticTxCount := report.Metrics.ConfirmedTxs
+			syntheticBlocks := report.Metrics.ConfirmedBlocks
+			if opts.FindMaxTPS && report.Metrics.MaxSustainableTxsPerBlock > 0 {
+				syntheticTxCount = report.Metrics.MaxSustainableTxsPerBlock
+				syntheticBlocks = 1
+			}
+			report.SyntheticIntervalTPS = ratePerSecond(
+				syntheticTxCount,
+				time.Duration(syntheticBlocks)*opts.SyntheticBlockInterval,
+			)
+		}
 	}
-	report.Metrics.TxBatchMessages, report.Metrics.TxBatchItems, report.Metrics.TxReconMessages, report.Metrics.TxReconItems, report.Metrics.TxRequestMessages, report.Metrics.TxRequestItems = aggregateRelayMetrics(report.Nodes)
+	relayMetrics := aggregateRelayMetrics(report.Nodes)
+	report.Metrics.TxBatchMessages = relayMetrics.BatchMessages
+	report.Metrics.TxBatchItems = relayMetrics.BatchItems
+	report.Metrics.TxReconMessages = relayMetrics.ReconMessages
+	report.Metrics.TxReconItems = relayMetrics.ReconItems
+	report.Metrics.TxRequestMessages = relayMetrics.RequestMessages
+	report.Metrics.TxRequestItems = relayMetrics.RequestItems
+	report.Metrics.TxBatchItemsPerMessage = ratioOrZero(relayMetrics.BatchItems, relayMetrics.BatchMessages)
+	report.Metrics.TxReconItemsPerMessage = ratioOrZero(relayMetrics.ReconItems, relayMetrics.ReconMessages)
+	report.Metrics.TxRequestItemsPerMessage = ratioOrZero(relayMetrics.RequestItems, relayMetrics.RequestMessages)
+	report.Metrics.DuplicateTxSuppressed = relayMetrics.DuplicateTxSuppressed
+	report.Metrics.KnownTxSuppressed = relayMetrics.KnownTxSuppressed
+	report.Metrics.CoalescedTxItems = relayMetrics.CoalescedTxItems
+	report.Metrics.CoalescedReconItems = relayMetrics.CoalescedReconItems
+	report.Metrics.WriterStarvationEvents = relayMetrics.WriterStarvationEvents
 	return report, nil
 }
 
@@ -415,7 +792,7 @@ func RunSuite(ctx context.Context, opts SuiteOptions) (*SuiteReport, error) {
 			NumCPU:    runtime.NumCPU(),
 		},
 		Notes: []string{
-			"Suite coverage mixes direct in-process submit, authenticated RPC batch submit, repeated confirmed-block runs, and real multi-node loopback relay.",
+			"Core suite coverage is intentionally narrow: synthetic and real e2e runs, plus tx and block throughput baselines.",
 			"Loopback cluster cases show BPU stack throughput with real node-to-node propagation but without WAN latency.",
 		},
 	}
@@ -435,8 +812,19 @@ func RunSuite(ctx context.Context, opts SuiteOptions) (*SuiteReport, error) {
 
 func RenderMarkdown(report *Report) string {
 	var b strings.Builder
-	b.WriteString("# Benchmark Report\n\n")
-	b.WriteString(fmt.Sprintf("- Scenario: `%s`\n", report.Scenario))
+	switch report.Benchmark {
+	case string(BenchmarkE2E):
+		b.WriteString("# BPU E2E Benchmark\n\n")
+	default:
+		b.WriteString("# BPU Throughput Benchmark\n\n")
+	}
+	b.WriteString(fmt.Sprintf("- Benchmark: `%s`\n", report.Benchmark))
+	if report.Mode != "" {
+		b.WriteString(fmt.Sprintf("- Mode: `%s`\n", report.Mode))
+	}
+	if report.Mining != "" {
+		b.WriteString(fmt.Sprintf("- Mining: `%s`\n", report.Mining))
+	}
 	b.WriteString(fmt.Sprintf("- Profile: `%s`\n", report.Profile))
 	b.WriteString(fmt.Sprintf("- Nodes: `%d`\n", report.NodeCount))
 	if report.Topology != "" {
@@ -449,33 +837,65 @@ func RenderMarkdown(report *Report) string {
 	if report.TxsPerBlock > 0 {
 		b.WriteString(fmt.Sprintf("- Txs per block: `%d`\n", report.TxsPerBlock))
 	}
+	if report.TargetBlocks > 0 {
+		b.WriteString(fmt.Sprintf("- Blocks: `%d`\n", report.TargetBlocks))
+	}
+	if report.RequestedDurationMS > 0 {
+		b.WriteString(fmt.Sprintf("- Requested duration: `%.0f ms`\n", report.RequestedDurationMS))
+	}
+	if report.BlockIntervalMS > 0 {
+		b.WriteString(fmt.Sprintf("- Block interval: `%.0f ms`\n", report.BlockIntervalMS))
+	}
 	if report.TxOriginSpread != "" {
 		b.WriteString(fmt.Sprintf("- Tx origin: `%s`\n", report.TxOriginSpread))
 	}
-	b.WriteString(fmt.Sprintf("- Admission duration: `%.2f ms`\n", report.AdmissionDurationMS))
-	b.WriteString(fmt.Sprintf("- Completion duration: `%.2f ms`\n", report.CompletionDurationMS))
-	b.WriteString(fmt.Sprintf("- Admission TPS: `%.2f`\n", report.AdmissionTPS))
-	b.WriteString(fmt.Sprintf("- Completion TPS: `%.2f`\n", report.CompletionTPS))
-	if report.ConfirmedTPS > 0 {
-		b.WriteString(fmt.Sprintf("- Confirmed TPS: `%.2f`\n", report.ConfirmedTPS))
+	if report.SyntheticMining {
+		b.WriteString(fmt.Sprintf("- Synthetic mining: `on` (`%.0f ms` cadence)\n", report.SyntheticBlockIntervalMS))
 	}
+	b.WriteString("\n## Throughput\n\n")
+	switch report.Benchmark {
+	case string(BenchmarkE2E):
+		b.WriteString("| Metric | Value |\n")
+		b.WriteString("| --- | ---: |\n")
+		b.WriteString(fmt.Sprintf("| Admission TPS | %.2f |\n", report.AdmissionTPS))
+		b.WriteString(fmt.Sprintf("| E2E TPS | %.2f |\n", report.CompletionTPS))
+		if report.ConfirmedProcessingTPS > 0 {
+			b.WriteString(fmt.Sprintf("| Confirmed processing TPS | %.2f |\n", report.ConfirmedProcessingTPS))
+		}
+		if report.ConfirmedWallTPS > 0 {
+			b.WriteString(fmt.Sprintf("| Confirmed wall TPS | %.2f |\n", report.ConfirmedWallTPS))
+		}
+		if report.SyntheticIntervalTPS > 0 {
+			b.WriteString(fmt.Sprintf("| Synthetic interval TPS | %.2f |\n", report.SyntheticIntervalTPS))
+		}
+	default:
+		b.WriteString("| Metric | Value |\n")
+		b.WriteString("| --- | ---: |\n")
+		if report.Mode == string(ThroughputModeBlock) {
+			b.WriteString(fmt.Sprintf("| Confirmed apply TPS | %.2f |\n", report.ConfirmedProcessingTPS))
+			b.WriteString(fmt.Sprintf("| Wall TPS | %.2f |\n", report.ConfirmedWallTPS))
+		} else {
+			b.WriteString(fmt.Sprintf("| Tx admission TPS | %.2f |\n", report.AdmissionTPS))
+			b.WriteString(fmt.Sprintf("| Completion TPS | %.2f |\n", report.CompletionTPS))
+		}
+	}
+	b.WriteString("\n## Timings\n\n")
+	b.WriteString("| Metric | Value |\n")
+	b.WriteString("| --- | ---: |\n")
+	b.WriteString(fmt.Sprintf("| Admission duration | %.2f ms |\n", report.AdmissionDurationMS))
+	b.WriteString(fmt.Sprintf("| Completion duration | %.2f ms |\n", report.CompletionDurationMS))
+	b.WriteString(fmt.Sprintf("| Decode | %.2f ms |\n", report.Phases.DecodeMS))
+	b.WriteString(fmt.Sprintf("| Validate / Admit | %.2f ms |\n", report.Phases.ValidateAdmitMS))
+	b.WriteString(fmt.Sprintf("| Relay fanout | %.2f ms |\n", report.Phases.RelayFanoutMS))
+	b.WriteString(fmt.Sprintf("| Convergence | %.2f ms |\n", report.Phases.ConvergenceMS))
 	if len(report.Profiling.Artifacts) != 0 {
 		b.WriteString("\n## Profiles\n\n")
 		for _, artifact := range report.Profiling.Artifacts {
 			b.WriteString(fmt.Sprintf("- `%s`: `%s`\n", artifact.Kind, artifact.Path))
 		}
 	}
-	b.WriteString("\n## Phase Timings\n\n")
-	b.WriteString("| Decode | Validate / Admit | Relay Fanout | Convergence |\n")
-	b.WriteString("| ---: | ---: | ---: | ---: |\n")
-	b.WriteString(fmt.Sprintf("| %.2f ms | %.2f ms | %.2f ms | %.2f ms |\n",
-		report.Phases.DecodeMS,
-		report.Phases.ValidateAdmitMS,
-		report.Phases.RelayFanoutMS,
-		report.Phases.ConvergenceMS,
-	))
 	if rows := scenarioMetricRows(report.Metrics); len(rows) != 0 {
-		b.WriteString("\n## Scenario Metrics\n\n")
+		b.WriteString("\n## Workload Metrics\n\n")
 		b.WriteString("| Metric | Value |\n")
 		b.WriteString("| --- | ---: |\n")
 		for _, row := range rows {
@@ -483,7 +903,7 @@ func RenderMarkdown(report *Report) string {
 		}
 	}
 	b.WriteString("\n## Nodes\n\n")
-	b.WriteString("| Name | Peers | Submitted | Block Height | Header Height | Mempool | Completion |\n")
+	b.WriteString("| Name | Peers | Submitted | Block Height | Header Height | Mempool | Complete |\n")
 	b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, node := range report.Nodes {
 		propagation := "-"
@@ -499,6 +919,14 @@ func RenderMarkdown(report *Report) string {
 		b.WriteString("| --- | ---: | ---: | ---: |\n")
 		for _, row := range rows {
 			b.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", row[0], row[1], row[2], row[3]))
+		}
+	}
+	if rows := relayMechanismRows(report.Nodes); len(rows) != 0 {
+		b.WriteString("\n## Relay Mechanisms\n\n")
+		b.WriteString("| Node | Erlay Rounds | Erlay Requested | Compact Plans | Graphene Plans | Graphene Decode Fails | Graphene Recoveries |\n")
+		b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+		for _, row := range rows {
+			b.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s |\n", row[0], row[1], row[2], row[3], row[4], row[5], row[6]))
 		}
 	}
 	if peers := flattenRelayPeers(report.Nodes); len(peers) != 0 {
@@ -530,30 +958,37 @@ func RenderMarkdown(report *Report) string {
 
 func RenderSuiteMarkdown(report *SuiteReport) string {
 	var b strings.Builder
-	b.WriteString("# Benchmark Suite Report\n\n")
+	b.WriteString("# BPU Benchmark Suite\n\n")
 	b.WriteString(fmt.Sprintf("- Profile: `%s`\n", report.Profile))
 	b.WriteString(fmt.Sprintf("- Cases: `%d`\n", len(report.Cases)))
 	b.WriteString(fmt.Sprintf("- Started: `%s`\n", report.StartedAt.UTC().Format(time.RFC3339)))
 	b.WriteString(fmt.Sprintf("- Completed: `%s`\n", report.CompletedAt.UTC().Format(time.RFC3339)))
 	b.WriteString("\n## Summary\n\n")
-	b.WriteString("| Case | Scenario | Nodes | Topology | Tx Count | Admission TPS | Completion TPS | Confirmed TPS | Validate / Admit | Relay Fanout | Convergence |\n")
-	b.WriteString("| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	b.WriteString("| Case | Benchmark | Mode | Mining | Nodes | Tx Count | Admit TPS | Complete TPS | Confirm TPS | Converge |\n")
+	b.WriteString("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, suiteCase := range report.Cases {
-		topology := suiteCase.Report.Topology
-		if topology == "" {
-			topology = "-"
+		mode := suiteCase.Report.Mode
+		if mode == "" {
+			mode = "-"
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %d | %s | %d | %.2f | %.2f | %.2f | %.2f ms | %.2f ms | %.2f ms |\n",
+		mining := suiteCase.Report.Mining
+		if mining == "" {
+			mining = "-"
+		}
+		confirmTPS := suiteCase.Report.ConfirmedProcessingTPS
+		if confirmTPS == 0 {
+			confirmTPS = suiteCase.Report.ConfirmedWallTPS
+		}
+		b.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %d | %d | %.2f | %.2f | %.2f | %.2f ms |\n",
 			suiteCase.Name,
-			suiteCase.Report.Scenario,
+			suiteCase.Report.Benchmark,
+			mode,
+			mining,
 			suiteCase.Report.NodeCount,
-			topology,
 			suiteCase.Report.TxCount,
 			suiteCase.Report.AdmissionTPS,
 			suiteCase.Report.CompletionTPS,
-			suiteCase.Report.ConfirmedTPS,
-			suiteCase.Report.Phases.ValidateAdmitMS,
-			suiteCase.Report.Phases.RelayFanoutMS,
+			confirmTPS,
 			suiteCase.Report.Phases.ConvergenceMS,
 		))
 	}
@@ -568,21 +1003,37 @@ func RenderSuiteMarkdown(report *SuiteReport) string {
 
 func RenderASCIISummary(report *Report) string {
 	lines := []string{
-		fmt.Sprintf("Scenario    %s", report.Scenario),
+		fmt.Sprintf("Benchmark   %s%s%s", report.Benchmark, asciiModeSuffix(report.Mode), asciiMiningSuffix(report.Mining)),
 		fmt.Sprintf("Profile     %s", report.Profile),
 		fmt.Sprintf("Layout      %d nodes%s", report.NodeCount, asciiTopologySuffix(report.Topology)),
 		fmt.Sprintf("Workload    %d txs%s%s%s", report.TxCount, asciiBatchSuffix(report.BatchSize), asciiBlockTargetSuffix(report.TxsPerBlock), asciiTxOriginSuffix(report.TxOriginSpread)),
-		fmt.Sprintf("Throughput  admission %.2f tx/s | completion %.2f tx/s", report.AdmissionTPS, report.CompletionTPS),
-		fmt.Sprintf("Phases      decode %.2f ms | admit %.2f ms | fanout %.2f ms | converge %.2f ms",
-			report.Phases.DecodeMS,
-			report.Phases.ValidateAdmitMS,
-			report.Phases.RelayFanoutMS,
-			report.Phases.ConvergenceMS,
-		),
 	}
-	if report.ConfirmedTPS > 0 {
-		lines = append(lines, fmt.Sprintf("Confirmed   %.2f tx/s", report.ConfirmedTPS))
+	switch report.Benchmark {
+	case string(BenchmarkE2E):
+		lines = append(lines,
+			fmt.Sprintf("Cadence     %.0f ms interval / %d blocks", report.BlockIntervalMS, report.TargetBlocks),
+			fmt.Sprintf("Throughput  admission %.2f tx/s | e2e %.2f tx/s", report.AdmissionTPS, report.CompletionTPS),
+			fmt.Sprintf("Confirm     processing %.2f tx/s | wall %.2f tx/s", report.ConfirmedProcessingTPS, report.ConfirmedWallTPS),
+		)
+		if report.SyntheticIntervalTPS > 0 {
+			lines = append(lines, fmt.Sprintf("Target TPS  synthetic %.2f tx/s", report.SyntheticIntervalTPS))
+		}
+	default:
+		if report.Mode == string(ThroughputModeBlock) {
+			lines = append(lines, fmt.Sprintf("Throughput  confirmed apply %.2f tx/s | wall %.2f tx/s", report.ConfirmedProcessingTPS, report.ConfirmedWallTPS))
+		} else {
+			lines = append(lines, fmt.Sprintf("Throughput  tx admission %.2f tx/s | completion %.2f tx/s", report.AdmissionTPS, report.CompletionTPS))
+		}
+		if report.RequestedDurationMS > 0 {
+			lines = append(lines, fmt.Sprintf("Window      requested %.0f ms | actual %.2f ms", report.RequestedDurationMS, report.CompletionDurationMS))
+		}
 	}
+	lines = append(lines, fmt.Sprintf("Phases      decode %.2f ms | admit %.2f ms | fanout %.2f ms | converge %.2f ms",
+		report.Phases.DecodeMS,
+		report.Phases.ValidateAdmitMS,
+		report.Phases.RelayFanoutMS,
+		report.Phases.ConvergenceMS,
+	))
 	if len(report.Profiling.Artifacts) != 0 {
 		lines = append(lines, fmt.Sprintf("Profiles    %d artifacts in %s", len(report.Profiling.Artifacts), filepath.Dir(report.Profiling.Artifacts[0].Path)))
 	}
@@ -598,7 +1049,7 @@ func RenderASCIISummary(report *Report) string {
 	if hottest := hottestPeer(flattenRelayPeers(report.Nodes)); hottest != "" {
 		lines = append(lines, hottest)
 	}
-	return renderASCIIBox("BPU Benchmark Summary", lines)
+	return renderASCIIBox(asciiSummaryTitle(report), lines)
 }
 
 func RenderSuiteASCIISummary(report *SuiteReport) string {
@@ -663,6 +1114,27 @@ func suppressLogs() func() {
 
 func withDefaults(opts RunOptions) RunOptions {
 	defaults := DefaultRunOptions()
+	if opts.Benchmark == "" {
+		switch opts.Scenario {
+		case ScenarioConfirmedBlocks:
+			opts.Benchmark = BenchmarkE2E
+		default:
+			opts.Benchmark = defaults.Benchmark
+		}
+	}
+	if (opts.Benchmark == BenchmarkE2E || opts.Scenario == ScenarioConfirmedBlocks) && !opts.SyntheticMining && opts.MiningMode == "" {
+		opts.SyntheticMining = true
+	}
+	if opts.ThroughputMode == "" {
+		opts.ThroughputMode = defaults.ThroughputMode
+	}
+	if opts.MiningMode == "" {
+		if opts.SyntheticMining {
+			opts.MiningMode = MiningModeSynthetic
+		} else {
+			opts.MiningMode = MiningModeReal
+		}
+	}
 	if opts.Scenario == "" {
 		opts.Scenario = defaults.Scenario
 	}
@@ -684,11 +1156,32 @@ func withDefaults(opts RunOptions) RunOptions {
 	if opts.TxsPerBlock <= 0 {
 		opts.TxsPerBlock = defaults.TxsPerBlock
 	}
+	if opts.BlockCount <= 0 && (opts.Benchmark == BenchmarkE2E || opts.Scenario == ScenarioConfirmedBlocks) {
+		opts.BlockCount = defaults.BlockCount
+	}
+	if opts.Duration <= 0 {
+		opts.Duration = defaults.Duration
+	}
+	if opts.BlockInterval <= 0 && (opts.Benchmark == BenchmarkE2E || opts.Scenario == ScenarioConfirmedBlocks) {
+		opts.BlockInterval = defaults.BlockInterval
+	}
 	if opts.TxOriginSpread == "" {
 		opts.TxOriginSpread = defaults.TxOriginSpread
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaults.Timeout
+	}
+	if opts.SyntheticBlockInterval <= 0 {
+		opts.SyntheticBlockInterval = defaults.SyntheticBlockInterval
+	}
+	if opts.ProgressInterval <= 0 {
+		opts.ProgressInterval = defaults.ProgressInterval
+	}
+	if opts.Benchmark == BenchmarkE2E && opts.Scenario == ScenarioConfirmedBlocks && opts.TxCount <= 0 && opts.TxsPerBlock > 0 && opts.BlockCount > 0 {
+		opts.TxCount = opts.TxsPerBlock * opts.BlockCount
+	}
+	if opts.Benchmark == BenchmarkE2E && opts.BlockInterval > 0 && opts.SyntheticBlockInterval <= 0 {
+		opts.SyntheticBlockInterval = opts.BlockInterval
 	}
 	return opts
 }
@@ -710,20 +1203,47 @@ func withSuiteDefaults(opts SuiteOptions) SuiteOptions {
 	if opts.TxsPerBlock <= 0 {
 		opts.TxsPerBlock = defaults.TxsPerBlock
 	}
+	if opts.BlockCount <= 0 {
+		opts.BlockCount = defaults.BlockCount
+	}
+	if opts.Duration <= 0 {
+		opts.Duration = defaults.Duration
+	}
+	if opts.BlockInterval <= 0 {
+		opts.BlockInterval = defaults.BlockInterval
+	}
 	if opts.TxOriginSpread == "" {
 		opts.TxOriginSpread = defaults.TxOriginSpread
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaults.Timeout
 	}
+	if opts.SyntheticBlockInterval <= 0 {
+		opts.SyntheticBlockInterval = defaults.SyntheticBlockInterval
+	}
 	return opts
 }
 
 func validateOptions(opts RunOptions) error {
+	switch opts.Benchmark {
+	case "", BenchmarkE2E, BenchmarkThroughput:
+	default:
+		return fmt.Errorf("unsupported benchmark: %s", opts.Benchmark)
+	}
 	switch opts.Scenario {
 	case ScenarioDirectSubmit, ScenarioRPCBatch, ScenarioP2PRelay, ScenarioConfirmedBlocks, ScenarioUserMix, ScenarioChainedPackages, ScenarioOrphanStorm, ScenarioBlockTemplateBuild:
 	default:
 		return fmt.Errorf("unsupported scenario: %s", opts.Scenario)
+	}
+	switch opts.ThroughputMode {
+	case "", ThroughputModeTx, ThroughputModeBlock:
+	default:
+		return fmt.Errorf("unsupported throughput mode: %s", opts.ThroughputMode)
+	}
+	switch opts.MiningMode {
+	case "", MiningModeSynthetic, MiningModeReal:
+	default:
+		return fmt.Errorf("unsupported mining mode: %s", opts.MiningMode)
 	}
 	switch opts.TxOriginSpread {
 	case TxOriginOneNode, TxOriginEven:
@@ -745,17 +1265,28 @@ func validateOptions(opts RunOptions) error {
 	if opts.Scenario == ScenarioConfirmedBlocks && opts.TxsPerBlock <= 0 {
 		return fmt.Errorf("confirmed-blocks requires txs_per_block > 0")
 	}
+	if opts.Benchmark == BenchmarkE2E && opts.BlockCount <= 0 {
+		return fmt.Errorf("e2e requires block_count > 0")
+	}
+	if opts.Benchmark == BenchmarkE2E && opts.BlockInterval <= 0 {
+		return fmt.Errorf("e2e requires block_interval > 0")
+	}
+	if opts.Benchmark == BenchmarkThroughput && opts.Duration <= 0 {
+		return fmt.Errorf("throughput requires duration > 0")
+	}
+	if opts.SyntheticMining && opts.Scenario != ScenarioConfirmedBlocks {
+		return fmt.Errorf("synthetic mining is only supported for confirmed-blocks")
+	}
+	if opts.SyntheticMining && opts.SyntheticBlockInterval <= 0 {
+		return fmt.Errorf("synthetic mining requires synthetic_block_interval > 0")
+	}
+	if opts.FindMaxTPS && (!opts.SyntheticMining || opts.Scenario != ScenarioConfirmedBlocks) {
+		return fmt.Errorf("find_max_tps requires confirmed-blocks with synthetic mining enabled")
+	}
 	switch opts.Topology {
 	case TopologyLine, TopologyMesh:
 	default:
 		return fmt.Errorf("unsupported topology: %s", opts.Topology)
-	}
-	maxSeedable, err := maxSeedableTxCount(opts.Profile)
-	if err != nil {
-		return err
-	}
-	if opts.TxCount > maxSeedable {
-		return fmt.Errorf("tx count %d exceeds current benchmark seed capacity %d for %s; lower --txs or extend the funding strategy", opts.TxCount, maxSeedable, opts.Profile)
 	}
 	if opts.Scenario == ScenarioConfirmedBlocks && opts.TxsPerBlock > opts.TxCount {
 		return fmt.Errorf("txs_per_block %d exceeds tx count %d", opts.TxsPerBlock, opts.TxCount)
@@ -773,172 +1304,99 @@ func suiteCases(opts SuiteOptions) []suiteCase {
 	if blockTxsPerBlock <= 0 {
 		blockTxsPerBlock = max(1, min(opts.BatchSize, opts.TxCount))
 	}
-	cases := []suiteCase{
+	e2eTxCount := blockTxsPerBlock * max(1, opts.BlockCount)
+	return []suiteCase{
 		{
-			Name: "direct-submit",
+			Name: "e2e-synthetic",
 			Options: RunOptions{
-				Scenario:       ScenarioDirectSubmit,
-				Profile:        opts.Profile,
-				NodeCount:      1,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "direct-submit"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "direct-submit"),
-				SuppressLogs:   opts.SuppressLogs,
+				Benchmark:              BenchmarkE2E,
+				Scenario:               ScenarioConfirmedBlocks,
+				Profile:                opts.Profile,
+				NodeCount:              opts.NodeCount,
+				Topology:               TopologyMesh,
+				TxCount:                e2eTxCount,
+				BatchSize:              opts.BatchSize,
+				TxsPerBlock:            blockTxsPerBlock,
+				BlockCount:             opts.BlockCount,
+				BlockInterval:          opts.BlockInterval,
+				TxOriginSpread:         opts.TxOriginSpread,
+				Timeout:                opts.Timeout,
+				DBRoot:                 suiteDBRoot(opts.DBRoot, "e2e-synthetic"),
+				ProfileDir:             suiteProfileRoot(opts.ProfileDir, "e2e-synthetic"),
+				SuppressLogs:           opts.SuppressLogs,
+				MiningMode:             MiningModeSynthetic,
+				SyntheticMining:        true,
+				SyntheticBlockInterval: opts.BlockInterval,
+				RelayConfirmedBlocks:   true,
 			},
 		},
 		{
-			Name: "rpc-batch",
+			Name: "e2e-real",
 			Options: RunOptions{
-				Scenario:       ScenarioRPCBatch,
-				Profile:        opts.Profile,
-				NodeCount:      1,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "rpc-batch"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "rpc-batch"),
-				SuppressLogs:   opts.SuppressLogs,
+				Benchmark:            BenchmarkE2E,
+				Scenario:             ScenarioConfirmedBlocks,
+				Profile:              opts.Profile,
+				NodeCount:            opts.NodeCount,
+				Topology:             TopologyMesh,
+				TxCount:              e2eTxCount,
+				BatchSize:            opts.BatchSize,
+				TxsPerBlock:          blockTxsPerBlock,
+				BlockCount:           opts.BlockCount,
+				BlockInterval:        opts.BlockInterval,
+				TxOriginSpread:       opts.TxOriginSpread,
+				Timeout:              opts.Timeout,
+				DBRoot:               suiteDBRoot(opts.DBRoot, "e2e-real"),
+				ProfileDir:           suiteProfileRoot(opts.ProfileDir, "e2e-real"),
+				SuppressLogs:         opts.SuppressLogs,
+				MiningMode:           MiningModeReal,
+				RelayConfirmedBlocks: true,
 			},
 		},
 		{
-			Name: "user-mix",
+			Name: "throughput-tx",
 			Options: RunOptions{
-				Scenario:       ScenarioUserMix,
-				Profile:        opts.Profile,
-				NodeCount:      1,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "user-mix"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "user-mix"),
-				SuppressLogs:   opts.SuppressLogs,
+				Benchmark:              BenchmarkThroughput,
+				ThroughputMode:         ThroughputModeTx,
+				Scenario:               ScenarioDirectSubmit,
+				Profile:                opts.Profile,
+				NodeCount:              1,
+				TxCount:                opts.TxCount,
+				BatchSize:              opts.BatchSize,
+				Duration:               opts.Duration,
+				TxOriginSpread:         opts.TxOriginSpread,
+				Timeout:                opts.Timeout,
+				DBRoot:                 suiteDBRoot(opts.DBRoot, "throughput-tx"),
+				ProfileDir:             suiteProfileRoot(opts.ProfileDir, "throughput-tx"),
+				SuppressLogs:           opts.SuppressLogs,
+				SyntheticBlockInterval: opts.BlockInterval,
 			},
 		},
 		{
-			Name: "chained-packages",
+			Name: "throughput-block",
 			Options: RunOptions{
-				Scenario:       ScenarioChainedPackages,
-				Profile:        opts.Profile,
-				NodeCount:      1,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "chained-packages"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "chained-packages"),
-				SuppressLogs:   opts.SuppressLogs,
-			},
-		},
-		{
-			Name: "orphan-storm",
-			Options: RunOptions{
-				Scenario:       ScenarioOrphanStorm,
-				Profile:        opts.Profile,
-				NodeCount:      1,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "orphan-storm"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "orphan-storm"),
-				SuppressLogs:   opts.SuppressLogs,
-			},
-		},
-		{
-			Name: "block-template-rebuild",
-			Options: RunOptions{
-				Scenario:       ScenarioBlockTemplateBuild,
-				Profile:        opts.Profile,
-				NodeCount:      1,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxsPerBlock:    opts.TxsPerBlock,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "block-template-rebuild"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "block-template-rebuild"),
-				SuppressLogs:   opts.SuppressLogs,
-			},
-		},
-		{
-			Name: "confirmed-blocks-2-line",
-			Options: RunOptions{
-				Scenario:       ScenarioConfirmedBlocks,
-				Profile:        opts.Profile,
-				NodeCount:      2,
-				Topology:       TopologyLine,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxsPerBlock:    blockTxsPerBlock,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "confirmed-blocks-2-line"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "confirmed-blocks-2-line"),
-				SuppressLogs:   opts.SuppressLogs,
-			},
-		},
-		{
-			Name: "p2p-relay-2-line",
-			Options: RunOptions{
-				Scenario:       ScenarioP2PRelay,
-				Profile:        opts.Profile,
-				NodeCount:      2,
-				Topology:       TopologyLine,
-				TxCount:        opts.TxCount,
-				BatchSize:      opts.BatchSize,
-				TxsPerBlock:    opts.TxsPerBlock,
-				TxOriginSpread: opts.TxOriginSpread,
-				Timeout:        opts.Timeout,
-				DBRoot:         suiteDBRoot(opts.DBRoot, "p2p-relay-2-line"),
-				ProfileDir:     suiteProfileRoot(opts.ProfileDir, "p2p-relay-2-line"),
-				SuppressLogs:   opts.SuppressLogs,
+				Benchmark:              BenchmarkThroughput,
+				ThroughputMode:         ThroughputModeBlock,
+				Scenario:               ScenarioConfirmedBlocks,
+				Profile:                opts.Profile,
+				NodeCount:              1,
+				TxCount:                max(opts.TxCount, blockTxsPerBlock*8),
+				BatchSize:              opts.BatchSize,
+				TxsPerBlock:            blockTxsPerBlock,
+				BlockCount:             max(1, (max(opts.TxCount, blockTxsPerBlock*8)+blockTxsPerBlock-1)/blockTxsPerBlock),
+				Duration:               opts.Duration,
+				BlockInterval:          opts.BlockInterval,
+				TxOriginSpread:         opts.TxOriginSpread,
+				Timeout:                opts.Timeout,
+				DBRoot:                 suiteDBRoot(opts.DBRoot, "throughput-block"),
+				ProfileDir:             suiteProfileRoot(opts.ProfileDir, "throughput-block"),
+				SuppressLogs:           opts.SuppressLogs,
+				MiningMode:             MiningModeSynthetic,
+				SyntheticMining:        true,
+				SyntheticBlockInterval: opts.BlockInterval,
+				RelayConfirmedBlocks:   false,
 			},
 		},
 	}
-	if opts.NodeCount > 2 {
-		cases = append(cases,
-			suiteCase{
-				Name: "p2p-relay-line",
-				Options: RunOptions{
-					Scenario:       ScenarioP2PRelay,
-					Profile:        opts.Profile,
-					NodeCount:      opts.NodeCount,
-					Topology:       TopologyLine,
-					TxCount:        opts.TxCount,
-					BatchSize:      opts.BatchSize,
-					TxsPerBlock:    opts.TxsPerBlock,
-					TxOriginSpread: opts.TxOriginSpread,
-					Timeout:        opts.Timeout,
-					DBRoot:         suiteDBRoot(opts.DBRoot, "p2p-relay-line"),
-					ProfileDir:     suiteProfileRoot(opts.ProfileDir, "p2p-relay-line"),
-					SuppressLogs:   opts.SuppressLogs,
-				},
-			},
-			suiteCase{
-				Name: "p2p-relay-mesh",
-				Options: RunOptions{
-					Scenario:       ScenarioP2PRelay,
-					Profile:        opts.Profile,
-					NodeCount:      opts.NodeCount,
-					Topology:       TopologyMesh,
-					TxCount:        opts.TxCount,
-					BatchSize:      opts.BatchSize,
-					TxsPerBlock:    opts.TxsPerBlock,
-					TxOriginSpread: opts.TxOriginSpread,
-					Timeout:        opts.Timeout,
-					DBRoot:         suiteDBRoot(opts.DBRoot, "p2p-relay-mesh"),
-					ProfileDir:     suiteProfileRoot(opts.ProfileDir, "p2p-relay-mesh"),
-					SuppressLogs:   opts.SuppressLogs,
-				},
-			},
-		)
-	}
-	return cases
 }
 
 func suiteProfileRoot(root, name string) string {
@@ -949,7 +1407,11 @@ func suiteProfileRoot(root, name string) string {
 }
 
 func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), error) {
-	genesis, err := loadGenesisFixture()
+	clusterProfile := benchmarkClusterProfile(opts)
+	if clusterProfile == types.BenchNet {
+		consensus.SetBenchNetParams(benchNetParamsForRun(opts))
+	}
+	genesis, err := loadBenchmarkGenesis(clusterProfile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -989,6 +1451,14 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 		}
 	}
 
+	maxOutboundPeers := max(16, opts.NodeCount*4)
+	if opts.NodeCount > 1 && (opts.Scenario == ScenarioP2PRelay || opts.Scenario == ScenarioConfirmedBlocks) {
+		// Multi-node benchmark topologies are wired explicitly by connectCluster.
+		// Disable background outbound refill so the benchmark measures the chosen
+		// line/mesh graph instead of a second auto-connected overlay.
+		maxOutboundPeers = 0
+	}
+
 	for i := 0; i < opts.NodeCount; i++ {
 		p2pAddr, err := reserveLoopbackAddr()
 		if err != nil {
@@ -1014,7 +1484,7 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 			errCh:     make(chan error, 1),
 		}
 		svc, err := node.OpenService(node.ServiceConfig{
-			Profile:          opts.Profile,
+			Profile:          clusterProfile,
 			DBPath:           dbPath,
 			RPCAddr:          rpcAddr,
 			RPCAuthToken:     authToken,
@@ -1024,7 +1494,7 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 			RPCMaxBodyBytes:  8 << 20,
 			P2PAddr:          p2pAddr,
 			MaxInboundPeers:  max(32, opts.NodeCount*4),
-			MaxOutboundPeers: max(16, opts.NodeCount*4),
+			MaxOutboundPeers: maxOutboundPeers,
 			HandshakeTimeout: 5 * time.Second,
 			// Loopback benchmarks should surface relay gaps quickly instead of
 			// spending most of the case timeout waiting on production-oriented
@@ -1037,7 +1507,13 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 			MaxDescendants:     mempoolCfg.maxDescendants,
 			MaxOrphans:         mempoolCfg.maxOrphans,
 			MinerPubKey:        pubKeyForSeed(byte(i + 1)),
-			GenesisFixture:     "fixtures/genesis/regtest.json",
+			GenesisFixture:     benchmarkGenesisLabel(clusterProfile),
+			// Benchmarks wire an explicit line/mesh topology and need that graph to
+			// stay fixed while measuring relay and block propagation. Letting normal
+			// addr gossip and known-peer restart logic mutate the peer set makes the
+			// benchmark report a moving target instead of the requested topology.
+			StaticPeerTopology: opts.NodeCount > 1 && (opts.Scenario == ScenarioP2PRelay || opts.Scenario == ScenarioConfirmedBlocks),
+			SyntheticMining:    opts.SyntheticMining,
 		}, genesis)
 		if err != nil {
 			cleanup()
@@ -1190,6 +1666,19 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		}
 		return runSubmissionScenario(ctx, cluster, submitters, opts, txs)
 	case ScenarioConfirmedBlocks:
+		if opts.FindMaxTPS {
+			lanes, err := seedSpendableLanes(submitter.svc, opts.TxCount, 2)
+			if err != nil {
+				return workloadOutcome{}, err
+			}
+			if err := waitForHeights(ctx, cluster, seedReadyHeight); err != nil {
+				return workloadOutcome{}, err
+			}
+			if _, err := waitForMempoolCounts(ctx, cluster, 0, time.Time{}); err != nil {
+				return workloadOutcome{}, err
+			}
+			return runConfirmedBlocksMaxRampScenario(ctx, cluster, submitter, submitters, opts, lanes)
+		}
 		txs, err := seedSpendableFanout(submitter.svc, opts.TxCount)
 		if err != nil {
 			return workloadOutcome{}, err
@@ -1281,31 +1770,50 @@ func benchmarkSubmitters(cluster []*clusterNode, opts RunOptions) []*clusterNode
 }
 
 func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, submitters []*clusterNode, opts RunOptions, txs []types.Transaction) (workloadOutcome, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
 	submitStarted := time.Now()
+	step := max(1, opts.BatchSize)
+	targetTxsPerBlock := min(opts.TxsPerBlock, len(txs))
+	if targetTxsPerBlock <= 0 {
+		targetTxsPerBlock = len(txs)
+	}
+	targetTxsPerBlock = min(len(txs), alignUp(targetTxsPerBlock, step))
+	initialTargetTxsPerBlock := targetTxsPerBlock
 	metrics := ScenarioMetrics{
-		TargetTxsPerBlock: min(opts.TxsPerBlock, len(txs)),
+		TargetTxsPerBlock: targetTxsPerBlock,
 	}
-	if metrics.TargetTxsPerBlock <= 0 {
-		metrics.TargetTxsPerBlock = len(txs)
-	}
-	blockConvergenceSamples := make([]float64, 0, (len(txs)+metrics.TargetTxsPerBlock-1)/metrics.TargetTxsPerBlock)
+	blockConvergenceSamples := make([]float64, 0, (len(txs)+targetTxsPerBlock-1)/targetTxsPerBlock)
+	blockRoundSamples := make([]float64, 0, cap(blockConvergenceSamples))
+	blockBuildSamples := make([]float64, 0, cap(blockConvergenceSamples))
+	blockSealSamples := make([]float64, 0, cap(blockConvergenceSamples))
+	scheduleLagSamples := make([]float64, 0, cap(blockConvergenceSamples))
+	const syntheticCadenceMissThreshold = 5 * time.Millisecond
 	var admissionElapsed time.Duration
+	var confirmedProcessing time.Duration
 	submittedByNode := make(map[string]int, len(submitters))
 	currentHeight := uint64(1)
 	submitterOffset := 0
-	for start := 0; start < len(txs); start += metrics.TargetTxsPerBlock {
-		end := start + metrics.TargetTxsPerBlock
-		if end > len(txs) {
-			end = len(txs)
+	rampTried := make([]int, 0, cap(blockConvergenceSamples))
+	for start := 0; start < len(txs); {
+		if opts.Benchmark == BenchmarkThroughput && opts.Duration > 0 && time.Since(submitStarted) >= opts.Duration {
+			break
 		}
+		remaining := len(txs) - start
+		waveTarget := min(metrics.TargetTxsPerBlock, remaining)
+		if waveTarget <= 0 {
+			break
+		}
+		roundStarted := time.Now()
+		end := start + waveTarget
 		wave := txs[start:end]
+		progressEventf(ctx, "round=%d/%d target_txs=%d remaining=%d", metrics.ConfirmedBlocks+1, max(1, opts.BlockCount), waveTarget, remaining)
 		// Keep each round bounded so the run spans multiple confirmed blocks
 		// instead of collapsing into a single oversized mempool wave.
 		admitStarted := time.Now()
 		for i, tx := range wave {
 			target := submitters[(submitterOffset+i)%len(submitters)]
-			admission, err := target.svc.SubmitTx(tx)
+			admission, err := callWithContext(ctx, func() (mempool.Admission, error) {
+				return target.svc.SubmitTx(tx)
+			})
 			if err != nil {
 				return workloadOutcome{}, err
 			}
@@ -1314,33 +1822,311 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 		}
 		submitterOffset = (submitterOffset + len(wave)) % len(submitters)
 		admissionElapsed += time.Since(admitStarted)
+		scheduledAt := syntheticE2EBlockTime(submitStarted, opts, metrics.ConfirmedBlocks+1)
+		if scheduledAt.IsZero() {
+			if _, err := waitForMempoolCounts(ctx, cluster, len(wave), time.Time{}); err != nil {
+				return workloadOutcome{}, err
+			}
+		} else {
+			if _, _, err := waitForMempoolCountsUntil(ctx, cluster, len(wave), time.Time{}, scheduledAt); err != nil {
+				return workloadOutcome{}, err
+			}
+			if err := waitUntil(ctx, scheduledAt); err != nil {
+				return workloadOutcome{}, err
+			}
+			if lag := time.Since(scheduledAt); lag > 0 {
+				scheduleLagSamples = append(scheduleLagSamples, durationMS(lag))
+				if lag > syntheticCadenceMissThreshold {
+					metrics.MissedIntervals++
+				}
+			}
+		}
+		var preparedBlock preparedBenchmarkBlock
+		var err error
+		for {
+			preparedBlock, err = buildConfirmedBenchmarkBlock(ctx, submitter.svc, opts)
+			if err != nil {
+				return workloadOutcome{}, err
+			}
+			blockStarted := time.Now()
+			accepted, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
+				hash, height, err := submitter.svc.AcceptLocalBenchmarkBlock(preparedBlock.block)
+				return acceptedBenchmarkBlock{hash: hash, height: height}, err
+			})
+			if err != nil {
+				if strings.Contains(err.Error(), "stale template") {
+					continue
+				}
+				return workloadOutcome{}, err
+			}
+			if hex.EncodeToString(accepted.hash[:]) != preparedBlock.hashHex {
+				return workloadOutcome{}, fmt.Errorf("accepted block hash mismatch: got %x want %s", accepted.hash, preparedBlock.hashHex)
+			}
+			blockBuildSamples = append(blockBuildSamples, durationMS(preparedBlock.buildDuration))
+			blockSealSamples = append(blockSealSamples, durationMS(preparedBlock.sealDuration))
+			if !opts.RelayConfirmedBlocks {
+				if err := submitBlockToFollowers(ctx, cluster[1:], preparedBlock.block); err != nil {
+					return workloadOutcome{}, err
+				}
+			}
+			currentHeight++
+			blockProcessing := time.Since(blockStarted)
+			if !(opts.Benchmark == BenchmarkE2E && opts.SyntheticMining) {
+				heightReached, err := waitForHeightsReached(ctx, cluster, currentHeight, blockStarted)
+				if err != nil {
+					return workloadOutcome{}, err
+				}
+				blockProcessing = maxDuration(heightReached)
+			}
+			confirmedProcessing += blockProcessing
+			blockConvergenceSamples = append(blockConvergenceSamples, durationMS(blockProcessing))
+			roundDuration := time.Since(roundStarted)
+			blockRoundSamples = append(blockRoundSamples, durationMS(roundDuration))
+			metrics.ConfirmedTxs += len(wave)
+			metrics.ConfirmedBlocks++
+			progressEventf(ctx, "block=%d accepted height=%d hash=%s round=%s max_mempool=%d",
+				metrics.ConfirmedBlocks,
+				currentHeight,
+				shortHash(preparedBlock.hashHex),
+				roundDuration.Round(time.Millisecond),
+				maxNodeMempoolCount(cluster),
+			)
+			start = end
+			if opts.FindMaxTPS {
+				rampTried = append(rampTried, waveTarget)
+				metrics.RampSteps++
+				if waveTarget == metrics.TargetTxsPerBlock && roundDuration <= opts.SyntheticBlockInterval {
+					metrics.MaxSustainableTxsPerBlock = waveTarget
+					if start < len(txs) {
+						nextTarget := min(len(txs), alignUp(metrics.TargetTxsPerBlock+step, step))
+						if nextTarget > metrics.TargetTxsPerBlock {
+							metrics.TargetTxsPerBlock = nextTarget
+						}
+					}
+				} else if waveTarget == metrics.TargetTxsPerBlock && roundDuration > opts.SyntheticBlockInterval {
+					metrics.FirstUnsustainedTxsPerBlock = waveTarget
+					start = len(txs)
+				}
+			}
+			break
+		}
+	}
+	completion := make(map[string]time.Duration)
+	var err error
+	if opts.Benchmark == BenchmarkE2E && opts.SyntheticMining {
+		completion = syntheticFinalPropagation(cluster, currentHeight, submitStarted)
+	} else {
+		completion, err = waitForMempoolCounts(ctx, cluster, 0, submitStarted)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+	}
+	if len(blockConvergenceSamples) > 0 {
+		metrics.BlockConvergeAvgMS = averageFloat64(blockConvergenceSamples)
+		metrics.BlockConvergeP95MS = percentileFloat64(blockConvergenceSamples, 95)
+		metrics.BlockConvergeMaxMS = maxFloat64(blockConvergenceSamples)
+	}
+	if len(blockRoundSamples) > 0 {
+		metrics.BlockRoundAvgMS = averageFloat64(blockRoundSamples)
+		metrics.BlockRoundP95MS = percentileFloat64(blockRoundSamples, 95)
+		metrics.BlockRoundMaxMS = maxFloat64(blockRoundSamples)
+	}
+	if len(blockBuildSamples) > 0 {
+		metrics.BlockBuildAvgMS = averageFloat64(blockBuildSamples)
+		metrics.BlockBuildP95MS = percentileFloat64(blockBuildSamples, 95)
+		metrics.BlockBuildMaxMS = maxFloat64(blockBuildSamples)
+	}
+	if len(blockSealSamples) > 0 {
+		metrics.BlockSealAvgMS = averageFloat64(blockSealSamples)
+		metrics.BlockSealP95MS = percentileFloat64(blockSealSamples, 95)
+		metrics.BlockSealMaxMS = maxFloat64(blockSealSamples)
+	}
+	if len(scheduleLagSamples) > 0 {
+		metrics.ScheduleLagAvgMS = averageFloat64(scheduleLagSamples)
+		metrics.ScheduleLagP95MS = percentileFloat64(scheduleLagSamples, 95)
+		metrics.ScheduleLagMaxMS = maxFloat64(scheduleLagSamples)
+	}
+	applyTemplateDiagnostics(&metrics, submitter.svc)
+	metrics.FinalMempoolTxs = maxNodeMempoolCount(cluster)
+	metrics.FinalBlockLag, metrics.FinalHeaderLag = maxNodeChainLag(cluster, currentHeight)
+	completed := time.Now()
+	if opts.FindMaxTPS && metrics.MaxSustainableTxsPerBlock > 0 {
+		metrics.TargetTxsPerBlock = metrics.MaxSustainableTxsPerBlock
+	}
+	extraNotes := []string{
+		fmt.Sprintf("Confirmed-blocks runs submit transactions in bounded rounds, waits for mempool convergence, seals one block on node-0, and waits for block-height convergence before the next round. The starting block target was %d txs.", initialTargetTxsPerBlock),
+	}
+	if opts.FindMaxTPS {
+		sort.Ints(rampTried)
+		extraNotes = append(extraNotes,
+			fmt.Sprintf("Synthetic max-TPS mode reused one live cluster and increased the block workload by %d txs after each sustainable round.", step),
+			fmt.Sprintf("Synthetic ramp attempted txs_per_block values: %s.", joinInts(rampTried)),
+		)
+		if metrics.FirstUnsustainedTxsPerBlock > 0 {
+			if metrics.MaxSustainableTxsPerBlock == 0 {
+				extraNotes = append(extraNotes,
+					fmt.Sprintf("The initial synthetic block target of %d txs/block already exceeded the cadence.", metrics.FirstUnsustainedTxsPerBlock),
+				)
+			} else {
+				extraNotes = append(extraNotes,
+					fmt.Sprintf("The largest sustained block load was %d txs/block; %d txs/block exceeded the synthetic cadence.", metrics.MaxSustainableTxsPerBlock, metrics.FirstUnsustainedTxsPerBlock),
+				)
+			}
+		} else {
+			extraNotes = append(extraNotes,
+				fmt.Sprintf("The run stayed within the synthetic cadence through %d txs/block; the search stopped because the seeded workload was exhausted.", metrics.MaxSustainableTxsPerBlock),
+			)
+		}
+	}
+	return workloadOutcome{
+		submitStarted:       submitStarted,
+		submitDone:          submitStarted.Add(admissionElapsed),
+		admissionTime:       admissionElapsed,
+		completed:           completed,
+		propagation:         completion,
+		submittedByNode:     submittedByNode,
+		confirmedProcessing: confirmedProcessing,
+		phases: PhaseReport{
+			ValidateAdmitMS: durationMS(admissionElapsed),
+			ConvergenceMS:   durationMS(maxDuration(completion)),
+		},
+		metrics:    metrics,
+		extraNotes: extraNotes,
+	}, nil
+}
+
+type preparedBenchmarkBlock struct {
+	block         types.Block
+	hashHex       string
+	buildDuration time.Duration
+	sealDuration  time.Duration
+}
+
+type acceptedBenchmarkBlock struct {
+	hash   [32]byte
+	height uint64
+}
+
+type spendableLane struct {
+	OutPoint    types.OutPoint
+	Value       uint64
+	SpenderSeed byte
+}
+
+type preparedLaneTx struct {
+	tx        types.Transaction
+	nextLanes []spendableLane
+	submitter *clusterNode
+}
+
+func runConfirmedBlocksMaxRampScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, submitters []*clusterNode, opts RunOptions, lanes []spendableLane) (workloadOutcome, error) {
+	submitStarted := time.Now()
+	step := max(1, opts.BatchSize)
+	targetTxsPerBlock := max(step, opts.TxsPerBlock)
+	targetTxsPerBlock = alignUp(targetTxsPerBlock, step)
+	metrics := ScenarioMetrics{
+		TargetTxsPerBlock: targetTxsPerBlock,
+	}
+	blockConvergenceSamples := make([]float64, 0, 16)
+	blockRoundSamples := make([]float64, 0, 16)
+	blockBuildSamples := make([]float64, 0, 16)
+	blockSealSamples := make([]float64, 0, 16)
+	var admissionElapsed time.Duration
+	var confirmedProcessing time.Duration
+	submittedByNode := make(map[string]int, len(submitters))
+	currentHeight := uint64(1)
+	submitterOffset := 0
+	rampTried := make([]int, 0, 16)
+	exhaustedLanes := false
+
+	for {
+		if len(lanes) == 0 {
+			exhaustedLanes = true
+			break
+		}
+		waveTarget := min(metrics.TargetTxsPerBlock, len(lanes))
+		if waveTarget <= 0 {
+			exhaustedLanes = true
+			break
+		}
+		roundStarted := time.Now()
+		wave, remainingLanes, nextOffset, err := prepareLaneWave(lanes, waveTarget, submitters, submitterOffset)
+		if err != nil {
+			if errors.Is(err, consensus.ErrInputsLessThanOutputs) {
+				exhaustedLanes = true
+				break
+			}
+			return workloadOutcome{}, err
+		}
+		submitterOffset = nextOffset
+		admitStarted := time.Now()
+		for _, prepared := range wave {
+			admission, err := callWithContext(ctx, func() (mempool.Admission, error) {
+				return prepared.submitter.svc.SubmitTx(prepared.tx)
+			})
+			if err != nil {
+				return workloadOutcome{}, err
+			}
+			metrics.AcceptedTxs += len(admission.Accepted)
+			submittedByNode[prepared.submitter.name]++
+		}
+		admissionElapsed += time.Since(admitStarted)
 		if _, err := waitForMempoolCounts(ctx, cluster, len(wave), time.Time{}); err != nil {
 			return workloadOutcome{}, err
 		}
-		minedBlock, minedHashHex, err := buildConfirmedBenchmarkBlock(submitter.svc, opts.Profile)
+		preparedBlock, err := buildConfirmedBenchmarkBlock(ctx, submitter.svc, opts)
 		if err != nil {
 			return workloadOutcome{}, err
 		}
 		blockStarted := time.Now()
-		hashes, err := submitter.svc.MineBlocks(1)
+		accepted, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
+			hash, height, err := submitter.svc.AcceptLocalBenchmarkBlock(preparedBlock.block)
+			return acceptedBenchmarkBlock{hash: hash, height: height}, err
+		})
 		if err != nil {
 			return workloadOutcome{}, err
 		}
-		if len(hashes) != 1 || hashes[0] != minedHashHex {
-			return workloadOutcome{}, fmt.Errorf("mined block hash mismatch: got %v want %s", hashes, minedHashHex)
+		if hex.EncodeToString(accepted.hash[:]) != preparedBlock.hashHex {
+			return workloadOutcome{}, fmt.Errorf("accepted block hash mismatch: got %x want %s", accepted.hash, preparedBlock.hashHex)
 		}
-		if err := submitBlockToFollowers(client, cluster[1:], minedBlock); err != nil {
-			return workloadOutcome{}, err
+		blockBuildSamples = append(blockBuildSamples, durationMS(preparedBlock.buildDuration))
+		blockSealSamples = append(blockSealSamples, durationMS(preparedBlock.sealDuration))
+		if !opts.RelayConfirmedBlocks {
+			if err := submitBlockToFollowers(ctx, cluster[1:], preparedBlock.block); err != nil {
+				return workloadOutcome{}, err
+			}
 		}
 		currentHeight++
 		heightReached, err := waitForHeightsReached(ctx, cluster, currentHeight, blockStarted)
 		if err != nil {
 			return workloadOutcome{}, err
 		}
-		blockConvergenceSamples = append(blockConvergenceSamples, durationMS(maxDuration(heightReached)))
-		metrics.ConfirmedTxs += len(wave)
+		blockProcessing := maxDuration(heightReached)
+		confirmedProcessing += blockProcessing
+		blockConvergenceSamples = append(blockConvergenceSamples, durationMS(blockProcessing))
+		roundDuration := time.Since(roundStarted)
+		blockRoundSamples = append(blockRoundSamples, durationMS(roundDuration))
 		metrics.ConfirmedBlocks++
+		rampTried = append(rampTried, waveTarget)
+
+		laneOutputs := confirmedLaneOutputs(preparedBlock.block, wave)
+		if len(laneOutputs) == 0 {
+			exhaustedLanes = true
+			break
+		}
+		metrics.ConfirmedTxs += len(laneOutputs) / 2
+		lanes = append(remainingLanes, laneOutputs...)
+		if roundDuration <= opts.SyntheticBlockInterval {
+			metrics.MaxSustainableTxsPerBlock = waveTarget
+			metrics.RampSteps++
+			metrics.TargetTxsPerBlock = nextSyntheticRampTarget(waveTarget, step, roundDuration, opts.SyntheticBlockInterval)
+			continue
+		}
+		metrics.FirstUnsustainedTxsPerBlock = waveTarget
+		metrics.RampSteps++
+		break
 	}
+
 	completion, err := waitForMempoolCounts(ctx, cluster, 0, submitStarted)
 	if err != nil {
 		return workloadOutcome{}, err
@@ -1350,59 +2136,275 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 		metrics.BlockConvergeP95MS = percentileFloat64(blockConvergenceSamples, 95)
 		metrics.BlockConvergeMaxMS = maxFloat64(blockConvergenceSamples)
 	}
+	if len(blockRoundSamples) > 0 {
+		metrics.BlockRoundAvgMS = averageFloat64(blockRoundSamples)
+		metrics.BlockRoundP95MS = percentileFloat64(blockRoundSamples, 95)
+		metrics.BlockRoundMaxMS = maxFloat64(blockRoundSamples)
+	}
+	if len(blockBuildSamples) > 0 {
+		metrics.BlockBuildAvgMS = averageFloat64(blockBuildSamples)
+		metrics.BlockBuildP95MS = percentileFloat64(blockBuildSamples, 95)
+		metrics.BlockBuildMaxMS = maxFloat64(blockBuildSamples)
+	}
+	if len(blockSealSamples) > 0 {
+		metrics.BlockSealAvgMS = averageFloat64(blockSealSamples)
+		metrics.BlockSealP95MS = percentileFloat64(blockSealSamples, 95)
+		metrics.BlockSealMaxMS = maxFloat64(blockSealSamples)
+	}
+	applyTemplateDiagnostics(&metrics, submitter.svc)
+	if metrics.MaxSustainableTxsPerBlock > 0 {
+		metrics.TargetTxsPerBlock = metrics.MaxSustainableTxsPerBlock
+	}
+	sort.Ints(rampTried)
+	extraNotes := []string{
+		fmt.Sprintf("Confirmed-blocks runs submit transactions in bounded rounds, waits for mempool convergence, seals one block on node-0, and waits for block-height convergence before the next round. The starting block target was %d txs.", alignUp(max(step, opts.TxsPerBlock), step)),
+		fmt.Sprintf("Synthetic max-TPS mode reused one live cluster, ramped aggressively while rounds stayed far below the cadence, and then refined in %d-tx steps near the edge.", step),
+		fmt.Sprintf("Synthetic ramp attempted txs_per_block values: %s.", joinInts(rampTried)),
+		"The synthetic max-TPS workload replenishes its spend queue from the benchmark's own confirmed outputs, so the ramp is limited by block processing rather than one-shot seeding.",
+	}
+	if metrics.FirstUnsustainedTxsPerBlock > 0 {
+		if metrics.MaxSustainableTxsPerBlock == 0 {
+			extraNotes = append(extraNotes,
+				fmt.Sprintf("The initial synthetic block target of %d txs/block already exceeded the cadence.", metrics.FirstUnsustainedTxsPerBlock),
+			)
+		} else {
+			extraNotes = append(extraNotes,
+				fmt.Sprintf("The largest sustained block load was %d txs/block; %d txs/block exceeded the synthetic cadence.", metrics.MaxSustainableTxsPerBlock, metrics.FirstUnsustainedTxsPerBlock),
+			)
+		}
+	} else if exhaustedLanes {
+		extraNotes = append(extraNotes,
+			fmt.Sprintf("The run stayed within the synthetic cadence through %d txs/block; the lane queue stopped growing because outputs became too small to split again.", metrics.MaxSustainableTxsPerBlock),
+		)
+	}
 	completed := time.Now()
 	return workloadOutcome{
-		submitStarted:   submitStarted,
-		submitDone:      submitStarted.Add(admissionElapsed),
-		admissionTime:   admissionElapsed,
-		completed:       completed,
-		propagation:     completion,
-		submittedByNode: submittedByNode,
+		submitStarted:       submitStarted,
+		submitDone:          submitStarted.Add(admissionElapsed),
+		admissionTime:       admissionElapsed,
+		completed:           completed,
+		propagation:         completion,
+		submittedByNode:     submittedByNode,
+		confirmedProcessing: confirmedProcessing,
 		phases: PhaseReport{
 			ValidateAdmitMS: durationMS(admissionElapsed),
 			ConvergenceMS:   durationMS(maxDuration(completion)),
 		},
-		metrics: metrics,
-		extraNotes: []string{
-			fmt.Sprintf("Confirmed-blocks runs submit up to %d transactions per round, waits for mempool convergence, mines one block on node-0, and waits for block-height convergence before the next round.", metrics.TargetTxsPerBlock),
-		},
+		metrics:    metrics,
+		extraNotes: extraNotes,
 	}, nil
 }
 
-func buildConfirmedBenchmarkBlock(svc *node.Service, profile types.ChainProfile) (types.Block, string, error) {
-	block, err := svc.BuildBlockTemplate()
-	if err != nil {
-		return types.Block{}, "", err
+func applyTemplateDiagnostics(metrics *ScenarioMetrics, svc *node.Service) {
+	if metrics == nil || svc == nil {
+		return
 	}
-	minedHeader, err := consensus.MineHeader(block.Header, consensus.ParamsForProfile(profile))
-	if err != nil {
-		return types.Block{}, "", err
-	}
-	block.Header = minedHeader
-	hash := consensus.HeaderHash(&block.Header)
-	return block, hex.EncodeToString(hash[:]), nil
+	templateStats := svc.BlockTemplateStats()
+	perf := svc.PerformanceMetrics()
+	metrics.TemplateCacheHits = templateStats.CacheHits
+	metrics.TemplateFrontier = templateStats.FrontierCandidates
+	metrics.TemplateFullBuilds = templateStats.FullBuilds
+	metrics.TemplateAppendExtends = templateStats.AppendExtends
+	metrics.TemplateNoChangeRefreshes = templateStats.NoChangeRefreshes
+	metrics.TemplateSelectAvgMS = perf.Latency.TemplateSelect.AvgMS
+	metrics.TemplateSelectP95MS = perf.Latency.TemplateSelect.P95MS
+	metrics.TemplateSelectMaxMS = perf.Latency.TemplateSelect.MaxMS
+	metrics.TemplateAccumulateAvgMS = perf.Latency.TemplateAccumulate.AvgMS
+	metrics.TemplateAccumulateP95MS = perf.Latency.TemplateAccumulate.P95MS
+	metrics.TemplateAccumulateMaxMS = perf.Latency.TemplateAccumulate.MaxMS
+	metrics.TemplateAssembleAvgMS = perf.Latency.TemplateAssemble.AvgMS
+	metrics.TemplateAssembleP95MS = perf.Latency.TemplateAssemble.P95MS
+	metrics.TemplateAssembleMaxMS = perf.Latency.TemplateAssemble.MaxMS
 }
 
-func submitBlockToFollowers(client *http.Client, followers []*clusterNode, block types.Block) error {
+func prepareLaneWave(lanes []spendableLane, count int, submitters []*clusterNode, submitterOffset int) ([]preparedLaneTx, []spendableLane, int, error) {
+	if count <= 0 {
+		return nil, append([]spendableLane(nil), lanes...), submitterOffset, nil
+	}
+	if count > len(lanes) {
+		count = len(lanes)
+	}
+	wave := make([]preparedLaneTx, 0, count)
+	remaining := append([]spendableLane(nil), lanes[count:]...)
+	offset := submitterOffset
+	for i := 0; i < count; i++ {
+		lane := lanes[i]
+		tx, values, err := buildFanoutTx(lane.SpenderSeed, lane.OutPoint, lane.Value, pubKeyForSeed(lane.SpenderSeed), 2)
+		if err != nil {
+			return nil, nil, submitterOffset, err
+		}
+		txid := consensus.TxID(&tx)
+		next := make([]spendableLane, 0, len(values))
+		for vout, value := range values {
+			next = append(next, spendableLane{
+				OutPoint:    types.OutPoint{TxID: txid, Vout: uint32(vout)},
+				Value:       value,
+				SpenderSeed: lane.SpenderSeed,
+			})
+		}
+		target := submitters[offset%len(submitters)]
+		offset++
+		wave = append(wave, preparedLaneTx{
+			tx:        tx,
+			nextLanes: next,
+			submitter: target,
+		})
+	}
+	return wave, remaining, offset % len(submitters), nil
+}
+
+func confirmedLaneOutputs(block types.Block, wave []preparedLaneTx) []spendableLane {
+	if len(block.Txs) <= 1 || len(wave) == 0 {
+		return nil
+	}
+	confirmed := make(map[[32]byte][]spendableLane, len(wave))
+	for _, prepared := range wave {
+		confirmed[consensus.TxID(&prepared.tx)] = prepared.nextLanes
+	}
+	outputs := make([]spendableLane, 0, len(wave)*2)
+	for _, tx := range block.Txs[1:] {
+		if next, ok := confirmed[consensus.TxID(&tx)]; ok {
+			outputs = append(outputs, next...)
+		}
+	}
+	return outputs
+}
+
+func nextSyntheticRampTarget(current, step int, roundDuration, cadence time.Duration) int {
+	if current <= 0 {
+		return max(step, 1)
+	}
+	if cadence <= 0 {
+		return current + step
+	}
+	if roundDuration*16 <= cadence {
+		return alignUp(current*4, step)
+	}
+	if roundDuration*4 <= cadence {
+		return alignUp(current*2, step)
+	}
+	return alignUp(current+step, step)
+}
+
+func buildConfirmedBenchmarkBlock(ctx context.Context, svc *node.Service, opts RunOptions) (preparedBenchmarkBlock, error) {
+	buildStarted := time.Now()
+	block, err := callWithContext(ctx, func() (types.Block, error) {
+		return svc.BuildBlockTemplate()
+	})
+	if err != nil {
+		return preparedBenchmarkBlock{}, err
+	}
+	buildDuration := time.Since(buildStarted)
+	sealStarted := time.Now()
+	if opts.SyntheticMining {
+		info := svc.ChainStateInfo()
+		stepSeconds := uint64(opts.SyntheticBlockInterval / time.Second)
+		if stepSeconds == 0 {
+			stepSeconds = 1
+		}
+		block.Header.Timestamp = info.TipTimestamp + stepSeconds
+	} else {
+		minedHeader, err := consensus.MineHeader(block.Header, consensus.ParamsForProfile(opts.Profile))
+		if err != nil {
+			return preparedBenchmarkBlock{}, err
+		}
+		block.Header = minedHeader
+	}
+	sealDuration := time.Since(sealStarted)
+	hash := consensus.HeaderHash(&block.Header)
+	return preparedBenchmarkBlock{
+		block:         block,
+		hashHex:       hex.EncodeToString(hash[:]),
+		buildDuration: buildDuration,
+		sealDuration:  sealDuration,
+	}, nil
+}
+
+type callResult[T any] struct {
+	value T
+	err   error
+}
+
+func callWithContext[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	resultCh := make(chan callResult[T], 1)
+	go func() {
+		value, err := fn()
+		resultCh <- callResult[T]{value: value, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	case result := <-resultCh:
+		return result.value, result.err
+	}
+}
+
+func submitBlockToFollowers(ctx context.Context, followers []*clusterNode, block types.Block) error {
 	if len(followers) == 0 {
 		return nil
 	}
-	blockHex := hex.EncodeToString(block.Encode())
+	blockHash := consensus.HeaderHash(&block.Header)
+	blockHashHex := hex.EncodeToString(blockHash[:])
 	for _, follower := range followers {
-		if follower.rpcAddr == "" {
-			return fmt.Errorf("%s missing rpc endpoint for confirmed-block benchmark", follower.name)
-		}
-		var out struct {
-			Applied bool `json:"applied"`
-		}
-		if err := callRPC(client, follower.rpcAddr, follower.authToken, "submitblock", map[string]string{"hex": blockHex}, &out); err != nil {
-			if strings.Contains(err.Error(), "block already known") {
+		_, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
+			hash, height, err := follower.svc.SubmitBenchmarkBlock(block)
+			return acceptedBenchmarkBlock{hash: hash, height: height}, err
+		})
+		if err != nil {
+			if errors.Is(err, node.ErrBlockAlreadyKnown) {
 				continue
+			}
+			if strings.Contains(err.Error(), "stale template") {
+				info := follower.svc.ChainStateInfo()
+				if info.TipHeaderHash == blockHashHex {
+					continue
+				}
 			}
 			return err
 		}
 	}
 	return nil
+}
+
+func syntheticE2EBlockTime(started time.Time, opts RunOptions, blockNumber int) time.Time {
+	if opts.Benchmark != BenchmarkE2E || !opts.SyntheticMining || opts.SyntheticBlockInterval <= 0 || blockNumber <= 0 {
+		return time.Time{}
+	}
+	return started.Add(time.Duration(blockNumber) * opts.SyntheticBlockInterval)
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
+}
+
+func waitUntil(ctx context.Context, deadline time.Time) error {
+	if deadline.IsZero() {
+		return nil
+	}
+	for {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return nil
+		}
+		next := wait
+		if next > time.Second {
+			next = time.Second
+		}
+		timer := time.NewTimer(next)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			progressHeartbeat(ctx, "wait-schedule", func() string {
+				return fmt.Sprintf("next_block_in=%s", time.Until(deadline).Round(time.Second))
+			})
+		}
+	}
 }
 
 func runSubmissionScenario(ctx context.Context, cluster []*clusterNode, submitters []*clusterNode, opts RunOptions, txs []types.Transaction) (workloadOutcome, error) {
@@ -1411,7 +2413,11 @@ func runSubmissionScenario(ctx context.Context, cluster []*clusterNode, submitte
 	if err != nil {
 		return workloadOutcome{}, err
 	}
-	propagation, err := waitForMempoolCounts(ctx, cluster, len(txs), submitStarted)
+	targetCount := submission.metrics.AcceptedTxs
+	if targetCount == 0 {
+		targetCount = len(txs)
+	}
+	propagation, err := waitForMempoolCounts(ctx, cluster, targetCount, submitStarted)
 	if err != nil {
 		return workloadOutcome{}, err
 	}
@@ -1543,6 +2549,9 @@ func submitWorkload(submitters []*clusterNode, txs []types.Transaction, opts Run
 		metrics := ScenarioMetrics{}
 		submittedByNode := make(map[string]int, len(submitters))
 		for i, tx := range txs {
+			if opts.Benchmark == BenchmarkThroughput && opts.Duration > 0 && time.Since(started) >= opts.Duration {
+				break
+			}
 			submitter := submitters[i%len(submitters)]
 			admission, err := submitter.svc.SubmitTx(tx)
 			if err != nil {
@@ -1563,9 +2572,13 @@ func submitWorkload(submitters []*clusterNode, txs []types.Transaction, opts Run
 		metrics := ScenarioMetrics{}
 		var decodeMS float64
 		var validateAdmitMS float64
+		started := time.Now()
 		submittedByNode := make(map[string]int, len(submitters))
 		batchIndex := 0
 		for start := 0; start < len(txs); start += opts.BatchSize {
+			if opts.Benchmark == BenchmarkThroughput && opts.Duration > 0 && time.Since(started) >= opts.Duration {
+				break
+			}
 			end := start + opts.BatchSize
 			if end > len(txs) {
 				end = len(txs)
@@ -1621,7 +2634,7 @@ func waitForHeights(ctx context.Context, nodes []*clusterNode, height uint64) er
 
 func waitForHeightsReached(ctx context.Context, nodes []*clusterNode, height uint64, started time.Time) (map[string]time.Duration, error) {
 	reached := make(map[string]time.Duration, len(nodes))
-	err := waitForCondition(ctx, func() (bool, error) {
+	err := waitForCondition(ctx, "wait-heights", func() (bool, error) {
 		allReached := true
 		for _, benchNode := range nodes {
 			if benchNode.svc.BlockHeight() >= height {
@@ -1642,17 +2655,18 @@ func waitForHeightsReached(ctx context.Context, nodes []*clusterNode, height uin
 }
 
 func waitForMempoolCounts(ctx context.Context, nodes []*clusterNode, target int, started time.Time) (map[string]time.Duration, error) {
+	reached, _, err := waitForMempoolCountsUntil(ctx, nodes, target, started, time.Time{})
+	return reached, err
+}
+
+func waitForMempoolCountsUntil(ctx context.Context, nodes []*clusterNode, target int, started time.Time, deadline time.Time) (map[string]time.Duration, bool, error) {
 	reached := make(map[string]time.Duration, len(nodes))
-	err := waitForCondition(ctx, func() (bool, error) {
+	var deadlineExceeded bool
+	err := waitForCondition(ctx, "wait-mempool", func() (bool, error) {
 		allReached := true
 		for _, benchNode := range nodes {
 			count := benchNode.svc.MempoolCount()
-			targetReached := false
-			if target <= 0 {
-				targetReached = count == 0
-			} else {
-				targetReached = count >= target
-			}
+			targetReached := count == target
 			if targetReached {
 				if !started.IsZero() {
 					if _, ok := reached[benchNode.name]; !ok {
@@ -1663,14 +2677,21 @@ func waitForMempoolCounts(ctx context.Context, nodes []*clusterNode, target int,
 			}
 			allReached = false
 		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			deadlineExceeded = true
+			return true, nil
+		}
 		return allReached, nil
 	}, func() string {
 		return mempoolStatus(nodes, target, reached)
 	})
-	return reached, err
+	if err != nil {
+		return reached, false, err
+	}
+	return reached, !deadlineExceeded, nil
 }
 
-func waitForCondition(ctx context.Context, fn func() (bool, error), status func() string) error {
+func waitForCondition(ctx context.Context, phase string, fn func() (bool, error), status func() string) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -1688,6 +2709,7 @@ func waitForCondition(ctx context.Context, fn func() (bool, error), status func(
 			}
 			return fmt.Errorf("%w (%s)", ctx.Err(), status())
 		case <-ticker.C:
+			progressHeartbeat(ctx, phase, status)
 		}
 	}
 }
@@ -1760,18 +2782,27 @@ func buildNodeReports(nodes []*clusterNode, reached map[string]time.Duration, su
 	for _, benchNode := range nodes {
 		perf := benchNode.svc.PerformanceMetrics()
 		report := NodeReport{
-			Name:                benchNode.name,
-			RPCAddr:             benchNode.rpcAddr,
-			P2PAddr:             benchNode.p2pAddr,
-			PeerCount:           benchNode.svc.PeerCount(),
-			BlockHeight:         benchNode.svc.BlockHeight(),
-			HeaderHeight:        benchNode.svc.HeaderHeight(),
-			MempoolCount:        benchNode.svc.MempoolCount(),
-			SubmittedTxs:        submittedByNode[benchNode.name],
-			BlockSigChecks:      perf.Counters.BlockSigChecks,
-			BlockSigFallbacks:   perf.Counters.BlockSigFallbacks,
-			BlockSigVerifyAvgMS: perf.Latency.BlockSigVerify.AvgMS,
-			RelayPeers:          buildPeerRelayReports(benchNode.svc.RelayPeerStats()),
+			Name:                  benchNode.name,
+			RPCAddr:               benchNode.rpcAddr,
+			P2PAddr:               benchNode.p2pAddr,
+			PeerCount:             benchNode.svc.PeerCount(),
+			BlockHeight:           benchNode.svc.BlockHeight(),
+			HeaderHeight:          benchNode.svc.HeaderHeight(),
+			MempoolCount:          benchNode.svc.MempoolCount(),
+			SubmittedTxs:          submittedByNode[benchNode.name],
+			BlockSigChecks:        perf.Counters.BlockSigChecks,
+			BlockSigFallbacks:     perf.Counters.BlockSigFallbacks,
+			BlockSigVerifyAvgMS:   perf.Latency.BlockSigVerify.AvgMS,
+			ErlayRounds:           perf.Counters.ErlayRounds,
+			ErlayRequestedTxs:     perf.Counters.ErlayRequestedTxs,
+			CompactBlockPlans:     perf.Counters.CompactBlockPlans,
+			GraphenePlans:         perf.Counters.GrapheneExtendedPlans,
+			GrapheneDecodeFails:   perf.Counters.GrapheneDecodeFails,
+			GrapheneRecoveries:    perf.Counters.GrapheneExtRecoveries,
+			TemplateSelectAvgMS:   perf.Latency.TemplateSelect.AvgMS,
+			TemplateAccAvgMS:      perf.Latency.TemplateAccumulate.AvgMS,
+			TemplateAssembleAvgMS: perf.Latency.TemplateAssemble.AvgMS,
+			RelayPeers:            buildPeerRelayReports(benchNode.svc.RelayPeerStats()),
 		}
 		if reachedAt, ok := reached[benchNode.name]; ok {
 			ms := durationMS(reachedAt)
@@ -1780,6 +2811,93 @@ func buildNodeReports(nodes []*clusterNode, reached map[string]time.Duration, su
 		out = append(out, report)
 	}
 	return out
+}
+
+func maxNodeMempoolCount(nodes []*clusterNode) int {
+	best := 0
+	for _, benchNode := range nodes {
+		if count := benchNode.svc.MempoolCount(); count > best {
+			best = count
+		}
+	}
+	return best
+}
+
+func maxNodeChainLag(nodes []*clusterNode, targetHeight uint64) (blockLag uint64, headerLag uint64) {
+	for _, benchNode := range nodes {
+		debug := benchNode.svc.SyncDebugSnapshot()
+		if debug.BlockHeight < targetHeight {
+			blockLag = max(blockLag, targetHeight-debug.BlockHeight)
+		}
+		if debug.HeaderHeight < targetHeight {
+			headerLag = max(headerLag, targetHeight-debug.HeaderHeight)
+		}
+	}
+	return blockLag, headerLag
+}
+
+func syntheticFinalPropagation(nodes []*clusterNode, targetHeight uint64, started time.Time) map[string]time.Duration {
+	reached := make(map[string]time.Duration, len(nodes))
+	if started.IsZero() {
+		return reached
+	}
+	now := time.Since(started)
+	for _, benchNode := range nodes {
+		debug := benchNode.svc.SyncDebugSnapshot()
+		if debug.BlockHeight >= targetHeight && debug.MempoolCount == 0 {
+			reached[benchNode.name] = now
+		}
+	}
+	return reached
+}
+
+func reportBenchmark(opts RunOptions) Benchmark {
+	if opts.Benchmark != "" {
+		return opts.Benchmark
+	}
+	switch opts.Scenario {
+	case ScenarioConfirmedBlocks:
+		return BenchmarkE2E
+	default:
+		return BenchmarkThroughput
+	}
+}
+
+func reportMode(opts RunOptions) string {
+	if reportBenchmark(opts) != BenchmarkThroughput {
+		return ""
+	}
+	if opts.ThroughputMode != "" {
+		return string(opts.ThroughputMode)
+	}
+	if opts.Scenario == ScenarioConfirmedBlocks {
+		return string(ThroughputModeBlock)
+	}
+	return string(ThroughputModeTx)
+}
+
+func reportMining(opts RunOptions) string {
+	if reportBenchmark(opts) != BenchmarkE2E {
+		return ""
+	}
+	if opts.MiningMode != "" {
+		return string(opts.MiningMode)
+	}
+	if opts.SyntheticMining {
+		return string(MiningModeSynthetic)
+	}
+	return string(MiningModeReal)
+}
+
+func reportFileStem(opts RunOptions) string {
+	stem := string(reportBenchmark(opts))
+	if mode := reportMode(opts); mode != "" {
+		return stem + "-" + mode
+	}
+	if mining := reportMining(opts); mining != "" {
+		return stem + "-" + mining
+	}
+	return stem
 }
 
 func reportTopology(opts RunOptions) string {
@@ -1795,23 +2913,41 @@ func reportTopology(opts RunOptions) string {
 func buildNotes(opts RunOptions, extra []string) []string {
 	notes := []string{
 		"All nodes run on local loopback, so the report measures BPU stack overhead rather than WAN latency.",
+		"For WAN-like latency, jitter, serialization pressure, and node churn, use `bench sim`; the cluster benchmarks intentionally stay on loopback so node overhead and real protocol behavior stay separable from network modeling.",
 	}
-	switch opts.Scenario {
-	case ScenarioDirectSubmit, ScenarioRPCBatch, ScenarioP2PRelay:
-		notes = append([]string{"Independent fanout spends are used so relay and admission are not dominated by tx chaining."}, notes...)
-	case ScenarioConfirmedBlocks:
+	switch reportBenchmark(opts) {
+	case BenchmarkE2E:
 		notes = append([]string{
-			"Confirmed-blocks submits transactions in waves, waits for mempool convergence, mines one block, and waits for the new height to converge before the next wave.",
-			"The mined block is then pushed to follower nodes through submitblock so confirmation timing stays deterministic even though locally mined block relay remains conservative.",
+			"E2E runs submit transactions in waves, wait for mempool convergence, seal one block, and wait for the new height to converge before the next wave.",
+			"E2E TPS includes submission, relay, template build, sealing, block propagation, and chain convergence.",
 		}, notes...)
-	case ScenarioUserMix:
-		notes = append([]string{"Mixed-user traffic combines broad one-input payments, change outputs, and short follow-up chains so the workload looks more like many wallets than a single lab pattern."}, notes...)
-	case ScenarioChainedPackages:
-		notes = append([]string{"Dependent chains are submitted in package order so ancestor accounting and package-aware template selection stay hot."}, notes...)
-	case ScenarioOrphanStorm:
-		notes = append([]string{"Children arrive before parents to stress orphan storage, promotion, and eviction accounting."}, notes...)
-	case ScenarioBlockTemplateBuild:
-		notes = append([]string{"Package-heavy mempool batches are followed by live block-template rebuilds against the real miner selection path."}, notes...)
+		if opts.SyntheticMining {
+			notes = append(notes,
+				fmt.Sprintf("Synthetic mining is enabled with a fixed %.0f ms external block cadence. PoW is skipped inside the local benchmark cluster, but the benchmark clock does not slow down when the cluster falls behind.", durationMS(opts.SyntheticBlockInterval)),
+				"If tx admission, relay, or block processing cannot keep up, transactions remain in the mempool and missed-interval / schedule-lag metrics increase instead of stretching the synthetic block interval or waiting for a hidden post-run drain.",
+				"Synthetic interval TPS is the configured-cadence throughput ceiling for the offered workload; compare it against end-to-end TPS, missed intervals, final mempool backlog, and final block/header lag to see whether the cluster stayed on schedule.",
+			)
+		} else {
+			preset := benchNetDifficultyPreset(opts.BlockInterval)
+			notes = append(notes,
+				fmt.Sprintf("Real mining runs on a fresh benchmark-only `benchnet` chain from genesis. The requested %.0f ms block interval selects a tuned starting difficulty preset with genesis bits `0x%08x`.", durationMS(opts.BlockInterval), preset.GenesisBits),
+				"The achieved cadence still varies with nonce-search luck around that starting difficulty, so compare requested versus actual block interval metrics before treating real-mining TPS as a stable regression number.",
+			)
+		}
+	case BenchmarkThroughput:
+		switch reportMode(opts) {
+		case string(ThroughputModeBlock):
+			notes = append([]string{
+				"Throughput block mode isolates block build and apply cost. Followers, if present, are fed through the benchmark path instead of waiting on network relay.",
+				fmt.Sprintf("Requested duration is %.0f ms; actual runtime may end sooner if the seeded workload is exhausted.", durationMS(opts.Duration)),
+			}, notes...)
+		default:
+			notes = append([]string{
+				"Throughput tx mode isolates decode, validation, signature verification, and mempool admission.",
+				fmt.Sprintf("Requested duration is %.0f ms; actual runtime may end sooner if the seeded workload is exhausted.", durationMS(opts.Duration)),
+				"Independent fanout spends are used so raw tx throughput is not dominated by deep chaining.",
+			}, notes...)
+		}
 	}
 	if opts.NodeCount > 1 && (opts.Scenario == ScenarioP2PRelay || opts.Scenario == ScenarioConfirmedBlocks) {
 		notes = append(notes, fmt.Sprintf("Real P2P relay is measured across %d nodes using the %s topology.", opts.NodeCount, opts.Topology))
@@ -1822,15 +2958,46 @@ func buildNotes(opts RunOptions, extra []string) []string {
 			notes = append(notes, "Transactions originate from node-0 only so the rest of the cluster acts purely as relay and confirmation followers.")
 		}
 	}
-	if opts.Scenario == ScenarioRPCBatch {
-		notes = append(notes, "Submission uses authenticated HTTP JSON-RPC submitpackedtxbatch to keep live stress focused on transport and admission rather than hex expansion.")
-	}
 	notes = append(notes, extra...)
 	return notes
 }
 
 func durationMS(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000
+}
+
+func alignUp(value, step int) int {
+	if step <= 1 {
+		return value
+	}
+	remainder := value % step
+	if remainder == 0 {
+		return value
+	}
+	return value + step - remainder
+}
+
+func alignDown(value, step int) int {
+	if step <= 1 {
+		return value
+	}
+	return value - (value % step)
+}
+
+func joinInts(values []int) string {
+	if len(values) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(values))
+	last := -1
+	for _, value := range values {
+		if value == last {
+			continue
+		}
+		out = append(out, strconv.Itoa(value))
+		last = value
+	}
+	return strings.Join(out, ", ")
 }
 
 func ratePerSecond(count int, elapsed time.Duration) float64 {
@@ -1918,47 +3085,73 @@ func buildPeerRelayReports(stats []node.PeerRelayStats) []PeerRelayReport {
 	out := make([]PeerRelayReport, 0, len(stats))
 	for _, stat := range stats {
 		out = append(out, PeerRelayReport{
-			Addr:          stat.Addr,
-			Outbound:      stat.Outbound,
-			QueueDepth:    stat.QueueDepth,
-			MaxQueueDepth: stat.MaxQueueDepth,
-			SentMessages:  stat.SentMessages,
-			TxInvItems:    stat.TxInvItems,
-			BlockInvItems: stat.BlockInvItems,
-			TxBatchMsgs:   stat.TxBatchMsgs,
-			TxBatchItems:  stat.TxBatchItems,
-			TxReconMsgs:   stat.TxReconMsgs,
-			TxReconItems:  stat.TxReconItems,
-			TxReqMsgs:     stat.TxReqMsgs,
-			TxReqItems:    stat.TxReqItems,
-			DroppedTxs:    stat.DroppedTxs,
-			RelayEvents:   stat.RelayEvents,
-			RelayAvgMS:    stat.RelayAvgMS,
-			RelayP95MS:    stat.RelayP95MS,
-			RelayMaxMS:    stat.RelayMaxMS,
+			Addr:                   stat.Addr,
+			Outbound:               stat.Outbound,
+			QueueDepth:             stat.QueueDepth,
+			MaxQueueDepth:          stat.MaxQueueDepth,
+			SentMessages:           stat.SentMessages,
+			TxInvItems:             stat.TxInvItems,
+			BlockInvItems:          stat.BlockInvItems,
+			TxBatchMsgs:            stat.TxBatchMsgs,
+			TxBatchItems:           stat.TxBatchItems,
+			TxReconMsgs:            stat.TxReconMsgs,
+			TxReconItems:           stat.TxReconItems,
+			TxReqMsgs:              stat.TxReqMsgs,
+			TxReqItems:             stat.TxReqItems,
+			DuplicateTxSuppressed:  stat.DuplicateTxSuppressed,
+			KnownTxSuppressed:      stat.KnownTxSuppressed,
+			CoalescedTxItems:       stat.CoalescedTxItems,
+			CoalescedReconItems:    stat.CoalescedReconItems,
+			DroppedTxs:             stat.DroppedTxs,
+			WriterStarvationEvents: stat.WriterStarvationEvents,
+			RelayEvents:            stat.RelayEvents,
+			RelayAvgMS:             stat.RelayAvgMS,
+			RelayP95MS:             stat.RelayP95MS,
+			RelayMaxMS:             stat.RelayMaxMS,
 		})
 	}
 	return out
 }
 
-func aggregateRelayMetrics(nodes []NodeReport) (int, int, int, int, int, int) {
-	var batchMessages int
-	var batchItems int
-	var reconMessages int
-	var reconItems int
-	var reqMessages int
-	var reqItems int
+type relayAggregateMetrics struct {
+	BatchMessages          int
+	BatchItems             int
+	ReconMessages          int
+	ReconItems             int
+	RequestMessages        int
+	RequestItems           int
+	DuplicateTxSuppressed  int
+	KnownTxSuppressed      int
+	CoalescedTxItems       int
+	CoalescedReconItems    int
+	WriterStarvationEvents int
+}
+
+func aggregateRelayMetrics(nodes []NodeReport) relayAggregateMetrics {
+	var out relayAggregateMetrics
 	for _, node := range nodes {
 		for _, peer := range node.RelayPeers {
-			batchMessages += peer.TxBatchMsgs
-			batchItems += peer.TxBatchItems
-			reconMessages += peer.TxReconMsgs
-			reconItems += peer.TxReconItems
-			reqMessages += peer.TxReqMsgs
-			reqItems += peer.TxReqItems
+			out.BatchMessages += peer.TxBatchMsgs
+			out.BatchItems += peer.TxBatchItems
+			out.ReconMessages += peer.TxReconMsgs
+			out.ReconItems += peer.TxReconItems
+			out.RequestMessages += peer.TxReqMsgs
+			out.RequestItems += peer.TxReqItems
+			out.DuplicateTxSuppressed += peer.DuplicateTxSuppressed
+			out.KnownTxSuppressed += peer.KnownTxSuppressed
+			out.CoalescedTxItems += peer.CoalescedTxItems
+			out.CoalescedReconItems += peer.CoalescedReconItems
+			out.WriterStarvationEvents += peer.WriterStarvationEvents
 		}
 	}
-	return batchMessages, batchItems, reconMessages, reconItems, reqMessages, reqItems
+	return out
+}
+
+func ratioOrZero(numerator int, denominator int) float64 {
+	if denominator <= 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
 }
 
 type relayPeerRow struct {
@@ -1999,10 +3192,51 @@ func scenarioMetricRows(metrics ScenarioMetrics) [][2]string {
 	if metrics.TargetTxsPerBlock > 0 {
 		rows = append(rows, [2]string{"Target txs per block", strconv.Itoa(metrics.TargetTxsPerBlock)})
 	}
+	if metrics.MaxSustainableTxsPerBlock > 0 {
+		rows = append(rows, [2]string{"Max sustainable txs per block", strconv.Itoa(metrics.MaxSustainableTxsPerBlock)})
+	}
+	if metrics.FirstUnsustainedTxsPerBlock > 0 {
+		rows = append(rows, [2]string{"First unsustained txs per block", strconv.Itoa(metrics.FirstUnsustainedTxsPerBlock)})
+	}
+	if metrics.RampSteps > 0 {
+		rows = append(rows, [2]string{"Ramp steps", strconv.Itoa(metrics.RampSteps)})
+	}
 	if metrics.BlockConvergeAvgMS > 0 {
 		rows = append(rows, [2]string{"Block converge avg", fmt.Sprintf("%.2f ms", metrics.BlockConvergeAvgMS)})
 		rows = append(rows, [2]string{"Block converge p95", fmt.Sprintf("%.2f ms", metrics.BlockConvergeP95MS)})
 		rows = append(rows, [2]string{"Block converge max", fmt.Sprintf("%.2f ms", metrics.BlockConvergeMaxMS)})
+	}
+	if metrics.BlockRoundAvgMS > 0 {
+		rows = append(rows, [2]string{"Block round avg", fmt.Sprintf("%.2f ms", metrics.BlockRoundAvgMS)})
+		rows = append(rows, [2]string{"Block round p95", fmt.Sprintf("%.2f ms", metrics.BlockRoundP95MS)})
+		rows = append(rows, [2]string{"Block round max", fmt.Sprintf("%.2f ms", metrics.BlockRoundMaxMS)})
+	}
+	if metrics.BlockBuildAvgMS > 0 {
+		rows = append(rows, [2]string{"Block build avg", fmt.Sprintf("%.2f ms", metrics.BlockBuildAvgMS)})
+		rows = append(rows, [2]string{"Block build p95", fmt.Sprintf("%.2f ms", metrics.BlockBuildP95MS)})
+		rows = append(rows, [2]string{"Block build max", fmt.Sprintf("%.2f ms", metrics.BlockBuildMaxMS)})
+	}
+	if metrics.BlockSealAvgMS > 0 || metrics.BlockSealMaxMS > 0 {
+		rows = append(rows, [2]string{"Block seal avg", fmt.Sprintf("%.2f ms", metrics.BlockSealAvgMS)})
+		rows = append(rows, [2]string{"Block seal p95", fmt.Sprintf("%.2f ms", metrics.BlockSealP95MS)})
+		rows = append(rows, [2]string{"Block seal max", fmt.Sprintf("%.2f ms", metrics.BlockSealMaxMS)})
+	}
+	if metrics.MissedIntervals > 0 {
+		rows = append(rows, [2]string{"Missed intervals", strconv.Itoa(metrics.MissedIntervals)})
+	}
+	if metrics.ScheduleLagAvgMS > 0 {
+		rows = append(rows, [2]string{"Schedule lag avg", fmt.Sprintf("%.2f ms", metrics.ScheduleLagAvgMS)})
+		rows = append(rows, [2]string{"Schedule lag p95", fmt.Sprintf("%.2f ms", metrics.ScheduleLagP95MS)})
+		rows = append(rows, [2]string{"Schedule lag max", fmt.Sprintf("%.2f ms", metrics.ScheduleLagMaxMS)})
+	}
+	if metrics.FinalMempoolTxs > 0 {
+		rows = append(rows, [2]string{"Final mempool txs", strconv.Itoa(metrics.FinalMempoolTxs)})
+	}
+	if metrics.FinalBlockLag > 0 {
+		rows = append(rows, [2]string{"Final block lag", strconv.FormatUint(metrics.FinalBlockLag, 10)})
+	}
+	if metrics.FinalHeaderLag > 0 {
+		rows = append(rows, [2]string{"Final header lag", strconv.FormatUint(metrics.FinalHeaderLag, 10)})
 	}
 	if metrics.OrphanedTxs > 0 {
 		rows = append(rows, [2]string{"Orphaned txs", strconv.Itoa(metrics.OrphanedTxs)})
@@ -2042,6 +3276,30 @@ func scenarioMetricRows(metrics ScenarioMetrics) [][2]string {
 	if metrics.TxRequestMessages > 0 {
 		rows = append(rows, [2]string{"Tx request msgs", strconv.Itoa(metrics.TxRequestMessages)})
 		rows = append(rows, [2]string{"Tx request items", strconv.Itoa(metrics.TxRequestItems)})
+		if metrics.TxRequestItemsPerMessage > 0 {
+			rows = append(rows, [2]string{"Tx request items/msg", fmt.Sprintf("%.2f", metrics.TxRequestItemsPerMessage)})
+		}
+	}
+	if metrics.TxReconMessages > 0 && metrics.TxReconItemsPerMessage > 0 {
+		rows = append(rows, [2]string{"Tx recon items/msg", fmt.Sprintf("%.2f", metrics.TxReconItemsPerMessage)})
+	}
+	if metrics.TxBatchMessages > 0 && metrics.TxBatchItemsPerMessage > 0 {
+		rows = append(rows, [2]string{"Tx batch items/msg", fmt.Sprintf("%.2f", metrics.TxBatchItemsPerMessage)})
+	}
+	if metrics.DuplicateTxSuppressed > 0 {
+		rows = append(rows, [2]string{"Duplicate tx suppressed", strconv.Itoa(metrics.DuplicateTxSuppressed)})
+	}
+	if metrics.KnownTxSuppressed > 0 {
+		rows = append(rows, [2]string{"Known tx suppressed", strconv.Itoa(metrics.KnownTxSuppressed)})
+	}
+	if metrics.CoalescedTxItems > 0 {
+		rows = append(rows, [2]string{"Coalesced tx items", strconv.Itoa(metrics.CoalescedTxItems)})
+	}
+	if metrics.CoalescedReconItems > 0 {
+		rows = append(rows, [2]string{"Coalesced recon items", strconv.Itoa(metrics.CoalescedReconItems)})
+	}
+	if metrics.WriterStarvationEvents > 0 {
+		rows = append(rows, [2]string{"Writer starvation", strconv.Itoa(metrics.WriterStarvationEvents)})
 	}
 	if metrics.TemplateRebuilds > 0 {
 		rows = append(rows, [2]string{"Template rebuilds", strconv.Itoa(metrics.TemplateRebuilds)})
@@ -2056,6 +3314,32 @@ func scenarioMetricRows(metrics ScenarioMetrics) [][2]string {
 		rows = append(rows, [2]string{"Template rebuild max", fmt.Sprintf("%.2f ms", metrics.TemplateRebuildMaxMS)})
 		rows = append(rows, [2]string{"Template selected txs", strconv.Itoa(metrics.TemplateSelectedTxs)})
 	}
+	if metrics.TemplateFullBuilds > 0 || metrics.TemplateAppendExtends > 0 || metrics.TemplateNoChangeRefreshes > 0 {
+		if metrics.TemplateFullBuilds > 0 {
+			rows = append(rows, [2]string{"Template full builds", strconv.Itoa(metrics.TemplateFullBuilds)})
+		}
+		if metrics.TemplateAppendExtends > 0 {
+			rows = append(rows, [2]string{"Template append extends", strconv.Itoa(metrics.TemplateAppendExtends)})
+		}
+		if metrics.TemplateNoChangeRefreshes > 0 {
+			rows = append(rows, [2]string{"Template no-change refreshes", strconv.Itoa(metrics.TemplateNoChangeRefreshes)})
+		}
+	}
+	if metrics.TemplateSelectAvgMS > 0 {
+		rows = append(rows, [2]string{"Template select avg", fmt.Sprintf("%.2f ms", metrics.TemplateSelectAvgMS)})
+		rows = append(rows, [2]string{"Template select p95", fmt.Sprintf("%.2f ms", metrics.TemplateSelectP95MS)})
+		rows = append(rows, [2]string{"Template select max", fmt.Sprintf("%.2f ms", metrics.TemplateSelectMaxMS)})
+	}
+	if metrics.TemplateAccumulateAvgMS > 0 {
+		rows = append(rows, [2]string{"Template accumulate avg", fmt.Sprintf("%.2f ms", metrics.TemplateAccumulateAvgMS)})
+		rows = append(rows, [2]string{"Template accumulate p95", fmt.Sprintf("%.2f ms", metrics.TemplateAccumulateP95MS)})
+		rows = append(rows, [2]string{"Template accumulate max", fmt.Sprintf("%.2f ms", metrics.TemplateAccumulateMaxMS)})
+	}
+	if metrics.TemplateAssembleAvgMS > 0 {
+		rows = append(rows, [2]string{"Template assemble avg", fmt.Sprintf("%.2f ms", metrics.TemplateAssembleAvgMS)})
+		rows = append(rows, [2]string{"Template assemble p95", fmt.Sprintf("%.2f ms", metrics.TemplateAssembleP95MS)})
+		rows = append(rows, [2]string{"Template assemble max", fmt.Sprintf("%.2f ms", metrics.TemplateAssembleMaxMS)})
+	}
 	return rows
 }
 
@@ -2064,6 +3348,20 @@ func asciiTopologySuffix(topology string) string {
 		return ""
 	}
 	return " / " + topology
+}
+
+func asciiModeSuffix(mode string) string {
+	if strings.TrimSpace(mode) == "" {
+		return ""
+	}
+	return " / " + mode
+}
+
+func asciiMiningSuffix(mining string) string {
+	if strings.TrimSpace(mining) == "" {
+		return ""
+	}
+	return " / " + mining
 }
 
 func asciiBatchSuffix(batchSize int) string {
@@ -2116,6 +3414,30 @@ func signatureMetricRows(nodes []NodeReport) [][]string {
 			formatCountWithCommas(node.BlockSigChecks),
 			formatCountWithCommas(node.BlockSigFallbacks),
 			fmt.Sprintf("%.2f ms", node.BlockSigVerifyAvgMS),
+		})
+	}
+	return rows
+}
+
+func relayMechanismRows(nodes []NodeReport) [][]string {
+	rows := make([][]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node.ErlayRounds == 0 &&
+			node.ErlayRequestedTxs == 0 &&
+			node.CompactBlockPlans == 0 &&
+			node.GraphenePlans == 0 &&
+			node.GrapheneDecodeFails == 0 &&
+			node.GrapheneRecoveries == 0 {
+			continue
+		}
+		rows = append(rows, []string{
+			node.Name,
+			formatCountWithCommas(node.ErlayRounds),
+			formatCountWithCommas(node.ErlayRequestedTxs),
+			formatCountWithCommas(node.CompactBlockPlans),
+			formatCountWithCommas(node.GraphenePlans),
+			formatCountWithCommas(node.GrapheneDecodeFails),
+			formatCountWithCommas(node.GrapheneRecoveries),
 		})
 	}
 	return rows
@@ -2186,19 +3508,38 @@ func hottestPeer(rows []relayPeerRow) string {
 }
 
 func asciiSuiteTable(cases []SuiteCaseReport) []string {
-	header := fmt.Sprintf("%-24s %10s %10s %10s %10s %10s", "Case", "Admit", "Complete", "Confirm", "Fanout", "Converge")
+	header := fmt.Sprintf("%-20s %-10s %-7s %10s %10s %10s", "Case", "Benchmark", "Mode", "Admit", "Complete", "Confirm")
 	rows := []string{header}
 	for _, suiteCase := range cases {
-		rows = append(rows, fmt.Sprintf("%-24s %10.2f %10.2f %10.2f %10.2f %10.2f",
+		mode := suiteCase.Report.Mode
+		if mode == "" {
+			mode = "-"
+		}
+		confirmTPS := suiteCase.Report.ConfirmedProcessingTPS
+		if confirmTPS == 0 {
+			confirmTPS = suiteCase.Report.ConfirmedWallTPS
+		}
+		rows = append(rows, fmt.Sprintf("%-20s %-10s %-7s %10.2f %10.2f %10.2f",
 			suiteCase.Name,
+			suiteCase.Report.Benchmark,
+			mode,
 			suiteCase.Report.AdmissionTPS,
 			suiteCase.Report.CompletionTPS,
-			suiteCase.Report.ConfirmedTPS,
-			suiteCase.Report.Phases.RelayFanoutMS,
-			suiteCase.Report.Phases.ConvergenceMS,
+			confirmTPS,
 		))
 	}
 	return rows
+}
+
+func asciiSummaryTitle(report *Report) string {
+	switch {
+	case report.Benchmark == string(BenchmarkE2E):
+		return "BPU E2E Benchmark"
+	case report.Mode == string(ThroughputModeBlock):
+		return "BPU Throughput Benchmark (Block)"
+	default:
+		return "BPU Throughput Benchmark (Tx)"
+	}
 }
 
 func renderASCIIBox(title string, lines []string) string {
@@ -2219,7 +3560,7 @@ func renderASCIIBox(title string, lines []string) string {
 	return b.String()
 }
 
-func loadGenesisFixture() (*types.Block, error) {
+func loadGenesisTemplate() (*types.Block, error) {
 	raw, err := os.ReadFile(resolveRepoPath("fixtures", "genesis", "regtest.json"))
 	if err != nil {
 		return nil, err
@@ -2235,6 +3576,97 @@ func loadGenesisFixture() (*types.Block, error) {
 		return nil, err
 	}
 	return &block, nil
+}
+
+func loadBenchmarkGenesis(profile types.ChainProfile) (*types.Block, error) {
+	template, err := loadGenesisTemplateForProfile(profile)
+	if err != nil {
+		return nil, err
+	}
+	if profile != types.BenchNet {
+		return template, nil
+	}
+	params := consensus.ParamsForProfile(types.BenchNet)
+	genesis := *template
+	genesis.Header.Timestamp = params.GenesisTimestamp
+	genesis.Header.NBits = params.GenesisBits
+	genesis.Header.Nonce = 0
+	minedHeader, err := consensus.MineHeader(genesis.Header, params)
+	if err != nil {
+		return nil, err
+	}
+	genesis.Header = minedHeader
+	return &genesis, nil
+}
+
+func loadGenesisTemplateForProfile(profile types.ChainProfile) (*types.Block, error) {
+	if profile == types.BenchNet {
+		return loadGenesisTemplate()
+	}
+	raw, err := os.ReadFile(resolveRepoPath("fixtures", "genesis", profile.String()+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var fixture struct {
+		BlockHex string `json:"block_hex"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		return nil, err
+	}
+	block, err := consensus.DecodeBlockHex(fixture.BlockHex, types.DefaultCodecLimits())
+	if err != nil {
+		return nil, err
+	}
+	return &block, nil
+}
+
+func benchmarkClusterProfile(opts RunOptions) types.ChainProfile {
+	if opts.Profile.IsRegtestLike() {
+		return types.BenchNet
+	}
+	return opts.Profile
+}
+
+func benchmarkGenesisLabel(profile types.ChainProfile) string {
+	if profile == types.BenchNet {
+		params := consensus.ParamsForProfile(types.BenchNet)
+		return fmt.Sprintf("benchmarks:benchnet:bits=%08x", params.GenesisBits)
+	}
+	return fmt.Sprintf("fixtures/genesis/%s.json", profile)
+}
+
+func benchNetParamsForRun(opts RunOptions) consensus.ChainParams {
+	params := consensus.RegtestParams()
+	params.Profile = types.BenchNet
+	if opts.Benchmark == BenchmarkE2E && opts.MiningMode == MiningModeReal {
+		preset := benchNetDifficultyPreset(opts.BlockInterval)
+		params.PowLimitBits = preset.PowLimitBits
+		params.GenesisBits = preset.GenesisBits
+	}
+	return params
+}
+
+func benchNetDifficultyPreset(target time.Duration) consensus.ChainParams {
+	candidates := []struct {
+		params   consensus.ChainParams
+		interval time.Duration
+	}{
+		{params: consensus.RegtestParams(), interval: time.Second},
+		{params: consensus.RegtestMediumParams(), interval: 15 * time.Second},
+		{params: consensus.RegtestHardParams(), interval: 2 * time.Minute},
+	}
+	if target <= 0 {
+		return candidates[1].params
+	}
+	best := candidates[0]
+	bestDiff := durationAbs(target - best.interval)
+	for _, candidate := range candidates[1:] {
+		if diff := durationAbs(target - candidate.interval); diff < bestDiff {
+			best = candidate
+			bestDiff = diff
+		}
+	}
+	return best.params
 }
 
 func pubKeyForSeed(seed byte) [32]byte {
@@ -2328,20 +3760,29 @@ func seedFundingOutputs(svc *node.Service, outputCount int, recipientSeed byte) 
 	if outputCount <= 0 {
 		return nil, nil
 	}
-	keyHashes := make([][32]byte, outputCount)
-	for i := range keyHashes {
-		keyHashes[i] = pubKeyForSeed(recipientSeed)
-	}
-	funding, err := svc.MineFundingOutputs(keyHashes)
+	outputs := make([]fundingOutput, 0, outputCount)
+	batchSize, err := maxSeedableTxCount(svc.Profile())
 	if err != nil {
 		return nil, err
 	}
-	outputs := make([]fundingOutput, 0, outputCount)
-	for _, output := range funding {
-		outputs = append(outputs, fundingOutput{
-			OutPoint: output.OutPoint,
-			Value:    output.Value,
-		})
+	if batchSize <= 0 {
+		return nil, errors.New("benchmark funding batch size must be positive")
+	}
+	for _, batchCount := range fundingBatchCounts(outputCount, batchSize) {
+		keyHashes := make([][32]byte, batchCount)
+		for i := range keyHashes {
+			keyHashes[i] = pubKeyForSeed(recipientSeed)
+		}
+		funding, err := svc.MineFundingOutputs(keyHashes)
+		if err != nil {
+			return nil, err
+		}
+		for _, output := range funding {
+			outputs = append(outputs, fundingOutput{
+				OutPoint: output.OutPoint,
+				Value:    output.Value,
+			})
+		}
 	}
 	return outputs, nil
 }
@@ -2392,25 +3833,38 @@ func seedFundingOutputsForUsers(svc *node.Service, outputCount, userCount int) (
 		return nil, nil
 	}
 	userCount = max(1, userCount)
-	recipients := make([][32]byte, 0, outputCount)
-	seeds := make([]byte, 0, outputCount)
-	for i := 0; i < outputCount; i++ {
-		seed := byte(2 + (i % userCount))
-		recipients = append(recipients, pubKeyForSeed(seed))
-		seeds = append(seeds, seed)
-	}
-	funding, err := svc.MineFundingOutputs(recipients)
+	outputs := make([]userFundingOutput, 0, outputCount)
+	batchSize, err := maxSeedableTxCount(svc.Profile())
 	if err != nil {
 		return nil, err
 	}
-	outputs := make([]userFundingOutput, 0, outputCount)
-	for vout, output := range funding {
-		outputs = append(outputs, userFundingOutput{
-			OutPoint:     output.OutPoint,
-			Value:        output.Value,
-			SpenderSeed:  seeds[vout],
-			RecipientTag: byte(vout % 251),
-		})
+	if batchSize <= 0 {
+		return nil, errors.New("benchmark funding batch size must be positive")
+	}
+	produced := 0
+	for _, batchCount := range fundingBatchCounts(outputCount, batchSize) {
+		recipients := make([][32]byte, 0, batchCount)
+		seeds := make([]byte, 0, batchCount)
+		for i := 0; i < batchCount; i++ {
+			globalIndex := produced + i
+			seed := byte(2 + (globalIndex % userCount))
+			recipients = append(recipients, pubKeyForSeed(seed))
+			seeds = append(seeds, seed)
+		}
+		funding, err := svc.MineFundingOutputs(recipients)
+		if err != nil {
+			return nil, err
+		}
+		for vout, output := range funding {
+			globalIndex := produced + vout
+			outputs = append(outputs, userFundingOutput{
+				OutPoint:     output.OutPoint,
+				Value:        output.Value,
+				SpenderSeed:  seeds[vout],
+				RecipientTag: byte(globalIndex % 251),
+			})
+		}
+		produced += batchCount
 	}
 	return outputs, nil
 }
@@ -2463,13 +3917,29 @@ func seedSpendableFanout(svc *node.Service, txCount int) ([]types.Transaction, e
 		tx, err := buildChildTx(2, output.OutPoint, output.Value, childPubKey)
 		if err != nil {
 			if errors.Is(err, consensus.ErrInputsLessThanOutputs) {
-				return nil, fmt.Errorf("tx count %d exceeds current benchmark seed capacity; lower --txs (the default suite uses %d)", txCount, DefaultRunOptions().TxCount)
+				return nil, fmt.Errorf("benchmark funding output %x:%d is too small to build a child transaction; funding batches should keep outputs above the child-tx fee floor", output.OutPoint.TxID, output.OutPoint.Vout)
 			}
 			return nil, err
 		}
 		txs = append(txs, tx)
 	}
 	return txs, nil
+}
+
+func seedSpendableLanes(svc *node.Service, laneCount int, recipientSeed byte) ([]spendableLane, error) {
+	outputs, err := seedFundingOutputs(svc, laneCount, recipientSeed)
+	if err != nil {
+		return nil, err
+	}
+	lanes := make([]spendableLane, 0, len(outputs))
+	for _, output := range outputs {
+		lanes = append(lanes, spendableLane{
+			OutPoint:    output.OutPoint,
+			Value:       output.Value,
+			SpenderSeed: recipientSeed,
+		})
+	}
+	return lanes, nil
 }
 
 func seedUserMixWorkload(svc *node.Service, txCount int) ([]types.Transaction, ScenarioMetrics, error) {
@@ -2720,6 +4190,17 @@ func maxSeedableTxCount(profile types.ChainProfile) (int, error) {
 		high = mid - 1
 	}
 	return low, nil
+}
+
+func fundingBatchCounts(total, batchSize int) []int {
+	if total <= 0 || batchSize <= 0 {
+		return nil
+	}
+	batches := make([]int, 0, (total+batchSize-1)/batchSize)
+	for remaining := total; remaining > 0; remaining -= batchSize {
+		batches = append(batches, min(batchSize, remaining))
+	}
+	return batches
 }
 
 func canSeedTxCount(txCount int, coinbaseValue uint64) (bool, error) {

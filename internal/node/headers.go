@@ -17,19 +17,30 @@ type HeaderReplaySummary struct {
 
 type HeaderChain struct {
 	params      consensus.ChainParams
+	logger      *slog.Logger
 	height      *uint64
 	tipHeader   *types.BlockHeader
 	recentTimes []uint64
+	skipPow     bool
 }
 
 type PersistentHeaderChain struct {
-	chain *HeaderChain
-	store *storage.ChainStore
+	chain  *HeaderChain
+	store  *storage.ChainStore
+	logger *slog.Logger
 }
 
 func NewHeaderChain(profile types.ChainProfile) *HeaderChain {
+	return NewHeaderChainWithLogger(profile, logging.Component("headers"))
+}
+
+func NewHeaderChainWithLogger(profile types.ChainProfile, logger *slog.Logger) *HeaderChain {
+	if logger == nil {
+		logger = logging.Component("headers")
+	}
 	return &HeaderChain{
 		params: consensus.ParamsForProfile(profile),
+		logger: logger,
 	}
 }
 
@@ -39,6 +50,21 @@ func HeaderChainFromStoredState(stored *storage.StoredHeaderState) (*HeaderChain
 		return nil, err
 	}
 	return chain, nil
+}
+
+func (c *HeaderChain) WithLogger(logger *slog.Logger) *HeaderChain {
+	if logger != nil {
+		c.logger = logger
+	}
+	return c
+}
+
+func (c *HeaderChain) SetSkipPow(skip bool) {
+	c.skipPow = skip
+}
+
+func (c *HeaderChain) SkipPow() bool {
+	return c.skipPow
 }
 
 func (c *HeaderChain) InitializeTip(height uint64, header types.BlockHeader) error {
@@ -55,7 +81,7 @@ func (c *HeaderChain) InitializeFromGenesisHeader(header types.BlockHeader) erro
 	if err := c.InitializeTip(0, header); err != nil {
 		return err
 	}
-	logging.Component("headers").Info("initialized header chain from genesis",
+	c.logger.Info("initialized header chain from genesis",
 		slog.String("profile", c.params.Profile.String()),
 		slog.String("hash", fmt.Sprintf("%x", consensus.HeaderHash(&header))),
 	)
@@ -66,11 +92,13 @@ func (c *HeaderChain) ApplyHeader(header *types.BlockHeader) error {
 	if c.height == nil || c.tipHeader == nil {
 		return ErrNoTip
 	}
-	if err := consensus.ValidateHeader(header, consensus.PrevBlockContext{
+	rules := consensus.DefaultConsensusRules()
+	rules.SkipPow = c.skipPow
+	if err := consensus.ValidateHeaderWithRules(header, consensus.PrevBlockContext{
 		Height:         *c.height,
 		Header:         *c.tipHeader,
 		MedianTimePast: consensus.MedianTimePast(c.recentTimes),
-	}, c.params); err != nil {
+	}, c.params, rules); err != nil {
 		return err
 	}
 	height := *c.height + 1
@@ -78,7 +106,7 @@ func (c *HeaderChain) ApplyHeader(header *types.BlockHeader) error {
 	tip := *header
 	c.tipHeader = &tip
 	c.recentTimes = appendRecentTime(c.recentTimes, header.Timestamp)
-	logging.Component("headers").Info("validated header",
+	c.logger.Info("validated header",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", consensus.HeaderHash(header))),
 	)
@@ -124,9 +152,16 @@ func (c *HeaderChain) StoredState() (*storage.StoredHeaderState, error) {
 }
 
 func OpenPersistentHeaderChain(path string, profile types.ChainProfile) (*PersistentHeaderChain, error) {
-	logger := logging.Component("headers")
-	logger.Info("opening persistent header chain", slog.String("path", path), slog.String("profile", profile.String()))
-	store, err := storage.Open(path)
+	return OpenPersistentHeaderChainWithLogger(path, profile, nil)
+}
+
+func OpenPersistentHeaderChainWithLogger(path string, profile types.ChainProfile, logger *slog.Logger) (*PersistentHeaderChain, error) {
+	if logger == nil {
+		logger = logging.Component("headers")
+	}
+	headerLogger := logging.ComponentWith(logger, "headers")
+	headerLogger.Info("opening persistent header chain", slog.String("path", path), slog.String("profile", profile.String()))
+	store, err := storage.OpenWithLogger(path, logging.ComponentWith(logger, "storage"))
 	if err != nil {
 		return nil, err
 	}
@@ -146,25 +181,26 @@ func OpenPersistentHeaderChain(path string, profile types.ChainProfile) (*Persis
 			store.Close()
 			return nil, err
 		}
+		chain.WithLogger(headerLogger)
 		recentTimes, err := loadIndexedAncestorTimestamps(store, consensus.HeaderHash(&stored.TipHeader), 11)
 		if err != nil {
 			store.Close()
 			return nil, err
 		}
 		chain.recentTimes = recentTimes
-		logger.Info("loaded persisted header chain", slog.Uint64("height", stored.Height))
+		headerLogger.Info("loaded persisted header chain", slog.Uint64("height", stored.Height))
 	} else {
-		chain = NewHeaderChain(profile)
-		logger.Info("no persisted header chain found", slog.String("path", path))
+		chain = NewHeaderChainWithLogger(profile, headerLogger)
+		headerLogger.Info("no persisted header chain found", slog.String("path", path))
 	}
-	return &PersistentHeaderChain{chain: chain, store: store}, nil
+	return &PersistentHeaderChain{chain: chain, store: store, logger: headerLogger}, nil
 }
 
 func (p *PersistentHeaderChain) Close() error {
 	if p == nil || p.store == nil {
 		return nil
 	}
-	logging.Component("headers").Info("closing persistent header chain")
+	p.logger.Info("closing persistent header chain")
 	return p.store.Close()
 }
 
@@ -179,7 +215,7 @@ func (p *PersistentHeaderChain) InitializeFromGenesisHeader(header types.BlockHe
 	if err := p.store.WriteHeaderState(stored); err != nil {
 		return err
 	}
-	logging.Component("headers").Info("persisted genesis header",
+	p.logger.Info("persisted genesis header",
 		slog.String("hash", fmt.Sprintf("%x", consensus.HeaderHash(&header))),
 	)
 	return p.store.PutHeader(0, &header)
@@ -196,7 +232,7 @@ func (p *PersistentHeaderChain) ApplyHeader(header *types.BlockHeader) error {
 	if err := p.store.WriteHeaderState(stored); err != nil {
 		return err
 	}
-	logging.Component("headers").Info("persisted header",
+	p.logger.Info("persisted header",
 		slog.Uint64("height", stored.Height),
 		slog.String("hash", fmt.Sprintf("%x", consensus.HeaderHash(header))),
 	)

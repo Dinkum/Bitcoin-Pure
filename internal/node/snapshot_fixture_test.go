@@ -29,6 +29,9 @@ func TestVerifyUTXOSnapshotFixtureMatchesGenesis(t *testing.T) {
 	if summary.UTXORoot != loaded.ExpectedUTXORoot {
 		t.Fatalf("snapshot utxo_root = %x, want %x", summary.UTXORoot, loaded.ExpectedUTXORoot)
 	}
+	if summary.Checksum != loaded.ExpectedChecksum {
+		t.Fatalf("snapshot utxo_checksum = %x, want %x", summary.Checksum, loaded.ExpectedChecksum)
+	}
 }
 
 func TestVerifyUTXOSnapshotFixtureMatchesBootstrapTip(t *testing.T) {
@@ -53,6 +56,9 @@ func TestVerifyUTXOSnapshotFixtureMatchesBootstrapTip(t *testing.T) {
 	}
 	if summary.UTXOCount != loaded.Fixture.ExpectedUTXOCount {
 		t.Fatalf("snapshot utxo count = %d, want %d", summary.UTXOCount, loaded.Fixture.ExpectedUTXOCount)
+	}
+	if summary.Checksum != loaded.ExpectedChecksum {
+		t.Fatalf("snapshot utxo_checksum = %x, want %x", summary.Checksum, loaded.ExpectedChecksum)
 	}
 }
 

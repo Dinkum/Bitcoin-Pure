@@ -5,7 +5,8 @@ APP_ROOT="/opt/bitcoin-pure"
 CURRENT_LINK="${APP_ROOT}/current"
 RELEASES_DIR="${APP_ROOT}/releases"
 CONFIG_DIR="/etc/bitcoin-pure"
-CONFIG_PATH="${CONFIG_DIR}/config.json"
+CONFIG_PATH="${CONFIG_DIR}/config.yaml"
+LEGACY_CONFIG_PATH="${CONFIG_DIR}/config.json"
 DATA_DIR="/var/lib/bitcoin-pure"
 LOG_DIR="/var/log/bitcoin-pure"
 BIN_LINK="/usr/local/bin/bpu-cli"
@@ -169,6 +170,7 @@ prepare_stage() {
 		--stage-dir "${STAGE_DIR}"
 		--current-link "${CURRENT_LINK}"
 		--config-path "${CONFIG_PATH}"
+		--legacy-config-path "${LEGACY_CONFIG_PATH}"
 		--data-dir "${DATA_DIR}"
 		--log-dir "${LOG_DIR}"
 		--service-name "${SERVICE_NAME}"
@@ -214,7 +216,8 @@ release_is_unchanged() {
 	local artifacts_dir
 	artifacts_dir="${STAGE_DIR}/.artifacts"
 	[[ -x "${CURRENT_LINK}/bin/bpu-cli" ]] || return 1
-	files_match "${artifacts_dir}/config.json" "${CONFIG_PATH}" || return 1
+	files_match "${artifacts_dir}/config.yaml" "${CONFIG_PATH}" || return 1
+	files_match "${artifacts_dir}/config.json" "${LEGACY_CONFIG_PATH}" || return 1
 	files_match "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" || return 1
 	files_match "${STAGE_DIR}/bin/bpu-cli" "${CURRENT_LINK}/bin/bpu-cli" || return 1
 	return 0
@@ -232,7 +235,10 @@ backup_live_state() {
 	# Fresh installs have no live state yet. Keep the backup step a no-op in
 	# that case so `set -e` does not abort the deployment before apply_release.
 	if [[ -f "${CONFIG_PATH}" ]]; then
-		cp -a "${CONFIG_PATH}" "${BACKUP_DIR}/config.json"
+		cp -a "${CONFIG_PATH}" "${BACKUP_DIR}/config.yaml"
+	fi
+	if [[ -f "${LEGACY_CONFIG_PATH}" ]]; then
+		cp -a "${LEGACY_CONFIG_PATH}" "${BACKUP_DIR}/config.json"
 	fi
 	if [[ -f "${UNIT_PATH}" ]]; then
 		cp -a "${UNIT_PATH}" "${BACKUP_DIR}/unit.service"
@@ -273,7 +279,8 @@ apply_release() {
 	local artifacts_dir
 	artifacts_dir="${STAGE_DIR}/.artifacts"
 	[[ -x "${STAGE_DIR}/bin/bpu-cli" ]] || fail "staged release binary is missing"
-	[[ -f "${artifacts_dir}/config.json" ]] || fail "staged release config is missing"
+	[[ -f "${artifacts_dir}/config.yaml" ]] || fail "staged release config is missing"
+	[[ -f "${artifacts_dir}/config.json" ]] || fail "staged release legacy config sidecar is missing"
 	[[ -f "${artifacts_dir}/${SERVICE_NAME}.service" ]] || fail "staged release unit file is missing"
 
 	if release_is_unchanged; then
@@ -288,7 +295,8 @@ apply_release() {
 	mkdir -p "${APP_ROOT}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
 
 	log "installing staged config"
-	install_candidate_file "${artifacts_dir}/config.json" "${CONFIG_PATH}" 600
+	install_candidate_file "${artifacts_dir}/config.yaml" "${CONFIG_PATH}" 600
+	install_candidate_file "${artifacts_dir}/config.json" "${LEGACY_CONFIG_PATH}" 600
 	log "installing staged service unit"
 	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" 644
 	log "switching current release"
@@ -312,7 +320,7 @@ apply_release() {
 }
 
 rpc_addr_value() {
-	python3 - "${CONFIG_PATH}" <<'PY'
+	python3 - "${LEGACY_CONFIG_PATH}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     print(json.load(fh).get("rpc_addr", ""))
@@ -358,7 +366,7 @@ wait_for_http() {
 }
 
 read_rpc_token() {
-	python3 - "${CONFIG_PATH}" <<'PY'
+	python3 - "${LEGACY_CONFIG_PATH}" <<'PY'
 import json, sys
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as fh:
@@ -415,7 +423,7 @@ print_install_summary() {
 	local version rpc_addr p2p_addr profile miner_enabled miner_workers service_state monitor_local monitor_public public_ip current_path rpc_host
 	local -a config_lines
 	version="$(metadata_value "${CURRENT_LINK}/.bpu-release.env" "version")"
-	mapfile -t config_lines < <(python3 - "${CONFIG_PATH}" <<'PY'
+	mapfile -t config_lines < <(python3 - "${LEGACY_CONFIG_PATH}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     cfg = json.load(fh)
@@ -469,7 +477,7 @@ EOF
 |   systemctl status ${SERVICE_NAME} --no-pager
 |   journalctl -u ${SERVICE_NAME} -f
 |   curl ${monitor_local}
-|   TOKEN=\$(python3 -c 'import json; print(json.load(open("${CONFIG_PATH}"))["rpc_auth_token"])')
+|   TOKEN=\$(python3 -c 'import json; print(json.load(open("${LEGACY_CONFIG_PATH}"))["rpc_auth_token"])')
 |   curl -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
 |     --data '{"method":"getinfo","params":{}}' ${monitor_local}
 +======================================================================+
@@ -506,7 +514,8 @@ rollback_release() {
 	else
 		rm -f "${BIN_LINK}"
 	fi
-	restore_or_remove "${BACKUP_DIR}/config.json" "${CONFIG_PATH}" 600
+	restore_or_remove "${BACKUP_DIR}/config.yaml" "${CONFIG_PATH}" 600
+	restore_or_remove "${BACKUP_DIR}/config.json" "${LEGACY_CONFIG_PATH}" 600
 	restore_or_remove "${BACKUP_DIR}/unit.service" "${UNIT_PATH}" 644
 	systemctl daemon-reload
 	if [[ "${SERVICE_WAS_ACTIVE}" -eq 1 ]]; then

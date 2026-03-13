@@ -29,8 +29,13 @@ func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
 
 func spendTx(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint64, recipientSeed byte, fee uint64) types.Transaction {
 	t.Helper()
+	return signedSpendTx(t, spenderSeed, prevOut, value, recipientSeed, fee)
+}
+
+func signedSpendTx(tb testing.TB, spenderSeed byte, prevOut types.OutPoint, value uint64, recipientSeed byte, fee uint64) types.Transaction {
+	tb.Helper()
 	if fee >= value {
-		t.Fatalf("fee %d must be less than value %d", fee, value)
+		tb.Fatalf("fee %d must be less than value %d", fee, value)
 	}
 	recipientPubKey := signerPubKey(recipientSeed)
 	tx := types.Transaction{
@@ -42,7 +47,7 @@ func spendTx(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint6
 	}
 	msg, err := consensus.Sighash(&tx, 0, []uint64{value})
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
 	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
@@ -71,6 +76,10 @@ func findSnapshot(t *testing.T, entries []SnapshotEntry, txid [32]byte) Snapshot
 	}
 	t.Fatalf("missing txid %x", txid)
 	return SnapshotEntry{}
+}
+
+func commitTipHash(seed byte) [32]byte {
+	return [32]byte{seed}
 }
 
 func TestAcceptTxRejectsConflictingSpend(t *testing.T) {
@@ -131,6 +140,55 @@ func TestAcceptTxTracksAncestorsAndDescendants(t *testing.T) {
 	}
 	if childEntry.AncestorFees != 2 {
 		t.Fatalf("child ancestor fees = %d, want 2", childEntry.AncestorFees)
+	}
+}
+
+func TestSnapshotSharedCachesAndInvalidatesOnEpochChange(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{41}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+	}
+
+	parent := spendTx(t, 1, prevOut, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+
+	sharedA := pool.SnapshotShared()
+	sharedB := pool.SnapshotShared()
+	if len(sharedA) != 1 || len(sharedB) != 1 {
+		t.Fatalf("shared snapshot lens = %d/%d, want 1", len(sharedA), len(sharedB))
+	}
+	if &sharedA[0] != &sharedB[0] {
+		t.Fatal("expected SnapshotShared to reuse the cached slice while the epoch is stable")
+	}
+
+	copied := pool.Snapshot()
+	copied[0].TxID = [32]byte{99}
+	sharedC := pool.SnapshotShared()
+	if sharedC[0].TxID != parentAdmission.TxID {
+		t.Fatal("mutating Snapshot() result should not affect cached shared snapshot")
+	}
+
+	child := spendTx(t, 2, types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}, 49, 3, 1)
+	if _, err := pool.AcceptTx(child, utxos, consensus.DefaultConsensusRules()); err != nil {
+		t.Fatalf("accept child: %v", err)
+	}
+
+	sharedAfter := pool.SnapshotShared()
+	if len(sharedAfter) != 2 {
+		t.Fatalf("shared snapshot len after mutation = %d, want 2", len(sharedAfter))
+	}
+	if &sharedAfter[0] == &sharedA[0] {
+		t.Fatal("expected epoch change to invalidate the cached shared snapshot")
 	}
 }
 
@@ -356,6 +414,148 @@ func TestAcceptTxEvictsOldestOrphan(t *testing.T) {
 	}
 }
 
+func TestAcceptTxEvictsLowestFeePackageWhenMempoolIsFull(t *testing.T) {
+	lowPrev := types.OutPoint{TxID: [32]byte{90}, Vout: 0}
+	midPrev := types.OutPoint{TxID: [32]byte{91}, Vout: 0}
+	highPrev := types.OutPoint{TxID: [32]byte{92}, Vout: 0}
+	low := spendTx(t, 1, lowPrev, 50, 4, 1)
+	mid := spendTx(t, 2, midPrev, 50, 5, 5)
+	high := spendTx(t, 3, highPrev, 50, 6, 9)
+	txBytes := len(low.Encode())
+
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxMempoolBytes:    txBytes * 2,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	utxos := consensus.UtxoSet{
+		lowPrev:  {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		midPrev:  {ValueAtoms: 50, PubKey: signerPubKey(2)},
+		highPrev: {ValueAtoms: 50, PubKey: signerPubKey(3)},
+	}
+
+	lowAdmission, err := pool.AcceptTx(low, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept low: %v", err)
+	}
+	midAdmission, err := pool.AcceptTx(mid, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept mid: %v", err)
+	}
+	highAdmission, err := pool.AcceptTx(high, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept high: %v", err)
+	}
+
+	if pool.Count() != 2 {
+		t.Fatalf("mempool count = %d, want 2", pool.Count())
+	}
+	if pool.Contains(lowAdmission.TxID) {
+		t.Fatalf("expected low-fee tx %x to be evicted", lowAdmission.TxID)
+	}
+	if !pool.Contains(midAdmission.TxID) {
+		t.Fatalf("expected medium-fee tx %x to remain", midAdmission.TxID)
+	}
+	if !pool.Contains(highAdmission.TxID) {
+		t.Fatalf("expected high-fee tx %x to remain", highAdmission.TxID)
+	}
+	stats := pool.Stats()
+	if stats.Bytes > txBytes*2 {
+		t.Fatalf("mempool bytes = %d, want <= %d", stats.Bytes, txBytes*2)
+	}
+}
+
+func TestAcceptTxRejectsWhenNewFeeRateDoesNotBeatFullMempool(t *testing.T) {
+	firstPrev := types.OutPoint{TxID: [32]byte{93}, Vout: 0}
+	secondPrev := types.OutPoint{TxID: [32]byte{94}, Vout: 0}
+	latePrev := types.OutPoint{TxID: [32]byte{95}, Vout: 0}
+	first := spendTx(t, 1, firstPrev, 50, 4, 3)
+	second := spendTx(t, 2, secondPrev, 50, 5, 5)
+	late := spendTx(t, 3, latePrev, 50, 6, 3)
+	txBytes := len(first.Encode())
+
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxMempoolBytes:    txBytes * 2,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	utxos := consensus.UtxoSet{
+		firstPrev:  {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		secondPrev: {ValueAtoms: 50, PubKey: signerPubKey(2)},
+		latePrev:   {ValueAtoms: 50, PubKey: signerPubKey(3)},
+	}
+
+	firstAdmission, err := pool.AcceptTx(first, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept first: %v", err)
+	}
+	secondAdmission, err := pool.AcceptTx(second, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept second: %v", err)
+	}
+	if _, err := pool.AcceptTx(late, utxos, consensus.DefaultConsensusRules()); !errors.Is(err, ErrMempoolFull) {
+		t.Fatalf("late err = %v, want ErrMempoolFull", err)
+	}
+
+	if pool.Count() != 2 {
+		t.Fatalf("mempool count = %d, want 2", pool.Count())
+	}
+	if !pool.Contains(firstAdmission.TxID) || !pool.Contains(secondAdmission.TxID) {
+		t.Fatal("existing transactions should remain after rejected admission")
+	}
+}
+
+func TestAcceptTxProtectsRequiredParentsDuringMempoolEviction(t *testing.T) {
+	parentPrev := types.OutPoint{TxID: [32]byte{96}, Vout: 0}
+	unrelatedPrev := types.OutPoint{TxID: [32]byte{97}, Vout: 0}
+	parent := spendTx(t, 1, parentPrev, 50, 2, 1)
+	unrelated := spendTx(t, 3, unrelatedPrev, 50, 4, 1)
+	txBytes := len(parent.Encode())
+
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxMempoolBytes:    txBytes * 2,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	utxos := consensus.UtxoSet{
+		parentPrev:    {ValueAtoms: 50, PubKey: signerPubKey(1)},
+		unrelatedPrev: {ValueAtoms: 50, PubKey: signerPubKey(3)},
+	}
+
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+	unrelatedAdmission, err := pool.AcceptTx(unrelated, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept unrelated: %v", err)
+	}
+	child := spendTx(t, 2, types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}, 49, 5, 9)
+	childAdmission, err := pool.AcceptTx(child, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept child: %v", err)
+	}
+
+	if !pool.Contains(parentAdmission.TxID) {
+		t.Fatalf("required parent %x was evicted", parentAdmission.TxID)
+	}
+	if pool.Contains(unrelatedAdmission.TxID) {
+		t.Fatalf("expected unrelated tx %x to be evicted", unrelatedAdmission.TxID)
+	}
+	if !pool.Contains(childAdmission.TxID) {
+		t.Fatalf("expected child tx %x to be admitted", childAdmission.TxID)
+	}
+}
+
 func TestSelectForBlockExcludesSameBlockDescendantsAndReturnsLTOR(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,
@@ -519,14 +719,14 @@ func TestPrepareAdmissionAndCommitPreparedHandleSameBatchParents(t *testing.T) {
 		t.Fatalf("prepared child missing count = %d, want 1", len(preparedChild.Missing))
 	}
 
-	parentAdmission, err := pool.CommitPrepared(preparedParent, utxos, consensus.DefaultConsensusRules())
+	parentAdmission, err := pool.CommitPrepared(preparedParent, utxos, [32]byte{}, consensus.DefaultConsensusRules())
 	if err != nil {
 		t.Fatalf("commit prepared parent: %v", err)
 	}
 	if len(parentAdmission.Accepted) != 1 {
 		t.Fatalf("parent accepted count = %d, want 1", len(parentAdmission.Accepted))
 	}
-	childAdmission, err := pool.CommitPrepared(preparedChild, utxos, consensus.DefaultConsensusRules())
+	childAdmission, err := pool.CommitPrepared(preparedChild, utxos, [32]byte{}, consensus.DefaultConsensusRules())
 	if err != nil {
 		t.Fatalf("commit prepared child: %v", err)
 	}
@@ -559,7 +759,7 @@ func TestAdvanceAdmissionSnapshotTracksSameBatchParents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare parent: %v", err)
 	}
-	parentAdmission, err := pool.CommitPrepared(parentPrepared, utxos, consensus.DefaultConsensusRules())
+	parentAdmission, err := pool.CommitPrepared(parentPrepared, utxos, [32]byte{}, consensus.DefaultConsensusRules())
 	if err != nil {
 		t.Fatalf("commit parent: %v", err)
 	}
@@ -611,6 +811,70 @@ func TestPrepareAdmissionSharedResolvesAgainstLiveParents(t *testing.T) {
 	}
 	if _, ok := prepared.Parents[parentAdmission.TxID]; !ok {
 		t.Fatalf("shared view missing live parent %x", parentAdmission.TxID)
+	}
+}
+
+func TestCommitPreparedReusesPreparedStateWhenEpochAndTipMatch(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{25}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+	}
+	tx := spendTx(t, 1, prevOut, 50, 2, 1)
+	prepared, err := pool.PrepareAdmission(tx, pool.AdmissionSnapshot(), utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("prepare admission: %v", err)
+	}
+	prepared.PreparedTip = commitTipHash(1)
+	prepared.HasPreparedTip = true
+
+	// A matching prepared tip and unchanged mempool epoch should let commit reuse
+	// the prepared resolution/validation result instead of touching the fallback
+	// chain UTXO view again.
+	admission, err := pool.CommitPrepared(prepared, consensus.UtxoSet{}, commitTipHash(1), consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("commit prepared: %v", err)
+	}
+	if admission.Orphaned {
+		t.Fatalf("expected prepared tx to remain validated rather than orphaned")
+	}
+	if len(admission.Accepted) != 1 || admission.Accepted[0].TxID != prepared.TxID {
+		t.Fatalf("unexpected prepared admission payload: %+v", admission.Accepted)
+	}
+}
+
+func TestCommitPreparedFallsBackWhenPreparedTipIsStale(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       256,
+		MaxDescendants:     256,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{26}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+	}
+	tx := spendTx(t, 1, prevOut, 50, 2, 1)
+	prepared, err := pool.PrepareAdmission(tx, pool.AdmissionSnapshot(), utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("prepare admission: %v", err)
+	}
+	prepared.PreparedTip = commitTipHash(2)
+	prepared.HasPreparedTip = true
+
+	admission, err := pool.CommitPrepared(prepared, consensus.UtxoSet{}, commitTipHash(3), consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("commit prepared fallback: %v", err)
+	}
+	if !admission.Orphaned {
+		t.Fatalf("expected stale prepared tip to fall back to live resolution and orphan the tx")
 	}
 }
 
@@ -1001,6 +1265,20 @@ func TestSelectForBlockOverlayKeepsBaseUTXOMapImmutable(t *testing.T) {
 	if _, ok := overlay.Lookup(rootPrev); ok {
 		t.Fatal("overlay still exposes spent root prevout")
 	}
+	if len(selected[0].SignatureChecks) != 0 {
+		t.Fatal("selection snapshots should stay lightweight and skip redundant signature rechecks")
+	}
+	if len(selected[0].SpentOutPoints) != len(parent.Base.Inputs) {
+		t.Fatalf("selection snapshot spent delta len = %d, want %d", len(selected[0].SpentOutPoints), len(parent.Base.Inputs))
+	}
+	if len(selected[0].CreatedLeaves) != len(parent.Base.Outputs) {
+		t.Fatalf("selection snapshot created delta len = %d, want %d", len(selected[0].CreatedLeaves), len(parent.Base.Outputs))
+	}
+	if snapshot := findSnapshot(t, pool.Snapshot(), parentAdmission.TxID); len(snapshot.SignatureChecks) != 0 {
+		t.Fatal("generic mempool snapshots should stay lightweight and exclude selection-only signature checks")
+	} else if len(snapshot.SpentOutPoints) != 0 || len(snapshot.CreatedLeaves) != 0 {
+		t.Fatal("generic mempool snapshots should stay lightweight and exclude selection-only accumulator deltas")
+	}
 }
 
 func TestAppendForBlockOverlayExtendsTentativeSelectionWithoutMaterializingBase(t *testing.T) {
@@ -1104,4 +1382,102 @@ func makeThreeStepChain(t *testing.T, prevOut types.OutPoint) (types.Transaction
 	child := spendTx(t, 2, types.OutPoint{TxID: parentTxID, Vout: 0}, 49, 3, 1)
 	childTxID := consensus.TxID(&child)
 	return parent, child, parentTxID, childTxID
+}
+
+func benchmarkSnapshotPool(tb testing.TB, txCount int) *Pool {
+	tb.Helper()
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	utxos := make(consensus.UtxoSet, txCount)
+	for i := 0; i < txCount; i++ {
+		prevOut := types.OutPoint{TxID: [32]byte{byte(i + 1), byte((i + 1) >> 8)}, Vout: 0}
+		utxos[prevOut] = consensus.UtxoEntry{ValueAtoms: 50, PubKey: signerPubKey(byte((i % 200) + 1))}
+		tx := signedSpendTx(tb, byte((i%200)+1), prevOut, 50, byte((i%200)+2), 1)
+		if _, err := pool.AcceptTx(tx, utxos, consensus.DefaultConsensusRules()); err != nil {
+			tb.Fatalf("accept tx %d: %v", i, err)
+		}
+	}
+	return pool
+}
+
+func benchmarkSelectionPool(tb testing.TB, txCount int) (*Pool, consensus.UtxoSet) {
+	tb.Helper()
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	utxos := make(consensus.UtxoSet, txCount)
+	for i := 0; i < txCount; i++ {
+		prevOut := types.OutPoint{TxID: [32]byte{byte(i + 1), byte((i + 1) >> 8)}, Vout: 0}
+		utxos[prevOut] = consensus.UtxoEntry{ValueAtoms: 50, PubKey: signerPubKey(byte((i%200) + 1))}
+		tx := signedSpendTx(tb, byte((i%200)+1), prevOut, 50, byte((i%200)+2), 1)
+		if _, err := pool.AcceptTx(tx, utxos, consensus.DefaultConsensusRules()); err != nil {
+			tb.Fatalf("accept tx %d: %v", i, err)
+		}
+	}
+	return pool, utxos
+}
+
+func BenchmarkSnapshot(b *testing.B) {
+	pool := benchmarkSnapshotPool(b, 2048)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		entries := pool.Snapshot()
+		if len(entries) != 2048 {
+			b.Fatalf("snapshot len = %d, want 2048", len(entries))
+		}
+	}
+}
+
+func BenchmarkSnapshotShared(b *testing.B) {
+	pool := benchmarkSnapshotPool(b, 2048)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		entries := pool.SnapshotShared()
+		if len(entries) != 2048 {
+			b.Fatalf("snapshot len = %d, want 2048", len(entries))
+		}
+	}
+}
+
+func BenchmarkSelectionSnapshotRebuild(b *testing.B) {
+	pool, _ := benchmarkSelectionPool(b, 2048)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.mu.Lock()
+		if pool.selection != nil {
+			pool.selection.snapshot = nil
+		}
+		snapshot := pool.selectionSnapshotLocked()
+		pool.mu.Unlock()
+		if len(snapshot.candidates) == 0 {
+			b.Fatal("selection snapshot returned no candidates")
+		}
+	}
+}
+
+func BenchmarkSelectionWalkFromCachedSnapshot(b *testing.B) {
+	pool, utxos := benchmarkSelectionPool(b, 2048)
+	pool.mu.Lock()
+	snapshot := pool.selectionSnapshotLocked()
+	pool.mu.Unlock()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		selected, totalFees, overlay := pool.selectForBlock(utxos, consensus.DefaultConsensusRules(), 1_000_000, snapshot)
+		if len(selected) == 0 || totalFees == 0 || overlay == nil {
+			b.Fatal("selection walk returned an empty candidate")
+		}
+	}
 }

@@ -29,7 +29,7 @@ func sampleTx() Transaction {
 			}},
 			Outputs: []TxOutput{{
 				ValueAtoms: 42,
-				PubKey:    [32]byte{2},
+				PubKey:     [32]byte{2},
 			}},
 		},
 		Auth: TxAuth{
@@ -69,7 +69,7 @@ func TestBlockRoundtrip(t *testing.T) {
 				CoinbaseExtraNonce: testCoinbaseExtraNonce(1),
 				Outputs: []TxOutput{{
 					ValueAtoms: 50,
-					PubKey:    [32]byte{5},
+					PubKey:     [32]byte{5},
 				}},
 			},
 		}},
@@ -92,7 +92,7 @@ func TestCoinbaseTransactionRoundtripPreservesHeight(t *testing.T) {
 			Inputs:             []TxInput{},
 			Outputs: []TxOutput{{
 				ValueAtoms: 50,
-				PubKey:    [32]byte{9},
+				PubKey:     [32]byte{9},
 			}},
 		},
 		Auth: TxAuth{Entries: []TxAuthEntry{}},
@@ -151,7 +151,7 @@ func TestRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
-func TestParseChainProfileAcceptsRegtestMediumAndHard(t *testing.T) {
+func TestParseChainProfileAcceptsRegtestMediumHardAndBenchNet(t *testing.T) {
 	profile, err := ParseChainProfile("regtest_medium")
 	if err != nil {
 		t.Fatalf("ParseChainProfile(regtest_medium): %v", err)
@@ -172,5 +172,16 @@ func TestParseChainProfileAcceptsRegtestMediumAndHard(t *testing.T) {
 	}
 	if !profile.IsRegtestLike() {
 		t.Fatal("regtest_hard should be treated as regtest-like")
+	}
+
+	profile, err = ParseChainProfile("benchnet")
+	if err != nil {
+		t.Fatalf("ParseChainProfile(benchnet): %v", err)
+	}
+	if profile != BenchNet {
+		t.Fatalf("profile = %q, want %q", profile, BenchNet)
+	}
+	if !profile.IsRegtestLike() {
+		t.Fatal("benchnet should be treated as regtest-like")
 	}
 }

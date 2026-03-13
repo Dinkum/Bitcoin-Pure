@@ -49,6 +49,84 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 	return tx
 }
 
+func specSighashForTest(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]byte, error) {
+	if inputIndex < 0 || inputIndex >= len(tx.Base.Inputs) {
+		return [32]byte{}, errors.New("input index out of range")
+	}
+	if len(inputAmounts) != len(tx.Base.Inputs) {
+		return [32]byte{}, errors.New("input amounts length mismatch")
+	}
+
+	prevouts := make([]byte, 0)
+	writeVarInt(&prevouts, uint64(len(tx.Base.Inputs)))
+	for _, input := range tx.Base.Inputs {
+		prevouts = append(prevouts, input.PrevOut.TxID[:]...)
+		prevouts = append(prevouts,
+			byte(input.PrevOut.Vout),
+			byte(input.PrevOut.Vout>>8),
+			byte(input.PrevOut.Vout>>16),
+			byte(input.PrevOut.Vout>>24),
+		)
+	}
+
+	outputs := make([]byte, 0)
+	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
+	for _, output := range tx.Base.Outputs {
+		outputs = append(outputs,
+			byte(output.ValueAtoms),
+			byte(output.ValueAtoms>>8),
+			byte(output.ValueAtoms>>16),
+			byte(output.ValueAtoms>>24),
+			byte(output.ValueAtoms>>32),
+			byte(output.ValueAtoms>>40),
+			byte(output.ValueAtoms>>48),
+			byte(output.ValueAtoms>>56),
+		)
+		outputs = append(outputs, output.PubKey[:]...)
+	}
+
+	amounts := make([]byte, 0)
+	writeVarInt(&amounts, uint64(len(inputAmounts)))
+	for _, amount := range inputAmounts {
+		amounts = append(amounts,
+			byte(amount),
+			byte(amount>>8),
+			byte(amount>>16),
+			byte(amount>>24),
+			byte(amount>>32),
+			byte(amount>>40),
+			byte(amount>>48),
+			byte(amount>>56),
+		)
+	}
+
+	preimage := make([]byte, 0, 108)
+	preimage = append(preimage,
+		byte(tx.Base.Version),
+		byte(tx.Base.Version>>8),
+		byte(tx.Base.Version>>16),
+		byte(tx.Base.Version>>24),
+	)
+	index := uint64(inputIndex)
+	preimage = append(preimage,
+		byte(index),
+		byte(index>>8),
+		byte(index>>16),
+		byte(index>>24),
+		byte(index>>32),
+		byte(index>>40),
+		byte(index>>48),
+		byte(index>>56),
+	)
+	prevoutsHash := crypto.Sha256d(prevouts)
+	outputsHash := crypto.Sha256d(outputs)
+	amountsHash := crypto.Sha256d(amounts)
+	preimage = append(preimage, prevoutsHash[:]...)
+	preimage = append(preimage, outputsHash[:]...)
+	preimage = append(preimage, amountsHash[:]...)
+	return crypto.TaggedHash(SighashTag, preimage), nil
+}
+
 func TestTxIDAndAuthIDAreStable(t *testing.T) {
 	tx := types.Transaction{
 		Base: types.TxBase{
@@ -238,6 +316,22 @@ func TestBuildBlockRootsMatchesDirectComputation(t *testing.T) {
 	}
 }
 
+func TestBuildBlockRootsFromIDsMatchesBuildBlockRoots(t *testing.T) {
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 50, PubKey: consensusTestPubKey(1)}})
+	first := signedSpendTxForConsensusTest(t, 1, types.OutPoint{TxID: TxID(&coinbase), Vout: 0}, 50, 2, 1)
+	second := signedSpendTxForConsensusTest(t, 2, types.OutPoint{TxID: [32]byte{9}, Vout: 0}, 25, 3, 1)
+	txs := []types.Transaction{coinbase, first, second}
+
+	txids, authids, txRoot, authRoot := BuildBlockRoots(txs)
+	reusedTxRoot, reusedAuthRoot := BuildBlockRootsFromIDs(txids, authids)
+	if reusedTxRoot != txRoot {
+		t.Fatalf("tx root mismatch: got %x want %x", reusedTxRoot, txRoot)
+	}
+	if reusedAuthRoot != authRoot {
+		t.Fatalf("auth root mismatch: got %x want %x", reusedAuthRoot, authRoot)
+	}
+}
+
 func TestMedianTimePastUsesMedianOfLastElevenTimestamps(t *testing.T) {
 	timestamps := []uint64{100, 70, 90, 110, 80, 60, 120, 50, 130, 40, 140}
 	if got, want := MedianTimePast(timestamps), uint64(90); got != want {
@@ -278,6 +372,37 @@ func TestValidateSignedSpend(t *testing.T) {
 	}
 	if summary.Fee != 10 {
 		t.Fatalf("unexpected fee: %d", summary.Fee)
+	}
+}
+
+func TestSighashMatchesSpecForMultiInputSpend(t *testing.T) {
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs: []types.TxInput{
+				{PrevOut: types.OutPoint{TxID: [32]byte{1}, Vout: 0}},
+				{PrevOut: types.OutPoint{TxID: [32]byte{2}, Vout: 1}},
+			},
+			Outputs: []types.TxOutput{
+				{ValueAtoms: 60, PubKey: consensusTestPubKey(8)},
+				{ValueAtoms: 15, PubKey: consensusTestPubKey(9)},
+			},
+		},
+	}
+	inputAmounts := []uint64{50, 30}
+
+	for i := range tx.Base.Inputs {
+		got, err := Sighash(&tx, i, inputAmounts)
+		if err != nil {
+			t.Fatalf("sighash input %d: %v", i, err)
+		}
+		want, err := specSighashForTest(&tx, i, inputAmounts)
+		if err != nil {
+			t.Fatalf("spec sighash input %d: %v", i, err)
+		}
+		if got != want {
+			t.Fatalf("sighash input %d = %x, want %x", i, got, want)
+		}
 	}
 }
 
