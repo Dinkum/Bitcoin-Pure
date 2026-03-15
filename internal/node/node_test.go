@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utxochecksum"
 )
 
 func compactTargetForTest(compact uint32) *big.Int {
@@ -82,6 +84,17 @@ func merkleSoloForNodeTest(item [32]byte) [32]byte {
 	return crypto.Sha256d(buf[:])
 }
 
+func TestAppendRecentTimeKeepsLastElevenTimestamps(t *testing.T) {
+	times := make([]uint64, 0, recentTimeWindow)
+	for i := uint64(1); i <= recentTimeWindow+2; i++ {
+		times = appendRecentTime(times, i)
+	}
+	want := []uint64{3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+	if !slices.Equal(times, want) {
+		t.Fatalf("recent times = %v, want %v", times, want)
+	}
+}
+
 // merkleRootForNodeTest keeps header fixtures anchored to the spec-tagged
 // tree rules instead of reusing the production consensus.MerkleRoot path.
 func merkleRootForNodeTest(items [][32]byte) [32]byte {
@@ -118,7 +131,10 @@ func spendTxForNodeTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, 
 			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: nodeSignerPubKey(recipientSeed)}},
 		},
 	}
-	msg, err := consensus.Sighash(&tx, 0, []uint64{value})
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+		ValueAtoms: value,
+		PubKey:     nodeSignerPubKey(spenderSeed),
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +387,7 @@ func TestCommittedViewReturnsDefensiveSnapshot(t *testing.T) {
 	if got, want := view.UTXORoot, block.Header.UTXORoot; got != want {
 		t.Fatalf("utxo root = %x, want %x", got, want)
 	}
-	if got := len(view.UTXOs); got != 1 {
+	if got := view.UTXOCount; got != 1 {
 		t.Fatalf("utxo count = %d, want 1", got)
 	}
 	if view.UTXOAcc == nil {
@@ -381,16 +397,14 @@ func TestCommittedViewReturnsDefensiveSnapshot(t *testing.T) {
 		t.Fatal("committed view exposed live accumulator handle")
 	}
 
-	for outPoint := range view.UTXOs {
-		delete(view.UTXOs, outPoint)
-	}
+	view.UTXOCount = 0
 	view.UTXOAcc = nil
 
 	refreshed, ok := state.CommittedView()
 	if !ok {
 		t.Fatal("expected committed view after snapshot mutation")
 	}
-	if got := len(refreshed.UTXOs); got != 1 {
+	if got := refreshed.UTXOCount; got != 1 {
 		t.Fatalf("refreshed utxo count = %d, want 1", got)
 	}
 	if refreshed.UTXOAcc == nil {
@@ -472,7 +486,7 @@ func TestDisconnectBlockRestoresAccumulatorState(t *testing.T) {
 	if _, err := state.ApplyBlock(&first); err != nil {
 		t.Fatal(err)
 	}
-	undo, err := captureUndoEntries(&first, genesisUTXOs)
+	undo, err := captureUndoEntries(&first, consensus.LookupWithErrFromSet(genesisUTXOs))
 	if err != nil {
 		t.Fatalf("capture undo: %v", err)
 	}
@@ -522,6 +536,55 @@ func TestPersistentRoundtrip(t *testing.T) {
 	defer reopened.Close()
 	if reopened.ChainState().TipHeight() == nil || *reopened.ChainState().TipHeight() != 0 {
 		t.Fatal("reopened tip height mismatch")
+	}
+}
+
+func TestPersistentRoundtripFromMeta(t *testing.T) {
+	path := t.TempDir()
+	persistent, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := genesisBlock()
+	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewChainState(types.Regtest)
+	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := persistent.ApplyBlock(&block); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistent.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenPersistentChainStateFromMeta(path, types.Regtest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.ChainState().TipHeight() == nil || *reopened.ChainState().TipHeight() != 1 {
+		t.Fatalf("reopened tip height mismatch: %v", reopened.ChainState().TipHeight())
+	}
+	if got, want := reopened.ChainState().UTXORoot(), consensus.ComputedUTXORoot(reopened.ChainState().UTXOs()); got != want {
+		t.Fatalf("reopened utxo root = %x, want %x", got, want)
+	}
+	iterated := 0
+	if err := reopened.ChainState().ForEachUTXO(func(types.OutPoint, consensus.UtxoEntry) error {
+		iterated++
+		return nil
+	}); err != nil {
+		t.Fatalf("ForEachUTXO: %v", err)
+	}
+	if iterated != reopened.ChainState().UTXOCount() {
+		t.Fatalf("iterated utxos = %d, want %d", iterated, reopened.ChainState().UTXOCount())
+	}
+	if reopened.ChainState().UTXOAccumulator() == nil {
+		t.Fatal("expected accumulator after metadata reopen")
 	}
 }
 
@@ -584,6 +647,20 @@ func TestHeaderReplayRejectsTimestampAtMedianTimePast(t *testing.T) {
 	err := chain.ApplyHeader(&bad)
 	if !errors.Is(err, consensus.ErrTimestampTooEarly) {
 		t.Fatalf("ApplyHeader error = %v, want %v", err, consensus.ErrTimestampTooEarly)
+	}
+}
+
+func TestHeaderReplayRejectsTimestampBeyondLocalSystemTimeWindow(t *testing.T) {
+	chain := NewHeaderChain(types.Regtest)
+	genesis := genesisBlock()
+	if err := chain.InitializeFromGenesisHeader(genesis.Header); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := nextCoinbaseBlock(0, genesis.Header, consensus.UtxoSet{}, 42, uint64(time.Now().Unix())+consensus.MaxFutureBlockTimeSeconds+1).Header
+	err := chain.ApplyHeader(&bad)
+	if !errors.Is(err, consensus.ErrTimestampTooFarFuture) {
+		t.Fatalf("ApplyHeader error = %v, want %v", err, consensus.ErrTimestampTooFarFuture)
 	}
 }
 
@@ -723,6 +800,82 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	}
 	if got, want := reopened.ChainState().UTXORoot(), consensus.ComputedUTXORoot(reopened.ChainState().UTXOs()); got != want {
 		t.Fatalf("unexpected reopened utxo root after reorg: got %x want %x", got, want)
+	}
+}
+
+func TestPersistentChainStateReorgsToHigherWorkBranchFromMeta(t *testing.T) {
+	path := t.TempDir()
+	persistent, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	genesis := genesisBlock()
+	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+
+	active := NewChainState(types.Regtest)
+	if _, err := active.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	a1 := nextCoinbaseBlock(0, genesis.Header, active.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := active.ApplyBlock(&a1); err != nil {
+		t.Fatal(err)
+	}
+	a2 := nextCoinbaseBlock(1, a1.Header, active.UTXOs(), 4, a1.Header.Timestamp+600)
+	if _, err := active.ApplyBlock(&a2); err != nil {
+		t.Fatal(err)
+	}
+
+	side := NewChainState(types.Regtest)
+	if _, err := side.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	b1 := nextCoinbaseBlock(0, genesis.Header, side.UTXOs(), 9, genesis.Header.Timestamp+600)
+	if _, err := side.ApplyBlock(&b1); err != nil {
+		t.Fatal(err)
+	}
+	b2 := nextCoinbaseBlock(1, b1.Header, side.UTXOs(), 10, b1.Header.Timestamp+600)
+	if _, err := side.ApplyBlock(&b2); err != nil {
+		t.Fatal(err)
+	}
+	b3 := nextCoinbaseBlock(2, b2.Header, side.UTXOs(), 11, b2.Header.Timestamp+600)
+
+	if _, err := persistent.ApplyBlock(&a1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistent.ApplyBlock(&a2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistent.ApplyBlock(&b1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistent.ApplyBlock(&b2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistent.ApplyBlock(&b3); err != nil {
+		t.Fatal(err)
+	}
+
+	sideTipHash := consensus.HeaderHash(&b3.Header)
+	if err := persistent.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenPersistentChainStateFromMeta(path, types.Regtest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := consensus.HeaderHash(reopened.ChainState().TipHeader()); got != sideTipHash {
+		t.Fatalf("unexpected reopened tip after metadata reorg open: got %x want %x", got, sideTipHash)
+	}
+	if got, want := reopened.ChainState().UTXORoot(), consensus.ComputedUTXORoot(reopened.ChainState().UTXOs()); got != want {
+		t.Fatalf("unexpected reopened utxo root after metadata reorg open: got %x want %x", got, want)
+	}
+	if got, want := reopened.ChainState().UTXOChecksum(), utxochecksum.Compute(reopened.ChainState().UTXOs()); got != want {
+		t.Fatalf("unexpected reopened checksum after metadata reorg open: got %x want %x", got, want)
 	}
 }
 
@@ -1609,6 +1762,92 @@ func TestGetChainStateRPC(t *testing.T) {
 	}
 }
 
+func TestPersistentApplyBlockPreservesUTXOChecksumOnTipExtension(t *testing.T) {
+	path := t.TempDir()
+	genesis := genesisBlock()
+	persistent, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatalf("OpenPersistentChainState: %v", err)
+	}
+	defer persistent.Close()
+	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatalf("InitializeFromGenesisBlock: %v", err)
+	}
+
+	baseState := NewChainState(types.Regtest)
+	if _, err := baseState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	first := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := persistent.ApplyBlock(&first); err != nil {
+		t.Fatalf("ApplyBlock(first): %v", err)
+	}
+
+	assertPersistentChecksumMatchesComputed(t, persistent)
+}
+
+func TestPersistentApplyBlockPreservesUTXOChecksumAcrossReorg(t *testing.T) {
+	path := t.TempDir()
+	genesis := genesisBlock()
+	persistent, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatalf("OpenPersistentChainState: %v", err)
+	}
+	defer persistent.Close()
+	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatalf("InitializeFromGenesisBlock: %v", err)
+	}
+
+	baseState := NewChainState(types.Regtest)
+	if _, err := baseState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	active1 := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	if _, err := baseState.ApplyBlock(&active1); err != nil {
+		t.Fatal(err)
+	}
+	active2 := nextCoinbaseBlock(1, active1.Header, baseState.UTXOs(), 4, active1.Header.Timestamp+600)
+	if _, err := persistent.ApplyBlock(&active1); err != nil {
+		t.Fatalf("ApplyBlock(active1): %v", err)
+	}
+	if _, err := persistent.ApplyBlock(&active2); err != nil {
+		t.Fatalf("ApplyBlock(active2): %v", err)
+	}
+
+	altState := NewChainState(types.Regtest)
+	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 5, genesis.Header.Timestamp+601)
+	if _, err := altState.ApplyBlock(&alt1); err != nil {
+		t.Fatal(err)
+	}
+	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 6, alt1.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt2); err != nil {
+		t.Fatal(err)
+	}
+	alt3 := nextCoinbaseBlock(2, alt2.Header, altState.UTXOs(), 7, alt2.Header.Timestamp+600)
+
+	if _, err := persistent.ApplyBlock(&alt1); err != nil {
+		t.Fatalf("ApplyBlock(alt1): %v", err)
+	}
+	if _, err := persistent.ApplyBlock(&alt2); err != nil {
+		t.Fatalf("ApplyBlock(alt2): %v", err)
+	}
+	if _, err := persistent.ApplyBlock(&alt3); err != nil {
+		t.Fatalf("ApplyBlock(alt3): %v", err)
+	}
+
+	view, ok := persistent.CommittedView()
+	if !ok {
+		t.Fatal("missing committed view after reorg")
+	}
+	if got, want := view.TipHash, consensus.HeaderHash(&alt3.Header); got != want {
+		t.Fatalf("tip hash = %x, want %x", got, want)
+	}
+	assertPersistentChecksumMatchesComputed(t, persistent)
+}
+
 func TestGetMempoolInfoRPC(t *testing.T) {
 	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 1_000
@@ -1689,6 +1928,38 @@ func TestGetMiningInfoRPC(t *testing.T) {
 	}
 	if out.CurrentBits == 0 || out.NextBits == 0 {
 		t.Fatal("expected current and next bits")
+	}
+}
+
+func assertPersistentChecksumMatchesComputed(t *testing.T, persistent *PersistentChainState) {
+	t.Helper()
+
+	view, ok := persistent.CommittedView()
+	if !ok {
+		t.Fatal("missing committed view")
+	}
+	liveState := persistent.ChainState()
+	if liveState == nil {
+		t.Fatal("missing live chain state clone")
+	}
+	want := utxochecksum.Compute(liveState.UTXOs())
+	if view.UTXOChecksum != want {
+		t.Fatalf("committed view checksum = %x, want %x", view.UTXOChecksum, want)
+	}
+
+	if got := liveState.UTXOChecksum(); got != want {
+		t.Fatalf("live state checksum = %x, want %x", got, want)
+	}
+
+	stored, err := persistent.Store().LoadChainState()
+	if err != nil {
+		t.Fatalf("LoadChainState: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("missing stored chain state")
+	}
+	if stored.UTXOChecksum != want {
+		t.Fatalf("stored checksum = %x, want %x", stored.UTXOChecksum, want)
 	}
 }
 
@@ -2037,7 +2308,7 @@ func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
 	}
 	utxos := svc.chainUtxoSnapshot()
 	for _, output := range outputs {
-		entry, ok := utxos[output.OutPoint]
+		entry, ok := utxos(output.OutPoint)
 		if !ok {
 			t.Fatalf("missing funding outpoint %+v", output.OutPoint)
 		}
@@ -2136,7 +2407,7 @@ func TestSeedStressLanesProducesConfirmedOutputs(t *testing.T) {
 	}
 	utxos := svc.chainUtxoSnapshot()
 	for i, output := range confirmed {
-		entry, ok := utxos[output.OutPoint]
+		entry, ok := utxos(output.OutPoint)
 		if !ok {
 			t.Fatalf("confirmed output %d missing from utxo set", i)
 		}
@@ -2231,7 +2502,7 @@ func TestMineBlocksProducesDistinctCoinbaseOutpoints(t *testing.T) {
 		t.Fatalf("hashes = %d, want 2", len(hashes))
 	}
 
-	utxos := svc.chainUtxoSnapshot()
+	utxos := svc.chainState.ChainState().UTXOs()
 	seen := make(map[[32]byte]struct{})
 	for outPoint := range utxos {
 		if _, ok := seen[outPoint.TxID]; ok {
@@ -2260,7 +2531,7 @@ func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
 	if !ok {
 		t.Fatal("missing committed chain view")
 	}
-	block := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 9, view.TipHeader.Timestamp+600)
+	block := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 9, view.TipHeader.Timestamp+600)
 	block.Header.Nonce = 0
 
 	originalTxID := consensus.TxID(&block.Txs[0])
@@ -2938,6 +3209,101 @@ func TestConnectPeerSkipsSelfEquivalentAddress(t *testing.T) {
 	}
 }
 
+func TestHandlePeerBlockAcceptanceErrorBansPeerAndCachesRejectedBlock(t *testing.T) {
+	svc := &Service{
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knownPeers:     make(map[string]storage.KnownPeerRecord),
+		bannedPeers:    make(map[string]time.Time),
+		rejectedBlocks: make(map[[32]byte]struct{}),
+		blockRequests:  make(map[[32]byte]blockDownloadRequest),
+		pendingBlocks:  make(map[[32]byte]pendingPeerBlock),
+		stopCh:         make(chan struct{}),
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	block := pendingPeerBlockForTest(99, 2)
+
+	err := svc.handlePeerBlockAcceptanceError(peer, &block, consensus.ErrMerkleTxIDMismatch)
+	if !errors.Is(err, consensus.ErrMerkleTxIDMismatch) {
+		t.Fatalf("handlePeerBlockAcceptanceError error = %v, want %v", err, consensus.ErrMerkleTxIDMismatch)
+	}
+	hash := consensus.HeaderHash(&block.Header)
+	if !svc.hasRejectedBlock(hash) {
+		t.Fatalf("rejected block hash %x was not cached", hash)
+	}
+	until, banned := svc.peerManager().bannedUntil(peer.addr)
+	if !banned {
+		t.Fatal("peer was not banned after misbehavior block error")
+	}
+	if until.Before(time.Now().UTC()) {
+		t.Fatalf("peer ban expiry = %s, want future time", until)
+	}
+}
+
+func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	listener := &scriptedListener{
+		results: []scriptedAcceptResult{
+			{err: temporaryAcceptTestError{err: errors.New("too many open files")}},
+			{err: net.ErrClosed},
+		},
+		secondAccept: make(chan struct{}),
+	}
+	svc := &Service{
+		logger:   logger,
+		listener: listener,
+		stopCh:   make(chan struct{}),
+	}
+	manager := &peerManager{svc: svc}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.acceptLoop()
+	}()
+
+	select {
+	case <-listener.secondAccept:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not retry after temporary accept error")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not exit after listener closed")
+	}
+	if got := listener.acceptCalls(); got != 2 {
+		t.Fatalf("accept calls = %d, want 2", got)
+	}
+}
+
+func TestSafeGoRecoversPanicAndRunsCleanup(t *testing.T) {
+	var buf bytes.Buffer
+	svc := &Service{
+		logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	}
+	cleaned := make(chan struct{})
+	svc.safeGoWithCleanup("panic-test", func() {
+		close(cleaned)
+	}, func() {
+		panic("boom")
+	})
+
+	select {
+	case <-cleaned:
+	case <-time.After(time.Second):
+		t.Fatal("panic cleanup did not run")
+	}
+	svc.wg.Wait()
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "goroutine panic") {
+		t.Fatalf("expected panic log, got %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "panic-test") {
+		t.Fatalf("expected goroutine name in log, got %q", logOutput)
+	}
+}
+
 func TestPeerWriteLoopSetsWriteDeadline(t *testing.T) {
 	conn := &deadlineSpyConn{}
 	svc := &Service{
@@ -3221,7 +3587,7 @@ func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 		msg: p2p.TxBatchMessage{Txs: filteredTxs},
 	}
 	peer.pendingTxOrder = [][32]byte{consensus.TxID(&tx)}
-	peer.pendingTxByID = map[[32]byte]types.Transaction{consensus.TxID(&tx): tx}
+	peer.pendingTxByID = map[[32]byte]*types.Transaction{consensus.TxID(&tx): &tx}
 	peer.pendingRecon = [][32]byte{{2}}
 	peer.txFlushArmed = true
 	peer.reconFlushArmed = true
@@ -3335,6 +3701,26 @@ func TestOnInvMessageRequestsFullBlockForKnownHeader(t *testing.T) {
 	}
 	if len(req.Items) != 1 || req.Items[0].Hash != hash || req.Items[0].Type != p2p.InvTypeBlockFull {
 		t.Fatalf("GetData items = %+v, want full block request for %x", req.Items, hash)
+	}
+}
+
+func TestOnInvMessageSkipsRecentlyRejectedBlock(t *testing.T) {
+	svc := &Service{
+		pool:           mempool.New(),
+		rejectedBlocks: make(map[[32]byte]struct{}),
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	hash := [32]byte{0xaa}
+	svc.rememberRejectedBlock(hash)
+
+	if err := svc.onInvMessage(peer, p2p.InvMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlock, Hash: hash}}}); err != nil {
+		t.Fatalf("onInvMessage: %v", err)
+	}
+
+	select {
+	case envelope := <-peer.sendQ:
+		t.Fatalf("unexpected outbound message for rejected block inv: %T", envelope.msg)
+	default:
 	}
 }
 
@@ -3529,10 +3915,146 @@ func TestOnGetDataMessageBatchesTxLookupsAndReportsMisses(t *testing.T) {
 	}
 }
 
+func TestOnGetDataMessageCapsServedBlocksPerRequest(t *testing.T) {
+	svc := &Service{
+		recentHdrs: recentHeaderCache{items: make(map[[32]byte]types.BlockHeader)},
+		recentBlks: recentBlockCache{items: make(map[[32]byte]types.Block)},
+	}
+	peer := &peerConn{
+		sendQ:       make(chan outboundMessage, maxServedBlocksPerGetData+2),
+		closed:      make(chan struct{}),
+		queuedInv:   make(map[p2p.InvVector]int),
+		queuedTx:    make(map[[32]byte]int),
+		knownTx:     make(map[[32]byte]struct{}),
+		pendingThin: make(map[[32]byte]*pendingThinBlock),
+	}
+
+	items := make([]p2p.InvVector, 0, maxServedBlocksPerGetData+2)
+	overflow := make([][32]byte, 0, 2)
+	for i := 0; i < maxServedBlocksPerGetData+2; i++ {
+		block := pendingPeerBlockForTest(uint64(200+i), 2)
+		hash := consensus.HeaderHash(&block.Header)
+		svc.cacheRecentBlock(block)
+		items = append(items, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: hash})
+		if i >= maxServedBlocksPerGetData {
+			overflow = append(overflow, hash)
+		}
+	}
+
+	if err := svc.onGetDataMessage(peer, p2p.GetDataMessage{Items: items}); err != nil {
+		t.Fatalf("onGetDataMessage: %v", err)
+	}
+
+	sawBlocks := 0
+	var sawNotFound bool
+	for i := 0; i < maxServedBlocksPerGetData+1; i++ {
+		envelope := <-peer.sendQ
+		switch msg := envelope.msg.(type) {
+		case p2p.BlockMessage:
+			sawBlocks++
+		case p2p.NotFoundMessage:
+			if len(msg.Items) != len(overflow) {
+				t.Fatalf("notfound count = %d, want %d", len(msg.Items), len(overflow))
+			}
+			for idx, item := range msg.Items {
+				if item.Type != p2p.InvTypeBlockFull || item.Hash != overflow[idx] {
+					t.Fatalf("unexpected notfound item %d: %+v", idx, item)
+				}
+			}
+			sawNotFound = true
+		default:
+			t.Fatalf("unexpected message type %T", envelope.msg)
+		}
+	}
+	if sawBlocks != maxServedBlocksPerGetData || !sawNotFound {
+		t.Fatalf("served blocks=%d notfound=%t", sawBlocks, sawNotFound)
+	}
+}
+
+func withInboundPeerTxRateLimitForTest(t *testing.T, rate float64, burst float64, violations int) {
+	t.Helper()
+	oldRate := inboundPeerTxRatePerSecond
+	oldBurst := inboundPeerTxBurst
+	oldViolations := inboundPeerTxViolationLimit
+	inboundPeerTxRatePerSecond = rate
+	inboundPeerTxBurst = burst
+	inboundPeerTxViolationLimit = violations
+	t.Cleanup(func() {
+		inboundPeerTxRatePerSecond = oldRate
+		inboundPeerTxBurst = oldBurst
+		inboundPeerTxViolationLimit = oldViolations
+	})
+}
+
+func TestOnPeerMessageRateLimitsInboundTxFlood(t *testing.T) {
+	withInboundPeerTxRateLimitForTest(t, 0, 2, 2)
+	svc := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+	batch := p2p.TxBatchMessage{Txs: []types.Transaction{{}, {}, {}}}
+
+	if err := svc.onPeerMessage(peer, batch); err != nil {
+		t.Fatalf("first over-limit batch should be dropped, got %v", err)
+	}
+	if len(peer.knownTx) != 0 {
+		t.Fatal("dropped over-limit batch should not enter known-tx tracking")
+	}
+
+	if err := svc.onPeerMessage(peer, batch); !errors.Is(err, errPeerInboundTxRateLimit) {
+		t.Fatalf("second over-limit batch error = %v, want %v", err, errPeerInboundTxRateLimit)
+	}
+}
+
 type deadlineSpyConn struct {
 	mu                  sync.Mutex
 	sawNonZeroWriteTime bool
 }
+
+type scriptedAcceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+type scriptedListener struct {
+	mu           sync.Mutex
+	results      []scriptedAcceptResult
+	calls        int
+	secondAccept chan struct{}
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	if l.calls == 2 && l.secondAccept != nil {
+		close(l.secondAccept)
+		l.secondAccept = nil
+	}
+	if l.calls > len(l.results) {
+		return nil, net.ErrClosed
+	}
+	result := l.results[l.calls-1]
+	return result.conn, result.err
+}
+
+func (l *scriptedListener) Close() error { return nil }
+func (l *scriptedListener) Addr() net.Addr {
+	return deadlineSpyAddr("listener")
+}
+
+func (l *scriptedListener) acceptCalls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+type temporaryAcceptTestError struct {
+	err error
+}
+
+func (e temporaryAcceptTestError) Error() string   { return e.err.Error() }
+func (e temporaryAcceptTestError) Unwrap() error   { return e.err }
+func (e temporaryAcceptTestError) Timeout() bool   { return false }
+func (e temporaryAcceptTestError) Temporary() bool { return true }
 
 func (c *deadlineSpyConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
 func (c *deadlineSpyConn) Write(b []byte) (int, error) { return len(b), nil }
@@ -4502,6 +5024,33 @@ func TestOnPeerTxBatchIgnoresDuplicateAdmissionError(t *testing.T) {
 	}
 }
 
+func TestHandlePeerTxAdmissionErrorsScoresInvalidSignaturesBeforeBan(t *testing.T) {
+	svc := &Service{
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knownPeers:  make(map[string]storage.KnownPeerRecord),
+		bannedPeers: make(map[string]time.Time),
+	}
+	peer := newPeerConnForTests("127.0.0.1:18444")
+
+	for attempt := 1; attempt < peerInvalidTxSignatureLimit; attempt++ {
+		if err := svc.handlePeerTxAdmissionErrors(peer, []error{consensus.ErrInvalidSignature}); err != nil {
+			t.Fatalf("attempt %d returned error %v, want warning-only", attempt, err)
+		}
+	}
+
+	err := svc.handlePeerTxAdmissionErrors(peer, []error{consensus.ErrInvalidSignature})
+	if !errors.Is(err, consensus.ErrInvalidSignature) {
+		t.Fatalf("threshold error = %v, want %v", err, consensus.ErrInvalidSignature)
+	}
+	until, banned := svc.peerManager().bannedUntil(peer.addr)
+	if !banned {
+		t.Fatal("peer should be banned after repeated invalid signatures")
+	}
+	if until.Before(time.Now().UTC()) {
+		t.Fatalf("ban expiry = %s, want future time", until)
+	}
+}
+
 func TestSubmitTxTracksAndRebroadcastsLocalOriginTransactions(t *testing.T) {
 	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
@@ -5237,6 +5786,117 @@ func TestOnPeerBlockMessageRequestsCatchUpForUnavailableParentState(t *testing.T
 	}
 	if !sawGetData {
 		t.Fatal("expected catch-up GetData request")
+	}
+}
+
+func withPendingPeerBlockLimitsForTest(t *testing.T, byteLimit uint64, perPeerLimit int) {
+	t.Helper()
+	oldByteLimit := maxPendingPeerBlockBytes
+	oldPeerLimit := maxPendingPeerBlocksPerPeer
+	maxPendingPeerBlockBytes = byteLimit
+	maxPendingPeerBlocksPerPeer = perPeerLimit
+	t.Cleanup(func() {
+		maxPendingPeerBlockBytes = oldByteLimit
+		maxPendingPeerBlocksPerPeer = oldPeerLimit
+	})
+}
+
+func pendingPeerBlockForTest(nonce uint64, outputs int) types.Block {
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{byte(nonce)}, Vout: uint32(nonce)}}},
+			Outputs: make([]types.TxOutput, outputs),
+		},
+		Auth: types.TxAuth{Entries: []types.TxAuthEntry{{Signature: [64]byte{byte(nonce)}}}},
+	}
+	for i := range tx.Base.Outputs {
+		tx.Base.Outputs[i] = types.TxOutput{
+			ValueAtoms: uint64(i + 1),
+			PubKey:     nodeSignerPubKey(byte((int(nonce)+i)%250 + 1)),
+		}
+	}
+	return types.Block{
+		Header: types.BlockHeader{
+			Version:       1,
+			PrevBlockHash: [32]byte{byte(nonce + 1)},
+			Timestamp:     nonce + 1,
+			Nonce:         nonce,
+		},
+		Txs: []types.Transaction{tx},
+	}
+}
+
+func TestStorePendingPeerBlockEnforcesPerPeerLimit(t *testing.T) {
+	withPendingPeerBlockLimitsForTest(t, 1<<20, 2)
+	svc := &Service{
+		pendingBlocks:       make(map[[32]byte]pendingPeerBlock),
+		pendingBlocksByPeer: make(map[string]int),
+		pendingChildren:     make(map[[32]byte]map[[32]byte]struct{}),
+	}
+	first := pendingPeerBlockForTest(1, 2)
+	second := pendingPeerBlockForTest(2, 2)
+	third := pendingPeerBlockForTest(3, 2)
+
+	if result := svc.storePendingPeerBlock("peer-a", &first); !result.Added || result.Evicted != 0 || result.Dropped {
+		t.Fatalf("first store = %+v, want added without eviction", result)
+	}
+	if result := svc.storePendingPeerBlock("peer-a", &second); !result.Added || result.Evicted != 0 || result.Dropped {
+		t.Fatalf("second store = %+v, want added without eviction", result)
+	}
+	result := svc.storePendingPeerBlock("peer-a", &third)
+	if !result.Added || result.Evicted != 1 || result.Dropped {
+		t.Fatalf("third store = %+v, want added with one eviction", result)
+	}
+
+	firstHash := consensus.HeaderHash(&first.Header)
+	secondHash := consensus.HeaderHash(&second.Header)
+	thirdHash := consensus.HeaderHash(&third.Header)
+	if svc.hasPendingPeerBlock(firstHash) {
+		t.Fatalf("oldest peer block %x should have been evicted", firstHash)
+	}
+	if !svc.hasPendingPeerBlock(secondHash) || !svc.hasPendingPeerBlock(thirdHash) {
+		t.Fatal("newer peer blocks should remain pending")
+	}
+	if got := svc.pendingPeerBlockCount(); got != 2 {
+		t.Fatalf("pending peer block count = %d, want 2", got)
+	}
+}
+
+func TestStorePendingPeerBlockEnforcesByteBudget(t *testing.T) {
+	first := pendingPeerBlockForTest(11, 4)
+	second := pendingPeerBlockForTest(12, 4)
+	third := pendingPeerBlockForTest(13, 4)
+	byteLimit := pendingPeerBlockEncodedSize(&first) + pendingPeerBlockEncodedSize(&second) + pendingPeerBlockEncodedSize(&third) - 1
+	withPendingPeerBlockLimitsForTest(t, byteLimit, 8)
+	svc := &Service{
+		pendingBlocks:       make(map[[32]byte]pendingPeerBlock),
+		pendingBlocksByPeer: make(map[string]int),
+		pendingChildren:     make(map[[32]byte]map[[32]byte]struct{}),
+	}
+
+	if result := svc.storePendingPeerBlock("peer-a", &first); !result.Added || result.Dropped {
+		t.Fatalf("first store = %+v, want added", result)
+	}
+	if result := svc.storePendingPeerBlock("peer-b", &second); !result.Added || result.Dropped {
+		t.Fatalf("second store = %+v, want added", result)
+	}
+	result := svc.storePendingPeerBlock("peer-c", &third)
+	if !result.Added || result.Evicted != 1 || result.Dropped {
+		t.Fatalf("third store = %+v, want added with one eviction", result)
+	}
+
+	firstHash := consensus.HeaderHash(&first.Header)
+	secondHash := consensus.HeaderHash(&second.Header)
+	thirdHash := consensus.HeaderHash(&third.Header)
+	if svc.hasPendingPeerBlock(firstHash) {
+		t.Fatalf("oldest block %x should have been evicted by byte budget", firstHash)
+	}
+	if !svc.hasPendingPeerBlock(secondHash) || !svc.hasPendingPeerBlock(thirdHash) {
+		t.Fatal("newer blocks should remain pending")
+	}
+	if got := svc.pendingPeerBlockBytes(); got > byteLimit {
+		t.Fatalf("pending peer block bytes = %d, want <= %d", got, byteLimit)
 	}
 }
 

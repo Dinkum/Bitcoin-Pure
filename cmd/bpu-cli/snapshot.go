@@ -118,11 +118,18 @@ func runSnapshotExport(args []string) error {
 		TipHeader:      stored.TipHeader,
 		TipHash:        consensus.HeaderHash(&stored.TipHeader),
 		BlockSizeState: stored.BlockSizeState,
-		UTXOs:          stored.UTXOs,
+		UTXOCount:      len(stored.UTXOs),
 		UTXORoot:       consensus.ComputedUTXORoot(stored.UTXOs),
 		UTXOChecksum:   stored.UTXOChecksum,
 	}
-	if err := node.ExportUTXOSnapshotFile(*outPath, view, stored.Profile, *genesisFixture, *chainFixture); err != nil {
+	if err := node.ExportUTXOSnapshotFile(*outPath, view, func(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+		for outPoint, entry := range stored.UTXOs {
+			if err := fn(outPoint, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, stored.Profile, *genesisFixture, *chainFixture); err != nil {
 		return err
 	}
 	fmt.Printf("db: %s\n", *dbPath)
@@ -132,7 +139,7 @@ func runSnapshotExport(args []string) error {
 	fmt.Printf("header_hash: %x\n", view.TipHash)
 	fmt.Printf("utxo_root: %x\n", view.UTXORoot)
 	fmt.Printf("utxo_checksum: %x\n", view.UTXOChecksum)
-	fmt.Printf("utxo_count: %d\n", len(view.UTXOs))
+	fmt.Printf("utxo_count: %d\n", view.UTXOCount)
 	return nil
 }
 

@@ -2,11 +2,13 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"testing"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utxochecksum"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -148,6 +150,126 @@ func TestWriteAndLoadChainStateRoundtrip(t *testing.T) {
 	}
 	if index == nil || index.Height != 0 {
 		t.Fatal("block index mismatch")
+	}
+}
+
+func TestLoadChainStateMetaSkipsUTXOScanButPreservesChecksum(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, utxos := sampleBlockAndUTXOs()
+	state := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}
+	if err := store.WriteFullState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := store.LoadChainStateMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta == nil {
+		t.Fatal("expected chain metadata")
+	}
+	if meta.Profile != state.Profile || meta.Height != state.Height || meta.TipHeader != state.TipHeader {
+		t.Fatalf("loaded metadata = %+v, want %+v", meta, state)
+	}
+	wantChecksum := utxochecksum.Compute(utxos)
+	if meta.UTXOChecksum != wantChecksum {
+		t.Fatalf("checksum = %x, want %x", meta.UTXOChecksum, wantChecksum)
+	}
+}
+
+func TestGetUTXOAndForEachUTXO(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, utxos := sampleBlockAndUTXOs()
+	state := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}
+	if err := store.WriteFullState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	var expectedOutPoint types.OutPoint
+	var expectedEntry consensus.UtxoEntry
+	for outPoint, entry := range utxos {
+		expectedOutPoint = outPoint
+		expectedEntry = entry
+		break
+	}
+
+	entry, ok, err := store.GetUTXO(expectedOutPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || entry != expectedEntry {
+		t.Fatalf("GetUTXO = (%+v, %t), want (%+v, true)", entry, ok, expectedEntry)
+	}
+
+	if _, ok, err := store.GetUTXO(types.OutPoint{TxID: [32]byte{9}, Vout: 99}); err != nil || ok {
+		t.Fatalf("missing GetUTXO = ok %t err %v, want ok false err nil", ok, err)
+	}
+
+	visited := make(consensus.UtxoSet)
+	if err := store.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		visited[outPoint] = entry
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(visited) != len(utxos) {
+		t.Fatalf("ForEachUTXO visited %d entries, want %d", len(visited), len(utxos))
+	}
+	if visited[expectedOutPoint] != expectedEntry {
+		t.Fatalf("ForEachUTXO entry = %+v, want %+v", visited[expectedOutPoint], expectedEntry)
+	}
+}
+
+func TestForEachUTXOStopsOnCallbackError(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	block, utxos := sampleBlockAndUTXOs()
+	state := &StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}
+	if err := store.WriteFullState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	stopErr := errors.New("stop scan")
+	err = store.ForEachUTXO(func(types.OutPoint, consensus.UtxoEntry) error {
+		return stopErr
+	})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("ForEachUTXO err = %v, want %v", err, stopErr)
 	}
 }
 
@@ -358,6 +480,7 @@ func TestWriteAndLoadKnownPeersRoundtrip(t *testing.T) {
 			LastSeen:     base,
 			LastSuccess:  base,
 			LastAttempt:  base.Add(-time.Minute),
+			BannedUntil:  base.Add(time.Hour),
 			FailureCount: 1,
 			Manual:       true,
 		},
@@ -384,7 +507,7 @@ func TestWriteAndLoadKnownPeersRoundtrip(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing loaded peer %q", addr)
 		}
-		if got.LastSeen != want.LastSeen || got.LastSuccess != want.LastSuccess || got.LastAttempt != want.LastAttempt || got.FailureCount != want.FailureCount || got.Manual != want.Manual {
+		if got.LastSeen != want.LastSeen || got.LastSuccess != want.LastSuccess || got.LastAttempt != want.LastAttempt || got.BannedUntil != want.BannedUntil || got.FailureCount != want.FailureCount || got.Manual != want.Manual {
 			t.Fatalf("loaded peer %q = %+v, want %+v", addr, got, want)
 		}
 	}

@@ -22,7 +22,7 @@ func TestLocalityOrderedUTXOsAndProofBatchPlanning(t *testing.T) {
 	if !ok {
 		t.Fatal("expected committed view")
 	}
-	first := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 3, view.TipHeader.Timestamp+1)
+	first := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 3, view.TipHeader.Timestamp+1)
 	if _, err := svc.chainState.ApplyBlock(&first); err != nil {
 		t.Fatalf("ApplyBlock(first): %v", err)
 	}
@@ -30,7 +30,7 @@ func TestLocalityOrderedUTXOsAndProofBatchPlanning(t *testing.T) {
 	if !ok {
 		t.Fatal("expected committed view after first block")
 	}
-	second := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 4, view.TipHeader.Timestamp+1)
+	second := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 4, view.TipHeader.Timestamp+1)
 	if _, err := svc.chainState.ApplyBlock(&second); err != nil {
 		t.Fatalf("ApplyBlock(second): %v", err)
 	}

@@ -148,7 +148,7 @@ func (s *Service) CompactFilterCheckpoint(interval uint64) (CompactFilterCheckpo
 	if interval == 0 {
 		interval = defaultFilterCheckpoint
 	}
-	view, ok := s.chainState.CommittedView()
+	view, ok := s.chainState.sharedCommittedView()
 	if !ok {
 		return CompactFilterCheckpointInfo{FilterType: compactfilter.Type(), Interval: interval}, nil
 	}

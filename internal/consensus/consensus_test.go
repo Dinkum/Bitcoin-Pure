@@ -40,7 +40,7 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: consensusTestPubKey(recipientSeed)}},
 		},
 	}
-	msg, err := Sighash(&tx, 0, []uint64{value})
+	msg, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: value, PubKey: consensusTestPubKey(spenderSeed)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,12 +49,12 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 	return tx
 }
 
-func specSighashForTest(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]byte, error) {
+func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry) ([32]byte, error) {
 	if inputIndex < 0 || inputIndex >= len(tx.Base.Inputs) {
 		return [32]byte{}, errors.New("input index out of range")
 	}
-	if len(inputAmounts) != len(tx.Base.Inputs) {
-		return [32]byte{}, errors.New("input amounts length mismatch")
+	if len(spentCoins) != len(tx.Base.Inputs) {
+		return [32]byte{}, errors.New("spent coins length mismatch")
 	}
 
 	prevouts := make([]byte, 0)
@@ -72,32 +72,13 @@ func specSighashForTest(tx *types.Transaction, inputIndex int, inputAmounts []ui
 	outputs := make([]byte, 0)
 	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
 	for _, output := range tx.Base.Outputs {
-		outputs = append(outputs,
-			byte(output.ValueAtoms),
-			byte(output.ValueAtoms>>8),
-			byte(output.ValueAtoms>>16),
-			byte(output.ValueAtoms>>24),
-			byte(output.ValueAtoms>>32),
-			byte(output.ValueAtoms>>40),
-			byte(output.ValueAtoms>>48),
-			byte(output.ValueAtoms>>56),
-		)
-		outputs = append(outputs, output.PubKey[:]...)
+		outputs = appendValuePubKeyEncoding(outputs, output.ValueAtoms, output.PubKey)
 	}
 
-	amounts := make([]byte, 0)
-	writeVarInt(&amounts, uint64(len(inputAmounts)))
-	for _, amount := range inputAmounts {
-		amounts = append(amounts,
-			byte(amount),
-			byte(amount>>8),
-			byte(amount>>16),
-			byte(amount>>24),
-			byte(amount>>32),
-			byte(amount>>40),
-			byte(amount>>48),
-			byte(amount>>56),
-		)
+	spentCoinPayload := make([]byte, 0)
+	writeVarInt(&spentCoinPayload, uint64(len(spentCoins)))
+	for _, coin := range spentCoins {
+		spentCoinPayload = appendValuePubKeyEncoding(spentCoinPayload, coin.ValueAtoms, coin.PubKey)
 	}
 
 	preimage := make([]byte, 0, 108)
@@ -120,10 +101,10 @@ func specSighashForTest(tx *types.Transaction, inputIndex int, inputAmounts []ui
 	)
 	prevoutsHash := crypto.Sha256d(prevouts)
 	outputsHash := crypto.Sha256d(outputs)
-	amountsHash := crypto.Sha256d(amounts)
+	spentCoinsHash := crypto.Sha256d(spentCoinPayload)
 	preimage = append(preimage, prevoutsHash[:]...)
 	preimage = append(preimage, outputsHash[:]...)
-	preimage = append(preimage, amountsHash[:]...)
+	preimage = append(preimage, spentCoinsHash[:]...)
 	return crypto.TaggedHash(SighashTag, preimage), nil
 }
 
@@ -339,6 +320,22 @@ func TestMedianTimePastUsesMedianOfLastElevenTimestamps(t *testing.T) {
 	}
 }
 
+func TestMedianTimePastHandlesLargerInputs(t *testing.T) {
+	timestamps := []uint64{15, 1, 8, 13, 3, 21, 5, 2, 34, 55, 89, 144, 233}
+	if got, want := MedianTimePast(timestamps), uint64(15); got != want {
+		t.Fatalf("median time past = %d, want %d", got, want)
+	}
+}
+
+func BenchmarkMedianTimePast11(b *testing.B) {
+	timestamps := []uint64{100, 70, 90, 110, 80, 60, 120, 50, 130, 40, 140}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = MedianTimePast(timestamps)
+	}
+}
+
 func TestValidateSignedSpend(t *testing.T) {
 	seed := [32]byte{7}
 	msgPub, _ := crypto.SignSchnorrForTest(seed, &[32]byte{})
@@ -360,7 +357,7 @@ func TestValidateSignedSpend(t *testing.T) {
 			}},
 		},
 	}
-	msg, err := Sighash(&tx, 0, []uint64{50})
+	msg, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: msgPub}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,20 +386,49 @@ func TestSighashMatchesSpecForMultiInputSpend(t *testing.T) {
 			},
 		},
 	}
-	inputAmounts := []uint64{50, 30}
+	spentCoins := []UtxoEntry{
+		{ValueAtoms: 50, PubKey: consensusTestPubKey(1)},
+		{ValueAtoms: 30, PubKey: consensusTestPubKey(2)},
+	}
 
 	for i := range tx.Base.Inputs {
-		got, err := Sighash(&tx, i, inputAmounts)
+		got, err := Sighash(&tx, i, spentCoins)
 		if err != nil {
 			t.Fatalf("sighash input %d: %v", i, err)
 		}
-		want, err := specSighashForTest(&tx, i, inputAmounts)
+		want, err := specSighashForTest(&tx, i, spentCoins)
 		if err != nil {
 			t.Fatalf("spec sighash input %d: %v", i, err)
 		}
 		if got != want {
 			t.Fatalf("sighash input %d = %x, want %x", i, got, want)
 		}
+	}
+}
+
+func TestSighashCommitsToSpentCoinPubKey(t *testing.T) {
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs: []types.TxInput{{
+				PrevOut: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+			}},
+			Outputs: []types.TxOutput{{
+				ValueAtoms: 49,
+				PubKey:     consensusTestPubKey(9),
+			}},
+		},
+	}
+	left, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(1)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(2)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left == right {
+		t.Fatal("expected sighash to change when spent coin pubkey changes")
 	}
 }
 
@@ -468,6 +494,38 @@ func TestComputedUTXORootMatchesAccumulatorRoot(t *testing.T) {
 	}
 	if got, want := ComputedUTXORoot(utxos), acc.Root(); got != want {
 		t.Fatalf("utxo root = %x, want %x", got, want)
+	}
+}
+
+func TestComputedUTXORootFromOverlayMatchesMaterializedSet(t *testing.T) {
+	base := UtxoSet{
+		types.OutPoint{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 10, PubKey: consensusTestPubKey(1)},
+		types.OutPoint{TxID: [32]byte{2}, Vout: 1}: {ValueAtoms: 20, PubKey: consensusTestPubKey(2)},
+		types.OutPoint{TxID: [32]byte{3}, Vout: 2}: {ValueAtoms: 30, PubKey: consensusTestPubKey(3)},
+	}
+	overlay := NewUtxoOverlay(base)
+	overlay.Spend(types.OutPoint{TxID: [32]byte{1}, Vout: 0})
+	overlay.Set(types.OutPoint{TxID: [32]byte{2}, Vout: 1}, UtxoEntry{ValueAtoms: 25, PubKey: consensusTestPubKey(4)})
+	overlay.Set(types.OutPoint{TxID: [32]byte{9}, Vout: 0}, UtxoEntry{ValueAtoms: 99, PubKey: consensusTestPubKey(5)})
+
+	got := computedUTXORootFromOverlay(overlay)
+	want := ComputedUTXORoot(overlay.Materialize())
+	if got != want {
+		t.Fatalf("overlay utxo root = %x, want %x", got, want)
+	}
+}
+
+func TestUtxoOverlayRecordsFirstLookupError(t *testing.T) {
+	lookupErr := errors.New("disk read failed")
+	overlay := NewUtxoOverlayWithLookup(func(types.OutPoint) (UtxoEntry, bool, error) {
+		return UtxoEntry{}, false, lookupErr
+	})
+
+	if _, ok := overlay.Lookup(types.OutPoint{TxID: [32]byte{7}, Vout: 1}); ok {
+		t.Fatal("unexpected lookup hit")
+	}
+	if err := overlay.Err(); !errors.Is(err, lookupErr) {
+		t.Fatalf("overlay.Err() = %v, want %v", err, lookupErr)
 	}
 }
 
@@ -1098,6 +1156,57 @@ func TestValidateHeaderAcceptsTimestampAboveMedianTimePast(t *testing.T) {
 		Height:         0,
 		Header:         prev,
 		MedianTimePast: 100,
+		CurrentTime:    101,
+	}, params); err != nil {
+		t.Fatalf("ValidateHeader: %v", err)
+	}
+}
+
+func TestValidateHeaderRejectsTimestampBeyondLocalSystemTimeWindow(t *testing.T) {
+	params := RegtestParams()
+	prev := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	currentTime := params.GenesisTimestamp + 100
+	header := types.BlockHeader{
+		Version:       1,
+		PrevBlockHash: HeaderHash(&prev),
+		Timestamp:     currentTime + MaxFutureBlockTimeSeconds + 1,
+		NBits:         params.GenesisBits,
+	}
+	err := ValidateHeader(&header, PrevBlockContext{
+		Height:         0,
+		Header:         prev,
+		MedianTimePast: params.GenesisTimestamp,
+		CurrentTime:    currentTime,
+	}, params)
+	if !errors.Is(err, ErrTimestampTooFarFuture) {
+		t.Fatalf("expected timestamp-too-far-future error, got %v", err)
+	}
+}
+
+func TestValidateHeaderAcceptsTimestampAtLocalSystemTimeWindowBoundary(t *testing.T) {
+	params := RegtestParams()
+	prev := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	currentTime := params.GenesisTimestamp + 100
+	header := types.BlockHeader{
+		Version:       1,
+		PrevBlockHash: HeaderHash(&prev),
+		Timestamp:     currentTime + MaxFutureBlockTimeSeconds,
+		NBits:         params.GenesisBits,
+	}
+	header = mineHeaderForTest(header)
+	if err := ValidateHeader(&header, PrevBlockContext{
+		Height:         0,
+		Header:         prev,
+		MedianTimePast: params.GenesisTimestamp,
+		CurrentTime:    currentTime,
 	}, params); err != nil {
 		t.Fatalf("ValidateHeader: %v", err)
 	}
@@ -1204,6 +1313,49 @@ func TestNextWorkRequiredASERTMatchesReferenceCases(t *testing.T) {
 				t.Fatalf("bits = 0x%08x, want 0x%08x", got, want)
 			}
 		})
+	}
+}
+
+func BenchmarkNextWorkRequiredASERT(b *testing.B) {
+	params := MainnetParams()
+	anchor := GenesisAsertAnchor(params)
+	prev := PrevBlockContext{
+		Height: 50_000,
+		Header: types.BlockHeader{
+			Timestamp: params.GenesisTimestamp + uint64(params.TargetSpacingSecs*50_000+17),
+			NBits:     params.GenesisBits,
+		},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := NextWorkRequiredASERT(anchor, prev, params); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMineHeaderInterruptible4096(b *testing.B) {
+	params := RegtestParams()
+	header := types.BlockHeader{
+		Version:        1,
+		PrevBlockHash:  [32]byte{1},
+		MerkleTxIDRoot: [32]byte{2},
+		MerkleAuthRoot: [32]byte{3},
+		UTXORoot:       [32]byte{4},
+		Timestamp:      params.GenesisTimestamp + uint64(params.TargetSpacingSecs),
+		NBits:          0x1b0404cb,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, ok, err := MineHeaderInterruptible(header, params, func(nonce uint64) bool { return nonce < 4096 })
+		if err != nil {
+			b.Fatal(err)
+		}
+		if ok {
+			b.Fatal("expected benchmark header to stop before finding pow")
+		}
 	}
 }
 

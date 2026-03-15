@@ -17,7 +17,23 @@ import (
 	"bitcoin-pure/internal/utreexo"
 )
 
-const SighashTag = "BPU/SigHashV1"
+const (
+	SighashTag                = "BPU/SigHashV1"
+	MaxFutureBlockTimeSeconds = 7200
+)
+
+var (
+	bigIntTwo            = big.NewInt(2)
+	bigIntThree          = big.NewInt(3)
+	bigIntOne            = big.NewInt(1)
+	bigIntABLADelta      = new(big.Int).SetUint64(ablaDelta)
+	bigIntABLAGammaTwice = new(big.Int).SetUint64(2 * ablaGammaDen)
+	asertCoeffLinear     = big.NewInt(195766423245049)
+	asertCoeffQuadratic  = big.NewInt(971821376)
+	asertCoeffCubic      = big.NewInt(5127)
+	asertPolyBias        = new(big.Int).Lsh(big.NewInt(1), 47)
+	asertScaleFactor     = big.NewInt(1 << 16)
+)
 
 type ChainParams struct {
 	Profile             types.ChainProfile
@@ -160,6 +176,34 @@ func UtxoLeaves(utxos UtxoSet) []utreexo.UtxoLeaf {
 	return leaves
 }
 
+func utxoLeavesFromOverlay(overlay *UtxoOverlay) []utreexo.UtxoLeaf {
+	if overlay == nil {
+		return nil
+	}
+	leaves := make([]utreexo.UtxoLeaf, 0, len(overlay.base)+len(overlay.created))
+	for outPoint, coin := range overlay.base {
+		if _, deleted := overlay.deleted[outPoint]; deleted {
+			continue
+		}
+		if _, replaced := overlay.created[outPoint]; replaced {
+			continue
+		}
+		leaves = append(leaves, utreexo.UtxoLeaf{
+			OutPoint:   outPoint,
+			ValueAtoms: coin.ValueAtoms,
+			PubKey:     coin.PubKey,
+		})
+	}
+	for outPoint, coin := range overlay.created {
+		leaves = append(leaves, utreexo.UtxoLeaf{
+			OutPoint:   outPoint,
+			ValueAtoms: coin.ValueAtoms,
+			PubKey:     coin.PubKey,
+		})
+	}
+	return leaves
+}
+
 func UtxoAccumulator(utxos UtxoSet) (*utreexo.Accumulator, error) {
 	return utreexo.NewAccumulatorFromLeaves(UtxoLeaves(utxos))
 }
@@ -185,6 +229,7 @@ type PrevBlockContext struct {
 	Height         uint64
 	Header         types.BlockHeader
 	MedianTimePast uint64
+	CurrentTime    uint64
 }
 
 type AsertAnchor struct {
@@ -206,6 +251,10 @@ type PreparedTxValidation struct {
 
 type UtxoLookup func(types.OutPoint) (UtxoEntry, bool)
 
+// UtxoLookupWithErr preserves backend lookup failures for consensus-critical
+// paths that must not silently treat disk I/O faults as "coin not found".
+type UtxoLookupWithErr func(types.OutPoint) (UtxoEntry, bool, error)
+
 // LookupFromSet adapts a concrete UTXO map to the generic lookup surface used
 // by validation and overlay-backed tentative state transitions.
 func LookupFromSet(utxos UtxoSet) UtxoLookup {
@@ -215,23 +264,61 @@ func LookupFromSet(utxos UtxoSet) UtxoLookup {
 	}
 }
 
+// LookupWithErrFromSet adapts an in-memory UTXO map to the error-aware lookup
+// interface used by disk-backed migration paths and tests.
+func LookupWithErrFromSet(utxos UtxoSet) UtxoLookupWithErr {
+	return func(out types.OutPoint) (UtxoEntry, bool, error) {
+		utxo, ok := utxos[out]
+		return utxo, ok, nil
+	}
+}
+
+// LookupWithErrFromLookup upgrades an error-free lookup to the error-aware
+// interface for callers that only need API compatibility.
+func LookupWithErrFromLookup(lookup UtxoLookup) UtxoLookupWithErr {
+	return func(out types.OutPoint) (UtxoEntry, bool, error) {
+		utxo, ok := lookup(out)
+		return utxo, ok, nil
+	}
+}
+
 // UtxoOverlay records only the spent/created delta on top of an immutable base
 // UTXO set. Hot paths can validate and tentatively apply state changes without
 // cloning the whole live set up front.
 type UtxoOverlay struct {
-	base    UtxoSet
-	lookup  UtxoLookup
-	created map[types.OutPoint]UtxoEntry
-	deleted map[types.OutPoint]struct{}
+	base       UtxoSet
+	baseLookup UtxoLookupWithErr
+	firstErr   error
+	created    map[types.OutPoint]UtxoEntry
+	deleted    map[types.OutPoint]struct{}
 }
 
 func NewUtxoOverlay(base UtxoSet) *UtxoOverlay {
 	return &UtxoOverlay{
-		base:    base,
-		lookup:  LookupFromSet(base),
-		created: make(map[types.OutPoint]UtxoEntry),
-		deleted: make(map[types.OutPoint]struct{}),
+		base:       base,
+		baseLookup: LookupWithErrFromSet(base),
+		created:    make(map[types.OutPoint]UtxoEntry),
+		deleted:    make(map[types.OutPoint]struct{}),
 	}
+}
+
+// NewUtxoOverlayWithBaseLookup preserves a materialized base set for callers
+// that still need Materialize while sourcing reads from an arbitrary backend.
+func NewUtxoOverlayWithBaseLookup(base UtxoSet, lookup UtxoLookupWithErr) *UtxoOverlay {
+	return &UtxoOverlay{
+		base:       base,
+		baseLookup: lookup,
+		created:    make(map[types.OutPoint]UtxoEntry),
+		deleted:    make(map[types.OutPoint]struct{}),
+	}
+}
+
+// NewUtxoOverlayWithLookup creates an overlay against an arbitrary lookup
+// backend. It is the additive constructor needed for the disk-backed UTXO
+// migration, while current callers that still need Materialize can continue to
+// use NewUtxoOverlay with a concrete map.
+func NewUtxoOverlayWithLookup(lookup UtxoLookupWithErr) *UtxoOverlay {
+	return NewUtxoOverlayWithBaseLookup(nil, lookup)
 }
 
 func (o *UtxoOverlay) Lookup(out types.OutPoint) (UtxoEntry, bool) {
@@ -244,7 +331,14 @@ func (o *UtxoOverlay) Lookup(out types.OutPoint) (UtxoEntry, bool) {
 	if _, ok := o.deleted[out]; ok {
 		return UtxoEntry{}, false
 	}
-	return o.lookup(out)
+	if o.baseLookup == nil {
+		return UtxoEntry{}, false
+	}
+	entry, ok, err := o.baseLookup(out)
+	if err != nil && o.firstErr == nil {
+		o.firstErr = err
+	}
+	return entry, ok
 }
 
 func (o *UtxoOverlay) Spend(out types.OutPoint) {
@@ -297,6 +391,14 @@ func (o *UtxoOverlay) Materialize() UtxoSet {
 	return out
 }
 
+// Err reports the first backend lookup failure observed through Lookup.
+func (o *UtxoOverlay) Err() error {
+	if o == nil {
+		return nil
+	}
+	return o.firstErr
+}
+
 func (o *UtxoOverlay) CreatedEntriesClone() map[types.OutPoint]UtxoEntry {
 	if o == nil || len(o.created) == 0 {
 		return nil
@@ -306,6 +408,27 @@ func (o *UtxoOverlay) CreatedEntriesClone() map[types.OutPoint]UtxoEntry {
 		out[outPoint] = entry
 	}
 	return out
+}
+
+// CreatedEntries exposes the created side of the overlay delta without copying.
+// Callers must treat the returned map as read-only.
+func (o *UtxoOverlay) CreatedEntries() map[types.OutPoint]UtxoEntry {
+	if o == nil || len(o.created) == 0 {
+		return nil
+	}
+	return o.created
+}
+
+// SpentOutPoints returns the deleted side of the overlay delta.
+func (o *UtxoOverlay) SpentOutPoints() []types.OutPoint {
+	if o == nil || len(o.deleted) == 0 {
+		return nil
+	}
+	spent := make([]types.OutPoint, 0, len(o.deleted))
+	for out := range o.deleted {
+		spent = append(spent, out)
+	}
+	return spent
 }
 
 type BlockValidationSummary struct {
@@ -319,7 +442,7 @@ type BlockValidationSummary struct {
 }
 
 const (
-	minParallelMerkleLeaves = 256
+	minParallelMerkleLeaves = 64
 	minParallelBlockHashes  = 128
 	minParallelSigChecks    = 256
 	minSigChecksPerWorker   = 128
@@ -351,6 +474,7 @@ var (
 	ErrInvalidPow            = errors.New("pow check failed")
 	ErrMiningNonceExhausted  = errors.New("mining header nonce space exhausted")
 	ErrTimestampTooEarly     = errors.New("block timestamp must be greater than median time past")
+	ErrTimestampTooFarFuture = errors.New("block timestamp must not exceed local system time plus 7200 seconds")
 	ErrBlockTooLarge         = errors.New("block too large")
 	ErrUTXORootMismatch      = errors.New("utxo root mismatch")
 )
@@ -368,6 +492,19 @@ func AuthID(tx *types.Transaction) [32]byte {
 func HeaderHash(header *types.BlockHeader) [32]byte {
 	encoded := header.Encode()
 	return crypto.Sha256d(encoded)
+}
+
+func encodeHeaderFixed(header types.BlockHeader) [types.BlockHeaderEncodedLen]byte {
+	var out [types.BlockHeaderEncodedLen]byte
+	binary.LittleEndian.PutUint32(out[0:4], header.Version)
+	copy(out[4:36], header.PrevBlockHash[:])
+	copy(out[36:68], header.MerkleTxIDRoot[:])
+	copy(out[68:100], header.MerkleAuthRoot[:])
+	copy(out[100:132], header.UTXORoot[:])
+	binary.LittleEndian.PutUint64(out[132:140], header.Timestamp)
+	binary.LittleEndian.PutUint32(out[140:144], header.NBits)
+	binary.LittleEndian.PutUint64(out[144:152], header.Nonce)
+	return out
 }
 
 func MerkleRoot(items [][32]byte) [32]byte {
@@ -578,22 +715,37 @@ func writeVarInt(out *[]byte, v uint64) {
 	}
 }
 
+func varIntLen(v uint64) int {
+	switch {
+	case v <= 0xfc:
+		return 1
+	case v <= 0xffff:
+		return 3
+	case v <= 0xffff_ffff:
+		return 5
+	default:
+		return 9
+	}
+}
+
 type sighashContext struct {
-	version      uint32
-	prevoutsHash [32]byte
-	outputsHash  [32]byte
-	amountsHash  [32]byte
+	version        uint32
+	prevoutsHash   [32]byte
+	outputsHash    [32]byte
+	spentCoinsHash [32]byte
 }
 
 // newSighashContext precomputes the tx-wide hashes shared by every input so
-// multi-input validation does not rebuild identical prevout/output/amount
+// multi-input validation does not rebuild identical prevout/output/spent-coin
 // commitments for each signature check.
-func newSighashContext(tx *types.Transaction, inputAmounts []uint64) (sighashContext, error) {
-	if len(inputAmounts) != len(tx.Base.Inputs) {
-		return sighashContext{}, fmt.Errorf("invalid sighash: input amounts length mismatch")
+func newSighashContext(tx *types.Transaction, spentCoins []UtxoEntry) (sighashContext, error) {
+	if len(spentCoins) != len(tx.Base.Inputs) {
+		return sighashContext{}, fmt.Errorf("invalid sighash: spent coins length mismatch")
 	}
 
-	prevouts := make([]byte, 0)
+	// These serializations are rebuilt for every transaction validation, so
+	// reserve the exact payload size up front and avoid repeated growth.
+	prevouts := make([]byte, 0, varIntLen(uint64(len(tx.Base.Inputs)))+len(tx.Base.Inputs)*36)
 	writeVarInt(&prevouts, uint64(len(tx.Base.Inputs)))
 	for _, input := range tx.Base.Inputs {
 		prevouts = append(prevouts, input.PrevOut.TxID[:]...)
@@ -605,42 +757,25 @@ func newSighashContext(tx *types.Transaction, inputAmounts []uint64) (sighashCon
 		)
 	}
 
-	outputs := make([]byte, 0)
+	outputs := make([]byte, 0, varIntLen(uint64(len(tx.Base.Outputs)))+len(tx.Base.Outputs)*40)
 	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
 	for _, output := range tx.Base.Outputs {
-		outputs = append(outputs,
-			byte(output.ValueAtoms),
-			byte(output.ValueAtoms>>8),
-			byte(output.ValueAtoms>>16),
-			byte(output.ValueAtoms>>24),
-			byte(output.ValueAtoms>>32),
-			byte(output.ValueAtoms>>40),
-			byte(output.ValueAtoms>>48),
-			byte(output.ValueAtoms>>56),
-		)
-		outputs = append(outputs, output.PubKey[:]...)
+		outputs = appendValuePubKeyEncoding(outputs, output.ValueAtoms, output.PubKey)
 	}
 
-	amounts := make([]byte, 0)
-	writeVarInt(&amounts, uint64(len(inputAmounts)))
-	for _, amount := range inputAmounts {
-		amounts = append(amounts,
-			byte(amount),
-			byte(amount>>8),
-			byte(amount>>16),
-			byte(amount>>24),
-			byte(amount>>32),
-			byte(amount>>40),
-			byte(amount>>48),
-			byte(amount>>56),
-		)
+	// Sighash commits to the full spent-coin encoding, not just amounts, so the
+	// authorization domain stays aligned with the canonical UTXO object layout.
+	spentCoinPayload := make([]byte, 0, varIntLen(uint64(len(spentCoins)))+len(spentCoins)*40)
+	writeVarInt(&spentCoinPayload, uint64(len(spentCoins)))
+	for _, coin := range spentCoins {
+		spentCoinPayload = appendValuePubKeyEncoding(spentCoinPayload, coin.ValueAtoms, coin.PubKey)
 	}
 
 	return sighashContext{
-		version:      tx.Base.Version,
-		prevoutsHash: crypto.Sha256d(prevouts),
-		outputsHash:  crypto.Sha256d(outputs),
-		amountsHash:  crypto.Sha256d(amounts),
+		version:        tx.Base.Version,
+		prevoutsHash:   crypto.Sha256d(prevouts),
+		outputsHash:    crypto.Sha256d(outputs),
+		spentCoinsHash: crypto.Sha256d(spentCoinPayload),
 	}, nil
 }
 
@@ -668,16 +803,30 @@ func (ctx sighashContext) hash(inputIndex int, inputCount int) ([32]byte, error)
 	)
 	preimage = append(preimage, ctx.prevoutsHash[:]...)
 	preimage = append(preimage, ctx.outputsHash[:]...)
-	preimage = append(preimage, ctx.amountsHash[:]...)
+	preimage = append(preimage, ctx.spentCoinsHash[:]...)
 	return crypto.TaggedHash(SighashTag, preimage), nil
 }
 
-func Sighash(tx *types.Transaction, inputIndex int, inputAmounts []uint64) ([32]byte, error) {
-	ctx, err := newSighashContext(tx, inputAmounts)
+func Sighash(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry) ([32]byte, error) {
+	ctx, err := newSighashContext(tx, spentCoins)
 	if err != nil {
 		return [32]byte{}, err
 	}
 	return ctx.hash(inputIndex, len(tx.Base.Inputs))
+}
+
+func appendValuePubKeyEncoding(dst []byte, valueAtoms uint64, pubKey [32]byte) []byte {
+	dst = append(dst,
+		byte(valueAtoms),
+		byte(valueAtoms>>8),
+		byte(valueAtoms>>16),
+		byte(valueAtoms>>24),
+		byte(valueAtoms>>32),
+		byte(valueAtoms>>40),
+		byte(valueAtoms>>48),
+		byte(valueAtoms>>56),
+	)
+	return append(dst, pubKey[:]...)
 }
 
 func ValidateTx(tx *types.Transaction, utxos UtxoSet, rules ConsensusRules) (TxValidationSummary, error) {
@@ -703,7 +852,6 @@ func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, _ C
 	}
 
 	seen := make(map[types.OutPoint]struct{}, len(tx.Base.Inputs))
-	inputAmounts := make([]uint64, 0, len(tx.Base.Inputs))
 	resolvedInputs := make([]UtxoEntry, 0, len(tx.Base.Inputs))
 	signatureChecks := make([]crypto.SchnorrBatchItem, 0, len(tx.Base.Inputs))
 	var inputSum uint64
@@ -723,7 +871,6 @@ func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, _ C
 			return PreparedTxValidation{}, ErrAmountOverflow
 		}
 		inputSum = next
-		inputAmounts = append(inputAmounts, utxo.ValueAtoms)
 		resolvedInputs = append(resolvedInputs, utxo)
 	}
 
@@ -741,7 +888,7 @@ func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, _ C
 		return PreparedTxValidation{}, ErrInputsLessThanOutputs
 	}
 
-	sighashCtx, err := newSighashContext(tx, inputAmounts)
+	sighashCtx, err := newSighashContext(tx, resolvedInputs)
 	if err != nil {
 		return PreparedTxValidation{}, err
 	}
@@ -790,6 +937,10 @@ func ComputedUTXORoot(utxos UtxoSet) [32]byte {
 	return utreexo.UtxoRoot(UtxoLeaves(utxos))
 }
 
+func computedUTXORootFromOverlay(overlay *UtxoOverlay) [32]byte {
+	return utreexo.UtxoRoot(utxoLeavesFromOverlay(overlay))
+}
+
 const (
 	ablaGammaDen   = uint64(37_938)
 	ablaThetaDen   = uint64(37_938)
@@ -809,32 +960,45 @@ func AdvanceBlockSizeState(prev BlockSizeState, blockSize uint64, params ChainPa
 }
 
 func ablaNextStep(prev BlockSizeState, params ChainParams) BlockSizeState {
-	e := max64(prev.Epsilon, params.BlockSizeFloor/2)
-	b := max64(prev.Beta, params.BlockSizeFloor/2)
+	e := max(prev.Epsilon, params.BlockSizeFloor/2)
+	b := max(prev.Beta, params.BlockSizeFloor/2)
 	y := e + b
-	x := min64(prev.BlockSize, y)
+	x := min(prev.BlockSize, y)
 
 	nextE := e
 	nextB := b
 	decay := b / ablaThetaDen
-	threeX := new(big.Int).Mul(new(big.Int).SetUint64(x), big.NewInt(3))
-	twoE := new(big.Int).Mul(new(big.Int).SetUint64(e), big.NewInt(2))
-	if threeX.Cmp(twoE) > 0 {
-		diff := new(big.Int).Sub(threeX, twoE)
-		dENum := new(big.Int).Mul(new(big.Int).SetUint64(e), diff)
-		denInner := new(big.Int).Add(
-			new(big.Int).SetUint64(e),
-			new(big.Int).Mul(new(big.Int).SetUint64(b), big.NewInt(3)),
-		)
-		dEDen := new(big.Int).Mul(denInner, big.NewInt(int64(2*ablaGammaDen)))
-		dE := bigIntToUint64(new(big.Int).Div(dENum, dEDen))
-		nextE = bigIntToUint64(new(big.Int).Add(new(big.Int).SetUint64(e), new(big.Int).SetUint64(dE)))
-		nextB = bigIntToUint64(new(big.Int).Add(
-			new(big.Int).SetUint64(b-decay),
-			new(big.Int).Mul(new(big.Int).SetUint64(dE), new(big.Int).SetUint64(ablaDelta)),
-		))
+
+	// Reuse local big.Int scratch values here instead of building a fresh tree of
+	// temporaries every block. The math remains identical, but the hot path stops
+	// manufacturing a pile of one-shot heap objects.
+	var xInt, eInt, bInt big.Int
+	var threeX, twoE, diff big.Int
+	var dENum, denInner, threeB, dEDen, dEInt big.Int
+	var nextEInt, nextBInt, baseBInt, deltaTerm big.Int
+
+	xInt.SetUint64(x)
+	eInt.SetUint64(e)
+	bInt.SetUint64(b)
+	threeX.Mul(&xInt, bigIntThree)
+	twoE.Mul(&eInt, bigIntTwo)
+
+	if threeX.Cmp(&twoE) > 0 {
+		diff.Sub(&threeX, &twoE)
+		dENum.Mul(&eInt, &diff)
+		threeB.Mul(&bInt, bigIntThree)
+		denInner.Add(&eInt, &threeB)
+		dEDen.Mul(&denInner, bigIntABLAGammaTwice)
+		dEInt.Div(&dENum, &dEDen)
+		nextEInt.Add(&eInt, &dEInt)
+		nextE = bigIntToUint64(&nextEInt)
+		baseBInt.SetUint64(b - decay)
+		deltaTerm.Mul(&dEInt, bigIntABLADelta)
+		nextBInt.Add(&baseBInt, &deltaTerm)
+		nextB = bigIntToUint64(&nextBInt)
 	} else {
-		shrinkNum := bigIntToUint64(new(big.Int).Sub(twoE, threeX))
+		diff.Sub(&twoE, &threeX)
+		shrinkNum := bigIntToUint64(&diff)
 		shrinkDen := 2 * ablaGammaDen
 		dE := ceilDivUint64(shrinkNum, shrinkDen)
 		nextE = saturatingSub(e, dE)
@@ -962,30 +1126,42 @@ func NextWorkRequiredASERT(anchor AsertAnchor, prev PrevBlockContext, params Cha
 	numShifts := exponent >> 16
 	frac := exponent - (numShifts << 16)
 
-	poly := new(big.Int).Mul(big.NewInt(195766423245049), big.NewInt(frac))
 	fracSquared := frac * frac
 	fracCubed := fracSquared * frac
-	poly.Add(poly, new(big.Int).Mul(big.NewInt(971821376), big.NewInt(fracSquared)))
-	poly.Add(poly, new(big.Int).Mul(big.NewInt(5127), big.NewInt(fracCubed)))
-	poly.Add(poly, new(big.Int).Lsh(big.NewInt(1), 47))
-	poly.Rsh(poly, 48)
-	poly.Add(poly, big.NewInt(1<<16))
 
-	nextTarget := new(big.Int).Mul(new(big.Int).Set(anchorTarget), poly)
+	// ASERT runs for every block/header validation, so reuse shared constants and
+	// local scratch big.Int values instead of constructing fresh temporaries on
+	// every polynomial term.
+	var fracInt, fracSquaredInt, fracCubedInt big.Int
+	var poly, term, nextTarget big.Int
+	fracInt.SetInt64(frac)
+	fracSquaredInt.SetInt64(fracSquared)
+	fracCubedInt.SetInt64(fracCubed)
+
+	poly.Mul(asertCoeffLinear, &fracInt)
+	term.Mul(asertCoeffQuadratic, &fracSquaredInt)
+	poly.Add(&poly, &term)
+	term.Mul(asertCoeffCubic, &fracCubedInt)
+	poly.Add(&poly, &term)
+	poly.Add(&poly, asertPolyBias)
+	poly.Rsh(&poly, 48)
+	poly.Add(&poly, asertScaleFactor)
+
+	nextTarget.Mul(anchorTarget, &poly)
 	if numShifts < 0 {
-		nextTarget.Rsh(nextTarget, uint(-numShifts))
+		nextTarget.Rsh(&nextTarget, uint(-numShifts))
 	} else if numShifts > 0 {
-		nextTarget.Lsh(nextTarget, uint(numShifts))
+		nextTarget.Lsh(&nextTarget, uint(numShifts))
 	}
-	nextTarget.Rsh(nextTarget, 16)
+	nextTarget.Rsh(&nextTarget, 16)
 
 	if nextTarget.Sign() <= 0 {
-		return targetToCompact(big.NewInt(1))
+		return targetToCompact(bigIntOne)
 	}
 	if nextTarget.Cmp(powLimit) > 0 {
 		return params.PowLimitBits, nil
 	}
-	return targetToCompact(nextTarget)
+	return targetToCompact(&nextTarget)
 }
 
 func NextWorkRequiredBitcoinLegacy(firstHeader *types.BlockHeader, prevHeader *types.BlockHeader, params ChainParams) (uint32, error) {
@@ -1031,12 +1207,21 @@ func checkPow(header *types.BlockHeader, params ChainParams) error {
 	if target.Cmp(powLimit) > 0 {
 		return ErrInvalidPow
 	}
+	targetBytes := targetToHashBytes(target)
 	hash := HeaderHash(header)
-	value := new(big.Int).SetBytes(hash[:])
-	if value.Cmp(target) > 0 {
+	if bytes.Compare(hash[:], targetBytes[:]) > 0 {
 		return ErrInvalidPow
 	}
 	return nil
+}
+
+func targetToHashBytes(target *big.Int) [32]byte {
+	var out [32]byte
+	if target == nil || target.Sign() <= 0 {
+		return out
+	}
+	target.FillBytes(out[:])
+	return out
 }
 
 func BlockWork(nBits uint32) ([32]byte, error) {
@@ -1131,6 +1316,22 @@ func MedianTimePast(timestamps []uint64) uint64 {
 	if len(timestamps) == 0 {
 		return 0
 	}
+	if len(timestamps) <= 11 {
+		// MTP uses the last 11 header timestamps, so keep the hot path entirely on
+		// the stack and use insertion sort for the tiny fixed window.
+		var sorted [11]uint64
+		n := copy(sorted[:], timestamps)
+		for i := 1; i < n; i++ {
+			value := sorted[i]
+			j := i - 1
+			for ; j >= 0 && sorted[j] > value; j-- {
+				sorted[j+1] = sorted[j]
+			}
+			sorted[j+1] = value
+		}
+		return sorted[n/2]
+	}
+
 	sorted := append([]uint64(nil), timestamps...)
 	slices.Sort(sorted)
 	return sorted[len(sorted)/2]
@@ -1146,6 +1347,9 @@ func validateHeaderWithRules(header *types.BlockHeader, prev PrevBlockContext, p
 	}
 	if header.Timestamp <= medianTimePast {
 		return ErrTimestampTooEarly
+	}
+	if prev.CurrentTime != 0 && header.Timestamp > prev.CurrentTime+MaxFutureBlockTimeSeconds {
+		return ErrTimestampTooFarFuture
 	}
 	expectedNBits, err := NextWorkRequired(prev, params)
 	if err != nil {
@@ -1196,13 +1400,16 @@ func MineHeaderInterruptible(header types.BlockHeader, params ChainParams, shoul
 	if target.Cmp(powLimit) > 0 {
 		return types.BlockHeader{}, false, ErrInvalidPow
 	}
+	targetBytes := targetToHashBytes(target)
+	encoded := encodeHeaderFixed(header)
 	for nonce := header.Nonce; ; nonce++ {
 		if shouldContinue != nil && nonce&0x0fff == 0 && !shouldContinue(nonce) {
 			return types.BlockHeader{}, false, nil
 		}
-		header.Nonce = nonce
-		hash := HeaderHash(&header)
-		if new(big.Int).SetBytes(hash[:]).Cmp(target) <= 0 {
+		binary.LittleEndian.PutUint64(encoded[144:152], nonce)
+		hash := crypto.Sha256d(encoded[:])
+		if bytes.Compare(hash[:], targetBytes[:]) <= 0 {
+			header.Nonce = nonce
 			return header, true, nil
 		}
 		if nonce == math.MaxUint64 {
@@ -1300,6 +1507,13 @@ func ValidateAndApplyBlockOverlayWithAccumulator(block *types.Block, prev PrevBl
 	return validateAndApplyBlockOverlay(block, prev, blockSizeState, utxos, accumulator, params, rules)
 }
 
+// ValidateAndApplyBlockOverlayWithLookup validates against an explicit lookup
+// backend while optionally keeping a materialized base set for callers that
+// still need to materialize the full post-block view during the transition.
+func ValidateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, base UtxoSet, lookup UtxoLookupWithErr, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
+	return validateAndApplyBlockOverlayWithLookup(block, prev, blockSizeState, base, lookup, accumulator, params, rules)
+}
+
 func ValidateAndApplyBlockViewWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, UtxoSet, *utreexo.Accumulator, error) {
 	summary, overlay, nextAcc, err := validateAndApplyBlockOverlay(block, prev, blockSizeState, utxos, accumulator, params, rules)
 	if err != nil {
@@ -1309,10 +1523,15 @@ func ValidateAndApplyBlockViewWithAccumulator(block *types.Block, prev PrevBlock
 }
 
 func validateAndApplyBlockOverlay(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
+	return validateAndApplyBlockOverlayWithLookup(block, prev, blockSizeState, utxos, LookupWithErrFromSet(utxos), accumulator, params, rules)
+}
+
+func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, base UtxoSet, lookup UtxoLookupWithErr, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
 	if len(block.Txs) == 0 {
 		return BlockValidationSummary{}, nil, nil, ErrEmptyBlock
 	}
-	if len(block.Encode()) > int(NextBlockSizeLimit(blockSizeState, params)) {
+	blockSize := uint64(len(block.Encode()))
+	if blockSize > uint64(NextBlockSizeLimit(blockSizeState, params)) {
 		return BlockValidationSummary{}, nil, nil, ErrBlockTooLarge
 	}
 
@@ -1350,7 +1569,7 @@ func validateAndApplyBlockOverlay(block *types.Block, prev PrevBlockContext, blo
 		}
 	}
 
-	tempUtxos := NewUtxoOverlay(utxos)
+	tempUtxos := NewUtxoOverlayWithBaseLookup(base, lookup)
 	claimedInputs := make(map[types.OutPoint]struct{})
 	signatureChecks := make([]crypto.SchnorrBatchItem, 0)
 	var totalFees uint64
@@ -1418,14 +1637,16 @@ func validateAndApplyBlockOverlay(block *types.Block, prev PrevBlockContext, blo
 				return BlockValidationSummary{}, nil, nil, ErrUTXORootMismatch
 			}
 		} else {
-			finalUtxos := tempUtxos.Materialize()
-			if ComputedUTXORoot(finalUtxos) != root {
+			if computedUTXORootFromOverlay(tempUtxos) != root {
 				return BlockValidationSummary{}, nil, nil, ErrUTXORootMismatch
 			}
 		}
 	}
+	if err := tempUtxos.Err(); err != nil {
+		return BlockValidationSummary{}, nil, nil, fmt.Errorf("utxo lookup failed during block validation: %w", err)
+	}
 
-	nextState := AdvanceBlockSizeState(blockSizeState, uint64(len(block.Encode())), params)
+	nextState := AdvanceBlockSizeState(blockSizeState, blockSize, params)
 	return BlockValidationSummary{
 		Height:                 prev.Height + 1,
 		TotalFees:              totalFees,
@@ -1457,7 +1678,7 @@ func verifyBlockSignatureChecks(items []crypto.SchnorrBatchItem) crypto.SchnorrB
 	chunkSize := (len(items) + workers - 1) / workers
 	results := make(chan crypto.SchnorrBatchResult, workers)
 	for start := 0; start < len(items); start += chunkSize {
-		end := minInt(start+chunkSize, len(items))
+		end := min(start+chunkSize, len(items))
 		chunk := items[start:end]
 		go func() {
 			results <- crypto.VerifySchnorrBatchXOnlyResult(chunk)
@@ -1490,27 +1711,6 @@ func DecodeTxHex(raw string, limits types.CodecLimits) (types.Transaction, error
 
 func DecodeBlockHex(raw string, limits types.CodecLimits) (types.Block, error) {
 	return types.DecodeBlockHex(raw, limits)
-}
-
-func min64(a, b uint64) uint64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max64(a, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func saturatingSub(a, b uint64) uint64 {

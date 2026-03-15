@@ -332,6 +332,9 @@ func (m *syncManager) scheduleBlockRequests(peerAddr string, hashes [][32]byte, 
 		if len(selected) >= limit {
 			break
 		}
+		if _, rejected := m.svc.rejectedBlocks[hash]; rejected {
+			continue
+		}
 		req, ok := m.svc.blockRequests[hash]
 		if ok && now.Sub(req.requestedAt) < timeout && req.peerAddr != "" && req.peerAddr != peerAddr {
 			continue

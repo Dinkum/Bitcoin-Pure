@@ -20,10 +20,17 @@ func TestExportUTXOSnapshotFileRoundTrip(t *testing.T) {
 		TipHash:      loaded.ExpectedHeaderHash,
 		UTXORoot:     loaded.ExpectedUTXORoot,
 		UTXOChecksum: loaded.ExpectedChecksum,
-		UTXOs:        cloneUtxos(loaded.UTXOs),
+		UTXOCount:    len(loaded.UTXOs),
 		TipHeader:    types.BlockHeader{UTXORoot: loaded.ExpectedUTXORoot},
 	}
-	if err := ExportUTXOSnapshotFile(path, view, types.Regtest, "fixtures/genesis/regtest.json", "fixtures/chains/regtest_bootstrap.json"); err != nil {
+	if err := ExportUTXOSnapshotFile(path, view, func(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+		for outPoint, entry := range loaded.UTXOs {
+			if err := fn(outPoint, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, types.Regtest, "fixtures/genesis/regtest.json", "fixtures/chains/regtest_bootstrap.json"); err != nil {
 		t.Fatalf("ExportUTXOSnapshotFile: %v", err)
 	}
 	exported, err := LoadUTXOSnapshotFixture(path)

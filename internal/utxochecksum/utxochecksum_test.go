@@ -40,3 +40,30 @@ func TestApplyDeltaMatchesFullRecompute(t *testing.T) {
 		t.Fatalf("delta checksum mismatch: got %x want %x", got, want)
 	}
 }
+
+type fakeUTXOStore struct {
+	utxos consensus.UtxoSet
+}
+
+func (f fakeUTXOStore) ForEachUTXO(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+	for outPoint, entry := range f.utxos {
+		if err := fn(outPoint, entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestComputeFromStoreMatchesCompute(t *testing.T) {
+	utxos := consensus.UtxoSet{
+		types.OutPoint{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 10, PubKey: [32]byte{2}},
+		types.OutPoint{TxID: [32]byte{3}, Vout: 1}: {ValueAtoms: 20, PubKey: [32]byte{4}},
+	}
+	got, err := ComputeFromStore(fakeUTXOStore{utxos: utxos})
+	if err != nil {
+		t.Fatalf("ComputeFromStore: %v", err)
+	}
+	if want := Compute(utxos); got != want {
+		t.Fatalf("store checksum mismatch: got %x want %x", got, want)
+	}
+}

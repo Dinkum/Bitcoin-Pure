@@ -71,7 +71,7 @@ func TestGetFilterHeadersRPCChainsCompactFilters(t *testing.T) {
 	if !ok {
 		t.Fatal("expected committed view")
 	}
-	first := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 3, view.TipHeader.Timestamp+600)
+	first := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 3, view.TipHeader.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(first); err != nil {
 		t.Fatalf("acceptMinedBlock(first): %v", err)
 	}
@@ -79,7 +79,7 @@ func TestGetFilterHeadersRPCChainsCompactFilters(t *testing.T) {
 	if !ok {
 		t.Fatal("expected committed view after first block")
 	}
-	second := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 4, view.TipHeader.Timestamp+600)
+	second := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 4, view.TipHeader.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(second); err != nil {
 		t.Fatalf("acceptMinedBlock(second): %v", err)
 	}
@@ -131,12 +131,12 @@ func TestGetFilterCheckpointRPC(t *testing.T) {
 	defer svc.Close()
 
 	view, _ := svc.chainState.CommittedView()
-	first := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 3, view.TipHeader.Timestamp+600)
+	first := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 3, view.TipHeader.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(first); err != nil {
 		t.Fatalf("acceptMinedBlock(first): %v", err)
 	}
 	view, _ = svc.chainState.CommittedView()
-	second := nextCoinbaseBlock(view.Height, view.TipHeader, view.UTXOs, 4, view.TipHeader.Timestamp+600)
+	second := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 4, view.TipHeader.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(second); err != nil {
 		t.Fatalf("acceptMinedBlock(second): %v", err)
 	}

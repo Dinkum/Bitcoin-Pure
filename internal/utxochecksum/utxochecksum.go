@@ -29,6 +29,21 @@ func Compute(utxos consensus.UtxoSet) [32]byte {
 	return acc.digest()
 }
 
+// ComputeFromStore computes the order-independent checksum by scanning a
+// store-backed UTXO source without materializing the full set in the caller.
+func ComputeFromStore(store interface {
+	ForEachUTXO(func(types.OutPoint, consensus.UtxoEntry) error) error
+}) ([32]byte, error) {
+	acc := newAccumulator()
+	if err := store.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		acc.add(outPoint, entry)
+		return nil
+	}); err != nil {
+		return [32]byte{}, err
+	}
+	return acc.digest(), nil
+}
+
 // ApplyDelta incrementally updates a checksum by removing spent entries and
 // adding created entries. Callers should only remove entries that existed in
 // the pre-update committed set.

@@ -17,6 +17,7 @@ import (
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/utxochecksum"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 )
 
 var (
@@ -70,6 +71,17 @@ type StoredChainState struct {
 	UTXOs          consensus.UtxoSet
 }
 
+// StoredChainStateMeta holds the chain tip metadata without materializing the
+// full UTXO set. This is the additive building block for the disk-backed UTXO
+// migration path.
+type StoredChainStateMeta struct {
+	Profile        types.ChainProfile
+	Height         uint64
+	TipHeader      types.BlockHeader
+	BlockSizeState consensus.BlockSizeState
+	UTXOChecksum   [32]byte
+}
+
 // FastSyncState persists the trust boundary for an imported snapshot until a
 // background replay from genesis reconstructs the same state locally.
 type FastSyncState struct {
@@ -91,6 +103,7 @@ type KnownPeerRecord struct {
 	LastSeen     time.Time
 	LastSuccess  time.Time
 	LastAttempt  time.Time
+	BannedUntil  time.Time
 	FailureCount uint32
 	Manual       bool
 }
@@ -156,18 +169,40 @@ type noopLogger struct{}
 func (noopLogger) Infof(string, ...interface{})  {}
 func (noopLogger) Fatalf(string, ...interface{}) {}
 
+// OpenOptions holds optional Pebble tuning for point-read-heavy workloads.
+// Zero values preserve Pebble defaults so existing callers keep their current
+// behavior unless they opt in.
+type OpenOptions struct {
+	PebbleCacheBytes      int64
+	BloomFilterBitsPerKey int
+}
+
 func Open(path string) (*ChainStore, error) {
 	return OpenWithLogger(path, logging.Component("storage"))
 }
 
 func OpenWithLogger(path string, logger *slog.Logger) (*ChainStore, error) {
+	return OpenWithLoggerAndOptions(path, logger, OpenOptions{})
+}
+
+func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions) (*ChainStore, error) {
 	if logger == nil {
 		logger = logging.Component("storage")
 	}
 	logger.Info("opening pebble chain store", slog.String("path", path))
-	db, err := pebble.Open(filepath.Clean(path), &pebble.Options{
-		Logger: noopLogger{},
-	})
+	pebbleOpts := &pebble.Options{Logger: noopLogger{}}
+	if opts.PebbleCacheBytes > 0 {
+		cache := pebble.NewCache(opts.PebbleCacheBytes)
+		defer cache.Unref()
+		pebbleOpts.Cache = cache
+	}
+	if opts.BloomFilterBitsPerKey > 0 {
+		pebbleOpts.Levels = []pebble.LevelOptions{{
+			FilterPolicy: bloom.FilterPolicy(opts.BloomFilterBitsPerKey),
+			FilterType:   pebble.TableFilter,
+		}}
+	}
+	db, err := pebble.Open(filepath.Clean(path), pebbleOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -199,94 +234,167 @@ func (s *ChainStore) Close() error {
 }
 
 func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
-	profileBytes, err := s.get(metaProfileKey)
+	meta, hasChecksum, err := s.loadChainStateMeta()
 	if err != nil {
 		return nil, err
 	}
-	if profileBytes == nil {
+	if meta == nil {
 		return nil, nil
+	}
+	utxos := make(consensus.UtxoSet)
+	if err := s.ForEachUTXO(func(outpoint types.OutPoint, entry consensus.UtxoEntry) error {
+		utxos[outpoint] = entry
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	checksum := meta.UTXOChecksum
+	if !hasChecksum {
+		checksum = utxochecksum.Compute(utxos)
+	}
+	return &StoredChainState{
+		Profile:        meta.Profile,
+		Height:         meta.Height,
+		TipHeader:      meta.TipHeader,
+		BlockSizeState: meta.BlockSizeState,
+		UTXOChecksum:   checksum,
+		UTXOs:          utxos,
+	}, nil
+}
+
+// LoadChainStateMeta loads only the persisted canonical chain metadata. It
+// intentionally avoids scanning the UTXO keyspace so callers can opt into a
+// disk-backed view without paying the startup RAM cost up front.
+func (s *ChainStore) LoadChainStateMeta() (*StoredChainStateMeta, error) {
+	meta, _, err := s.loadChainStateMeta()
+	return meta, err
+}
+
+func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
+	profileBytes, err := s.get(metaProfileKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if profileBytes == nil {
+		return nil, false, nil
 	}
 	heightBytes, err := s.get(metaTipHeightKey)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	headerBytes, err := s.get(metaTipHeaderKey)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	blockSizeBytes, err := s.get(metaBlockSizeStateKey)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	checksumBytes, err := s.get(metaUTXOChecksumKey)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if heightBytes == nil && headerBytes == nil && blockSizeBytes == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if heightBytes == nil || headerBytes == nil || blockSizeBytes == nil {
-		return nil, errors.New("invalid data: missing chain metadata")
+		return nil, false, errors.New("invalid data: missing chain metadata")
 	}
 
 	profile, err := types.ParseChainProfile(string(profileBytes))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	height, err := decodeU64(heightBytes)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	header, err := types.DecodeBlockHeader(headerBytes)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	blockSizeState, err := decodeBlockSizeState(blockSizeBytes)
 	if err != nil {
-		return nil, err
-	}
-
-	utxos := make(consensus.UtxoSet)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: utxoPrefix,
-		UpperBound: utxoPrefixEnd,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		outpoint, err := decodeOutPoint(iter.Key()[len(utxoPrefix):])
-		if err != nil {
-			return nil, err
-		}
-		entry, err := decodeUTXOEntry(iter.Value())
-		if err != nil {
-			return nil, err
-		}
-		utxos[outpoint] = entry
-	}
-	if err := iter.Error(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var checksum [32]byte
 	switch {
 	case checksumBytes == nil:
-		checksum = utxochecksum.Compute(utxos)
+		// Older stores may predate persisted checksum metadata. Callers that also
+		// need the UTXO set can recompute it after scanning.
 	case len(checksumBytes) != len(checksum):
-		return nil, errors.New("invalid data: bad utxo checksum metadata")
+		return nil, false, errors.New("invalid data: bad utxo checksum metadata")
 	default:
 		copy(checksum[:], checksumBytes)
 	}
-
-	return &StoredChainState{
+	return &StoredChainStateMeta{
 		Profile:        profile,
 		Height:         height,
 		TipHeader:      header,
 		BlockSizeState: blockSizeState,
 		UTXOChecksum:   checksum,
-		UTXOs:          utxos,
-	}, nil
+	}, checksumBytes != nil, nil
+}
+
+// GetUTXO performs a single-key Pebble lookup for a committed UTXO entry.
+// A returned nil error cleanly distinguishes "not found" from I/O failure.
+func (s *ChainStore) GetUTXO(outPoint types.OutPoint) (consensus.UtxoEntry, bool, error) {
+	val, closer, err := s.db.Get(utxoKey(outPoint))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return consensus.UtxoEntry{}, false, nil
+	}
+	if err != nil {
+		return consensus.UtxoEntry{}, false, err
+	}
+	defer closer.Close()
+	entry, err := decodeUTXOEntry(val)
+	if err != nil {
+		return consensus.UtxoEntry{}, false, err
+	}
+	return entry, true, nil
+}
+
+// UTXOLookupWithErr exposes a consensus lookup that preserves I/O failures for
+// correctness-critical callers.
+func (s *ChainStore) UTXOLookupWithErr() consensus.UtxoLookupWithErr {
+	return func(out types.OutPoint) (consensus.UtxoEntry, bool, error) {
+		return s.GetUTXO(out)
+	}
+}
+
+// UTXOLookupFunc exposes a read-only lookup that treats disk faults like
+// misses. This is suitable for non-consensus read paths only.
+func (s *ChainStore) UTXOLookupFunc() consensus.UtxoLookup {
+	return func(out types.OutPoint) (consensus.UtxoEntry, bool) {
+		entry, ok, _ := s.GetUTXO(out)
+		return entry, ok
+	}
+}
+
+// ForEachUTXO scans the committed UTXO keyspace in key order.
+func (s *ChainStore) ForEachUTXO(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: utxoPrefix,
+		UpperBound: utxoPrefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		outpoint, err := decodeOutPoint(iter.Key()[len(utxoPrefix):])
+		if err != nil {
+			return err
+		}
+		entry, err := decodeUTXOEntry(iter.Value())
+		if err != nil {
+			return err
+		}
+		if err := fn(outpoint, entry); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }
 
 func (s *ChainStore) LoadFastSyncState() (*FastSyncState, error) {
@@ -681,6 +789,62 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 		slog.Int("deleted_utxos", deleted),
 		slog.Int("written_utxos", written),
 		slog.Int("final_utxo_count", len(next.UTXOs)),
+	)
+	return nil
+}
+
+// CommitReorgDelta atomically persists the post-reorg canonical metadata, UTXO
+// delta, locality updates, and active-height journal rewrite. The validated
+// branch blocks themselves are expected to have been stored already.
+func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []BlockIndexEntry) error {
+	if meta == nil {
+		return errors.New("reorg chain metadata is required")
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := writeMetaFromMeta(batch, meta); err != nil {
+		return err
+	}
+	for _, outPoint := range spent {
+		if err := batch.Delete(utxoKey(outPoint), nil); err != nil {
+			return err
+		}
+	}
+	for outPoint, entry := range created {
+		if err := batch.Set(utxoKey(outPoint), encodeUTXOEntry(entry), nil); err != nil {
+			return err
+		}
+	}
+	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
+		return err
+	}
+	pairs := journalPairsFromEntries(activeEntries)
+	if err := s.appendJournalEntriesBatch(batch,
+		chainJournalEntry{
+			Kind:         journalRewriteBlockHeights,
+			ForkHeight:   forkHeight,
+			OldTipHeight: oldTipHeight,
+			Pairs:        pairs,
+		},
+		chainJournalEntry{
+			Kind:         journalRewriteHeaderHeights,
+			ForkHeight:   forkHeight,
+			OldTipHeight: oldTipHeight,
+			Pairs:        pairs,
+		},
+	); err != nil {
+		return err
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		return err
+	}
+	s.notifyDerivedReplay()
+	s.logger.Info("committed reorg delta",
+		slog.Uint64("height", meta.Height),
+		slog.Int("spent_utxos", len(spent)),
+		slog.Int("created_utxos", len(created)),
+		slog.Int("active_entries", len(activeEntries)),
 	)
 	return nil
 }
@@ -1441,6 +1605,20 @@ func sortOutPointsCanonical(outPoints []types.OutPoint) {
 }
 
 func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
+	checksum := state.UTXOChecksum
+	if checksum == ([32]byte{}) {
+		checksum = utxochecksum.Compute(state.UTXOs)
+	}
+	return writeMetaFromMeta(batch, &StoredChainStateMeta{
+		Profile:        state.Profile,
+		Height:         state.Height,
+		TipHeader:      state.TipHeader,
+		BlockSizeState: state.BlockSizeState,
+		UTXOChecksum:   checksum,
+	})
+}
+
+func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
 	if err := writeHeaderMeta(batch, &StoredHeaderState{
 		Profile:   state.Profile,
 		Height:    state.Height,
@@ -1457,11 +1635,7 @@ func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
 	if err := batch.Set(metaBlockSizeStateKey, encodeBlockSizeState(state.BlockSizeState), nil); err != nil {
 		return err
 	}
-	checksum := state.UTXOChecksum
-	if checksum == ([32]byte{}) {
-		checksum = utxochecksum.Compute(state.UTXOs)
-	}
-	return batch.Set(metaUTXOChecksumKey, checksum[:], nil)
+	return batch.Set(metaUTXOChecksumKey, state.UTXOChecksum[:], nil)
 }
 
 func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry, active bool) error {
@@ -1470,6 +1644,15 @@ func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntr
 		return err
 	}
 	return putHeaderBatch(batch, entry, active)
+}
+
+func journalPairsFromEntries(entries []BlockIndexEntry) []chainJournalHeightHash {
+	pairs := make([]chainJournalHeightHash, 0, len(entries))
+	for _, entry := range entries {
+		hash := consensus.HeaderHash(&entry.Header)
+		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: hash})
+	}
+	return pairs
 }
 
 func writeHeaderMeta(batch *pebble.Batch, state *StoredHeaderState) error {
@@ -1890,13 +2073,14 @@ func decodeLegacyBlockSizeState(buf []byte) (consensus.BlockSizeState, error) {
 }
 
 func encodeKnownPeerRecord(record KnownPeerRecord) []byte {
-	buf := make([]byte, 29)
-	binary.LittleEndian.PutUint64(buf[:8], uint64(record.LastSeen.UTC().UnixNano()))
-	binary.LittleEndian.PutUint64(buf[8:16], uint64(record.LastSuccess.UTC().UnixNano()))
-	binary.LittleEndian.PutUint64(buf[16:24], uint64(record.LastAttempt.UTC().UnixNano()))
-	binary.LittleEndian.PutUint32(buf[24:28], record.FailureCount)
+	buf := make([]byte, 37)
+	binary.LittleEndian.PutUint64(buf[:8], encodeKnownPeerTime(record.LastSeen))
+	binary.LittleEndian.PutUint64(buf[8:16], encodeKnownPeerTime(record.LastSuccess))
+	binary.LittleEndian.PutUint64(buf[16:24], encodeKnownPeerTime(record.LastAttempt))
+	binary.LittleEndian.PutUint64(buf[24:32], encodeKnownPeerTime(record.BannedUntil))
+	binary.LittleEndian.PutUint32(buf[32:36], record.FailureCount)
 	if record.Manual {
-		buf[28] = 1
+		buf[36] = 1
 	}
 	return buf
 }
@@ -1914,14 +2098,35 @@ func decodeKnownPeerRecord(buf []byte) (KnownPeerRecord, error) {
 			LastSuccess: lastSeen,
 		}, nil
 	}
-	if len(buf) != 29 {
+	if len(buf) != 29 && len(buf) != 37 {
 		return KnownPeerRecord{}, fmt.Errorf("invalid known peer encoding length: %d", len(buf))
 	}
-	return KnownPeerRecord{
-		LastSeen:     time.Unix(0, int64(binary.LittleEndian.Uint64(buf[:8]))).UTC(),
-		LastSuccess:  time.Unix(0, int64(binary.LittleEndian.Uint64(buf[8:16]))).UTC(),
-		LastAttempt:  time.Unix(0, int64(binary.LittleEndian.Uint64(buf[16:24]))).UTC(),
-		FailureCount: binary.LittleEndian.Uint32(buf[24:28]),
-		Manual:       buf[28] == 1,
-	}, nil
+	record := KnownPeerRecord{
+		LastSeen:    decodeKnownPeerTime(binary.LittleEndian.Uint64(buf[:8])),
+		LastSuccess: decodeKnownPeerTime(binary.LittleEndian.Uint64(buf[8:16])),
+		LastAttempt: decodeKnownPeerTime(binary.LittleEndian.Uint64(buf[16:24])),
+	}
+	if len(buf) == 29 {
+		record.FailureCount = binary.LittleEndian.Uint32(buf[24:28])
+		record.Manual = buf[28] == 1
+		return record, nil
+	}
+	record.BannedUntil = decodeKnownPeerTime(binary.LittleEndian.Uint64(buf[24:32]))
+	record.FailureCount = binary.LittleEndian.Uint32(buf[32:36])
+	record.Manual = buf[36] == 1
+	return record, nil
+}
+
+func encodeKnownPeerTime(value time.Time) uint64 {
+	if value.IsZero() {
+		return 0
+	}
+	return uint64(value.UTC().UnixNano())
+}
+
+func decodeKnownPeerTime(raw uint64) time.Time {
+	if raw == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, int64(raw)).UTC()
 }
