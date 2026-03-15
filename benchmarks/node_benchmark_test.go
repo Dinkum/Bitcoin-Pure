@@ -359,15 +359,18 @@ func buildAggregateSpendTx(spenderSeed byte, outputs []fundingOutput, outputPubK
 			Outputs: []types.TxOutput{{ValueAtoms: 1, PubKey: outputPubKey}},
 		},
 	}
-	inputAmounts := make([]uint64, 0, len(outputs))
+	spentCoins := make([]consensus.UtxoEntry, 0, len(outputs))
 	var inputSum uint64
 	for _, output := range outputs {
 		tx.Base.Inputs = append(tx.Base.Inputs, types.TxInput{PrevOut: output.OutPoint})
-		inputAmounts = append(inputAmounts, output.Value)
+		spentCoins = append(spentCoins, consensus.UtxoEntry{
+			ValueAtoms: output.Value,
+			PubKey:     output.PubKey,
+		})
 		inputSum += output.Value
 	}
 
-	tx, err := signMultiInputTx(tx, spenderSeed, inputAmounts)
+	tx, err := signMultiInputTx(tx, spenderSeed, spentCoins)
 	if err != nil {
 		return types.Transaction{}, err
 	}
@@ -376,13 +379,13 @@ func buildAggregateSpendTx(spenderSeed byte, outputs []fundingOutput, outputPubK
 		return types.Transaction{}, consensus.ErrInputsLessThanOutputs
 	}
 	tx.Base.Outputs[0].ValueAtoms = inputSum - fee
-	return signMultiInputTx(tx, spenderSeed, inputAmounts)
+	return signMultiInputTx(tx, spenderSeed, spentCoins)
 }
 
-func signMultiInputTx(tx types.Transaction, spenderSeed byte, inputAmounts []uint64) (types.Transaction, error) {
+func signMultiInputTx(tx types.Transaction, spenderSeed byte, spentCoins []consensus.UtxoEntry) (types.Transaction, error) {
 	auth := make([]types.TxAuthEntry, len(tx.Base.Inputs))
 	for i := range tx.Base.Inputs {
-		msg, err := consensus.Sighash(&tx, i, inputAmounts)
+		msg, err := consensus.Sighash(&tx, i, spentCoins)
 		if err != nil {
 			return types.Transaction{}, err
 		}

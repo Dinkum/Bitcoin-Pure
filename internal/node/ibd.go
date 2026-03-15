@@ -125,7 +125,7 @@ func ReplayBlocksHeadersFirstPersistent(path string, profile types.ChainProfile,
 		}
 	}
 
-	view, ok := chainState.CommittedView()
+	view, ok := chainState.sharedCommittedView()
 	if !ok {
 		return HeadersFirstIBDSummary{}, ErrNoTip
 	}
@@ -135,7 +135,7 @@ func ReplayBlocksHeadersFirstPersistent(path string, profile types.ChainProfile,
 		BlockTipHeight:  view.Height,
 		TipHeaderHash:   view.TipHash,
 		UTXORoot:        view.UTXORoot,
-		UTXOCount:       len(view.UTXOs),
+		UTXOCount:       view.UTXOCount,
 		BlockSizeLimit:  consensus.NextBlockSizeLimit(view.BlockSizeState, consensus.ParamsForProfile(profile)),
 	}
 	logger.Info("completed persistent headers-first replay",

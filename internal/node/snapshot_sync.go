@@ -45,7 +45,11 @@ type SnapshotHistoricalVerificationSummary struct {
 // ExportUTXOSnapshotFile writes a deterministic snapshot fixture for the
 // current committed chainstate so operators can move that state to a fresh
 // node or archive it for offline verification.
-func ExportUTXOSnapshotFile(path string, view CommittedChainView, profile types.ChainProfile, genesisFixture string, chainFixture string) error {
+func ExportUTXOSnapshotFile(path string, view CommittedChainView, iterate func(func(types.OutPoint, consensus.UtxoEntry) error) error, profile types.ChainProfile, genesisFixture string, chainFixture string) error {
+	entries, err := encodeSnapshotFixtureEntriesFromIterator(view.UTXOCount, iterate)
+	if err != nil {
+		return err
+	}
 	fixture := UTXOSnapshotFixture{
 		Version:               UTXOSnapshotFixtureVersion,
 		Profile:               profile.String(),
@@ -55,8 +59,8 @@ func ExportUTXOSnapshotFile(path string, view CommittedChainView, profile types.
 		ExpectedHeaderHashHex: hex.EncodeToString(view.TipHash[:]),
 		ExpectedUTXORootHex:   hex.EncodeToString(view.UTXORoot[:]),
 		ExpectedChecksumHex:   hex.EncodeToString(view.UTXOChecksum[:]),
-		ExpectedUTXOCount:     len(view.UTXOs),
-		UTXOs:                 encodeSnapshotFixtureEntries(view.UTXOs),
+		ExpectedUTXOCount:     view.UTXOCount,
+		UTXOs:                 entries,
 	}
 	buf, err := json.MarshalIndent(fixture, "", "  ")
 	if err != nil {
@@ -264,7 +268,7 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 		if block == nil {
 			return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("missing stored block at height %d", height)
 		}
-		undo, err := captureUndoEntries(block, state.UTXOs())
+		undo, err := captureUndoEntries(block, state.utxoLookup)
 		if err != nil {
 			return SnapshotHistoricalVerificationSummary{}, err
 		}
@@ -298,7 +302,7 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 	if state.UTXOChecksum() != fastSyncState.SnapshotChecksum {
 		return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("historical snapshot checksum mismatch: expected %x, got %x", fastSyncState.SnapshotChecksum, state.UTXOChecksum())
 	}
-	if err := compareSnapshotUTXOs(state.UTXOs(), snapshotUTXOs); err != nil {
+	if err := compareSnapshotUTXOsIter(state.UTXOCount(), state.ForEachUTXO, snapshotUTXOs); err != nil {
 		return SnapshotHistoricalVerificationSummary{}, err
 	}
 	if err := store.ClearFastSyncState(); err != nil {
@@ -341,8 +345,19 @@ func encodeSnapshotFixtureEntries(utxos consensus.UtxoSet) []UTXOSnapshotFixture
 	return entries
 }
 
+func encodeSnapshotFixtureEntriesFromIterator(utxoCount int, iterate func(func(types.OutPoint, consensus.UtxoEntry) error) error) ([]UTXOSnapshotFixtureEntry, error) {
+	utxos := make(consensus.UtxoSet, utxoCount)
+	if err := iterate(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		utxos[outPoint] = entry
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return encodeSnapshotFixtureEntries(utxos), nil
+}
+
 func ensureSnapshotImportTargetEmpty(store *storage.ChainStore) error {
-	if stored, err := store.LoadChainState(); err != nil {
+	if stored, err := store.LoadChainStateMeta(); err != nil {
 		return err
 	} else if stored != nil {
 		return fmt.Errorf("snapshot import target already has chain state at height %d", stored.Height)

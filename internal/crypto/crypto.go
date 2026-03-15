@@ -3,6 +3,8 @@ package crypto
 import (
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
+	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -23,6 +25,8 @@ type SchnorrBatchResult struct {
 	Fallback bool
 }
 
+var taggedHashCache sync.Map
+
 func Sha256(buf []byte) Hash32 {
 	return sha256.Sum256(buf)
 }
@@ -33,7 +37,9 @@ func Sha256d(buf []byte) Hash32 {
 }
 
 func TaggedHash(tag string, payload []byte) Hash32 {
-	tagHash := Sha256([]byte(tag))
+	// Tags are low-cardinality protocol constants, so caching their SHA-256
+	// avoids repeating identical work on every tagged hash invocation.
+	tagHash := cachedTagHash(tag)
 	h := sha256.New()
 	h.Write(tagHash[:])
 	h.Write(tagHash[:])
@@ -41,6 +47,15 @@ func TaggedHash(tag string, payload []byte) Hash32 {
 	var out Hash32
 	copy(out[:], h.Sum(nil))
 	return out
+}
+
+func cachedTagHash(tag string) Hash32 {
+	if cached, ok := taggedHashCache.Load(tag); ok {
+		return cached.(Hash32)
+	}
+	hash := Sha256([]byte(tag))
+	cached, _ := taggedHashCache.LoadOrStore(tag, hash)
+	return cached.(Hash32)
 }
 
 func IsValidXOnlyPubKey(pubKey *[32]byte) bool {
@@ -70,6 +85,11 @@ func VerifySchnorrBatchXOnly(items []SchnorrBatchItem) bool {
 	case 1:
 		item := items[0]
 		return VerifySchnorrXOnly(&item.PubKey, &item.Signature, &item.Msg)
+	}
+
+	scalars, ok := newBatchScalarSource()
+	if !ok {
+		return false
 	}
 
 	var lhs secp.ModNScalar
@@ -109,7 +129,7 @@ func VerifySchnorrBatchXOnly(items []SchnorrBatchItem) bool {
 		var e secp.ModNScalar
 		e.SetBytes((*[32]byte)(commitment))
 
-		coeff, ok := randomBatchScalar(i)
+		coeff, ok := scalars.scalar(i)
 		if !ok {
 			return false
 		}
@@ -202,18 +222,34 @@ func signWithPrivKey(privKey *btcec.PrivateKey, msg *[32]byte) ([32]byte, [64]by
 	return xonly, encodedSig
 }
 
-func randomBatchScalar(index int) (secp.ModNScalar, bool) {
+type batchScalarSource struct {
+	seed [32]byte
+}
+
+func newBatchScalarSource() (batchScalarSource, bool) {
+	var source batchScalarSource
+	if _, err := crand.Read(source.seed[:]); err != nil {
+		return batchScalarSource{}, false
+	}
+	return source, true
+}
+
+func (s batchScalarSource) scalar(index int) (secp.ModNScalar, bool) {
 	var coeff secp.ModNScalar
 	if index == 0 {
 		coeff.SetInt(1)
 		return coeff, true
 	}
+
+	// Batch verification only needs independent non-zero coefficients. Expand one
+	// cryptographic seed into per-item candidates to avoid a syscall per item.
+	var material [40]byte
+	copy(material[:32], s.seed[:])
+	binary.LittleEndian.PutUint32(material[32:36], uint32(index))
 	for attempts := 0; attempts < 8; attempts++ {
-		var buf [32]byte
-		if _, err := crand.Read(buf[:]); err != nil {
-			return secp.ModNScalar{}, false
-		}
-		coeff.SetBytes(&buf)
+		binary.LittleEndian.PutUint32(material[36:], uint32(attempts))
+		candidate := Sha256(material[:])
+		coeff.SetBytes(&candidate)
 		if !coeff.IsZero() {
 			return coeff, true
 		}

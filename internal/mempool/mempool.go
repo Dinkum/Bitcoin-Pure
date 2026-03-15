@@ -151,19 +151,21 @@ type Stats struct {
 }
 
 type Pool struct {
-	mu         sync.RWMutex
-	cfg        PoolConfig
-	entries    map[[32]byte]*Entry
-	spent      map[types.OutPoint][32]byte
-	orphans    map[[32]byte]*orphanEntry
-	orphanDeps map[types.OutPoint][][32]byte
-	sequence   uint64
-	epoch      uint64
-	selection  *selectionCache
-	stats      poolStats
-	topByFee   []SnapshotEntry
-	topDirty   bool
-	snapshot   []SnapshotEntry
+	mu          sync.RWMutex
+	cfg         PoolConfig
+	entries     map[[32]byte]*Entry
+	spent       map[types.OutPoint][32]byte
+	orphans     map[[32]byte]*orphanEntry
+	orphanDeps  map[types.OutPoint][][32]byte
+	sequence    uint64
+	epoch       uint64
+	selection   *selectionCache
+	stats       poolStats
+	cachedStats Stats
+	statsDirty  bool
+	topByFee    []SnapshotEntry
+	topDirty    bool
+	snapshot    []SnapshotEntry
 }
 
 type orphanEntry struct {
@@ -250,6 +252,7 @@ func NewWithConfig(cfg PoolConfig) *Pool {
 		orphans:    make(map[[32]byte]*orphanEntry),
 		orphanDeps: make(map[types.OutPoint][][32]byte),
 		stats:      poolStats{feeCounts: make(map[uint64]int)},
+		statsDirty: true,
 	}
 }
 
@@ -355,7 +358,22 @@ func (p *Pool) SnapshotShared() []SnapshotEntry {
 
 func (p *Pool) Stats() Stats {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
+	if !p.statsDirty {
+		cached := p.cachedStats
+		p.mu.RUnlock()
+		return cached
+	}
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.statsDirty {
+		p.recomputeStatsLocked()
+	}
+	return p.cachedStats
+}
+
+func (p *Pool) recomputeStatsLocked() {
 	out := Stats{
 		Count:     len(p.entries),
 		Orphans:   len(p.orphans),
@@ -363,7 +381,9 @@ func (p *Pool) Stats() Stats {
 		TotalFees: p.stats.totalFees,
 	}
 	if out.Count == 0 {
-		return out
+		p.cachedStats = out
+		p.statsDirty = false
+		return
 	}
 	fees := make([]uint64, 0, len(p.stats.feeCounts))
 	for fee := range p.stats.feeCounts {
@@ -381,7 +401,8 @@ func (p *Pool) Stats() Stats {
 			break
 		}
 	}
-	return out
+	p.cachedStats = out
+	p.statsDirty = false
 }
 
 func (p *Pool) TopByFee(limit int) []SnapshotEntry {
@@ -441,10 +462,13 @@ func (p *Pool) AdmissionSnapshot() AdmissionSnapshot {
 }
 
 func AdvanceAdmissionSnapshot(snapshot *AdmissionSnapshot, chainUtxos consensus.UtxoSet, accepted []AcceptedTx) error {
+	return AdvanceAdmissionSnapshotWithLookup(snapshot, consensus.LookupFromSet(chainUtxos), accepted)
+}
+
+func AdvanceAdmissionSnapshotWithLookup(snapshot *AdmissionSnapshot, chainLookup consensus.UtxoLookup, accepted []AcceptedTx) error {
 	if snapshot == nil {
 		return nil
 	}
-	chainLookup := consensus.LookupFromSet(chainUtxos)
 	for _, entry := range accepted {
 		view, parents, missing, err := resolveInputsWithView(entry.Tx, chainLookup, snapshot.Entries, snapshot.Spent)
 		if err != nil {
@@ -489,10 +513,18 @@ func (v SharedAdmissionView) Release() {
 }
 
 func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.prepareAdmission(tx, snapshot.Epoch, snapshot.Entries, snapshot.Spent, snapshot.Orphans, chainUtxos, rules)
+	return p.PrepareAdmissionWithLookup(tx, snapshot, consensus.LookupFromSet(chainUtxos), rules)
+}
+
+func (p *Pool) PrepareAdmissionWithLookup(tx types.Transaction, snapshot AdmissionSnapshot, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.prepareAdmission(tx, snapshot.Epoch, snapshot.Entries, snapshot.Spent, snapshot.Orphans, chainLookup, rules)
 }
 
 func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmissionView, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.PrepareAdmissionSharedWithLookup(tx, view, consensus.LookupFromSet(chainUtxos), rules)
+}
+
+func (p *Pool) PrepareAdmissionSharedWithLookup(tx types.Transaction, view SharedAdmissionView, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	if view.pool != p {
 		return PreparedAdmission{}, errors.New("shared admission view belongs to different mempool")
 	}
@@ -512,7 +544,7 @@ func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmission
 		return PreparedAdmission{}, ErrTxTooLarge
 	}
 
-	liveView, parents, missing, err := p.resolveInputsAgainstLiveView(tx, consensus.LookupFromSet(chainUtxos))
+	liveView, parents, missing, err := p.resolveInputsAgainstLiveView(tx, chainLookup)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -559,7 +591,7 @@ func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmission
 	return prepared, nil
 }
 
-func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte, orphans map[[32]byte]struct{}, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte, orphans map[[32]byte]struct{}, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	txid := consensus.TxID(&tx)
 	if _, ok := entries[txid]; ok {
 		return PreparedAdmission{}, ErrTxAlreadyExists
@@ -576,7 +608,7 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 		return PreparedAdmission{}, ErrTxTooLarge
 	}
 
-	view, parents, missing, err := resolveInputsWithView(tx, consensus.LookupFromSet(chainUtxos), entries, spent)
+	view, parents, missing, err := resolveInputsWithView(tx, chainLookup, entries, spent)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -624,6 +656,10 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 }
 
 func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.UtxoSet, chainTipHash [32]byte, rules consensus.ConsensusRules) (Admission, error) {
+	return p.CommitPreparedWithLookup(prepared, consensus.LookupFromSet(chainUtxos), chainTipHash, rules)
+}
+
+func (p *Pool) CommitPreparedWithLookup(prepared PreparedAdmission, chainLookup consensus.UtxoLookup, chainTipHash [32]byte, rules consensus.ConsensusRules) (Admission, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.entries[prepared.TxID]; ok {
@@ -654,12 +690,12 @@ func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.U
 			Summary:  accepted.Summary,
 			Accepted: []AcceptedTx{accepted},
 		}
-		admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), consensus.LookupFromSet(chainUtxos), rules)...)
+		admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainLookup, rules)...)
 		p.bumpEpochLocked()
 		return admission, nil
 	}
 
-	view, parents, missing, err := p.resolveInputs(prepared.Tx, consensus.LookupFromSet(chainUtxos))
+	view, parents, missing, err := p.resolveInputs(prepared.Tx, chainLookup)
 	if err != nil {
 		return Admission{}, err
 	}
@@ -678,12 +714,16 @@ func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.U
 		Summary:  accepted.Summary,
 		Accepted: []AcceptedTx{accepted},
 	}
-	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), consensus.LookupFromSet(chainUtxos), rules)...)
+	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainLookup, rules)...)
 	p.bumpEpochLocked()
 	return admission, nil
 }
 
 func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (Admission, error) {
+	return p.AcceptTxWithLookup(tx, consensus.LookupFromSet(chainUtxos), rules)
+}
+
+func (p *Pool) AcceptTxWithLookup(tx types.Transaction, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (Admission, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	txid := consensus.TxID(&tx)
@@ -702,7 +742,7 @@ func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rule
 		return Admission{}, ErrTxTooLarge
 	}
 
-	view, parents, missing, err := p.resolveInputs(tx, consensus.LookupFromSet(chainUtxos))
+	view, parents, missing, err := p.resolveInputs(tx, chainLookup)
 	if err != nil {
 		return Admission{}, err
 	}
@@ -722,14 +762,21 @@ func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rule
 		Summary:  accepted.Summary,
 		Accepted: []AcceptedTx{accepted},
 	}
-	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(txid, tx), consensus.LookupFromSet(chainUtxos), rules)...)
+	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(txid, tx), chainLookup, rules)...)
 	p.bumpEpochLocked()
 	return admission, nil
 }
 
+// SelectForBlock preserves the caller's committed UTXO map and keeps selection
+// state inside an overlay, so read-only callers do not pay for a full clone.
 func (p *Pool) SelectForBlock(chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
-	tempUtxos := cloneUtxos(chainUtxos)
-	return p.SelectForBlockInPlace(tempUtxos, rules, maxTxBytes)
+	selected, totalFees, _ := p.SelectForBlockOverlay(chainUtxos, rules, maxTxBytes)
+	return selected, totalFees
+}
+
+func (p *Pool) SelectForBlockWithLookup(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
+	selected, totalFees, _ := p.SelectForBlockOverlayWithLookup(baseLookup, rules, maxTxBytes)
+	return selected, totalFees
 }
 
 // SelectForBlockOverlay builds block candidates against an immutable base UTXO
@@ -742,27 +789,13 @@ func (p *Pool) SelectForBlockOverlay(baseUtxos consensus.UtxoSet, rules consensu
 	return p.selectForBlock(baseUtxos, rules, maxTxBytes, snapshot)
 }
 
-// SelectForBlockFromBase builds block candidates against an immutable base UTXO
-// view and returns the post-selection UTXO set without mutating the caller's
-// published chain map.
-func (p *Pool) SelectForBlockFromBase(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, consensus.UtxoSet) {
-	selected, totalFees, overlay := p.SelectForBlockOverlay(baseUtxos, rules, maxTxBytes)
-	return selected, totalFees, overlay.Materialize()
-}
-
-// SelectForBlockInPlace consumes a mutable chain view and advances it as eligible
-// transactions are accepted. Eligibility is still checked against the original
-// pre-block UTXO set so block assembly cannot create same-block dependency edges.
-func (p *Pool) SelectForBlockInPlace(currentUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64) {
-	selected, totalFees, overlay := p.SelectForBlockOverlay(currentUtxos, rules, maxTxBytes)
-	finalUtxos := overlay.Materialize()
-	for outPoint := range currentUtxos {
-		delete(currentUtxos, outPoint)
-	}
-	for outPoint, entry := range finalUtxos {
-		currentUtxos[outPoint] = entry
-	}
-	return selected, totalFees
+// SelectForBlockOverlayWithLookup builds block candidates against a generic
+// committed-chain lookup and returns the post-selection overlay.
+func (p *Pool) SelectForBlockOverlayWithLookup(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
+	p.mu.Lock()
+	snapshot := p.selectionSnapshotLocked()
+	p.mu.Unlock()
+	return p.selectForBlockWithLookup(baseLookup, rules, maxTxBytes, snapshot)
 }
 
 func (p *Pool) selectForBlock(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, snapshot selectionSnapshot) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
@@ -797,13 +830,51 @@ func (p *Pool) selectForBlock(baseUtxos consensus.UtxoSet, rules consensus.Conse
 	return selected, totalFees, overlay
 }
 
+func (p *Pool) selectForBlockWithLookup(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int, snapshot selectionSnapshot) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
+	preBlockUtxos := baseLookup
+	overlay := consensus.NewUtxoOverlayWithLookup(consensus.LookupWithErrFromLookup(baseLookup))
+	selected := make([]SnapshotEntry, 0, len(snapshot.candidates))
+	included := make(map[[32]byte]struct{}, len(snapshot.candidates))
+	claimed := make(map[types.OutPoint]struct{})
+	usedBytes := 0
+	var totalFees uint64
+	p.runSelectionSnapshot(snapshot, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+		if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
+			return false
+		}
+		if !p.meetsRelayFloor(filteredFee, filteredSize) {
+			return false
+		}
+		packageFees, ok := applyCandidatePackageSnapshot(preBlockUtxos, overlay, claimed, filtered, rules)
+		if !ok {
+			return false
+		}
+		usedBytes += filteredSize
+		totalFees += packageFees
+		for _, entry := range filtered {
+			included[entry.TxID] = struct{}{}
+			selected = append(selected, entry)
+		}
+		return true
+	})
+
+	sortSnapshotEntriesByTxID(selected)
+	return selected, totalFees, overlay
+}
+
 // AppendForBlockOverlay extends a previously-built tentative block state
 // without forcing the caller to materialize a full post-selection UTXO map.
 func (p *Pool) AppendForBlockOverlay(preBlockUtxos consensus.UtxoSet, currentUtxos *consensus.UtxoOverlay, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
+	return p.AppendForBlockOverlayWithLookup(consensus.LookupFromSet(preBlockUtxos), currentUtxos, rules, maxTxBytes, selected)
+}
+
+// AppendForBlockOverlayWithLookup extends a tentative block state against an
+// immutable committed-chain lookup without forcing callers to materialize that
+// base view as a full map first.
+func (p *Pool) AppendForBlockOverlayWithLookup(preBlockLookup consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, rules consensus.ConsensusRules, maxTxBytes int, selected []SnapshotEntry) ([]SnapshotEntry, uint64) {
 	p.mu.Lock()
 	snapshot := p.selectionSnapshotLocked()
 	p.mu.Unlock()
-	preBlockLookup := consensus.LookupFromSet(preBlockUtxos)
 	appendOnly := make([]SnapshotEntry, 0, len(snapshot.candidates))
 	included := make(map[[32]byte]struct{}, len(selected))
 	claimed := claimedOutPointsForSnapshots(selected)
@@ -895,6 +966,10 @@ func (p *Pool) RemoveConfirmed(block *types.Block) {
 // PromoteReadyOrphansForBlock rechecks orphan transactions that were waiting on
 // outputs created by the newly accepted block.
 func (p *Pool) PromoteReadyOrphansForBlock(block *types.Block, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) []AcceptedTx {
+	return p.PromoteReadyOrphansForBlockWithLookup(block, consensus.LookupFromSet(chainUtxos), rules)
+}
+
+func (p *Pool) PromoteReadyOrphansForBlockWithLookup(block *types.Block, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) []AcceptedTx {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if block == nil {
@@ -908,7 +983,7 @@ func (p *Pool) PromoteReadyOrphansForBlock(block *types.Block, chainUtxos consen
 	if len(outputs) == 0 {
 		return nil
 	}
-	promoted := p.promoteReadyOrphans(outputs, consensus.LookupFromSet(chainUtxos), rules)
+	promoted := p.promoteReadyOrphans(outputs, chainLookup, rules)
 	if len(promoted) > 0 {
 		p.bumpEpochLocked()
 	}
@@ -1510,6 +1585,7 @@ func (p *Pool) packageForSelection(txid [32]byte) []*Entry {
 func (p *Pool) bumpEpochLocked() {
 	p.epoch++
 	p.snapshot = nil
+	p.statsDirty = true
 	if p.selection != nil {
 		p.selection.epoch = p.epoch
 	}
@@ -1947,10 +2023,15 @@ func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, included map[[32
 }
 
 func candidateLess(left, right packageCandidate) bool {
-	leftScore := float64(left.Fee) / float64(left.Size)
-	rightScore := float64(right.Fee) / float64(right.Size)
-	if leftScore != rightScore {
-		return leftScore > rightScore
+	leftSize := uint64(left.Size)
+	rightSize := uint64(right.Size)
+	leftHi, leftLo := bits.Mul64(left.Fee, rightSize)
+	rightHi, rightLo := bits.Mul64(right.Fee, leftSize)
+	if leftHi != rightHi {
+		return leftHi > rightHi
+	}
+	if leftLo != rightLo {
+		return leftLo > rightLo
 	}
 	if left.Fee != right.Fee {
 		return left.Fee > right.Fee

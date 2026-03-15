@@ -37,7 +37,7 @@ type blockTemplateCache struct {
 	selectedAuthIDs [][32]byte
 	totalFees       uint64
 	usedTxBytes     int
-	baseUtxos       consensus.UtxoSet
+	baseLookup      consensus.UtxoLookup
 	selectionView   *consensus.UtxoOverlay
 	baseAcc         *utreexo.Accumulator
 	selectionAcc    *utreexo.Accumulator
@@ -62,7 +62,7 @@ type chainSelectionSnapshot struct {
 	height         uint64
 	tipHeader      types.BlockHeader
 	blockSizeState consensus.BlockSizeState
-	utxos          consensus.UtxoSet
+	utxoLookup     consensus.UtxoLookup
 	utxoAcc        *utreexo.Accumulator
 }
 
@@ -133,11 +133,11 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot)
+	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot)
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	generation := m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseUtxos, selectionView, snapshot.utxoAcc, selectionAcc)
+	generation := m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, snapshot.utxoAcc, selectionAcc)
 	m.templateStats.noteFullBuild(m.svc.pool.SelectionCandidateCount())
 	m.svc.noteTemplateRebuild()
 	m.svc.perf.noteTemplateDuration(time.Since(startedAt))
@@ -205,15 +205,15 @@ func (m *minerManager) mineOneBlock() ([32]byte, error) {
 	}
 }
 
-func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, []types.Transaction, [][32]byte, [][32]byte, uint64, int, consensus.UtxoSet, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
+func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, []types.Transaction, [][32]byte, [][32]byte, uint64, int, consensus.UtxoLookup, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
 	startedAt := time.Now()
-	baseUtxos := snapshot.utxos
+	baseLookup := snapshot.utxoLookup
 	maxTemplateBytes := int(consensus.NextBlockSizeLimit(snapshot.blockSizeState, consensus.ParamsForProfile(m.svc.cfg.Profile)))
 	if maxTemplateBytes > 1024 {
 		maxTemplateBytes -= 1024
 	}
 	selectStartedAt := time.Now()
-	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlay(baseUtxos, consensus.DefaultConsensusRules(), maxTemplateBytes)
+	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlayWithLookup(baseLookup, consensus.DefaultConsensusRules(), maxTemplateBytes)
 	m.svc.perf.noteTemplateSelectDuration(time.Since(selectStartedAt))
 	selectedTxs, selectedTxIDs, selectedAuthIDs, usedTxBytes := buildSelectedTemplateVectors(selectedEntries)
 	selectedSpends, selectedLeaves := selectedEntryAccumulatorDeltas(selectedEntries)
@@ -240,7 +240,7 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (typ
 		slog.Uint64("total_fees", totalFees),
 		slog.Duration("template_duration", time.Since(startedAt)),
 	)
-	return block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseUtxos, selectionView, selectionAcc, nil
+	return block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc, nil
 }
 
 func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, selectionAcc *utreexo.Accumulator) (types.Block, error) {
@@ -314,7 +314,7 @@ func (m *minerManager) chainSelectionSnapshot() (chainSelectionSnapshot, error) 
 		height:         view.Height,
 		tipHeader:      view.TipHeader,
 		blockSizeState: view.BlockSizeState,
-		utxos:          view.UTXOs,
+		utxoLookup:     m.svc.chainState.Store().UTXOLookupFunc(),
 		utxoAcc:        view.UTXOAcc,
 	}, nil
 }
@@ -346,7 +346,7 @@ func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoc
 	}
 
 	appendSelectStartedAt := time.Now()
-	added, addedFees := m.svc.pool.AppendForBlockOverlay(m.template.baseUtxos, m.template.selectionView, consensus.DefaultConsensusRules(), maxTemplateBytes, m.template.selected)
+	added, addedFees := m.svc.pool.AppendForBlockOverlayWithLookup(m.template.baseLookup, m.template.selectionView, consensus.DefaultConsensusRules(), maxTemplateBytes, m.template.selected)
 	m.svc.perf.noteTemplateSelectDuration(time.Since(appendSelectStartedAt))
 	if len(added) == 0 {
 		m.template.mempoolEpoch = mempoolEpoch
@@ -391,7 +391,7 @@ func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoc
 	return cloneBlock(m.template.block), m.template.generation, true, nil
 }
 
-func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, usedTxBytes int, baseUtxos consensus.UtxoSet, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
+func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, usedTxBytes int, baseLookup consensus.UtxoLookup, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
 	m.templateMu.Lock()
 	defer m.templateMu.Unlock()
 	if m.templateGeneration == 0 {
@@ -410,7 +410,7 @@ func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64,
 		selectedAuthIDs: append([][32]byte(nil), selectedAuthIDs...),
 		totalFees:       totalFees,
 		usedTxBytes:     usedTxBytes,
-		baseUtxos:       baseUtxos,
+		baseLookup:      baseLookup,
 		selectionView:   selectionView,
 		baseAcc:         baseAcc,
 		selectionAcc:    selectionAcc,

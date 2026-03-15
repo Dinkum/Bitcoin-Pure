@@ -69,3 +69,12 @@ func TestSchnorrBatchRejectsTamperedSignature(t *testing.T) {
 		t.Fatal("tampered batch should report fallback attempt")
 	}
 }
+
+func BenchmarkTaggedHash(b *testing.B) {
+	payload := []byte("benchmark payload for tagged hashing")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = TaggedHash("BPU/SigHashV1", payload)
+	}
+}

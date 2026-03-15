@@ -58,11 +58,11 @@ type PendingTx struct {
 }
 
 type PendingOutput struct {
-	Vout       uint32 `json:"vout"`
-	Value      uint64 `json:"value"`
-	Address    string `json:"address"`
-	PubKeyHex  string `json:"pubkey_hex"`
-	Change     bool   `json:"change"`
+	Vout      uint32 `json:"vout"`
+	Value     uint64 `json:"value"`
+	Address   string `json:"address"`
+	PubKeyHex string `json:"pubkey_hex"`
+	Change    bool   `json:"change"`
 }
 
 type PendingOutPoint struct {
@@ -372,7 +372,10 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 		},
 		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, 1)},
 	}
-	msg, err := consensus.Sighash(&tx, 0, []uint64{input.Value})
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+		ValueAtoms: input.Value,
+		PubKey:     mustParsePubKey(input.Address.PubKeyHex),
+	}})
 	if err != nil {
 		return CPFPPlan{}, err
 	}
@@ -700,15 +703,18 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 		},
 		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, len(inputs))},
 	}
-	inputAmounts := make([]uint64, len(inputs))
+	spentCoins := make([]consensus.UtxoEntry, len(inputs))
 	inputTotal := uint64(0)
 	for i, coin := range inputs {
 		tx.Base.Inputs = append(tx.Base.Inputs, types.TxInput{PrevOut: coin.OutPoint})
-		inputAmounts[i] = coin.Value
+		spentCoins[i] = consensus.UtxoEntry{
+			ValueAtoms: coin.Value,
+			PubKey:     mustParsePubKey(coin.Address.PubKeyHex),
+		}
 		inputTotal += coin.Value
 	}
 	for i, coin := range inputs {
-		msg, err := consensus.Sighash(&tx, i, inputAmounts)
+		msg, err := consensus.Sighash(&tx, i, spentCoins)
 		if err != nil {
 			return SendPlan{}, err
 		}
@@ -746,11 +752,11 @@ func walletOwnedOutputs(wallet Wallet, tx types.Transaction) []PendingOutput {
 			continue
 		}
 		out = append(out, PendingOutput{
-			Vout:       uint32(vout),
-			Value:      output.ValueAtoms,
-			Address:    addr.Address,
+			Vout:      uint32(vout),
+			Value:     output.ValueAtoms,
+			Address:   addr.Address,
 			PubKeyHex: addr.PubKeyHex,
-			Change:     addr.Change,
+			Change:    addr.Change,
 		})
 	}
 	return out

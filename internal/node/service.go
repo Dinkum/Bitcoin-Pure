@@ -43,6 +43,7 @@ import (
 const (
 	localOriginRebroadcastInterval = 30 * time.Second
 	maxPendingPeerBlocks           = 512
+	maxServedBlocksPerGetData      = 16
 	erlayReconcileInterval         = 5 * time.Second
 	erlayReconcileBatchLimit       = 256
 	// Give distributed-origin submissions a slightly larger window to
@@ -51,9 +52,28 @@ const (
 	erlayReconFlushDelay = 5 * time.Millisecond
 )
 
-var dandelionFluffDelay = 2 * time.Second
+var (
+	dandelionFluffDelay = 2 * time.Second
+	// Keep the orphan/side-branch staging queue bounded by memory footprint,
+	// not just object count, so one peer cannot pin arbitrarily many large
+	// blocks in RAM while their parents are still missing.
+	maxPendingPeerBlockBytes    uint64 = 512 << 20
+	maxPendingPeerBlocksPerPeer        = 32
+	inboundPeerTxRatePerSecond         = 1000.0
+	inboundPeerTxBurst                 = 2000.0
+	inboundPeerTxViolationLimit        = 3
+	peerInvalidTxSignatureLimit        = 3
+)
 
-var ErrBlockHeaderNotIndexed = errors.New("block header not indexed")
+const (
+	peerMisbehaviorBanDuration = time.Hour
+	maxRejectedBlockHashes     = 4096
+)
+
+var (
+	ErrBlockHeaderNotIndexed  = errors.New("block header not indexed")
+	errPeerInboundTxRateLimit = errors.New("peer exceeded inbound tx rate limit")
+)
 
 type ServiceConfig struct {
 	Profile                   types.ChainProfile
@@ -74,6 +94,8 @@ type ServiceConfig struct {
 	HandshakeTimeout          time.Duration
 	StallTimeout              time.Duration
 	MaxMessageBytes           int
+	PebbleCacheBytes          int64
+	PebbleBloomBitsPerKey     int
 	MinRelayFeePerByte        uint64
 	MaxTxSize                 int
 	MaxMempoolBytes           int
@@ -243,45 +265,50 @@ type Service struct {
 	pool        *mempool.Pool
 	genesis     *types.Block
 
-	stateMu          sync.RWMutex
-	stressMu         sync.Mutex
-	peerMu           sync.RWMutex
-	downloadMu       sync.Mutex
-	recentMu         sync.RWMutex
-	rebroadcastMu    sync.Mutex
-	peers            map[string]*peerConn
-	outboundPeers    map[string]struct{}
-	knownPeers       map[string]storage.KnownPeerRecord
-	blockRequests    map[[32]byte]blockDownloadRequest
-	txRequests       map[[32]byte]blockDownloadRequest
-	pendingBlocks    map[[32]byte]pendingPeerBlock
-	pendingChildren  map[[32]byte]map[[32]byte]struct{}
-	pendingBlockFIFO [][32]byte
-	localRebroadcast map[[32]byte]time.Time
-	stressPending    map[[32]byte]stressLaneBatch
-	recentHdrs       recentHeaderCache
-	recentBlks       recentBlockCache
-	peerMgr          *peerManager
-	syncMgr          *syncManager
-	relaySched       *relayScheduler
-	minerMgr         *minerManager
-	avaMgr           *avalancheManager
-	mineHeaderFn     func(types.BlockHeader, consensus.ChainParams, func(uint64) bool) (types.BlockHeader, bool, error)
-	nodeID           string
-	dashboard        dashboardCache
-	systemStats      dashboardSystemStats
-	perf             performanceMetricsCollector
-	throughput       throughputSummaryTelemetry
-	runtimeStatus    runtimeStatusTelemetry
-	startedAt        time.Time
-	publicPage       bool
-	listener         net.Listener
-	rpcSrv           *http.Server
-	stopCh           chan struct{}
-	stopOnce         sync.Once
-	closeOnce        sync.Once
-	closeErr         error
-	wg               sync.WaitGroup
+	stateMu             sync.RWMutex
+	stressMu            sync.Mutex
+	peerMu              sync.RWMutex
+	downloadMu          sync.Mutex
+	recentMu            sync.RWMutex
+	rebroadcastMu       sync.Mutex
+	peers               map[string]*peerConn
+	outboundPeers       map[string]struct{}
+	knownPeers          map[string]storage.KnownPeerRecord
+	bannedPeers         map[string]time.Time
+	blockRequests       map[[32]byte]blockDownloadRequest
+	txRequests          map[[32]byte]blockDownloadRequest
+	pendingBlocks       map[[32]byte]pendingPeerBlock
+	pendingBlockBytes   uint64
+	pendingBlocksByPeer map[string]int
+	rejectedBlocks      map[[32]byte]struct{}
+	rejectedBlockOrder  [][32]byte
+	pendingChildren     map[[32]byte]map[[32]byte]struct{}
+	pendingBlockFIFO    [][32]byte
+	localRebroadcast    map[[32]byte]time.Time
+	stressPending       map[[32]byte]stressLaneBatch
+	recentHdrs          recentHeaderCache
+	recentBlks          recentBlockCache
+	peerMgr             *peerManager
+	syncMgr             *syncManager
+	relaySched          *relayScheduler
+	minerMgr            *minerManager
+	avaMgr              *avalancheManager
+	mineHeaderFn        func(types.BlockHeader, consensus.ChainParams, func(uint64) bool) (types.BlockHeader, bool, error)
+	nodeID              string
+	dashboard           dashboardCache
+	systemStats         dashboardSystemStats
+	perf                performanceMetricsCollector
+	throughput          throughputSummaryTelemetry
+	runtimeStatus       runtimeStatusTelemetry
+	startedAt           time.Time
+	publicPage          bool
+	listener            net.Listener
+	rpcSrv              *http.Server
+	stopCh              chan struct{}
+	stopOnce            sync.Once
+	closeOnce           sync.Once
+	closeErr            error
+	wg                  sync.WaitGroup
 }
 
 type SyncDebugSnapshot struct {
@@ -294,32 +321,36 @@ type SyncDebugSnapshot struct {
 }
 
 type peerConn struct {
-	svc            *Service
-	addr           string
-	targetAddr     string
-	outbound       bool
-	connectedAt    time.Time
-	traffic        *peerTrafficMeter
-	wire           *p2p.Conn
-	version        p2p.VersionMessage
-	lastProgress   atomic.Int64
-	bestHeight     atomic.Uint64
-	controlQ       chan outboundMessage
-	relayPriorityQ chan outboundMessage
-	sendQ          chan outboundMessage
-	closed         chan struct{}
-	closeOnce      sync.Once
-	invMu          sync.Mutex
-	queuedInv      map[p2p.InvVector]int
-	txMu           sync.Mutex
-	queuedTx       map[[32]byte]int
-	knownTx        map[[32]byte]struct{}
-	knownTxOrder   [][32]byte
-	knownTxNext    int
+	svc                 *Service
+	addr                string
+	targetAddr          string
+	outbound            bool
+	connectedAt         time.Time
+	traffic             *peerTrafficMeter
+	wire                *p2p.Conn
+	version             p2p.VersionMessage
+	lastProgress        atomic.Int64
+	bestHeight          atomic.Uint64
+	controlQ            chan outboundMessage
+	relayPriorityQ      chan outboundMessage
+	sendQ               chan outboundMessage
+	closed              chan struct{}
+	closeOnce           sync.Once
+	invMu               sync.Mutex
+	queuedInv           map[p2p.InvVector]int
+	txMu                sync.Mutex
+	queuedTx            map[[32]byte]int
+	knownTx             map[[32]byte]struct{}
+	knownTxOrder        [][32]byte
+	knownTxNext         int
+	inboundTxTokens     float64
+	inboundTxLastRefill time.Time
+	inboundTxViolations int
+	invalidTxSignatures int
 	// Keep buffered relay payloads keyed by txid so coalescing does not repeatedly copy
 	// whole transaction structs through intermediate queue slices on busy fanout paths.
 	pendingTxOrder  [][32]byte
-	pendingTxByID   map[[32]byte]types.Transaction
+	pendingTxByID   map[[32]byte]*types.Transaction
 	txFlushArmed    bool
 	pendingRecon    [][32]byte
 	reconFlushArmed bool
@@ -514,7 +545,17 @@ type blockDownloadRequest struct {
 type pendingPeerBlock struct {
 	block      types.Block
 	peerAddr   string
+	sizeBytes  uint64
 	receivedAt time.Time
+}
+
+type pendingPeerBlockStoreResult struct {
+	Added        bool
+	PendingCount int
+	PendingBytes uint64
+	Evicted      int
+	Dropped      bool
+	DropReason   string
 }
 
 type recentHeaderCache struct {
@@ -948,6 +989,12 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	if cfg.RPCIdleTimeout <= 0 {
 		cfg.RPCIdleTimeout = 30 * time.Second
 	}
+	if cfg.PebbleCacheBytes <= 0 {
+		cfg.PebbleCacheBytes = 2 << 30
+	}
+	if cfg.PebbleBloomBitsPerKey <= 0 {
+		cfg.PebbleBloomBitsPerKey = 10
+	}
 	logger.Info("opening node service",
 		slog.String("profile", cfg.Profile.String()),
 		slog.String("db_path", cfg.DBPath),
@@ -958,7 +1005,16 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	if cfg.SyntheticMining {
 		rules.SkipPow = true
 	}
-	chainState, err := OpenPersistentChainStateWithRulesAndLogger(filepath.Clean(cfg.DBPath), cfg.Profile, rules, rootLogger)
+	chainState, err := openPersistentChainStateFromMeta(
+		filepath.Clean(cfg.DBPath),
+		cfg.Profile,
+		rules,
+		rootLogger,
+		storage.OpenOptions{
+			PebbleCacheBytes:      cfg.PebbleCacheBytes,
+			BloomFilterBitsPerKey: cfg.PebbleBloomBitsPerKey,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1017,23 +1073,26 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 			MaxDescendants:     cfg.MaxDescendants,
 			MaxOrphans:         cfg.MaxOrphans,
 		}),
-		genesis:          genesis,
-		peers:            make(map[string]*peerConn),
-		outboundPeers:    make(map[string]struct{}),
-		knownPeers:       make(map[string]storage.KnownPeerRecord),
-		blockRequests:    make(map[[32]byte]blockDownloadRequest),
-		txRequests:       make(map[[32]byte]blockDownloadRequest),
-		pendingBlocks:    make(map[[32]byte]pendingPeerBlock),
-		pendingChildren:  make(map[[32]byte]map[[32]byte]struct{}),
-		localRebroadcast: make(map[[32]byte]time.Time),
-		stressPending:    make(map[[32]byte]stressLaneBatch),
-		recentHdrs:       recentHeaderCache{items: make(map[[32]byte]types.BlockHeader)},
-		recentBlks:       recentBlockCache{items: make(map[[32]byte]types.Block)},
-		startedAt:        time.Now(),
-		nodeID:           nodeID,
-		publicPage:       shouldServePublicDashboard(),
-		stopCh:           make(chan struct{}),
-		mineHeaderFn:     consensus.MineHeaderInterruptible,
+		genesis:             genesis,
+		peers:               make(map[string]*peerConn),
+		outboundPeers:       make(map[string]struct{}),
+		knownPeers:          make(map[string]storage.KnownPeerRecord),
+		bannedPeers:         make(map[string]time.Time),
+		blockRequests:       make(map[[32]byte]blockDownloadRequest),
+		txRequests:          make(map[[32]byte]blockDownloadRequest),
+		pendingBlocks:       make(map[[32]byte]pendingPeerBlock),
+		pendingBlocksByPeer: make(map[string]int),
+		rejectedBlocks:      make(map[[32]byte]struct{}),
+		pendingChildren:     make(map[[32]byte]map[[32]byte]struct{}),
+		localRebroadcast:    make(map[[32]byte]time.Time),
+		stressPending:       make(map[[32]byte]stressLaneBatch),
+		recentHdrs:          recentHeaderCache{items: make(map[[32]byte]types.BlockHeader)},
+		recentBlks:          recentBlockCache{items: make(map[[32]byte]types.Block)},
+		startedAt:           time.Now(),
+		nodeID:              nodeID,
+		publicPage:          shouldServePublicDashboard(),
+		stopCh:              make(chan struct{}),
+		mineHeaderFn:        consensus.MineHeaderInterruptible,
 	}
 	svc.peerMgr = &peerManager{svc: svc}
 	svc.syncMgr = &syncManager{svc: svc}
@@ -1102,13 +1161,11 @@ func (s *Service) Start(ctx context.Context) error {
 		if s.publicPage {
 			s.logger.Info("public ascii dashboard enabled", slog.String("addr", s.cfg.RPCAddr), slog.Duration("cache_ttl", time.Minute))
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.safeGo("rpc-server", func() {
 			if err := s.rpcSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Error("rpc server failed", slog.String("addr", s.cfg.RPCAddr), slog.Any("error", err))
 			}
-		}()
+		})
 	}
 	if s.cfg.P2PAddr != "" {
 		ln, err := net.Listen("tcp", s.cfg.P2PAddr)
@@ -1117,11 +1174,9 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 		s.listener = ln
 		s.logger.Info("p2p listener enabled", slog.String("addr", s.cfg.P2PAddr))
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.safeGo("accept-loop", func() {
 			s.acceptLoop()
-		}()
+		})
 	}
 	for _, addr := range s.cfg.Peers {
 		if addr == "" {
@@ -1135,62 +1190,45 @@ func (s *Service) Start(ctx context.Context) error {
 		if err := s.recordDashboardSystemSample(); err != nil {
 			s.logger.Debug("dashboard system sampler warmup failed", slog.Any("error", err))
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.safeGo("dashboard-system-loop", func() {
 			s.dashboardSystemLoop()
-		}()
+		})
 	}
 	if s.cfg.ThroughputSummaryInterval > 0 {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.safeGo("throughput-summary-loop", func() {
 			s.throughputSummaryLoop()
-		}()
+		})
 	}
 	s.startFastSyncHistoricalVerification()
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
+	s.safeGo("node-status-loop", func() {
 		s.nodeStatusLoop()
-	}()
+	})
 	if s.cfg.P2PAddr != "" || len(s.cfg.Peers) > 0 {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.safeGo("sync-watchdog-loop", func() {
 			s.syncWatchdogLoop()
-		}()
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		})
+		s.safeGo("outbound-refill-loop", func() {
 			s.outboundRefillLoop()
-		}()
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		})
+		s.safeGo("local-rebroadcast-loop", func() {
 			s.localRebroadcastLoop()
-		}()
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		})
+		s.safeGo("erlay-reconcile-loop", func() {
 			s.erlayReconcileLoop()
-		}()
+		})
 		if s.avalancheManager().enabled() {
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
+			s.safeGo("avalanche-poll-loop", func() {
 				s.avalancheManager().pollLoop()
-			}()
+			})
 		}
 	}
 	if s.cfg.MinerEnabled {
 		s.logger.Info("continuous miner enabled", slog.Int("workers", s.cfg.MinerWorkers))
 		for workerID := 0; workerID < s.cfg.MinerWorkers; workerID++ {
-			s.wg.Add(1)
-			go func(workerID int) {
-				defer s.wg.Done()
+			workerID := workerID
+			s.safeGo(fmt.Sprintf("miner-loop-%d", workerID), func() {
 				s.minerManager().minerLoop(workerID)
-			}(workerID)
+			})
 		}
 	}
 	select {
@@ -1218,14 +1256,12 @@ func (s *Service) startFastSyncHistoricalVerification() {
 		slog.Uint64("height", fastSyncState.SnapshotHeight),
 		slog.String("header_hash", fmt.Sprintf("%x", fastSyncState.SnapshotHeaderHash)),
 	)
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
+	s.safeGo("snapshot-history-verify", func() {
 		logger := logging.ComponentWith(s.logger, "snapshot")
 		if _, err := VerifyFastSyncSnapshotFromStore(s.chainState.Store(), s.cfg.Profile, s.genesis, logger); err != nil {
 			logger.Warn("background historical snapshot verification failed", slog.Any("error", err))
 		}
-	}()
+	})
 }
 
 func (s *Service) peerManager() *peerManager {
@@ -1300,8 +1336,6 @@ const (
 )
 
 func (p *peerConn) enqueueDirectMessage(envelope outboundMessage) error {
-	timer := time.NewTimer(controlMessageEnqueueTimeout)
-	defer timer.Stop()
 	q := p.sendQ
 	if p.controlQ != nil {
 		q = p.controlQ
@@ -1309,6 +1343,20 @@ func (p *peerConn) enqueueDirectMessage(envelope outboundMessage) error {
 	} else {
 		envelope.lane = relayQueueLaneSend
 	}
+
+	// Fast path: the queue usually has room immediately, so avoid allocating a
+	// timer unless we actually need to wait for backpressure to clear.
+	select {
+	case <-p.closed:
+		return io.EOF
+	case q <- envelope:
+		p.telemetry.noteEnqueue(p.queueDepths())
+		return nil
+	default:
+	}
+
+	timer := time.NewTimer(controlMessageEnqueueTimeout)
+	defer timer.Stop()
 	select {
 	case <-p.closed:
 		return io.EOF
@@ -1351,7 +1399,13 @@ func (p *peerConn) enqueueTxReconWithPolicy(msg p2p.TxReconMessage, suppressKnow
 		p.enqueueRelayRecon(batch)
 	}
 	if armFlush {
-		go p.flushPendingReconAfterDelay()
+		if p.svc != nil {
+			p.svc.safeGoDetachedWithCleanup("peer-flush-pending-recon", p.clearPendingReconFlushArm, func() {
+				p.flushPendingReconAfterDelay()
+			})
+		} else {
+			go p.flushPendingReconAfterDelay()
+		}
 	}
 	return nil
 }
@@ -1415,7 +1469,13 @@ func (p *peerConn) enqueueTxBatch(msg p2p.TxBatchMessage) error {
 		p.enqueueRelayTxs(batch)
 	}
 	if armFlush {
-		go p.flushPendingTxsAfterDelay()
+		if p.svc != nil {
+			p.svc.safeGoDetachedWithCleanup("peer-flush-pending-txs", p.clearPendingTxFlushArm, func() {
+				p.flushPendingTxsAfterDelay()
+			})
+		} else {
+			go p.flushPendingTxsAfterDelay()
+		}
 	}
 	return nil
 }
@@ -1681,11 +1741,44 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 	case p2p.XBlockTxMessage:
 		return s.onXBlockTxMessage(peer, m)
 	case p2p.TxMessage:
+		allowed, err := peer.allowInboundTxs(1)
+		if err != nil {
+			if errors.Is(err, errPeerInboundTxRateLimit) {
+				s.logger.Warn("disconnecting peer for sustained inbound tx flood",
+					slog.String("addr", peer.addr),
+					slog.Int("tx_count", 1),
+				)
+				return err
+			}
+		}
+		if !allowed {
+			s.logger.Debug("dropping inbound tx due to rate limit",
+				slog.String("addr", peer.addr),
+			)
+			return nil
+		}
 		peer.noteKnownTxs(m)
 		admissions, errs, _, _ := s.submitDecodedTxsFrom([]types.Transaction{m.Tx}, peer)
 		peer.noteUsefulTxs(countAcceptedAdmissions(admissions), time.Now())
 		return s.handlePeerTxAdmissionErrors(peer, errs)
 	case p2p.TxBatchMessage:
+		allowed, err := peer.allowInboundTxs(len(m.Txs))
+		if err != nil {
+			if errors.Is(err, errPeerInboundTxRateLimit) {
+				s.logger.Warn("disconnecting peer for sustained inbound tx flood",
+					slog.String("addr", peer.addr),
+					slog.Int("tx_count", len(m.Txs)),
+				)
+				return err
+			}
+		}
+		if !allowed {
+			s.logger.Debug("dropping inbound tx batch due to rate limit",
+				slog.String("addr", peer.addr),
+				slog.Int("tx_count", len(m.Txs)),
+			)
+			return nil
+		}
 		peer.noteKnownTxs(m)
 		admissions, errs, _, _ := s.submitDecodedTxsFrom(m.Txs, peer)
 		peer.noteUsefulTxs(countAcceptedAdmissions(admissions), time.Now())
@@ -1716,7 +1809,7 @@ func (s *Service) Info() ServiceInfo {
 	tipHeight := uint64(0)
 	var tipHash [32]byte
 	var utxoRoot [32]byte
-	view, haveView := s.chainState.CommittedView()
+	view, haveView := s.chainState.sharedCommittedView()
 	if haveView {
 		tipHeight = view.Height
 		tipHash = view.TipHash
@@ -1747,7 +1840,7 @@ func (s *Service) Info() ServiceInfo {
 
 func (s *Service) ChainStateInfo() ChainStateInfo {
 	s.stateMu.RLock()
-	view, ok := s.chainState.CommittedView()
+	view, ok := s.chainState.sharedCommittedView()
 	headerHeight := uint64(0)
 	if tip := s.headerChain.TipHeight(); tip != nil {
 		headerHeight = *tip
@@ -1763,7 +1856,7 @@ func (s *Service) ChainStateInfo() ChainStateInfo {
 		TipHeaderHash:      hex.EncodeToString(view.TipHash[:]),
 		UTXORoot:           hex.EncodeToString(view.UTXORoot[:]),
 		UTXOChecksum:       hex.EncodeToString(view.UTXOChecksum[:]),
-		UTXOCount:          len(view.UTXOs),
+		UTXOCount:          view.UTXOCount,
 		NextBlockSizeLimit: consensus.NextBlockSizeLimit(view.BlockSizeState, consensus.ParamsForProfile(s.cfg.Profile)),
 		TipTimestamp:       view.TipHeader.Timestamp,
 	}
@@ -1803,7 +1896,7 @@ func (s *Service) MiningInfo() MiningInfo {
 		info.MinerPubKey = hex.EncodeToString(s.cfg.MinerPubKey[:])
 	}
 	s.stateMu.RLock()
-	view, ok := s.chainState.CommittedView()
+	view, ok := s.chainState.sharedCommittedView()
 	s.stateMu.RUnlock()
 	if !ok {
 		return info
@@ -1859,25 +1952,20 @@ func (s *Service) UTXOsByPubKeys(pubKeys [][32]byte) []PubKeyUTXO {
 	for _, pubKey := range pubKeys {
 		wanted[pubKey] = struct{}{}
 	}
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.CommittedView()
-	utxos := s.chainState.ChainState().UTXOs()
-	if !ok {
-		utxos = s.chainState.ChainState().UTXOs()
-	} else {
-		utxos = view.UTXOs
-	}
 	out := make([]PubKeyUTXO, 0)
-	for outPoint, entry := range utxos {
+	if err := s.chainState.Store().ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
 		if _, ok := wanted[entry.PubKey]; !ok {
-			continue
+			return nil
 		}
 		out = append(out, PubKeyUTXO{
 			OutPoint: outPoint,
 			Value:    entry.ValueAtoms,
 			PubKey:   entry.PubKey,
 		})
+		return nil
+	}); err != nil {
+		s.logger.Warn("scan utxos by pubkey failed", slog.Any("error", err))
+		return nil
 	}
 	slices.SortFunc(out, func(a, b PubKeyUTXO) int {
 		if cmp := bytes.Compare(a.PubKey[:], b.PubKey[:]); cmp != 0 {
@@ -1951,7 +2039,7 @@ func (s *Service) WalletActivityByPubKeys(pubKeys [][32]byte, limit int) ([]Wall
 		return nil, nil
 	}
 	s.stateMu.RLock()
-	view, ok := s.chainState.CommittedView()
+	view, ok := s.chainState.sharedCommittedView()
 	s.stateMu.RUnlock()
 	if !ok {
 		return nil, ErrNoTip
@@ -2098,7 +2186,7 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 			mempoolSize = s.pool.Count()
 			return admissions, errs, orphanCount, mempoolSize
 		}
-		admission, err := s.pool.AcceptTx(txs[0], s.chainUtxoSnapshot(), rules)
+		admission, err := s.pool.AcceptTxWithLookup(txs[0], s.chainUtxoSnapshot(), rules)
 		if err != nil {
 			errs[0] = err
 		} else {
@@ -2147,7 +2235,7 @@ func (s *Service) submitDecodedTxsFrom(txs []types.Transaction, source *peerConn
 			accepted = append(accepted, retryAccepted...)
 			break
 		}
-		admission, err := s.pool.CommitPrepared(prepared[i], chainUtxos, tipHash, rules)
+		admission, err := s.pool.CommitPreparedWithLookup(prepared[i], chainUtxos, tipHash, rules)
 		if err != nil {
 			errs[i] = err
 			continue
@@ -2193,7 +2281,7 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 	snapshot := s.pool.AdmissionSnapshot()
 	retried := false
 	var fallbackTipHash [32]byte
-	var fallbackChainUtxos consensus.UtxoSet
+	var fallbackChainUtxos consensus.UtxoLookup
 
 	for i, tx := range txs {
 		if err := s.avalancheManager().rejectionError(tx); err != nil {
@@ -2205,7 +2293,7 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 				if fallbackTipHash != currentTip {
 					fallbackTipHash, fallbackChainUtxos = s.chainUtxoSnapshotWithTip()
 				}
-				admission, err := s.pool.AcceptTx(tx, fallbackChainUtxos, rules)
+				admission, err := s.pool.AcceptTxWithLookup(tx, fallbackChainUtxos, rules)
 				if err != nil {
 					errs[i] = err
 					continue
@@ -2218,14 +2306,14 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 			snapshot = s.pool.AdmissionSnapshot()
 			retried = true
 		}
-		prepared, err := s.pool.PrepareAdmission(tx, snapshot, chainUtxos, rules)
+		prepared, err := s.pool.PrepareAdmissionWithLookup(tx, snapshot, chainUtxos, rules)
 		if err != nil {
 			errs[i] = err
 			continue
 		}
 		prepared.PreparedTip = tipHash
 		prepared.HasPreparedTip = true
-		admission, err := s.pool.CommitPrepared(prepared, chainUtxos, tipHash, rules)
+		admission, err := s.pool.CommitPreparedWithLookup(prepared, chainUtxos, tipHash, rules)
 		if err != nil {
 			errs[i] = err
 			continue
@@ -2236,7 +2324,7 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 			snapshot.Orphans[prepared.TxID] = struct{}{}
 			continue
 		}
-		if err := mempool.AdvanceAdmissionSnapshot(&snapshot, chainUtxos, admission.Accepted); err != nil {
+		if err := mempool.AdvanceAdmissionSnapshotWithLookup(&snapshot, chainUtxos, admission.Accepted); err != nil {
 			snapshot = s.pool.AdmissionSnapshot()
 		}
 	}
@@ -2273,7 +2361,7 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, tipHash, rules)
 	view.Release()
 	var fallbackTipHash [32]byte
-	var fallbackChainUtxos consensus.UtxoSet
+	var fallbackChainUtxos consensus.UtxoLookup
 	for i, tx := range txs {
 		if err := s.avalancheManager().rejectionError(tx); err != nil {
 			errs[i] = err
@@ -2287,7 +2375,7 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 			if fallbackTipHash != currentTip {
 				fallbackTipHash, fallbackChainUtxos = s.chainUtxoSnapshotWithTip()
 			}
-			admission, err := s.pool.AcceptTx(tx, fallbackChainUtxos, rules)
+			admission, err := s.pool.AcceptTxWithLookup(tx, fallbackChainUtxos, rules)
 			if err != nil {
 				errs[i] = err
 				continue
@@ -2296,7 +2384,7 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 			accepted = append(accepted, admission.Accepted...)
 			continue
 		}
-		admission, err := s.pool.CommitPrepared(prepared[i], chainUtxos, tipHash, rules)
+		admission, err := s.pool.CommitPreparedWithLookup(prepared[i], chainUtxos, tipHash, rules)
 		if err != nil {
 			errs[i] = err
 			continue
@@ -2339,7 +2427,7 @@ func decodePackedTransactions(encoded string) ([]types.Transaction, error) {
 	return txs, nil
 }
 
-func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempool.SharedAdmissionView, chainUtxos consensus.UtxoSet, tipHash [32]byte, rules consensus.ConsensusRules) ([]mempool.PreparedAdmission, []error) {
+func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempool.SharedAdmissionView, chainUtxos consensus.UtxoLookup, tipHash [32]byte, rules consensus.ConsensusRules) ([]mempool.PreparedAdmission, []error) {
 	prepared := make([]mempool.PreparedAdmission, len(txs))
 	errs := make([]error, len(txs))
 	if len(txs) == 0 {
@@ -2363,7 +2451,7 @@ func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempoo
 					errs[idx] = err
 					continue
 				}
-				item, err := s.pool.PrepareAdmissionShared(txs[idx], view, chainUtxos, rules)
+				item, err := s.pool.PrepareAdmissionSharedWithLookup(txs[idx], view, chainUtxos, rules)
 				if err != nil {
 					errs[idx] = err
 					continue
@@ -2631,14 +2719,8 @@ func (s *Service) buildFundingBlock(keyHashes [][32]byte) (types.Block, []Fundin
 	return minedBlock, funding, nil
 }
 
-func (s *Service) chainUtxoSnapshot() consensus.UtxoSet {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.sharedCommittedView()
-	if !ok {
-		return s.chainState.ChainState().UTXOs()
-	}
-	return view.UTXOs
+func (s *Service) chainUtxoSnapshot() consensus.UtxoLookup {
+	return s.chainState.Store().UTXOLookupFunc()
 }
 
 func coinbaseTxForHeight(height uint64, outputs []types.TxOutput) types.Transaction {
@@ -2770,14 +2852,12 @@ func blockCreatedLeaves(txs []types.Transaction) []utreexo.UtxoLeaf {
 	return created
 }
 
-func (s *Service) chainUtxoSnapshotWithTip() ([32]byte, consensus.UtxoSet) {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.sharedCommittedView()
+func (s *Service) chainUtxoSnapshotWithTip() ([32]byte, consensus.UtxoLookup) {
+	tip, ok := s.chainState.tipSnapshot()
 	if !ok {
-		return [32]byte{}, s.chainState.ChainState().UTXOs()
+		return [32]byte{}, s.chainState.Store().UTXOLookupFunc()
 	}
-	return view.TipHash, view.UTXOs
+	return tip.TipHash, s.chainState.Store().UTXOLookupFunc()
 }
 
 func (s *Service) chainTipHash() [32]byte {
@@ -3173,6 +3253,7 @@ func (s *Service) applyPeerHeaders(headers []types.BlockHeader) (int, error) {
 			Height:         prevEntry.Height,
 			Header:         prevEntry.Header,
 			MedianTimePast: consensus.MedianTimePast(recentTimes),
+			CurrentTime:    uint64(time.Now().Unix()),
 		}, s.headerChain.params, rules); err != nil {
 			return applied, err
 		}
@@ -3302,7 +3383,7 @@ func (s *Service) applyPeerBlock(block *types.Block) (bool, consensus.BlockValid
 	}
 	beforeHeight := uint64(0)
 	var beforeHash [32]byte
-	if view, ok := s.chainState.CommittedView(); ok {
+	if view, ok := s.chainState.sharedCommittedView(); ok {
 		beforeHeight = view.Height
 		beforeHash = view.TipHash
 	}
@@ -3317,7 +3398,7 @@ func (s *Service) applyPeerBlock(block *types.Block) (bool, consensus.BlockValid
 	}
 	afterHeight := uint64(0)
 	var afterHash [32]byte
-	if view, ok := s.chainState.CommittedView(); ok {
+	if view, ok := s.chainState.sharedCommittedView(); ok {
 		afterHeight = view.Height
 		afterHash = view.TipHash
 	}
@@ -3416,7 +3497,7 @@ func (s *Service) runErlayReconcileRound() {
 }
 
 func (s *Service) promoteReadyOrphansAfterBlock(block *types.Block) {
-	promoted := s.pool.PromoteReadyOrphansForBlock(block, s.chainUtxoSnapshot(), consensus.DefaultConsensusRules())
+	promoted := s.pool.PromoteReadyOrphansForBlockWithLookup(block, s.chainUtxoSnapshot(), consensus.DefaultConsensusRules())
 	if len(promoted) == 0 {
 		return
 	}
@@ -3458,6 +3539,16 @@ func (s *Service) removeLocalRebroadcastForBlock(block *types.Block) {
 
 func (s *Service) acceptPeerBlockMessage(peer *peerConn, block *types.Block) error {
 	hash := consensus.HeaderHash(&block.Header)
+	if s.hasRejectedBlock(hash) {
+		s.releaseBlockRequest(hash)
+		s.peerManager().banPeerAddr(peer.addr, peerMisbehaviorBanDuration, "relayed cached invalid block")
+		s.logger.Warn("peer relayed cached invalid block",
+			slog.String("addr", peer.addr),
+			slog.String("hash", shortHexBytes(hash, 16)),
+			slog.Duration("ban", peerMisbehaviorBanDuration),
+		)
+		return errors.New("peer relayed cached invalid block")
+	}
 	applied, summary, applyDuration, err := s.applyPeerBlock(block)
 	if errors.Is(err, ErrBlockHeaderNotIndexed) {
 		if _, seen := s.recentHeader(hash); seen {
@@ -3510,6 +3601,19 @@ func (s *Service) handlePeerTxAdmissionErrors(peer *peerConn, errs []error) erro
 		if err == nil {
 			continue
 		}
+		if errors.Is(err, consensus.ErrInvalidSignature) {
+			peer.invalidTxSignatures++
+			if peer.invalidTxSignatures < peerInvalidTxSignatureLimit {
+				s.logger.Warn("peer submitted transaction with invalid signature",
+					slog.String("addr", peer.addr),
+					slog.Int("invalid_sig_count", peer.invalidTxSignatures),
+					slog.Int("ban_threshold", peerInvalidTxSignatureLimit),
+				)
+				continue
+			}
+			s.peerManager().banPeerAddr(peer.addr, peerMisbehaviorBanDuration, err.Error())
+			return err
+		}
 		if isBenignPeerTxAdmissionError(err) {
 			s.logger.Debug("ignoring non-fatal peer tx admission error",
 				slog.String("addr", peer.addr),
@@ -3555,36 +3659,48 @@ func (s *Service) handlePeerBlockAcceptanceError(peer *peerConn, block *types.Bl
 		s.drainPendingPeerBlocks(hash)
 		return s.requestBlocks(peer)
 	case errors.Is(err, ErrUnknownParent):
-		added, pendingCount, evicted, evictedHash := s.storePendingPeerBlock(peer.addr, block)
+		storeResult := s.storePendingPeerBlock(peer.addr, block)
 		s.releaseBlockRequest(hash)
 		s.logger.Warn("peer block arrived before parent header",
 			slog.String("addr", peer.addr),
 			slog.String("hash", shortHexBytes(hash, 16)),
 			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
-			slog.Bool("queued", added),
-			slog.Int("pending_blocks", pendingCount),
+			slog.Bool("queued", storeResult.Added),
+			slog.Int("pending_blocks", storeResult.PendingCount),
+			slog.Uint64("pending_bytes", storeResult.PendingBytes),
 			slog.Uint64("tip_height", s.blockHeight()),
 			slog.Uint64("header_height", s.headerHeight()),
 			slog.String("peer_sync", s.peerSyncDebugSummary(4)),
 			slog.String("inflight_blocks", s.inflightBlockDebugSummary(6)),
 			slog.String("pending_detail", s.pendingPeerBlockDebugSummary(6)),
 		)
-		if evicted {
-			s.logger.Warn("evicted oldest queued peer block while retaining out-of-order block",
-				slog.String("hash", shortHexBytes(evictedHash, 16)),
-				slog.Int("limit", maxPendingPeerBlocks),
+		if storeResult.Evicted > 0 {
+			s.logger.Warn("evicted queued peer blocks while retaining out-of-order block",
+				slog.Int("evicted_blocks", storeResult.Evicted),
+				slog.Int("count_limit", maxPendingPeerBlocks),
+				slog.Uint64("byte_limit", maxPendingPeerBlockBytes),
+				slog.Int("per_peer_limit", maxPendingPeerBlocksPerPeer),
+			)
+		}
+		if storeResult.Dropped {
+			s.logger.Warn("dropped out-of-order peer block from pending queue",
+				slog.String("addr", peer.addr),
+				slog.String("hash", shortHexBytes(hash, 16)),
+				slog.String("reason", storeResult.DropReason),
+				slog.Uint64("pending_bytes", storeResult.PendingBytes),
 			)
 		}
 		return s.requestHeaders(peer, hash)
 	case errors.Is(err, ErrParentStateUnavailable) || errors.Is(err, ErrBlockHeaderNotIndexed):
-		added, pendingCount, evicted, evictedHash := s.storePendingPeerBlock(peer.addr, block)
+		storeResult := s.storePendingPeerBlock(peer.addr, block)
 		s.releaseBlockRequest(hash)
 		s.logger.Warn("peer block requires catch-up before apply",
 			slog.String("addr", peer.addr),
 			slog.String("hash", shortHexBytes(hash, 16)),
 			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
-			slog.Bool("queued", added),
-			slog.Int("pending_blocks", pendingCount),
+			slog.Bool("queued", storeResult.Added),
+			slog.Int("pending_blocks", storeResult.PendingCount),
+			slog.Uint64("pending_bytes", storeResult.PendingBytes),
 			slog.Any("error", err),
 			slog.Uint64("tip_height", s.blockHeight()),
 			slog.Uint64("header_height", s.headerHeight()),
@@ -3592,10 +3708,20 @@ func (s *Service) handlePeerBlockAcceptanceError(peer *peerConn, block *types.Bl
 			slog.String("inflight_blocks", s.inflightBlockDebugSummary(6)),
 			slog.String("pending_detail", s.pendingPeerBlockDebugSummary(6)),
 		)
-		if evicted {
-			s.logger.Warn("evicted oldest queued peer block while retaining competing-branch child",
-				slog.String("hash", shortHexBytes(evictedHash, 16)),
-				slog.Int("limit", maxPendingPeerBlocks),
+		if storeResult.Evicted > 0 {
+			s.logger.Warn("evicted queued peer blocks while retaining competing-branch child",
+				slog.Int("evicted_blocks", storeResult.Evicted),
+				slog.Int("count_limit", maxPendingPeerBlocks),
+				slog.Uint64("byte_limit", maxPendingPeerBlockBytes),
+				slog.Int("per_peer_limit", maxPendingPeerBlocksPerPeer),
+			)
+		}
+		if storeResult.Dropped {
+			s.logger.Warn("dropped competing-branch child from pending queue",
+				slog.String("addr", peer.addr),
+				slog.String("hash", shortHexBytes(hash, 16)),
+				slog.String("reason", storeResult.DropReason),
+				slog.Uint64("pending_bytes", storeResult.PendingBytes),
 			)
 		}
 		if syncErr := s.requestHeaders(peer, hash); syncErr != nil {
@@ -3603,11 +3729,19 @@ func (s *Service) handlePeerBlockAcceptanceError(peer *peerConn, block *types.Bl
 		}
 		return s.requestBlocks(peer)
 	default:
+		s.releaseBlockRequest(hash)
+		s.removePendingPeerBlock(hash)
+		misbehavior := isPeerMisbehaviorBlockError(err)
+		if misbehavior {
+			s.rememberRejectedBlock(hash)
+			s.peerManager().banPeerAddr(peer.addr, peerMisbehaviorBanDuration, err.Error())
+		}
 		s.logger.Warn("peer block apply failed",
 			slog.String("addr", peer.addr),
 			slog.String("hash", shortHexBytes(hash, 16)),
 			slog.String("parent", shortHexBytes(block.Header.PrevBlockHash, 16)),
 			slog.Any("error", err),
+			slog.Bool("peer_misbehavior", misbehavior),
 			slog.Uint64("tip_height", s.blockHeight()),
 			slog.Uint64("header_height", s.headerHeight()),
 			slog.String("peer_sync", s.peerSyncDebugSummary(4)),
@@ -3617,41 +3751,111 @@ func (s *Service) handlePeerBlockAcceptanceError(peer *peerConn, block *types.Bl
 	}
 }
 
-func (s *Service) storePendingPeerBlock(peerAddr string, block *types.Block) (bool, int, bool, [32]byte) {
+func (s *Service) storePendingPeerBlock(peerAddr string, block *types.Block) pendingPeerBlockStoreResult {
 	hash := consensus.HeaderHash(&block.Header)
 	parent := block.Header.PrevBlockHash
 	now := time.Now()
+	blockBytes := pendingPeerBlockEncodedSize(block)
 
 	s.downloadMu.Lock()
 	defer s.downloadMu.Unlock()
-
-	if existing, ok := s.pendingBlocks[hash]; ok {
-		if existing.peerAddr == "" {
-			existing.peerAddr = peerAddr
-		}
-		existing.block = *block
-		existing.receivedAt = now
-		s.pendingBlocks[hash] = existing
-		return false, len(s.pendingBlocks), false, [32]byte{}
+	if s.pendingBlocks == nil {
+		s.pendingBlocks = make(map[[32]byte]pendingPeerBlock)
+	}
+	if s.pendingBlocksByPeer == nil {
+		s.pendingBlocksByPeer = make(map[string]int)
+	}
+	if s.pendingChildren == nil {
+		s.pendingChildren = make(map[[32]byte]map[[32]byte]struct{})
 	}
 
-	var evictedHash [32]byte
-	evicted := false
-	if len(s.pendingBlocks) >= maxPendingPeerBlocks {
-		evictedHash, evicted = s.evictOldestPendingPeerBlockLocked()
+	result := pendingPeerBlockStoreResult{}
+	if blockBytes > maxPendingPeerBlockBytes {
+		result.PendingCount = len(s.pendingBlocks)
+		result.PendingBytes = s.pendingBlockBytes
+		result.Dropped = true
+		result.DropReason = "block exceeds pending queue byte budget"
+		return result
+	}
+
+	if existing, ok := s.pendingBlocks[hash]; ok {
+		if existing.peerAddr == "" && peerAddr != "" {
+			existing.peerAddr = peerAddr
+			s.pendingBlocksByPeer[peerAddr]++
+		}
+		s.pendingBlockBytes -= existing.sizeBytes
+		existing.block = *block
+		existing.sizeBytes = blockBytes
+		existing.receivedAt = now
+		s.pendingBlocks[hash] = existing
+		s.pendingBlockBytes += existing.sizeBytes
+		for s.pendingBlockBytes > maxPendingPeerBlockBytes {
+			if _, evicted := s.evictOldestPendingPeerBlockExceptLocked(hash); !evicted {
+				result.Dropped = true
+				result.DropReason = "pending queue could not make room for block refresh"
+				break
+			}
+			result.Evicted++
+		}
+		result.PendingCount = len(s.pendingBlocks)
+		result.PendingBytes = s.pendingBlockBytes
+		return result
+	}
+
+	if peerAddr != "" {
+		for s.pendingBlocksByPeer[peerAddr] >= maxPendingPeerBlocksPerPeer {
+			if _, evicted := s.evictOldestPendingPeerBlockForPeerLocked(peerAddr); !evicted {
+				break
+			}
+			result.Evicted++
+		}
+	}
+	for len(s.pendingBlocks) >= maxPendingPeerBlocks {
+		if _, evicted := s.evictOldestPendingPeerBlockLocked(); !evicted {
+			break
+		}
+		result.Evicted++
+	}
+	for s.pendingBlockBytes+blockBytes > maxPendingPeerBlockBytes {
+		if _, evicted := s.evictOldestPendingPeerBlockLocked(); !evicted {
+			break
+		}
+		result.Evicted++
+	}
+	if peerAddr != "" && s.pendingBlocksByPeer[peerAddr] >= maxPendingPeerBlocksPerPeer {
+		result.PendingCount = len(s.pendingBlocks)
+		result.PendingBytes = s.pendingBlockBytes
+		result.Dropped = true
+		result.DropReason = "peer pending block quota reached"
+		return result
+	}
+	if s.pendingBlockBytes+blockBytes > maxPendingPeerBlockBytes {
+		result.PendingCount = len(s.pendingBlocks)
+		result.PendingBytes = s.pendingBlockBytes
+		result.Dropped = true
+		result.DropReason = "pending queue byte budget exhausted"
+		return result
 	}
 
 	s.pendingBlocks[hash] = pendingPeerBlock{
 		block:      *block,
 		peerAddr:   peerAddr,
+		sizeBytes:  blockBytes,
 		receivedAt: now,
 	}
+	if peerAddr != "" {
+		s.pendingBlocksByPeer[peerAddr]++
+	}
+	s.pendingBlockBytes += blockBytes
 	if s.pendingChildren[parent] == nil {
 		s.pendingChildren[parent] = make(map[[32]byte]struct{})
 	}
 	s.pendingChildren[parent][hash] = struct{}{}
 	s.pendingBlockFIFO = append(s.pendingBlockFIFO, hash)
-	return true, len(s.pendingBlocks), evicted, evictedHash
+	result.Added = true
+	result.PendingCount = len(s.pendingBlocks)
+	result.PendingBytes = s.pendingBlockBytes
+	return result
 }
 
 func (s *Service) removePendingPeerBlock(hash [32]byte) {
@@ -3661,17 +3865,8 @@ func (s *Service) removePendingPeerBlock(hash [32]byte) {
 }
 
 func (s *Service) removePendingPeerBlockLocked(hash [32]byte) {
-	entry, ok := s.pendingBlocks[hash]
-	if !ok {
+	if _, ok := s.deletePendingPeerBlockLocked(hash); !ok {
 		return
-	}
-	delete(s.pendingBlocks, hash)
-	parent := entry.block.Header.PrevBlockHash
-	if children, ok := s.pendingChildren[parent]; ok {
-		delete(children, hash)
-		if len(children) == 0 {
-			delete(s.pendingChildren, parent)
-		}
 	}
 	for i, candidate := range s.pendingBlockFIFO {
 		if candidate == hash {
@@ -3685,21 +3880,82 @@ func (s *Service) evictOldestPendingPeerBlockLocked() ([32]byte, bool) {
 	for len(s.pendingBlockFIFO) > 0 {
 		hash := s.pendingBlockFIFO[0]
 		s.pendingBlockFIFO = s.pendingBlockFIFO[1:]
-		if _, ok := s.pendingBlocks[hash]; !ok {
+		if _, ok := s.deletePendingPeerBlockLocked(hash); !ok {
 			continue
 		}
-		entry := s.pendingBlocks[hash]
-		delete(s.pendingBlocks, hash)
-		parent := entry.block.Header.PrevBlockHash
-		if children, ok := s.pendingChildren[parent]; ok {
-			delete(children, hash)
-			if len(children) == 0 {
-				delete(s.pendingChildren, parent)
+		return hash, true
+	}
+	return [32]byte{}, false
+}
+
+func (s *Service) evictOldestPendingPeerBlockExceptLocked(skip [32]byte) ([32]byte, bool) {
+	for _, hash := range s.pendingBlockFIFO {
+		if hash == skip {
+			continue
+		}
+		if _, ok := s.deletePendingPeerBlockLocked(hash); !ok {
+			continue
+		}
+		for i, candidate := range s.pendingBlockFIFO {
+			if candidate == hash {
+				s.pendingBlockFIFO = append(s.pendingBlockFIFO[:i], s.pendingBlockFIFO[i+1:]...)
+				break
 			}
 		}
 		return hash, true
 	}
 	return [32]byte{}, false
+}
+
+func (s *Service) evictOldestPendingPeerBlockForPeerLocked(peerAddr string) ([32]byte, bool) {
+	for _, hash := range s.pendingBlockFIFO {
+		entry, ok := s.pendingBlocks[hash]
+		if !ok || entry.peerAddr != peerAddr {
+			continue
+		}
+		if _, ok := s.deletePendingPeerBlockLocked(hash); !ok {
+			continue
+		}
+		for i, candidate := range s.pendingBlockFIFO {
+			if candidate == hash {
+				s.pendingBlockFIFO = append(s.pendingBlockFIFO[:i], s.pendingBlockFIFO[i+1:]...)
+				break
+			}
+		}
+		return hash, true
+	}
+	return [32]byte{}, false
+}
+
+func (s *Service) deletePendingPeerBlockLocked(hash [32]byte) (pendingPeerBlock, bool) {
+	entry, ok := s.pendingBlocks[hash]
+	if !ok {
+		return pendingPeerBlock{}, false
+	}
+	delete(s.pendingBlocks, hash)
+	if s.pendingBlockBytes >= entry.sizeBytes {
+		s.pendingBlockBytes -= entry.sizeBytes
+	} else {
+		s.pendingBlockBytes = 0
+	}
+	if entry.peerAddr != "" {
+		s.pendingBlocksByPeer[entry.peerAddr]--
+		if s.pendingBlocksByPeer[entry.peerAddr] <= 0 {
+			delete(s.pendingBlocksByPeer, entry.peerAddr)
+		}
+	}
+	parent := entry.block.Header.PrevBlockHash
+	if children, ok := s.pendingChildren[parent]; ok {
+		delete(children, hash)
+		if len(children) == 0 {
+			delete(s.pendingChildren, parent)
+		}
+	}
+	return entry, true
+}
+
+func pendingPeerBlockEncodedSize(block *types.Block) uint64 {
+	return uint64(len(block.Encode()))
 }
 
 func (s *Service) pendingPeerBlockChildren(parent [32]byte) []pendingPeerBlock {
@@ -3742,6 +3998,67 @@ func (s *Service) pendingPeerBlockCount() int {
 	s.downloadMu.Lock()
 	defer s.downloadMu.Unlock()
 	return len(s.pendingBlocks)
+}
+
+func (s *Service) pendingPeerBlockBytes() uint64 {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	return s.pendingBlockBytes
+}
+
+func (s *Service) hasRejectedBlock(hash [32]byte) bool {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	_, ok := s.rejectedBlocks[hash]
+	return ok
+}
+
+func (s *Service) rememberRejectedBlock(hash [32]byte) {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	if s.rejectedBlocks == nil {
+		s.rejectedBlocks = make(map[[32]byte]struct{})
+	}
+	if _, ok := s.rejectedBlocks[hash]; ok {
+		return
+	}
+	s.rejectedBlocks[hash] = struct{}{}
+	s.rejectedBlockOrder = append(s.rejectedBlockOrder, hash)
+	if len(s.rejectedBlockOrder) <= maxRejectedBlockHashes {
+		return
+	}
+	evicted := s.rejectedBlockOrder[0]
+	s.rejectedBlockOrder = s.rejectedBlockOrder[1:]
+	delete(s.rejectedBlocks, evicted)
+}
+
+func isPeerMisbehaviorBlockError(err error) bool {
+	return errors.Is(err, consensus.ErrEmptyBlock) ||
+		errors.Is(err, consensus.ErrFirstTxNotCoinbase) ||
+		errors.Is(err, consensus.ErrTxOrderInvalid) ||
+		errors.Is(err, consensus.ErrCoinbaseHasAuth) ||
+		errors.Is(err, consensus.ErrCoinbaseHeightInvalid) ||
+		errors.Is(err, consensus.ErrCoinbaseExtraNonce) ||
+		errors.Is(err, consensus.ErrCoinbaseNoOutputs) ||
+		errors.Is(err, consensus.ErrEmptyInputs) ||
+		errors.Is(err, consensus.ErrEmptyOutputs) ||
+		errors.Is(err, consensus.ErrAuthCountMismatch) ||
+		errors.Is(err, consensus.ErrDuplicateInput) ||
+		errors.Is(err, consensus.ErrMissingUTXO) ||
+		errors.Is(err, consensus.ErrInvalidOutputPubKey) ||
+		errors.Is(err, consensus.ErrInvalidSignature) ||
+		errors.Is(err, consensus.ErrAmountOverflow) ||
+		errors.Is(err, consensus.ErrInputsLessThanOutputs) ||
+		errors.Is(err, consensus.ErrCoinbaseOverpay) ||
+		errors.Is(err, consensus.ErrPrevHashMismatch) ||
+		errors.Is(err, consensus.ErrMerkleTxIDMismatch) ||
+		errors.Is(err, consensus.ErrMerkleAuthMismatch) ||
+		errors.Is(err, consensus.ErrInvalidNBits) ||
+		errors.Is(err, consensus.ErrInvalidCompactTarget) ||
+		errors.Is(err, consensus.ErrInvalidPow) ||
+		errors.Is(err, consensus.ErrBlockTooLarge) ||
+		errors.Is(err, consensus.ErrUTXORootMismatch) ||
+		errors.Is(err, consensus.ErrTimestampTooEarly)
 }
 
 func (s *Service) pendingPeerBlockDebugSummary(limit int) string {
@@ -3964,7 +4281,10 @@ func stressLaneReservePubKey() [32]byte {
 }
 
 func signStressLaneTx(tx types.Transaction, prevValue uint64) (types.Transaction, error) {
-	msg, err := consensus.Sighash(&tx, 0, []uint64{prevValue})
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+		ValueAtoms: prevValue,
+		PubKey:     stressLaneReservePubKey(),
+	}})
 	if err != nil {
 		return types.Transaction{}, err
 	}
@@ -4020,9 +4340,9 @@ func buildStressLaneFanoutTx(prevOut types.OutPoint, prevValue uint64, pubKeys [
 	return tx, outputs, nil
 }
 
-func stressLaneBatchConfirmed(utxos consensus.UtxoSet, outputs []FundingOutput) bool {
+func stressLaneBatchConfirmed(lookup consensus.UtxoLookup, outputs []FundingOutput) bool {
 	for _, output := range outputs {
-		entry, ok := utxos[output.OutPoint]
+		entry, ok := lookup(output.OutPoint)
 		if !ok || entry.ValueAtoms != output.Value || entry.PubKey != output.PubKey {
 			return false
 		}
@@ -5225,16 +5545,16 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		if params.Addr == "" {
 			return nil, errors.New("addr is required")
 		}
-		go func() {
+		s.safeGoDetached("rpc-addpeer", func() {
 			if err := s.ConnectPeer(params.Addr); err != nil {
 				s.logger.Warn("rpc addpeer failed", slog.String("addr", params.Addr), slog.Any("error", err))
 			}
-		}()
+		})
 		return map[string]any{"addr": params.Addr}, nil
 	case "stop":
-		go func() {
+		s.safeGoDetached("rpc-stop", func() {
 			_ = s.Close()
-		}()
+		})
 		return map[string]any{"stopping": true}, nil
 	default:
 		return nil, fmt.Errorf("unknown rpc method: %s", req.Method)
@@ -5346,6 +5666,15 @@ func (s *Service) onInvMessage(peer *peerConn, msg p2p.InvMessage) error {
 				txItems = append(txItems, item)
 			}
 		case p2p.InvTypeBlock:
+			if s.hasRejectedBlock(item.Hash) {
+				if s.logger != nil {
+					s.logger.Debug("ignoring inv for recently rejected block",
+						slog.String("addr", peer.addr),
+						slog.String("hash", shortHexBytes(item.Hash, 16)),
+					)
+				}
+				continue
+			}
 			if _, ok := s.recentHeader(item.Hash); ok {
 				if _, ok := s.recentBlock(item.Hash); !ok {
 					blockItems = append(blockItems, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: item.Hash})
@@ -5404,6 +5733,33 @@ func (p *peerConn) noteHeight(height uint64) {
 			return
 		}
 	}
+}
+
+func (p *peerConn) allowInboundTxs(count int) (bool, error) {
+	if count <= 0 {
+		return true, nil
+	}
+	now := time.Now()
+	if p.inboundTxLastRefill.IsZero() {
+		p.inboundTxLastRefill = now
+		p.inboundTxTokens = inboundPeerTxBurst
+	}
+	if elapsed := now.Sub(p.inboundTxLastRefill).Seconds(); elapsed > 0 {
+		p.inboundTxTokens = min(inboundPeerTxBurst, p.inboundTxTokens+elapsed*inboundPeerTxRatePerSecond)
+		p.inboundTxLastRefill = now
+	}
+	needed := float64(count)
+	if p.inboundTxTokens >= needed {
+		p.inboundTxTokens -= needed
+		p.inboundTxViolations = 0
+		return true, nil
+	}
+	p.inboundTxViolations++
+	p.inboundTxTokens = 0
+	if p.inboundTxViolations >= inboundPeerTxViolationLimit {
+		return false, errPeerInboundTxRateLimit
+	}
+	return false, nil
 }
 
 func (p *peerConn) snapshotHeight() uint64 {
@@ -5585,11 +5941,16 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 	notFound := make([]p2p.InvVector, 0)
 	send := make([]p2p.Message, 0, len(msg.Items))
 	requestedTxIDs := make([][32]byte, 0, len(msg.Items))
+	servedBlocks := 0
 	for _, item := range msg.Items {
 		switch item.Type {
 		case p2p.InvTypeTx:
 			requestedTxIDs = append(requestedTxIDs, item.Hash)
 		case p2p.InvTypeBlock:
+			if servedBlocks >= maxServedBlocksPerGetData {
+				notFound = append(notFound, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: item.Hash})
+				continue
+			}
 			blockMsg, ok, err := s.preferredBlockRelayMessage(peer, item.Hash)
 			if err != nil {
 				return err
@@ -5599,7 +5960,12 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 				continue
 			}
 			send = append(send, blockMsg)
+			servedBlocks++
 		case p2p.InvTypeBlockExtended:
+			if servedBlocks >= maxServedBlocksPerGetData {
+				notFound = append(notFound, item)
+				continue
+			}
 			block, ok, err := s.loadBlock(item.Hash)
 			if err != nil {
 				return err
@@ -5609,7 +5975,12 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 				continue
 			}
 			send = append(send, buildXThinBlockMessage(block))
+			servedBlocks++
 		case p2p.InvTypeBlockFull:
+			if servedBlocks >= maxServedBlocksPerGetData {
+				notFound = append(notFound, item)
+				continue
+			}
 			block, ok, err := s.loadBlock(item.Hash)
 			if err != nil {
 				return err
@@ -5619,6 +5990,7 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 				continue
 			}
 			send = append(send, p2p.BlockMessage{Block: block})
+			servedBlocks++
 		default:
 			notFound = append(notFound, item)
 		}
@@ -5992,7 +6364,9 @@ func (s *Service) relayAcceptedTxs(peers []*peerConn, accepted []mempool.Accepte
 		sourceAddr = source.addr
 	}
 	txids := acceptedTxIDs(accepted)
-	go s.runDandelionFluffAfterDelay(txids, sourceAddr)
+	s.safeGoDetached("dandelion-fluff-delay", func() {
+		s.runDandelionFluffAfterDelay(txids, sourceAddr)
+	})
 }
 
 func (s *Service) broadcastAcceptedTxsToPeersRetry(peers []*peerConn, accepted []mempool.AcceptedTx) {
@@ -6048,7 +6422,10 @@ func (s *Service) scheduleLocalRelayFallbacks(peers []*peerConn, accepted []memp
 		if armed == 0 {
 			continue
 		}
-		go s.runLocalRelayFallback(peer, append([][32]byte(nil), txids...))
+		fallbackTxIDs := append([][32]byte(nil), txids...)
+		s.safeGoDetached("local-relay-fallback", func() {
+			s.runLocalRelayFallback(peer, fallbackTxIDs)
+		})
 	}
 }
 
@@ -6478,12 +6855,13 @@ func (p *peerConn) stagePendingTxs(txs []types.Transaction) ([][]types.Transacti
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
 	if p.pendingTxByID == nil {
-		p.pendingTxByID = make(map[[32]byte]types.Transaction, len(txs))
+		p.pendingTxByID = make(map[[32]byte]*types.Transaction, len(txs))
 	}
 	for _, tx := range txs {
+		txCopy := tx
 		txid := consensus.TxID(&tx)
 		p.pendingTxOrder = append(p.pendingTxOrder, txid)
-		p.pendingTxByID[txid] = tx
+		p.pendingTxByID[txid] = &txCopy
 	}
 	p.telemetry.noteCoalescedTxs(len(txs))
 	ready := make([][]types.Transaction, 0, len(p.pendingTxOrder)/maxBatch+1)
@@ -6570,6 +6948,18 @@ func (p *peerConn) flushPendingReconAfterDelay() {
 	}
 }
 
+func (p *peerConn) clearPendingTxFlushArm() {
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	p.txFlushArmed = false
+}
+
+func (p *peerConn) clearPendingReconFlushArm() {
+	p.txMu.Lock()
+	defer p.txMu.Unlock()
+	p.reconFlushArmed = false
+}
+
 func (p *peerConn) takePendingTxs() [][]types.Transaction {
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
@@ -6598,7 +6988,7 @@ func (p *peerConn) takePendingTxBatchLocked(size int) []types.Transaction {
 		if !ok {
 			continue
 		}
-		batch = append(batch, tx)
+		batch = append(batch, *tx)
 		delete(p.pendingTxByID, txid)
 	}
 	p.pendingTxOrder = p.pendingTxOrder[size:]

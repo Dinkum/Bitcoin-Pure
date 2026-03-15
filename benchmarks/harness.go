@@ -3674,7 +3674,10 @@ func pubKeyForSeed(seed byte) [32]byte {
 }
 
 func signSingleInputTx(tx types.Transaction, spenderSeed byte, prevValue uint64) (types.Transaction, error) {
-	msg, err := consensus.Sighash(&tx, 0, []uint64{prevValue})
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+		ValueAtoms: prevValue,
+		PubKey:     pubKeyForSeed(spenderSeed),
+	}})
 	if err != nil {
 		return types.Transaction{}, err
 	}
@@ -3747,6 +3750,7 @@ func buildChildTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, ou
 type fundingOutput struct {
 	OutPoint types.OutPoint
 	Value    uint64
+	PubKey   [32]byte
 }
 
 type userFundingOutput struct {
@@ -3781,6 +3785,7 @@ func seedFundingOutputs(svc *node.Service, outputCount int, recipientSeed byte) 
 			outputs = append(outputs, fundingOutput{
 				OutPoint: output.OutPoint,
 				Value:    output.Value,
+				PubKey:   pubKeyForSeed(recipientSeed),
 			})
 		}
 	}

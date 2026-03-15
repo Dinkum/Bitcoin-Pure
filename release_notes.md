@@ -1,5 +1,31 @@
 # Release Notes
 
+## v0.1.16
+Major
+- Switched the live node onto a disk-backed UTXO path. Normal startup now opens chainstate from metadata, serves committed UTXO reads directly from Pebble, and no longer depends on preloading the full UTXO map into RAM before the node becomes usable.
+- Reworked chainstate and reorg persistence around direct UTXO deltas instead of full-map rewrites. Active-tip extension and reorg handling now keep metadata, block/undo records, `utxo/` keys, locality index updates, and journal rewrites inside the same atomic Pebble commit boundary.
+- Hardened transaction signing semantics. Consensus sighash now commits to the full spent coin encoding `(value_in_atoms, pubkey)` instead of only input amounts, and the published `SPEC.md` sighash wording now matches the shipped behavior.
+- Landed a broad node hardening pass against runtime failure and peer abuse:
+  - inbound peer acceptance now retries transient `Accept()` failures instead of dying permanently
+  - long-lived service and peer goroutines now recover panics and log stack traces instead of crashing the process
+  - recently rejected invalid blocks are cached and provably invalid block senders are short-term banned
+  - pending block buffering is capped by bytes and per-peer limits instead of only block count
+  - inbound transaction floods are rate-limited per peer, and repeated bad-signature admissions now escalate to ban/disconnect
+
+Minor
+- Added metadata-only storage/open APIs plus direct `GetUTXO`, iterator, and error-aware lookup surfaces so consensus-critical validation can distinguish “missing UTXO” from disk I/O failure cleanly.
+- Moved mempool admission, prepared admission, orphan promotion, and block-template selection onto lookup-backed chain snapshots instead of cloned committed UTXO maps.
+- Switched snapshot verification and export helpers onto iterator-based UTXO walks, reducing dependence on materialized compatibility maps in node and snapshot flows.
+- Added an explicit block timestamp upper bound: headers are now invalid when `timestamp > local_system_time + 7200`, on top of the existing median-time-past floor.
+- Improved sighash and validation hot paths with cached tagged-hash prefixes and preallocated shared serialization buffers for prevouts, outputs, amounts/spent-coin context, and related consensus hashing.
+- Reduced mining overhead in the hottest loop by comparing PoW targets without per-iteration `big.Int` allocation and by hashing a pre-encoded header buffer with in-place nonce patching.
+- Cut repeated small-block consensus overhead with stack-backed `MedianTimePast`, lower parallel Merkle threshold for medium blocks, reused `math/big` constants/scratch values in ASERT and ABLA, and one-pass block encoding reuse during validation.
+- Tightened mempool/template performance by replacing floating-point feerate ranking with exact integer cross-products and caching fee histogram summary stats for hot `Stats()` reads.
+- Reduced peer-relay overhead by adding a no-allocation fast path for direct-message enqueue and storing pending transaction staging entries by pointer instead of repeatedly copying full transaction structs through maps.
+- Capped served block payloads per `getdata` request so a single peer can no longer trigger unbounded block reads and sends from one message.
+- Added a store-scan `utxo_checksum` path for snapshot and verification surfaces while keeping block-apply and reorg checksum maintenance incremental.
+- Extended regression coverage across consensus, mempool, storage, wallet, snapshot, peer-manager, and node-service flows to lock in the new chainstate, replay-protection, and resilience behavior.
+
 ## v0.1.15
 Major
 - Added full snapshot import/export fast-sync with retained trust anchors and background historical replay. `bpu-cli snapshot export` can now write deterministic tip snapshots, `bpu-cli snapshot import` can seed a fresh node from one of those snapshots, and the node keeps replaying stored history from genesis in the background until the imported chainstate is locally re-verified.

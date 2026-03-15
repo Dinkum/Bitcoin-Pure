@@ -22,13 +22,15 @@ type peerManager struct {
 }
 
 const (
-	addrSelectionCooldown   = 2 * time.Minute
-	autoPeerFailureCeiling  = 3
-	controlQueueBurstLimit  = 8
-	priorityQueueBurstLimit = 4
-	sendQueueBurstLimit     = 1
-	inboundProtectionWindow = 45 * time.Second
-	outboundReplacementGap  = 250.0
+	acceptLoopInitialBackoff = 5 * time.Millisecond
+	acceptLoopMaxBackoff     = 5 * time.Second
+	addrSelectionCooldown    = 2 * time.Minute
+	autoPeerFailureCeiling   = 3
+	controlQueueBurstLimit   = 8
+	priorityQueueBurstLimit  = 4
+	sendQueueBurstLimit      = 1
+	inboundProtectionWindow  = 45 * time.Second
+	outboundReplacementGap   = 250.0
 )
 
 type outboundAddrCandidate struct {
@@ -83,6 +85,7 @@ type outboundReservation struct {
 }
 
 func (m *peerManager) acceptLoop() {
+	backoff := acceptLoopInitialBackoff
 	for {
 		conn, err := m.svc.listener.Accept()
 		if err != nil {
@@ -90,19 +93,58 @@ func (m *peerManager) acceptLoop() {
 			case <-m.svc.stopCh:
 				return
 			default:
-				m.svc.logger.Error("accept loop failed", slog.Any("error", err))
+			}
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			if temporaryAcceptError(err) {
+				m.svc.logger.Warn("accept loop temporary error; retrying",
+					slog.Any("error", err),
+					slog.Duration("backoff", backoff),
+				)
+				if !waitForAcceptRetry(m.svc.stopCh, backoff) {
+					return
+				}
+				backoff = min(backoff*2, acceptLoopMaxBackoff)
+				continue
+			}
+			m.svc.logger.Error("accept loop failed", slog.Any("error", err))
+			return
 		}
+		if bannedUntil, banned := m.bannedUntil(conn.RemoteAddr().String()); banned {
+			m.svc.logger.Warn("rejecting banned inbound peer",
+				slog.String("addr", conn.RemoteAddr().String()),
+				slog.Time("banned_until", bannedUntil),
+			)
+			_ = conn.Close()
+			continue
+		}
+		backoff = acceptLoopInitialBackoff
 		if !m.ensureInboundCapacity(conn.RemoteAddr().String()) {
 			_ = conn.Close()
 			continue
 		}
-		m.svc.wg.Add(1)
-		go func() {
-			defer m.svc.wg.Done()
+		m.svc.safeGoWithCleanup("peer-handle-inbound", func() {
+			_ = conn.Close()
+		}, func() {
 			m.handlePeer(conn, false, "")
-		}()
+		})
+	}
+}
+
+func temporaryAcceptError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Temporary()
+}
+
+func waitForAcceptRetry(stopCh <-chan struct{}, backoff time.Duration) bool {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-stopCh:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -166,6 +208,9 @@ func (m *peerManager) connectPeer(addr string, manual bool) error {
 	if addr == "" {
 		return nil
 	}
+	if bannedUntil, banned := m.bannedUntil(addr); banned {
+		return fmt.Errorf("peer is banned until %s", bannedUntil.UTC().Format(time.RFC3339))
+	}
 	if m.isSelfPeerAddr(addr) {
 		m.svc.logger.Debug("skipping self peer address",
 			slog.String("addr", addr),
@@ -190,11 +235,11 @@ func (m *peerManager) connectPeer(addr string, manual bool) error {
 		)
 	}
 
-	m.svc.wg.Add(1)
-	go func() {
-		defer m.svc.wg.Done()
+	m.svc.safeGoWithCleanup("maintain-outbound-peer", func() {
+		m.releaseOutboundReservation(addr)
+	}, func() {
 		m.maintainOutboundPeer(addr)
-	}()
+	})
 	return nil
 }
 
@@ -395,18 +440,14 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		)
 	}()
 
-	m.svc.wg.Add(1)
-	go func() {
-		defer m.svc.wg.Done()
+	m.svc.safeGoWithCleanup("peer-write-loop", peer.close, func() {
 		m.peerWriteLoop(peer)
-	}()
+	})
 
 	m.svc.requestSync(peer)
-	m.svc.wg.Add(1)
-	go func() {
-		defer m.svc.wg.Done()
+	m.svc.safeGoWithCleanup("peer-ping-loop", peer.close, func() {
 		m.peerPingLoop(peer)
-	}()
+	})
 
 	for {
 		if m.svc.cfg.StallTimeout > 0 {
@@ -444,6 +485,12 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 			return
 		}
 	}
+}
+
+func (m *peerManager) releaseOutboundReservation(addr string) {
+	m.svc.peerMu.Lock()
+	defer m.svc.peerMu.Unlock()
+	delete(m.svc.outboundPeers, addr)
 }
 
 func (m *peerManager) peerPingLoop(peer *peerConn) {
@@ -602,7 +649,7 @@ func (m *peerManager) outboundRefillCandidates(limit int) []string {
 	candidates := make([]outboundAddrCandidate, 0, len(m.svc.knownPeers))
 	for addr, record := range m.svc.knownPeers {
 		addr = normalizePeerAddr(addr)
-		if addr == "" || m.isSelfPeerAddr(addr) {
+		if addr == "" || m.isSelfPeerAddr(addr) || m.isBannedAddrLocked(addr, now) {
 			continue
 		}
 		if _, ok := m.svc.outboundPeers[addr]; ok {
@@ -982,14 +1029,15 @@ func (m *peerManager) knownPeerAddrs() []string {
 	m.svc.peerMu.RLock()
 	defer m.svc.peerMu.RUnlock()
 	set := make(map[string]struct{})
+	now := time.Now().UTC()
 	for _, addr := range m.svc.cfg.Peers {
 		addr = normalizePeerAddr(addr)
-		if addr != "" && !m.isSelfPeerAddr(addr) {
+		if addr != "" && !m.isSelfPeerAddr(addr) && !m.isBannedAddrLocked(addr, now) {
 			set[addr] = struct{}{}
 		}
 	}
 	for addr := range m.svc.knownPeers {
-		if addr != "" && !m.isSelfPeerAddr(addr) {
+		if addr != "" && !m.isSelfPeerAddr(addr) && !m.isBannedAddrLocked(addr, now) {
 			set[addr] = struct{}{}
 		}
 	}
@@ -1021,12 +1069,20 @@ func (m *peerManager) loadPersistedKnownPeers(peers map[string]storage.KnownPeer
 	}
 	m.svc.peerMu.Lock()
 	defer m.svc.peerMu.Unlock()
+	if m.svc.bannedPeers == nil {
+		m.svc.bannedPeers = make(map[string]time.Time)
+	}
+	now := time.Now().UTC()
 	for addr, record := range peers {
 		addr = normalizePeerAddr(addr)
 		if addr == "" || m.isSelfPeerAddr(addr) {
 			continue
 		}
-		m.svc.knownPeers[addr] = normalizeKnownPeerRecord(record)
+		record = normalizeKnownPeerRecord(record)
+		m.svc.knownPeers[addr] = record
+		if record.BannedUntil.After(now) {
+			m.svc.bannedPeers[peerBanKey(addr)] = record.BannedUntil
+		}
 	}
 }
 
@@ -1175,6 +1231,7 @@ func normalizeKnownPeerRecord(record storage.KnownPeerRecord) storage.KnownPeerR
 	record.LastSeen = record.LastSeen.UTC()
 	record.LastSuccess = record.LastSuccess.UTC()
 	record.LastAttempt = record.LastAttempt.UTC()
+	record.BannedUntil = record.BannedUntil.UTC()
 	if record.LastSeen.IsZero() {
 		record.LastSeen = record.LastSuccess
 	}
@@ -1244,6 +1301,79 @@ func (m *peerManager) recordKnownPeerFailure(addr string, at time.Time) {
 		record.LastAttempt = at.UTC()
 		record.FailureCount++
 	})
+}
+
+func (m *peerManager) banPeerAddr(addr string, duration time.Duration, reason string) {
+	addr = normalizePeerAddr(addr)
+	if addr == "" || duration <= 0 {
+		return
+	}
+	now := time.Now().UTC()
+	until := now.Add(duration)
+	m.svc.peerMu.Lock()
+	if m.svc.knownPeers == nil {
+		m.svc.knownPeers = make(map[string]storage.KnownPeerRecord)
+	}
+	if m.svc.bannedPeers == nil {
+		m.svc.bannedPeers = make(map[string]time.Time)
+	}
+	record := m.svc.knownPeers[addr]
+	if until.After(record.BannedUntil) {
+		record.BannedUntil = until
+	}
+	record.LastSeen = now
+	m.svc.knownPeers[addr] = normalizeKnownPeerRecord(record)
+	key := peerBanKey(addr)
+	if key != "" && until.After(m.svc.bannedPeers[key]) {
+		m.svc.bannedPeers[key] = until
+	}
+	trimKnownPeerMapLocked(m.svc.knownPeers)
+	snapshot := cloneKnownPeerMap(m.svc.knownPeers)
+	m.svc.peerMu.Unlock()
+	m.svc.logger.Warn("banning peer for misbehavior",
+		slog.String("addr", addr),
+		slog.String("reason", reason),
+		slog.Time("banned_until", until),
+	)
+	if m.svc.chainState != nil {
+		if err := m.svc.chainState.Store().WriteKnownPeers(snapshot); err != nil {
+			m.svc.logger.Warn("failed to persist peer ban",
+				slog.String("addr", addr),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
+
+func (m *peerManager) bannedUntil(addr string) (time.Time, bool) {
+	key := peerBanKey(addr)
+	if key == "" {
+		return time.Time{}, false
+	}
+	now := time.Now().UTC()
+	m.svc.peerMu.Lock()
+	defer m.svc.peerMu.Unlock()
+	if m.svc.bannedPeers == nil {
+		m.svc.bannedPeers = make(map[string]time.Time)
+	}
+	until := m.svc.bannedPeers[key]
+	if until.IsZero() {
+		return time.Time{}, false
+	}
+	if until.After(now) {
+		return until, true
+	}
+	delete(m.svc.bannedPeers, key)
+	return time.Time{}, false
+}
+
+func (m *peerManager) isBannedAddrLocked(addr string, now time.Time) bool {
+	key := peerBanKey(addr)
+	if key == "" || m.svc.bannedPeers == nil {
+		return false
+	}
+	until := m.svc.bannedPeers[key]
+	return until.After(now)
 }
 
 func (m *peerManager) updateKnownPeerRecord(addr string, mutate func(*storage.KnownPeerRecord)) {
@@ -1367,6 +1497,20 @@ func isWildcardOrLoopbackHost(host string) bool {
 func normalizePeerHost(host string) string {
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
 	return strings.ToLower(host)
+}
+
+func peerBanKey(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	if ip, ok := parsePeerAddr(addr); ok {
+		return ip.String()
+	}
+	return normalizePeerHost(addr)
 }
 
 func parsePeerAddr(host string) (netip.Addr, bool) {

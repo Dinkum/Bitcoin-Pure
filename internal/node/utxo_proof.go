@@ -81,7 +81,7 @@ type RPCProofStep struct {
 func (s *Service) UTXOProof(outPoint types.OutPoint) (AnchoredUTXOProof, error) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.CommittedView()
+	view, ok := s.chainState.sharedCommittedView()
 	if !ok {
 		return AnchoredUTXOProof{}, ErrNoTip
 	}
@@ -103,7 +103,7 @@ func (s *Service) UTXOProof(outPoint types.OutPoint) (AnchoredUTXOProof, error) 
 func (s *Service) UTXOProofBatch(outPoints []types.OutPoint) (AnchoredUTXOProofBatch, error) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	view, ok := s.chainState.CommittedView()
+	view, ok := s.chainState.sharedCommittedView()
 	if !ok {
 		return AnchoredUTXOProofBatch{}, ErrNoTip
 	}

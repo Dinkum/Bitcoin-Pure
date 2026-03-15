@@ -45,7 +45,10 @@ func signedSpendTx(tb testing.TB, spenderSeed byte, prevOut types.OutPoint, valu
 			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: recipientPubKey}},
 		},
 	}
-	msg, err := consensus.Sighash(&tx, 0, []uint64{value})
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+		ValueAtoms: value,
+		PubKey:     signerPubKey(spenderSeed),
+	}})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -334,8 +337,12 @@ func TestAcceptTxPromotesMultiInputOrphanOnlyWhenAllParentsReady(t *testing.T) {
 		},
 	}
 	authEntries := make([]types.TxAuthEntry, 0, 2)
+	spentCoins := []consensus.UtxoEntry{
+		{ValueAtoms: 49, PubKey: signerPubKey(3)},
+		{ValueAtoms: 49, PubKey: signerPubKey(4)},
+	}
 	for inputIndex := range join.Base.Inputs {
-		msg, err := consensus.Sighash(&join, inputIndex, []uint64{49, 49})
+		msg, err := consensus.Sighash(&join, inputIndex, spentCoins)
 		if err != nil {
 			t.Fatalf("sighash join input %d: %v", inputIndex, err)
 		}
@@ -1111,6 +1118,9 @@ func TestStatsTracksCountsFeesAndBytesIncrementally(t *testing.T) {
 	if stats.LowFee != firstAdmission.Summary.Fee || stats.HighFee != secondAdmission.Summary.Fee || stats.MedianFee != secondAdmission.Summary.Fee {
 		t.Fatalf("unexpected fee summary: %+v", stats)
 	}
+	if cached := pool.Stats(); cached != stats {
+		t.Fatalf("cached stats = %+v, want %+v", cached, stats)
+	}
 
 	block := &types.Block{
 		Txs: []types.Transaction{
@@ -1122,6 +1132,9 @@ func TestStatsTracksCountsFeesAndBytesIncrementally(t *testing.T) {
 	stats = pool.Stats()
 	if stats.Count != 1 || stats.TotalFees != secondAdmission.Summary.Fee || stats.LowFee != secondAdmission.Summary.Fee || stats.HighFee != secondAdmission.Summary.Fee {
 		t.Fatalf("unexpected stats after removal: %+v", stats)
+	}
+	if cached := pool.Stats(); cached != stats {
+		t.Fatalf("cached stats after removal = %+v, want %+v", cached, stats)
 	}
 }
 
@@ -1281,6 +1294,40 @@ func TestSelectForBlockOverlayKeepsBaseUTXOMapImmutable(t *testing.T) {
 	}
 }
 
+func TestSelectForBlockKeepsBaseUTXOMapImmutable(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	rootPrev := types.OutPoint{TxID: [32]byte{44}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		rootPrev: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+	}
+
+	parent := spendTx(t, 1, rootPrev, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+
+	selected, totalFees := pool.SelectForBlock(utxos, consensus.DefaultConsensusRules(), 1_000_000)
+	if len(selected) != 1 {
+		t.Fatalf("selected len = %d, want 1", len(selected))
+	}
+	if totalFees != parentAdmission.Summary.Fee {
+		t.Fatalf("selected fees = %d, want %d", totalFees, parentAdmission.Summary.Fee)
+	}
+	if _, ok := utxos[rootPrev]; !ok {
+		t.Fatal("base utxo map was mutated during selection")
+	}
+	if _, ok := utxos[types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}]; ok {
+		t.Fatal("selection leaked created outputs into the base utxo map")
+	}
+}
+
 func TestAppendForBlockOverlayExtendsTentativeSelectionWithoutMaterializingBase(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,
@@ -1335,7 +1382,7 @@ func TestAppendForBlockOverlayExtendsTentativeSelectionWithoutMaterializingBase(
 	}
 }
 
-func TestSelectForBlockInPlaceAdvancesProvidedUTXOView(t *testing.T) {
+func TestSelectForBlockOverlayTracksTentativeState(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,
 		MaxTxSize:          1_000_000,
@@ -1359,19 +1406,18 @@ func TestSelectForBlockInPlaceAdvancesProvidedUTXOView(t *testing.T) {
 		t.Fatalf("accept child: %v", err)
 	}
 
-	currentUtxos := cloneUtxos(utxos)
-	selected, _ := pool.SelectForBlockInPlace(currentUtxos, consensus.DefaultConsensusRules(), 1_000_000)
+	selected, _, overlay := pool.SelectForBlockOverlay(utxos, consensus.DefaultConsensusRules(), 1_000_000)
 	if len(selected) != 1 {
 		t.Fatalf("selected len = %d, want 1", len(selected))
 	}
-	if _, ok := currentUtxos[rootPrev]; ok {
-		t.Fatalf("expected original prevout to be spent from in-place view")
+	if _, ok := overlay.Lookup(rootPrev); ok {
+		t.Fatalf("expected original prevout to be spent from tentative overlay")
 	}
-	if _, ok := currentUtxos[types.OutPoint{TxID: childTxID, Vout: 0}]; ok {
+	if _, ok := overlay.Lookup(types.OutPoint{TxID: childTxID, Vout: 0}); ok {
 		t.Fatalf("did not expect descendant output to exist in selected block view")
 	}
-	if _, ok := currentUtxos[types.OutPoint{TxID: parentTxID, Vout: 0}]; !ok {
-		t.Fatalf("expected selected output to remain in in-place view")
+	if _, ok := overlay.Lookup(types.OutPoint{TxID: parentTxID, Vout: 0}); !ok {
+		t.Fatalf("expected selected output to remain in tentative overlay")
 	}
 }
 
@@ -1417,7 +1463,7 @@ func benchmarkSelectionPool(tb testing.TB, txCount int) (*Pool, consensus.UtxoSe
 	utxos := make(consensus.UtxoSet, txCount)
 	for i := 0; i < txCount; i++ {
 		prevOut := types.OutPoint{TxID: [32]byte{byte(i + 1), byte((i + 1) >> 8)}, Vout: 0}
-		utxos[prevOut] = consensus.UtxoEntry{ValueAtoms: 50, PubKey: signerPubKey(byte((i%200) + 1))}
+		utxos[prevOut] = consensus.UtxoEntry{ValueAtoms: 50, PubKey: signerPubKey(byte((i % 200) + 1))}
 		tx := signedSpendTx(tb, byte((i%200)+1), prevOut, 50, byte((i%200)+2), 1)
 		if _, err := pool.AcceptTx(tx, utxos, consensus.DefaultConsensusRules()); err != nil {
 			tb.Fatalf("accept tx %d: %v", i, err)
@@ -1435,6 +1481,41 @@ func BenchmarkSnapshot(b *testing.B) {
 		if len(entries) != 2048 {
 			b.Fatalf("snapshot len = %d, want 2048", len(entries))
 		}
+	}
+}
+
+func TestCandidateLessUsesExactFeerateOrdering(t *testing.T) {
+	// These ratios are distinct but close enough that selection ordering should
+	// stay on exact integer math rather than float rounding behavior.
+	higherRate := packageCandidate{
+		TxID: [32]byte{1},
+		Fee:  1_000_002,
+		Size: 1_000_000,
+	}
+	lowerRate := packageCandidate{
+		TxID: [32]byte{2},
+		Fee:  1_000_000,
+		Size: 999_999,
+	}
+	if !candidateLess(higherRate, lowerRate) {
+		t.Fatal("higher feerate candidate should sort first")
+	}
+	if candidateLess(lowerRate, higherRate) {
+		t.Fatal("lower feerate candidate should sort after the higher feerate one")
+	}
+
+	tieByRateLowerFee := packageCandidate{
+		TxID: [32]byte{3},
+		Fee:  20,
+		Size: 10,
+	}
+	tieByRateHigherFee := packageCandidate{
+		TxID: [32]byte{4},
+		Fee:  40,
+		Size: 20,
+	}
+	if !candidateLess(tieByRateHigherFee, tieByRateLowerFee) {
+		t.Fatal("equal-feerate candidates should break ties on absolute fee")
 	}
 }
 
@@ -1478,6 +1559,30 @@ func BenchmarkSelectionWalkFromCachedSnapshot(b *testing.B) {
 		selected, totalFees, overlay := pool.selectForBlock(utxos, consensus.DefaultConsensusRules(), 1_000_000, snapshot)
 		if len(selected) == 0 || totalFees == 0 || overlay == nil {
 			b.Fatal("selection walk returned an empty candidate")
+		}
+	}
+}
+
+func BenchmarkStatsHot(b *testing.B) {
+	pool, utxos := benchmarkSelectionPool(b, 2048)
+	statsPrevOut := types.OutPoint{TxID: [32]byte{0xff, 0xff, 0xff, 0xff}, Vout: 0}
+	if _, err := pool.AcceptTx(signedSpendTx(b, 201, statsPrevOut, 50, 202, 1), func() consensus.UtxoSet {
+		clone := make(consensus.UtxoSet, len(utxos)+1)
+		for k, v := range utxos {
+			clone[k] = v
+		}
+		clone[statsPrevOut] = consensus.UtxoEntry{ValueAtoms: 50, PubKey: signerPubKey(201)}
+		return clone
+	}(), consensus.DefaultConsensusRules()); err != nil {
+		b.Fatalf("accept tx for stats benchmark: %v", err)
+	}
+	_ = pool.Stats()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stats := pool.Stats()
+		if stats.Count == 0 {
+			b.Fatal("stats unexpectedly empty")
 		}
 	}
 }

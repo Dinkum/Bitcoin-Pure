@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
@@ -73,7 +74,8 @@ func (c *HeaderChain) InitializeTip(height uint64, header types.BlockHeader) err
 	}
 	c.height = &height
 	c.tipHeader = &header
-	c.recentTimes = []uint64{header.Timestamp}
+	c.recentTimes = make([]uint64, 1, recentTimeWindow)
+	c.recentTimes[0] = header.Timestamp
 	return nil
 }
 
@@ -98,6 +100,7 @@ func (c *HeaderChain) ApplyHeader(header *types.BlockHeader) error {
 		Height:         *c.height,
 		Header:         *c.tipHeader,
 		MedianTimePast: consensus.MedianTimePast(c.recentTimes),
+		CurrentTime:    uint64(time.Now().Unix()),
 	}, c.params, rules); err != nil {
 		return err
 	}

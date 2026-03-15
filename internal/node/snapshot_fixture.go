@@ -152,8 +152,7 @@ func VerifyUTXOSnapshotAtHeight(profile types.ChainProfile, genesis *types.Block
 	if header.UTXORoot != snapshotRoot {
 		return SnapshotVerificationSummary{}, fmt.Errorf("snapshot root does not match header utxo_root at height %d: expected %x, got %x", height, header.UTXORoot, snapshotRoot)
 	}
-	liveUTXOs := state.UTXOs()
-	if err := compareSnapshotUTXOs(liveUTXOs, snapshot); err != nil {
+	if err := compareSnapshotUTXOsIter(state.UTXOCount(), state.ForEachUTXO, snapshot); err != nil {
 		return SnapshotVerificationSummary{}, err
 	}
 	if liveRoot := state.UTXORoot(); liveRoot != snapshotRoot {
@@ -211,6 +210,30 @@ func compareSnapshotUTXOs(live, snapshot consensus.UtxoSet) error {
 		if got != expected {
 			return fmt.Errorf("snapshot entry mismatch for %x:%d", outPoint.TxID, outPoint.Vout)
 		}
+	}
+	return nil
+}
+
+func compareSnapshotUTXOsIter(liveCount int, iterate func(func(types.OutPoint, consensus.UtxoEntry) error) error, snapshot consensus.UtxoSet) error {
+	if liveCount != len(snapshot) {
+		return fmt.Errorf("snapshot utxo set size mismatch: expected %d, got %d", len(snapshot), liveCount)
+	}
+	seen := 0
+	if err := iterate(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		expected, ok := snapshot[outPoint]
+		if !ok {
+			return fmt.Errorf("snapshot contains unexpected live outpoint %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		if entry != expected {
+			return fmt.Errorf("snapshot entry mismatch for %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		seen++
+		return nil
+	}); err != nil {
+		return err
+	}
+	if seen != len(snapshot) {
+		return fmt.Errorf("snapshot utxo iteration count mismatch: expected %d, got %d", len(snapshot), seen)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
@@ -44,22 +45,23 @@ type CommittedChainView struct {
 	TipHeader      types.BlockHeader
 	TipHash        [32]byte
 	BlockSizeState consensus.BlockSizeState
-	UTXOs          consensus.UtxoSet
+	UTXOCount      int
 	UTXOAcc        *utreexo.Accumulator
 	UTXORoot       [32]byte
 	UTXOChecksum   [32]byte
 }
 
 // sharedCommittedChainView is an internal-only snapshot for hot paths such as
-// block template assembly. The published committed UTXO map is immutable, so
-// internal readers can borrow it directly instead of paying the full defensive
-// clone cost required by exported read surfaces.
+// block template assembly. It carries only immutable tip metadata plus the
+// maintained accumulator/count scalars; callers that need actual UTXO reads
+// fetch through the store-backed lookup helpers instead of borrowing the
+// compatibility map directly.
 type sharedCommittedChainView struct {
 	Height         uint64
 	TipHeader      types.BlockHeader
 	TipHash        [32]byte
 	BlockSizeState consensus.BlockSizeState
-	UTXOs          consensus.UtxoSet
+	UTXOCount      int
 	UTXOAcc        *utreexo.Accumulator
 	UTXORoot       [32]byte
 	UTXOChecksum   [32]byte
@@ -79,6 +81,9 @@ type ChainState struct {
 	recentTimes    []uint64
 	blockSizeState consensus.BlockSizeState
 	utxos          consensus.UtxoSet
+	utxoLookup     consensus.UtxoLookupWithErr
+	utxoScan       func(func(types.OutPoint, consensus.UtxoEntry) error) error
+	utxoCount      int
 	utxoAcc        *utreexo.Accumulator
 	utxoChecksum   [32]byte
 }
@@ -92,6 +97,7 @@ type PersistentChainState struct {
 
 type appliedBlockDetail struct {
 	summary     consensus.BlockValidationSummary
+	overlay     *consensus.UtxoOverlay
 	createdUTXO map[types.OutPoint]consensus.UtxoEntry
 }
 
@@ -103,6 +109,7 @@ func NewChainState(profile types.ChainProfile) *ChainState {
 		logger:         logging.Component("chain"),
 		blockSizeState: consensus.NewBlockSizeState(params),
 		utxos:          make(consensus.UtxoSet),
+		utxoLookup:     consensus.LookupWithErrFromSet(consensus.UtxoSet{}),
 	}
 }
 
@@ -129,15 +136,75 @@ func ChainStateFromStoredState(stored *storage.StoredChainState) (*ChainState, e
 	return state, nil
 }
 
+func chainStateFromStoredMeta(stored *storage.StoredChainStateMeta, utxos consensus.UtxoSet, lookup consensus.UtxoLookupWithErr, scan func(func(types.OutPoint, consensus.UtxoEntry) error) error, utxoCount int, acc *utreexo.Accumulator) (*ChainState, error) {
+	if stored == nil {
+		return nil, nil
+	}
+	if acc == nil && utxos != nil {
+		var err error
+		acc, err = consensus.UtxoAccumulator(utxos)
+		if err != nil {
+			return nil, err
+		}
+	}
+	state := NewChainState(stored.Profile)
+	height := stored.Height
+	tipHeader := stored.TipHeader
+	state.height = &height
+	state.tipHeader = &tipHeader
+	state.recentTimes = make([]uint64, 1, recentTimeWindow)
+	state.recentTimes[0] = stored.TipHeader.Timestamp
+	state.blockSizeState = stored.BlockSizeState
+	if utxos != nil {
+		state.replaceMaterializedUTXOs(cloneUtxos(utxos))
+	} else {
+		state.utxos = nil
+		state.utxoCount = utxoCount
+	}
+	if lookup != nil {
+		state.utxoLookup = lookup
+	}
+	state.utxoScan = scan
+	state.utxoAcc = acc
+	if stored.UTXOChecksum != ([32]byte{}) {
+		state.utxoChecksum = stored.UTXOChecksum
+	} else if state.utxos != nil {
+		state.utxoChecksum = utxochecksum.Compute(state.utxos)
+	}
+	return state, nil
+}
+
+func buildAccumulatorFromStore(store *storage.ChainStore) (*utreexo.Accumulator, int, error) {
+	leaves := make([]utreexo.UtxoLeaf, 0)
+	utxoCount := 0
+	if err := store.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		leaves = append(leaves, utreexo.UtxoLeaf{
+			OutPoint:   outPoint,
+			ValueAtoms: entry.ValueAtoms,
+			PubKey:     entry.PubKey,
+		})
+		utxoCount++
+		return nil
+	}); err != nil {
+		return nil, 0, err
+	}
+	acc, err := utreexo.NewAccumulatorFromLeaves(leaves)
+	if err != nil {
+		return nil, 0, err
+	}
+	return acc, utxoCount, nil
+}
+
 func (c *ChainState) InitializeTip(height uint64, header types.BlockHeader, blockSizeState consensus.BlockSizeState, utxos consensus.UtxoSet) error {
 	if c.tipHeader != nil {
 		return ErrTipAlreadyInitialized
 	}
 	c.height = &height
 	c.tipHeader = &header
-	c.recentTimes = []uint64{header.Timestamp}
+	c.recentTimes = make([]uint64, 1, recentTimeWindow)
+	c.recentTimes[0] = header.Timestamp
 	c.blockSizeState = blockSizeState
-	c.utxos = cloneUtxos(utxos)
+	c.replaceMaterializedUTXOs(cloneUtxos(utxos))
 	acc, err := consensus.UtxoAccumulator(c.utxos)
 	if err != nil {
 		return err
@@ -207,7 +274,7 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 		CoinbaseTxID:        coinbaseTxID,
 		PostGenesisUTXORoot: postGenesisUTXORoot,
 		UTXOChecksum:        utxochecksum.Compute(utxos),
-		UTXOCount:           len(c.utxos),
+		UTXOCount:           c.utxoCount,
 		BlockSizeLimit:      consensus.NextBlockSizeLimit(c.blockSizeState, c.params),
 	}
 	c.utxoChecksum = summary.UTXOChecksum
@@ -232,7 +299,7 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 		slog.Uint64("height", detail.summary.Height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
 		slog.Int("txs", len(block.Txs)),
-		slog.Int("utxo_count", len(c.utxos)),
+		slog.Int("utxo_count", c.utxoCount),
 		slog.Uint64("next_block_size_limit", consensus.NextBlockSizeLimit(detail.summary.NextBlockSizeState, c.params)),
 	)
 	return detail.summary, nil
@@ -245,11 +312,12 @@ func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail,
 	// The published chain UTXO map is immutable. Validation runs against that
 	// shared base view and only swaps in a freshly materialized post-block map
 	// once the block is fully validated.
-	summary, overlay, nextAcc, err := consensus.ValidateAndApplyBlockOverlayWithAccumulator(
+	summary, overlay, nextAcc, err := consensus.ValidateAndApplyBlockOverlayWithLookup(
 		block,
 		c.prevBlockContext(),
 		c.blockSizeState,
 		c.utxos,
+		c.utxoLookup,
 		c.utxoAcc,
 		c.params,
 		c.rules,
@@ -257,19 +325,25 @@ func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail,
 	if err != nil {
 		return appliedBlockDetail{}, err
 	}
-	finalUtxos := overlay.Materialize()
 	createdUTXO := overlay.CreatedEntriesClone()
-	spentUTXO := blockSpentCommittedUTXOs(c.utxos, block)
+	spentUTXO, err := blockSpentCommittedUTXOs(c.utxoLookup, block)
+	if err != nil {
+		return appliedBlockDetail{}, err
+	}
 	height := summary.Height
 	c.height = &height
 	tip := block.Header
 	c.tipHeader = &tip
 	c.recentTimes = appendRecentTime(c.recentTimes, block.Header.Timestamp)
 	c.blockSizeState = summary.NextBlockSizeState
-	c.utxos = finalUtxos
+	if c.utxos != nil {
+		c.replaceMaterializedUTXOs(overlay.Materialize())
+	} else {
+		c.utxoCount += len(createdUTXO) - len(spentUTXO)
+	}
 	c.utxoAcc = nextAcc
 	c.utxoChecksum = utxochecksum.ApplyDelta(c.utxoChecksum, spentUTXO, createdUTXO)
-	return appliedBlockDetail{summary: summary, createdUTXO: createdUTXO}, nil
+	return appliedBlockDetail{summary: summary, overlay: overlay, createdUTXO: createdUTXO}, nil
 }
 
 func (c *ChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySummary, error) {
@@ -286,7 +360,7 @@ func (c *ChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySummary, err
 		TipHeaderHash:  consensus.HeaderHash(c.tipHeader),
 		UTXORoot:       c.UTXORoot(),
 		UTXOChecksum:   c.UTXOChecksum(),
-		UTXOCount:      len(c.utxos),
+		UTXOCount:      c.utxoCount,
 		BlockSizeLimit: consensus.NextBlockSizeLimit(c.blockSizeState, c.params),
 	}, nil
 }
@@ -308,19 +382,49 @@ func (c *ChainState) BlockSizeState() consensus.BlockSizeState {
 }
 
 func (c *ChainState) UTXOs() consensus.UtxoSet {
+	if c.utxos == nil {
+		utxos, err := c.materializeUTXOs()
+		if err != nil {
+			c.logger.Warn("materialize committed utxos failed", slog.Any("error", err))
+			return nil
+		}
+		return utxos
+	}
 	return cloneUtxos(c.utxos)
+}
+
+func (c *ChainState) ForEachUTXO(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+	if fn == nil {
+		return nil
+	}
+	if c.utxos != nil {
+		for outPoint, entry := range c.utxos {
+			if err := fn(outPoint, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if c.utxoScan == nil {
+		return fmt.Errorf("utxo iteration unavailable")
+	}
+	return c.utxoScan(fn)
+}
+
+func (c *ChainState) UTXOCount() int {
+	return c.utxoCount
 }
 
 func (c *ChainState) UTXORoot() [32]byte {
 	if c.utxoAcc == nil {
-		return consensus.ComputedUTXORoot(c.utxos)
+		return consensus.ComputedUTXORoot(c.UTXOs())
 	}
 	return c.utxoAcc.Root()
 }
 
 func (c *ChainState) UTXOChecksum() [32]byte {
 	if c.utxoChecksum == ([32]byte{}) {
-		return utxochecksum.Compute(c.utxos)
+		return utxochecksum.Compute(c.UTXOs())
 	}
 	return c.utxoChecksum
 }
@@ -334,7 +438,7 @@ func (c *ChainState) CommittedView() (CommittedChainView, bool) {
 		TipHeader:      *c.tipHeader,
 		TipHash:        consensus.HeaderHash(c.tipHeader),
 		BlockSizeState: c.blockSizeState,
-		UTXOs:          cloneUtxos(c.utxos),
+		UTXOCount:      c.utxoCount,
 		UTXOAcc:        c.utxoAcc.Clone(),
 		UTXORoot:       c.UTXORoot(),
 		UTXOChecksum:   c.UTXOChecksum(),
@@ -351,7 +455,7 @@ func (c *ChainState) sharedCommittedView() (sharedCommittedChainView, bool) {
 		TipHeader:      *c.tipHeader,
 		TipHash:        consensus.HeaderHash(c.tipHeader),
 		BlockSizeState: c.blockSizeState,
-		UTXOs:          c.utxos,
+		UTXOCount:      c.utxoCount,
 		UTXOAcc:        c.utxoAcc,
 		UTXORoot:       c.UTXORoot(),
 		UTXOChecksum:   c.UTXOChecksum(),
@@ -376,13 +480,17 @@ func (c *ChainState) StoredState() (*storage.StoredChainState, error) {
 	if c.height == nil || c.tipHeader == nil {
 		return nil, ErrNoTip
 	}
+	utxos, err := c.materializeUTXOs()
+	if err != nil {
+		return nil, err
+	}
 	return &storage.StoredChainState{
 		Profile:        c.Profile(),
 		Height:         *c.height,
 		TipHeader:      *c.tipHeader,
 		BlockSizeState: c.blockSizeState,
 		UTXOChecksum:   c.UTXOChecksum(),
-		UTXOs:          cloneUtxos(c.utxos),
+		UTXOs:          utxos,
 	}, nil
 }
 
@@ -399,35 +507,54 @@ func (c *ChainState) StoredStateMeta() (*storage.StoredChainState, error) {
 	}, nil
 }
 
-func blockSpentCommittedUTXOs(committed consensus.UtxoSet, block *types.Block) map[types.OutPoint]consensus.UtxoEntry {
+func blockSpentCommittedUTXOs(lookup consensus.UtxoLookupWithErr, block *types.Block) (map[types.OutPoint]consensus.UtxoEntry, error) {
 	spent := make(map[types.OutPoint]consensus.UtxoEntry)
 	for i := 1; i < len(block.Txs); i++ {
 		for _, input := range block.Txs[i].Base.Inputs {
-			entry, ok := committed[input.PrevOut]
+			entry, ok, err := lookup(input.PrevOut)
+			if err != nil {
+				return nil, fmt.Errorf("spent utxo lookup failed: %w", err)
+			}
 			if !ok {
 				continue
 			}
 			spent[input.PrevOut] = entry
 		}
 	}
-	return spent
+	return spent, nil
 }
 
 func OpenPersistentChainState(path string, profile types.ChainProfile) (*PersistentChainState, error) {
 	return OpenPersistentChainStateWithRulesAndLogger(path, profile, consensus.DefaultConsensusRules(), slog.Default())
 }
 
+func OpenPersistentChainStateFromMeta(path string, profile types.ChainProfile) (*PersistentChainState, error) {
+	return OpenPersistentChainStateFromMetaWithRulesAndLogger(path, profile, consensus.DefaultConsensusRules(), slog.Default())
+}
+
 func OpenPersistentChainStateWithRules(path string, profile types.ChainProfile, rules consensus.ConsensusRules) (*PersistentChainState, error) {
 	return OpenPersistentChainStateWithRulesAndLogger(path, profile, rules, slog.Default())
 }
 
+func OpenPersistentChainStateFromMetaWithRules(path string, profile types.ChainProfile, rules consensus.ConsensusRules) (*PersistentChainState, error) {
+	return OpenPersistentChainStateFromMetaWithRulesAndLogger(path, profile, rules, slog.Default())
+}
+
 func OpenPersistentChainStateWithRulesAndLogger(path string, profile types.ChainProfile, rules consensus.ConsensusRules, logger *slog.Logger) (*PersistentChainState, error) {
+	return openPersistentChainStateFromMeta(path, profile, rules, logger, storage.OpenOptions{})
+}
+
+func OpenPersistentChainStateFromMetaWithRulesAndLogger(path string, profile types.ChainProfile, rules consensus.ConsensusRules, logger *slog.Logger) (*PersistentChainState, error) {
+	return openPersistentChainStateFromMeta(path, profile, rules, logger, storage.OpenOptions{})
+}
+
+func openPersistentChainState(path string, profile types.ChainProfile, rules consensus.ConsensusRules, logger *slog.Logger, storeOptions storage.OpenOptions) (*PersistentChainState, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	chainLogger := logging.ComponentWith(logger, "chain")
 	chainLogger.Info("opening persistent chain state", slog.String("path", path), slog.String("profile", profile.String()))
-	store, err := storage.OpenWithLogger(path, logging.ComponentWith(logger, "storage"))
+	store, err := storage.OpenWithLoggerAndOptions(path, logging.ComponentWith(logger, "storage"), storeOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -458,6 +585,57 @@ func OpenPersistentChainStateWithRulesAndLogger(path string, profile types.Chain
 		chainLogger.Info("loaded persisted chain state",
 			slog.Uint64("height", stored.Height),
 			slog.Int("utxo_count", len(stored.UTXOs)),
+			slog.Uint64("block_size_limit", consensus.NextBlockSizeLimit(stored.BlockSizeState, state.params)),
+		)
+	} else {
+		state = NewChainState(profile).WithLogger(chainLogger).WithRules(rules)
+		chainLogger.Info("no persisted chain state found", slog.String("path", path))
+	}
+	return &PersistentChainState{logger: chainLogger, state: state, store: store}, nil
+}
+
+func openPersistentChainStateFromMeta(path string, profile types.ChainProfile, rules consensus.ConsensusRules, logger *slog.Logger, storeOptions storage.OpenOptions) (*PersistentChainState, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	chainLogger := logging.ComponentWith(logger, "chain")
+	chainLogger.Info("opening persistent chain state from metadata", slog.String("path", path), slog.String("profile", profile.String()))
+	store, err := storage.OpenWithLoggerAndOptions(path, logging.ComponentWith(logger, "storage"), storeOptions)
+	if err != nil {
+		return nil, err
+	}
+	stored, err := store.LoadChainStateMeta()
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	var state *ChainState
+	if stored != nil {
+		if stored.Profile != profile {
+			store.Close()
+			return nil, fmt.Errorf("stored profile mismatch: expected %s, got %s", profile, stored.Profile)
+		}
+		acc, utxoCount, err := buildAccumulatorFromStore(store)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		state, err = chainStateFromStoredMeta(stored, nil, store.UTXOLookupWithErr(), store.ForEachUTXO, utxoCount, acc)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		state.WithLogger(chainLogger)
+		recentTimes, err := loadIndexedAncestorTimestamps(store, consensus.HeaderHash(&stored.TipHeader), 11)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		state.recentTimes = recentTimes
+		state.WithRules(rules)
+		chainLogger.Info("loaded persisted chain state from metadata",
+			slog.Uint64("height", stored.Height),
+			slog.Int("utxo_count", utxoCount),
 			slog.Uint64("block_size_limit", consensus.NextBlockSizeLimit(stored.BlockSizeState, state.params)),
 		)
 	} else {
@@ -596,6 +774,33 @@ func cloneUtxos(utxos consensus.UtxoSet) consensus.UtxoSet {
 	return out
 }
 
+func (c *ChainState) replaceMaterializedUTXOs(utxos consensus.UtxoSet) {
+	// Keep the compatibility map, lookup adapter, and scalar count in lockstep
+	// while the on-disk cutover is still removing map-based callers.
+	c.utxos = utxos
+	if c.utxos != nil {
+		c.utxoLookup = consensus.LookupWithErrFromSet(c.utxos)
+	}
+	c.utxoCount = len(c.utxos)
+}
+
+func (c *ChainState) materializeUTXOs() (consensus.UtxoSet, error) {
+	if c.utxos != nil {
+		return cloneUtxos(c.utxos), nil
+	}
+	if c.utxoScan == nil {
+		return nil, fmt.Errorf("utxo materialization unavailable")
+	}
+	utxos := make(consensus.UtxoSet, c.utxoCount)
+	if err := c.utxoScan(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		utxos[outPoint] = entry
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return utxos, nil
+}
+
 func cloneUint64Ptr(value *uint64) *uint64 {
 	if value == nil {
 		return nil
@@ -617,16 +822,19 @@ func (c *ChainState) prevBlockContext() consensus.PrevBlockContext {
 		Height:         *c.height,
 		Header:         *c.tipHeader,
 		MedianTimePast: consensus.MedianTimePast(c.recentTimes),
+		CurrentTime:    uint64(time.Now().Unix()),
 	}
 }
 
+const recentTimeWindow = 11
+
 func appendRecentTime(times []uint64, timestamp uint64) []uint64 {
-	const medianWindow = 11
-	next := append(append([]uint64(nil), times...), timestamp)
-	if len(next) > medianWindow {
-		next = next[len(next)-medianWindow:]
+	if len(times) < recentTimeWindow {
+		return append(times, timestamp)
 	}
-	return next
+	copy(times, times[1:])
+	times[len(times)-1] = timestamp
+	return times
 }
 
 func loadIndexedAncestorTimestamps(store *storage.ChainStore, tipHash [32]byte, limit int) ([]uint64, error) {

@@ -76,16 +76,18 @@ For each input i, the signature signs a hash of:
   - For each input: (prev_txid, prev_output_index).
 - The list of all outputs:
   - For each output: (value_in_atoms, pubkey).
-- The list of all input amounts:
-  - For each input: the value_in_atoms of the referenced UTXO.
+- The list of all spent coins:
+  - For each input: the canonical encoding of the referenced UTXO as (value_in_atoms, pubkey).
+
+The spent-coin encoding is identical to the canonical output encoding used by consensus for a transaction output.
 
 In words:
-“Input i authorizes this exact set of inputs and outputs with these exact amounts.”
+“Input i authorizes this exact set of inputs and outputs while committing to the exact coins being spent.”
 
 Properties:
 - Exactly one sighash mode; no SIGHASH flags.
 - All inputs share the same global context, differing only by the index i.
-- Implementations may pre-hash shared components for efficiency; consensus message is as described.
+- Implementations may pre-hash shared components for efficiency; in particular, the shared prevout list, output list, and spent-coin list may be hashed once per transaction and reused across all inputs.
 
 
 ### txid vs Signatures (Malleability & Commitment)
@@ -138,6 +140,8 @@ Header timestamp validity:
 - Let `MTP(prev)` be the median of the timestamps of the previous 11 headers on the same branch.
   - If fewer than 11 previous headers exist, use all available previous headers back to genesis.
 - A block is valid only if `header.timestamp > MTP(prev)`.
+- A block is valid only if `header.timestamp <= local_system_time + 7200`.
+  - `local_system_time` is the validating node's current Unix time from its local system clock, not peer-adjusted or median network time.
 
 Body:
 - Ordered list of transactions.
