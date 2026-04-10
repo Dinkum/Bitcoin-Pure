@@ -45,6 +45,7 @@ target/
 /ci/scratch/
 
 # Root-level markdown notes are local unless explicitly published.
+/beta-pq-ideas.md
 /*.md
 !/README.md
 !/SPEC.md

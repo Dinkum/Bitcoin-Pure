@@ -8,7 +8,10 @@ Note - Additional, more technical specs can be found in /specs/:
 -----------
 Bitcoin Pure is a minimalist, payments-only proof-of-work chain. The goal is to make a lean, cash focused version of Bitcoin that cleans up problamatic parts of the original protocol. We aim to better manifest the spirit of Bitcion, not change it. Bitcoin can scale to cheap, fast, secure, scarce, online cash for the entire world if we let it.
 
-- One spend rule, one signature scheme.
+- Scriptless UTXO model with typed outputs and typed locking payloads.
+- Default transaction family: x-only secp256k1 outputs with Schnorr authorization.
+- Optional post-quantum transaction family: PQ lock outputs with ML-DSA-65 authorization.
+- Mixed-family compatibility: x-only secp256k1 outputs and PQ lock outputs may coexist, and mixed-family transactions are valid.
 - No scripts, no smart contracts, no timelocks, no OP_RETURN.
 - 10-minute blocks, SHA256d PoW, ASERT difficulty with a 1-day half-life.
 - Dynamic block size cap with a 32 MB floor, growing slowly with real usage.
@@ -43,66 +46,146 @@ All on-chain amounts are integers in atoms. BPU is UI only.
 --------------------------------------
 Outputs:
 - Each output:
+  - type: canonical varint,
   - value: uint64 integer number of atoms,
-  - pubkey: 32-byte x-only secp256k1 public key.
+  - payload32: 32-byte payload.
+- Initial output types:
+  - OUTPUT_XONLY_P2PK = 0x00
+  - OUTPUT_PQ_LOCK32  = 0x01
+- Interpretation:
+  - if `type == OUTPUT_XONLY_P2PK`
+    - `payload32` is a 32-byte x-only secp256k1 public key.
+  - if `type == OUTPUT_PQ_LOCK32`
+    - `payload32` is a 32-byte PQ lock commitment.
 - Design rationale: see Appendix A.1.
 
 Inputs / spends:
 - Each input references a previous output by (txid, output_index).
-- To spend an output, the transaction carries per input:
-  - a 64-byte Schnorr signature.
+- Each non-coinbase input carries exactly one self-framing auth entry in the transaction `Auth` section.
+- The number of auth entries in `Auth` MUST equal the number of non-coinbase inputs.
+- For a coinbase transaction, `Auth` is empty.
+- The referenced output type determines the permitted spend family and validation semantics for that input.
+- Mixed-family transactions are valid.
 
-Validation for an input:
-- Verify the Schnorr signature against the referenced UTXO pubkey and the sighash message defined in §3.
+Transactions MUST be decodable without referenced-UTXO lookup. Therefore each non-coinbase auth entry MUST be self-framing. Referenced output type affects validation semantics, but not raw transaction decodability.
 
-There is exactly one output type and one spend rule.
-No script language, no multisig, no timelocks, no hashlocks, no OP_RETURN in consensus.
+There is exactly one transaction model:
+- typed outputs in `Base`,
+- one auth entry per non-coinbase input in `Auth`,
+- spend-family validation selected by referenced output type.
+
+No script language, no native multisig, no timelocks, no hashlocks, no OP_RETURN in consensus.
+
+
+### Auth Entry Framing
+
+Each non-coinbase auth entry is encoded as:
+- `auth_len`: canonical varint,
+- `auth_payload`: exactly `auth_len` raw bytes.
+
+Auth entries are ordered to correspond exactly to non-coinbase inputs in input order.
+
+Raw transaction decoding of `Auth` is length-delimited only. Family-specific interpretation of `auth_payload` occurs when validating an input against the referenced output type.
+
+Any non-canonical varint encoding in consensus serialization is invalid. In this section, that includes `auth_len`, `alg_id`, `vk_len`, and `sig_len`.
+
+Family-specific interpretation of `auth_payload`:
+- if the referenced output type is `OUTPUT_XONLY_P2PK`
+  - `auth_payload` MUST be exactly one 64-byte Schnorr signature.
+- if the referenced output type is `OUTPUT_PQ_LOCK32`
+  - `auth_payload` MUST be parsed as PQ auth v1:
+    - `alg_id`: canonical varint,
+    - `vk_len`: canonical varint,
+    - `vk`: exactly `vk_len` raw bytes,
+    - `sig_len`: canonical varint,
+    - `sig`: exactly `sig_len` raw bytes.
+
+Parser and validity rules:
+- For every supported output family, the family-specific auth parser MUST consume the entire `auth_payload`; trailing bytes render the transaction invalid.
+- Too-short auth payloads are invalid.
+- Too-long auth payloads are invalid.
+- For PQ auth v1, malformed inner length fields are invalid.
+- If the referenced output type is not a supported output type, the input is invalid.
+- Unknown PQ algorithms are invalid.
 
 
 3. Signatures and Sighash (What Is Signed)
 ------------------------------------------
 Cryptography:
-- Curve: secp256k1.
-- Public keys: 32-byte x-only (Taproot/BIP340-style).
-- Signatures: 64-byte Schnorr.
 - Hash: SHA-256, with tagged hashing for domain separation.
+- Default spend family:
+  - curve: secp256k1,
+  - public keys: 32-byte x-only,
+  - signatures: 64-byte Schnorr.
+- PQ spend family:
+  - output payload: 32-byte PQ lock commitment,
+  - auth payload: revealed PQ verification material plus PQ signature.
+
+PQ auth v1 constants:
+- `ALG_MLDSA65 = 0x01`
+
+PQ auth v1 restrictions:
+- `alg_id` MUST equal `ALG_MLDSA65`.
+- `vk_len` MUST equal `1952`.
+- `sig_len` MUST equal `3309`.
+- `vk` and `sig` MUST be interpreted as the exact raw ML-DSA-65 verification-key and signature byte strings for PQ auth v1.
+
+PQ lock derivation:
+- `pq_lock32 = TaggedHash("BPU/PQLOCK/v1", canonical_alg_id_bytes || vk)`
+
+where:
+- `canonical_alg_id_bytes` is the shortest canonical varint encoding of `alg_id`,
+- `vk` is the exact verification-key byte string carried in the auth payload.
 
 Conceptual sighash:
-For each input i, the signature signs a hash of:
+For each input i, the family-specific authorization check is performed over a hash of:
 
 - Transaction version.
-- Index i of the input being signed.
+- Index i of the input being authorized.
 - The list of all input prevouts:
-  - For each input: (prev_txid, prev_output_index).
+  - For each input: `(prev_txid, prev_output_index)`.
 - The list of all outputs:
-  - For each output: (value_in_atoms, pubkey).
+  - For each output: `(type, value_in_atoms, payload32)`.
 - The list of all spent coins:
-  - For each input: the canonical encoding of the referenced UTXO as (value_in_atoms, pubkey).
+  - For each input: the canonical encoding of the referenced UTXO as `(type, value_in_atoms, payload32)`.
 
 The spent-coin encoding is identical to the canonical output encoding used by consensus for a transaction output.
 
 In words:
-“Input i authorizes this exact set of inputs and outputs while committing to the exact coins being spent.”
+“Input i authorizes this exact set of inputs and outputs while committing to the exact typed coins being spent.”
 
 Properties:
 - Exactly one sighash mode; no SIGHASH flags.
 - All inputs share the same global context, differing only by the index i.
 - Implementations may pre-hash shared components for efficiency; in particular, the shared prevout list, output list, and spent-coin list may be hashed once per transaction and reused across all inputs.
+- The output type tag is part of the committed output encoding and part of the committed spent-coin encoding.
+
+Validation semantics:
+- If the referenced output type is `OUTPUT_XONLY_P2PK`:
+  - `auth_payload` MUST be exactly one 64-byte Schnorr signature,
+  - the signature is verified against `payload32` interpreted as an x-only secp256k1 public key and the sighash message defined above.
+- If the referenced output type is `OUTPUT_PQ_LOCK32`:
+  - `auth_payload` MUST be valid PQ auth v1,
+  - `alg_id` MUST equal `ALG_MLDSA65`,
+  - `TaggedHash("BPU/PQLOCK/v1", canonical_alg_id_bytes || vk)` MUST equal the referenced output `payload32`,
+  - the PQ signature MUST verify over the same BPU sighash message.
 
 
-### txid vs Signatures (Malleability & Commitment)
--------------------------------------------------
+### txid vs Auth (Malleability & Commitment)
+--------------------------------------------
 Internal transaction structure:
 
 - Base:
   - version,
   - list of inputs (prevouts: txid + index),
-  - list of outputs (value + pubkey).
+  - list of outputs `(type, value, payload32)`.
 - Auth:
-  - for each non-coinbase input: (signature).
+  - for each non-coinbase input, in non-coinbase input order: one self-framing auth entry.
+- For a non-coinbase transaction, the number of auth entries MUST equal the number of inputs.
+- For a coinbase transaction, `Auth` is empty, and `authid` is the hash of the canonical empty `Auth` serialization.
 
 Identifiers:
-- txid   = hash(Base) only (signatures excluded).
+- txid   = hash(Base) only (`Auth` excluded).
 - authid = hash(Auth).
 
 Blocks commit to both:
@@ -115,8 +198,8 @@ Merkle rules:
 - Because non-coinbase transactions are canonically ordered by LTOR, tx_root and auth_root commit to ordered sequences, not keyed maps.
 
 Effects:
-- txid is stable under any signature changes → no txid malleability.
-- Signatures remain fully committed via auth_root.
+- txid is stable under any auth changes → no txid malleability.
+- Auth material remains fully committed via auth_root.
 - For a given ordered transaction list, all fully-valid nodes must derive the same tx_root and auth_root.
 
 
@@ -325,12 +408,14 @@ Meaning:
 - Representation: canonical authenticated radix tree / Merklix-style tree:
   - Each live UTXO is keyed by outpoint:
     - outpoint = (txid, vout).
-  - Each live UTXO leaf commits to:
+  - Each live UTXO leaf commits to the canonical committed coin payload for BPU:
+    - type,
     - value_in_atoms as uint64,
-    - pubkey,
-    - the canonical committed coin payload for BPU v1:
-      - value_in_atoms as uint64,
-      - pubkey.
+    - payload32.
+  - Initial interpretations of the committed coin payload are:
+    - `(OUTPUT_XONLY_P2PK, value, xonly_pubkey32)`
+    - `(OUTPUT_PQ_LOCK32, value, pq_lock32)`
+  - The outpoint-keyed live UTXO map remains unchanged; only the committed coin payload changes.
   - Internal nodes commit to child hashes using fixed tagged hashing.
   - Empty branches, path compression rules, key encoding, leaf encoding,
     branch encoding, and root hashing are all consensus-defined.
@@ -373,6 +458,7 @@ Security:
 
 Transaction is valid if:
 - Structure well-formed.
+- For a non-coinbase transaction, the number of auth entries equals the number of inputs.
 - All referenced inputs exist in the chain UTXO state and are unspent:
   - for consensus block validation, each input must correspond to a UTXO that is
     unspent in the union of:
@@ -382,7 +468,10 @@ Transaction is valid if:
 - No duplicate input references within the tx.
 - Sum(inputs) ≥ sum(outputs); difference is fee.
 - For each non-coinbase input:
-  - Schnorr signature verifies under the referenced UTXO pubkey and the sighash as defined in §3.
+  - the auth entry is well-formed and self-framing,
+  - the referenced output type is supported,
+  - family-specific auth parsing succeeds and fully consumes `auth_payload`,
+  - family-specific authorization under the referenced output type succeeds as defined in §3.
 
 Block is valid if:
 - Header has correct PoW (hash ≤ target).
@@ -410,8 +499,12 @@ P2P, Relay, and Mempool (Recommended)
 Addresses:
 - CashAddr-style addresses (e.g. `bpu:...`) encoding:
   - address type + payload-size version bits,
-  - 32-byte x-only pubkey payload,
+  - output type + 32-byte payload32,
   - CashAddr checksum committed to the human-readable prefix.
+- Initial address families:
+  - `OUTPUT_XONLY_P2PK` with `payload32 = xonly_pubkey32`,
+  - `OUTPUT_PQ_LOCK32` with `payload32 = pq_lock32`.
+- PQ addresses encode the 32-byte lock commitment, not the raw PQ verification key.
 
 P2P / relay architecture:
 - Transport encryption is not required by spec; nodes MAY use plaintext transport by default.
@@ -596,11 +689,14 @@ Validation requirement:
 12. Wallet Behavior 
 ---------------------------------
 - Generate a fresh address (key) per receive; use HD derivation for UX.
+- Support typed address generation for both the default x-only secp256k1 family and the PQ lock family.
 - Display balances in BPU with decimals; store and transmit values as atoms.
 - Fee estimation:
   - Use recent block fullness and mempool pressure.
+  - Account for materially larger PQ auth sizes when estimating transaction size and fees.
 - Use CPFP for fee-bumping stuck txs.
-- Multi-party custody MAY be implemented off-chain via key/signature aggregation, but consensus remains unchanged: each input presents exactly one Schnorr signature and spends exactly one x-only pubkey output.
+- Wallets SHOULD support mixed-family transactions when both output families are in use.
+- Multi-party custody MAY be implemented off-chain via key/signature aggregation, but consensus remains unchanged: each input presents exactly one auth object and spends exactly one typed output.
 - Please find a non consensus spec for wallet multisig in specs/musig_wallet.md
 
 ### Block Filters for Lite Clients (BIP157/158-Style)
@@ -613,15 +709,18 @@ Mechanism:
 - For each block, full nodes SHOULD serve a compact filter (BPU-Filter)
   similar to BIP158.
 - The filter is built over:
-  - all output pubkeys created in the block,
-  - all spent-prevout pubkeys consumed by inputs in the block.
+  - all created `(type, payload32)` watch items from outputs in the block,
+  - all spent-prevout `(type, payload32)` watch items consumed by inputs in the block.
 - Implemented as a Golomb-coded or similar probabilistic set.
 
 Meaning:
-- Output pubkey entries let a lite client detect newly received funds.
-- Spent-prevout pubkey entries let a lite client detect spends of coins
-  previously controlled by that pubkey.
-- This is the scriptless-UTXO analogue of script-based compact block filters.
+- Created-output watch items let a lite client detect newly received funds.
+- Spent-prevout watch items let a lite client detect spends of coins
+  previously controlled by that watch item.
+- Initial watch-item interpretations are:
+  - `(OUTPUT_XONLY_P2PK, xonly_pubkey32)` for the default x-only secp256k1 family,
+  - `(OUTPUT_PQ_LOCK32, pq_lock32)` for the PQ lock family.
+- This is the typed-output scriptless analogue of script-based compact block filters.
 
 Lite clients:
 - Sync headers (including utxo_root and PoW).
@@ -754,15 +853,18 @@ END — Bitcoin Pure (Consensus + UX)
 Appendix A — Design Rationale (Non-Normative)
 =============================================
 
-A.1 Direct Public-Key Outputs vs Hashed Public-Key Outputs
-----------------------------------------------------------
+A.1 Output Locking Design
+------------------------
 
-BPU v1 commits outputs directly to 32-byte x-only public keys rather than to hashed public keys.
+BPU uses two output-locking forms:
+- direct 32-byte x-only public keys for the x-only spend family,
+- 32-byte PQ lock commitments for the PQ spend family.
 
 Reasoning:
-- This removes the need to carry a 32-byte public key again in every spend.
-- The result is smaller inputs and better cash efficiency.
+- Direct x-only public-key outputs remove the need to carry a 32-byte public key again in every x-only-family spend.
+- The result is smaller x-only-family inputs and better cash efficiency.
 - Hashed public-key outputs offer only a partial hedge against long-exposure quantum risk.
-- A serious post-quantum transition would require a future consensus decision regardless.
-- That future hard fork may introduce new output forms, spend typing, alternate signature schemes, and/or block-height-based migration rules.
-- BPU v1 therefore does not impose a permanent transaction-size penalty on every spend for a partial defense that would still require a later migration strategy.
+- PQ outputs use 32-byte lock commitments derived from PQ verification material rather than storing raw PQ verification keys directly in outputs.
+- This keeps outputs, addresses, committed coin payloads, and lite-client watch items compact across both transaction families.
+- Larger PQ verification material is carried at spend time in `Auth` rather than being permanently stored in every PQ output and live UTXO entry.
+- This preserves efficient x-only-family transactions while providing a scriptless PQ transaction family.

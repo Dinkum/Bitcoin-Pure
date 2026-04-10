@@ -11,6 +11,7 @@ This document defines only:
 - the logical structure of a transaction,
 - the exact serialized structure of a transaction,
 - the exact serialized structure of transaction inputs, outputs, and auth entries,
+- the exact serialized structure of supported family-specific auth payload layouts,
 - the structural distinction between coinbase and non-coinbase transactions,
 - the base/auth split,
 - the derivation of `txid` and `authid`.
@@ -58,12 +59,14 @@ Transaction
 │  │  └─ prev_output_index : uint32
 │  ├─ output_count : varint
 │  └─ outputs[] : TxOutput
+│     ├─ type : varint
 │     ├─ value_atoms : uint64
-│     └─ pubkey : bytes32
+│     └─ payload32 : bytes32
 └─ Auth
    ├─ auth_count : varint
    └─ entries[] : TxAuthEntry
-      └─ signature : bytes64
+      ├─ auth_len : varint
+      └─ auth_payload : bytes[auth_len]
 ```
 
 ### 4.2 Coinbase Transaction
@@ -77,8 +80,9 @@ Transaction
 │  ├─ coinbase_extra_nonce : bytes16
 │  ├─ output_count : varint
 │  └─ outputs[] : TxOutput
+│     ├─ type : varint
 │     ├─ value_atoms : uint64
-│     └─ pubkey : bytes32
+│     └─ payload32 : bytes32
 └─ Auth
    └─ auth_count : varint = 0
 ```
@@ -123,26 +127,42 @@ with no additional wrapper or outer framing.
 - Type: `uint64`
 - Encoding: little-endian
 
-### 6.5 `pubkey`
+### 6.5 `type`
+
+- Type: canonical varint
+- Meaning:
+  - `OUTPUT_XONLY_P2PK = 0x00`
+  - `OUTPUT_PQ_LOCK32  = 0x01`
+
+### 6.6 `payload32`
 
 - Type: `bytes32`
 - Encoding: raw 32 bytes
-- Meaning: x-only secp256k1 public key
+- Meaning depends on `type`:
+  - if `type == OUTPUT_XONLY_P2PK`
+    - `payload32` is a 32-byte x-only secp256k1 public key
+  - if `type == OUTPUT_PQ_LOCK32`
+    - `payload32` is a 32-byte PQ lock commitment
 
-### 6.6 `signature`
+### 6.7 `auth_len`
 
-- Type: `bytes64`
-- Encoding: raw 64 bytes
-- Meaning: Schnorr signature
+- Type: canonical varint
+- Meaning: byte length of `auth_payload`
 
-### 6.7 `coinbase_height`
+### 6.8 `auth_payload`
+
+- Type: `bytes[auth_len]`
+- Encoding: exactly `auth_len` raw bytes
+- Raw transaction decoding is length-delimited only; family-specific interpretation is defined by the referenced output type and the supported auth payload layouts in §12.3.
+
+### 6.9 `coinbase_height`
 
 - Type: canonical varint
 - Meaning: block height committed by a coinbase transaction
 
 `coinbase_height` is part of `base` and therefore part of `txid`.
 
-### 6.8 `coinbase_extra_nonce`
+### 6.10 `coinbase_extra_nonce`
 
 - Type: `bytes16`
 - Encoding: raw 16 bytes
@@ -169,28 +189,32 @@ There is no `scriptSig`, no `sequence`, no annex, and no witness structure.
 
 A transaction output contains exactly:
 
-1. `value_atoms`
-2. `pubkey`
+1. `type`
+2. `value_atoms`
+3. `payload32`
 
 Serialized size of one output:
 
-- `8 + 32 = 40` bytes
+- `varint(type) + 8 + 32` bytes
 
-There is exactly one consensus output shape.
+There is exactly one consensus output envelope.
+Family semantics are selected by `type`.
 
 ### 7.3 `TxAuthEntry`
 
 A transaction auth entry contains exactly:
 
-1. `signature`
+1. `auth_len`
+2. `auth_payload`
 
 Serialized size of one auth entry:
 
-- `64` bytes
+- `varint(auth_len) + auth_len` bytes
 
 Auth entries are positional:
 
-- auth entry `i` corresponds to input `i`
+- auth entry `i` corresponds to non-coinbase input `i`
+- raw transaction decoding of auth entries is determined by `auth_len` only
 
 ## 8. Coinbase vs Non-Coinbase Shape
 
@@ -223,6 +247,11 @@ The only miner-controlled coinbase payload field is the fixed-width `coinbase_ex
 
 - `uint32` and `uint64` encode little-endian
 - counts encode as canonical varints
+- `type` encodes as canonical varint
+- `auth_len` encodes as canonical varint
+- `alg_id` encodes as canonical varint
+- `vk_len` encodes as canonical varint
+- `sig_len` encodes as canonical varint
 - `coinbase_height` encodes as canonical varint
 - `coinbase_extra_nonce` encodes as exactly 16 raw bytes
 - byte arrays encode as raw bytes with no prefix unless explicitly stated
@@ -286,8 +315,9 @@ Each input encodes exactly as:
 
 Each output encodes exactly as:
 
-1. `value_atoms` as 8 little-endian bytes
-2. `pubkey` as 32 raw bytes
+1. `type` as canonical varint
+2. `value_atoms` as 8 little-endian bytes
+3. `payload32` as 32 raw bytes
 
 ## 12. Auth Encoding
 
@@ -298,9 +328,12 @@ The transaction `auth` region is exactly:
 
 Each auth entry encodes exactly as:
 
-1. `signature` as 64 raw bytes
+1. `auth_len` as canonical varint
+2. `auth_payload` as exactly `auth_len` raw bytes
 
 Additional auth bytes are not permitted.
+
+Transactions MUST remain decodable without referenced-UTXO lookup; therefore auth entries are framed only by `auth_len`, and referenced output type does not affect raw transaction decoding.
 
 ### 12.1 Non-Coinbase Auth Shape
 
@@ -313,6 +346,26 @@ For a non-coinbase transaction:
 For a coinbase transaction:
 
 - `auth_count == 0`
+- no auth entries follow
+
+### 12.3 Supported Family Auth Payload Layouts (Structure Only)
+
+This subsection defines supported `auth_payload` byte layouts only.
+Whether a given `auth_payload` is valid for a referenced output type is defined in `SPEC.md`.
+
+If the referenced output type is `OUTPUT_XONLY_P2PK`, the interpreted `auth_payload` layout is exactly:
+
+1. `signature` as 64 raw bytes
+
+If the referenced output type is `OUTPUT_PQ_LOCK32`, the interpreted `auth_payload` layout is exactly:
+
+1. `alg_id` as canonical varint
+2. `vk_len` as canonical varint
+3. `vk` as exactly `vk_len` raw bytes
+4. `sig_len` as canonical varint
+5. `sig` as exactly `sig_len` raw bytes
+
+For a supported family layout, the interpreted layout MUST consume the entire `auth_payload`; trailing bytes are invalid.
 
 ## 13. Full Transaction Encoding
 
@@ -367,6 +420,8 @@ The BPU transaction format defined here does **not** include:
 - multisig fields in consensus
 - `OP_RETURN`
 - sighash flags
+- a script interpreter
+- a top-level auth-kind discriminator
 
 ## 16. Cross-References
 

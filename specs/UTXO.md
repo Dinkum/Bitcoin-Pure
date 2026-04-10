@@ -43,8 +43,14 @@ The live UTXO set is a keyed map from outpoint to coin record.
 For Bitcoin Pure v1, the canonical coin record committed by `utxo_root`
 contains exactly:
 
-1. `value_atoms` as `uint64`
-2. `pubkey` as `bytes32`
+1. `type` as canonical varint
+2. `value_atoms` as `uint64`
+3. `payload32` as `bytes32`
+
+Initial interpretations of the canonical committed coin record are:
+
+- `(OUTPUT_XONLY_P2PK, value_atoms, xonly_pubkey32)`
+- `(OUTPUT_PQ_LOCK32, value_atoms, pq_lock32)`
 
 Coinbase maturity and other chain semantics may depend on data maintained by
 the validating node, but they are not part of the committed `utxo_root` leaf
@@ -77,12 +83,13 @@ Tagged-hash domain separators:
 
 For one live UTXO leaf:
 
-- `LeafHash(utxo) = TaggedHash(UTXOLeafTag, key(outpoint) || value_atoms || pubkey)`
+- `LeafHash(utxo) = TaggedHash(UTXOLeafTag, key(outpoint) || type_encoding || value_atoms || payload32)`
 
 where:
 
+- `type_encoding` is the shortest canonical varint encoding of `type`
 - `value_atoms` is the canonical 8-byte little-endian `uint64`
-- `pubkey` is the canonical 32-byte raw x-only public key
+- `payload32` is the canonical 32-byte raw payload committed by the output type
 
 For a binary branch:
 
@@ -123,7 +130,7 @@ Duplicate-key rule:
 
 Input:
 
-- the current live UTXO set as a set of `(outpoint, value_atoms, pubkey)`
+- the current live UTXO set as a set of `(outpoint, type, value_atoms, payload32)`
   tuples
 
 Algorithm:
@@ -149,6 +156,9 @@ after applying that block’s accepted state transition.
 The exact block transition rules are defined elsewhere, but once the resulting
 live UTXO set is determined, `utxo_root` MUST be computed exactly by this
 document.
+
+The live UTXO map remains keyed by outpoint. Mixed-family compatibility changes
+the committed coin payload, not the outpoint-keyed structure of the live set.
 
 ## 10. Implementation Freedom
 
