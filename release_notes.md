@@ -1,5 +1,17 @@
 # Release Notes
 
+## v0.1.17
+Major
+- Added mixed-family transaction support to the published protocol spec. `SPEC.md` now defines typed outputs and typed locking payloads, with an x-only secp256k1 spend family alongside a PQ lock spend family using ML-DSA-65 authorization.
+- Split transaction authorization into explicit self-framing auth entries. The spec now defines `Auth` as length-delimited per-input auth payloads, keeps `txid = hash(Base)` and `authid = hash(Auth)`, and preserves the ordered `tx_root` / `auth_root` commitment model under the new spend-family structure.
+- Upgraded the canonical transaction and UTXO sub-specs to match the new consensus coin shape. `specs/TX.md` now defines typed outputs plus family-specific auth payload grammars, and `specs/UTXO.md` now commits typed coin payloads in the canonical live-state leaf hash.
+
+Minor
+- Updated the main transaction-validity, address, wallet, and compact-filter sections in `SPEC.md` so they describe typed outputs, mixed-family transactions, typed watch items, and PQ lock addresses instead of a Schnorr-only x-only model.
+- Clarified the published sighash and state-commitment model so committed outputs and spent coins are encoded as `(type, value_in_atoms, payload32)` across transaction signing and `utxo_root` derivation.
+- Refreshed the protocol rationale appendix in `SPEC.md` to describe the current output-locking design: direct x-only public-key outputs for the x-only spend family and 32-byte lock commitments for the PQ spend family.
+- Updated the public `README.md` with the current post-quantum direction, external migration references, and the current no-cutover status.
+
 ## v0.1.16
 Major
 - Switched the live node onto a disk-backed UTXO path. Normal startup now opens chainstate from metadata, serves committed UTXO reads directly from Pebble, and no longer depends on preloading the full UTXO map into RAM before the node becomes usable.
