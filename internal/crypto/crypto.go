@@ -45,7 +45,7 @@ func TaggedHash(tag string, payload []byte) Hash32 {
 	h.Write(tagHash[:])
 	h.Write(payload)
 	var out Hash32
-	copy(out[:], h.Sum(nil))
+	h.Sum(out[:0])
 	return out
 }
 
@@ -73,6 +73,18 @@ func VerifySchnorrXOnly(pubKey *[32]byte, sig *[64]byte, msg *[32]byte) bool {
 		return false
 	}
 	return parsedSig.Verify(msg[:], parsedPubKey)
+}
+
+// VerifySchnorrXOnlyItems verifies each signature independently. This is the
+// deterministic verifier consensus code should use for acceptance decisions.
+func VerifySchnorrXOnlyItems(items []SchnorrBatchItem) bool {
+	for i := range items {
+		item := items[i]
+		if !VerifySchnorrXOnly(&item.PubKey, &item.Signature, &item.Msg) {
+			return false
+		}
+	}
+	return true
 }
 
 // VerifySchnorrBatchXOnly performs BIP340-style batch verification across a set

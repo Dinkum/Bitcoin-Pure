@@ -1,5 +1,24 @@
 # Release Notes
 
+## v0.1.18
+Major
+- Implemented typed transaction outputs and typed UTXO payloads across the node. Transactions, UTXO commitments, sighash construction, storage, wallet code, compact filters, and fixtures now carry explicit output families instead of assuming every coin is an x-only public-key output.
+- Added ML-DSA-65 post-quantum authorization support. The node can generate, encode, sign, verify, persist, and relay PQ-lock outputs and PQ authorization payloads using 32-byte lock commitments and explicit verification-key/signature payloads.
+- Bound transaction authorization to chain lineage. Consensus sighash domains now include the active chain profile and lineage, preventing signatures from being valid across unrelated BPU networks that share the same transaction shape.
+- Added performance gating for CI and release discipline. `bench gate run` and `bench gate compare` now execute the tracked microbenchmarks plus a fixed synthetic multi-node e2e benchmark, with budget enforcement wired through `benchmarks/perf-gate.json` and `scripts/ci-bench-gate.sh`.
+- Added steady-state confirmed-block benchmarking for sustained throughput work. The e2e harness can preload a converged backlog, mine fixed-cadence blocks against it, and report confirmed processing TPS, wall TPS, missed intervals, block convergence, and relay mechanism counters.
+
+Minor
+- Extended compact filters from x-only pubkey matches to typed watch items, so lite-wallet scans can match both created outputs and spent coins for each supported output family.
+- Added watch-item RPC surfaces for wallet and UTXO lookup flows, including typed `getutxosbywatchitems` and `getwalletactivitybywatchitems` queries.
+- Added a relay-side transaction reject cache keyed by full transaction identity `(txid, authid)`, reducing repeated validation work for replayed invalid, low-fee, full-mempool, and failed orphan-promotion transactions.
+- Added a bounded validated-transaction cache for exact mempool-admitted transactions, allowing block validation to skip already-proven auth and output-payload checks while still enforcing contextual consensus state.
+- Improved high-throughput relay behavior with larger benchmark message headroom, requested transaction batches on the relay-priority lane, periodic Avalanche conflict pruning, and richer compact-block recovery counters.
+- Reduced allocation pressure in hot paths by adding encoded-length helpers, stack-backed tagged hashing outputs, lower-copy Utreexo hashing, and more direct block/UTXO apply paths.
+- Expanded benchmark and runtime telemetry with template-phase timings, relay queue pressure, compact block received/recovered/fallback counters, steady-state backlog reporting, and inner CPU profiling for the block-cycle benchmark.
+- Regenerated genesis, bootstrap, and snapshot fixtures for the typed-output and chain-bound authorization model.
+- Refreshed public documentation and protocol sub-specs to describe typed outputs, PQ locks, version policy, and typed UTXO commitments.
+
 ## v0.1.17
 Major
 - Added mixed-family transaction support to the published protocol spec. `SPEC.md` now defines typed outputs and typed locking payloads, with an x-only secp256k1 spend family alongside a PQ lock spend family using ML-DSA-65 authorization.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"math/big"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -40,7 +41,7 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: consensusTestPubKey(recipientSeed)}},
 		},
 	}
-	msg, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: value, PubKey: consensusTestPubKey(spenderSeed)}})
+	msg, err := SighashWithParams(&tx, 0, []UtxoEntry{{ValueAtoms: value, PubKey: consensusTestPubKey(spenderSeed)}}, RegtestParams())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +50,71 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 	return tx
 }
 
-func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry) ([32]byte, error) {
+func TestParsePQAuthPayloadUsesSpecFixedLayout(t *testing.T) {
+	verificationKey := bytes.Repeat([]byte{0x11}, crypto.MLDSA65VerificationKeySize)
+	signature := bytes.Repeat([]byte{0x22}, crypto.MLDSA65SignatureSize)
+	payload := append(append([]byte(nil), verificationKey...), signature...)
+
+	parsed, err := parsePQAuthPayload(payload)
+	if err != nil {
+		t.Fatalf("parsePQAuthPayload: %v", err)
+	}
+	if !bytes.Equal(parsed.VerificationKey, verificationKey) {
+		t.Fatal("verification key parsed from the wrong payload segment")
+	}
+	if !bytes.Equal(parsed.Signature, signature) {
+		t.Fatal("signature parsed from the wrong payload segment")
+	}
+
+	if _, err := parsePQAuthPayload(payload[:len(payload)-1]); !errors.Is(err, ErrInvalidAuthPayload) {
+		t.Fatalf("short payload err = %v, want ErrInvalidAuthPayload", err)
+	}
+	if _, err := parsePQAuthPayload(append(payload, 0x00)); !errors.Is(err, ErrInvalidAuthPayload) {
+		t.Fatalf("long payload err = %v, want ErrInvalidAuthPayload", err)
+	}
+
+	legacyFramed := make([]byte, 0, len(payload)+8)
+	legacyFramed = types.AppendCanonicalVarInt(legacyFramed, types.AlgMLDSA65)
+	legacyFramed = types.AppendCanonicalVarInt(legacyFramed, uint64(len(verificationKey)))
+	legacyFramed = append(legacyFramed, verificationKey...)
+	legacyFramed = types.AppendCanonicalVarInt(legacyFramed, uint64(len(signature)))
+	legacyFramed = append(legacyFramed, signature...)
+	if _, err := parsePQAuthPayload(legacyFramed); !errors.Is(err, ErrInvalidAuthPayload) {
+		t.Fatalf("legacy framed payload err = %v, want ErrInvalidAuthPayload", err)
+	}
+}
+
+func TestVerifyBlockSignatureChecksUsesExactVerifier(t *testing.T) {
+	items := make([]crypto.SchnorrBatchItem, 0, 4)
+	for i := 0; i < 4; i++ {
+		msg := crypto.Sha256([]byte{byte(50 + i), byte(60 + i)})
+		pubKey, sig := crypto.RandomSignSchnorrForTest(&msg)
+		items = append(items, crypto.SchnorrBatchItem{
+			PubKey:    pubKey,
+			Signature: sig,
+			Msg:       msg,
+		})
+	}
+
+	result := verifyBlockSignatureChecks(items)
+	if !result.Valid {
+		t.Fatal("valid block signature checks unexpectedly failed")
+	}
+	if result.Fallback {
+		t.Fatal("consensus exact verifier should not report batch fallback")
+	}
+
+	items[2].Signature[12] ^= 0x01
+	result = verifyBlockSignatureChecks(items)
+	if result.Valid {
+		t.Fatal("tampered block signature checks unexpectedly verified")
+	}
+	if result.Fallback {
+		t.Fatal("consensus exact verifier should not report batch fallback on failure")
+	}
+}
+
+func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry, params ChainParams) ([32]byte, error) {
 	if inputIndex < 0 || inputIndex >= len(tx.Base.Inputs) {
 		return [32]byte{}, errors.New("input index out of range")
 	}
@@ -105,7 +170,7 @@ func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []Utxo
 	preimage = append(preimage, prevoutsHash[:]...)
 	preimage = append(preimage, outputsHash[:]...)
 	preimage = append(preimage, spentCoinsHash[:]...)
-	return crypto.TaggedHash(SighashTag, preimage), nil
+	return crypto.TaggedHash(params.SighashTag(), preimage), nil
 }
 
 func TestTxIDAndAuthIDAreStable(t *testing.T) {
@@ -357,7 +422,7 @@ func TestValidateSignedSpend(t *testing.T) {
 			}},
 		},
 	}
-	msg, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: msgPub}})
+	msg, err := SighashWithParams(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: msgPub}}, MainnetParams())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,11 +457,11 @@ func TestSighashMatchesSpecForMultiInputSpend(t *testing.T) {
 	}
 
 	for i := range tx.Base.Inputs {
-		got, err := Sighash(&tx, i, spentCoins)
+		got, err := SighashWithParams(&tx, i, spentCoins, MainnetParams())
 		if err != nil {
 			t.Fatalf("sighash input %d: %v", i, err)
 		}
-		want, err := specSighashForTest(&tx, i, spentCoins)
+		want, err := specSighashForTest(&tx, i, spentCoins, MainnetParams())
 		if err != nil {
 			t.Fatalf("spec sighash input %d: %v", i, err)
 		}
@@ -419,16 +484,43 @@ func TestSighashCommitsToSpentCoinPubKey(t *testing.T) {
 			}},
 		},
 	}
-	left, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(1)}})
+	left, err := SighashWithParams(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(1)}}, MainnetParams())
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := Sighash(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(2)}})
+	right, err := SighashWithParams(&tx, 0, []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(2)}}, MainnetParams())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if left == right {
 		t.Fatal("expected sighash to change when spent coin pubkey changes")
+	}
+}
+
+func TestSighashChangesAcrossProfiles(t *testing.T) {
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs: []types.TxInput{{
+				PrevOut: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+			}},
+			Outputs: []types.TxOutput{{
+				ValueAtoms: 49,
+				PubKey:     consensusTestPubKey(9),
+			}},
+		},
+	}
+	spent := []UtxoEntry{{ValueAtoms: 50, PubKey: consensusTestPubKey(1)}}
+	mainnet, err := SighashWithParams(&tx, 0, spent, MainnetParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	regtest, err := SighashWithParams(&tx, 0, spent, RegtestParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainnet == regtest {
+		t.Fatal("expected profile-specific sighash domains to differ")
 	}
 }
 
@@ -526,6 +618,25 @@ func TestUtxoOverlayRecordsFirstLookupError(t *testing.T) {
 	}
 	if err := overlay.Err(); !errors.Is(err, lookupErr) {
 		t.Fatalf("overlay.Err() = %v, want %v", err, lookupErr)
+	}
+}
+
+func TestUtxoOverlayApplyToSetMatchesMaterialize(t *testing.T) {
+	base := UtxoSet{
+		types.OutPoint{TxID: [32]byte{1}, Vout: 0}: {ValueAtoms: 10, PubKey: consensusTestPubKey(1)},
+		types.OutPoint{TxID: [32]byte{2}, Vout: 1}: {ValueAtoms: 20, PubKey: consensusTestPubKey(2)},
+		types.OutPoint{TxID: [32]byte{3}, Vout: 2}: {ValueAtoms: 30, PubKey: consensusTestPubKey(3)},
+	}
+	overlay := NewUtxoOverlay(base)
+	overlay.Spend(types.OutPoint{TxID: [32]byte{1}, Vout: 0})
+	overlay.Set(types.OutPoint{TxID: [32]byte{2}, Vout: 1}, UtxoEntry{ValueAtoms: 25, PubKey: consensusTestPubKey(4)})
+	overlay.Set(types.OutPoint{TxID: [32]byte{9}, Vout: 0}, UtxoEntry{ValueAtoms: 99, PubKey: consensusTestPubKey(5)})
+
+	got := cloneUtxos(base)
+	overlay.ApplyToSet(got)
+	want := overlay.Materialize()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ApplyToSet result = %+v, want %+v", got, want)
 	}
 }
 
@@ -1008,6 +1119,72 @@ func TestValidateAndApplyBlockRejectsInvalidSignatureAcrossBatch(t *testing.T) {
 	_, err = ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), cloneUtxos(utxos), params, DefaultConsensusRules())
 	if !errors.Is(err, ErrInvalidSignature) {
 		t.Fatalf("expected invalid signature, got %v", err)
+	}
+}
+
+func TestValidateAndApplyBlockSkipsCachedValidatedAuth(t *testing.T) {
+	params := RegtestParams()
+	prevOut := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
+	utxos := UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: consensusTestPubKey(1)},
+	}
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	spend := signedSpendTxForConsensusTest(t, 1, prevOut, 50, 2, 1)
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(9)}})
+	txs := []types.Transaction{coinbase, spend}
+	txids, authids, txRoot, authRoot := BuildBlockRoots(txs)
+
+	nextUTXOs := cloneUtxos(utxos)
+	delete(nextUTXOs, prevOut)
+	nextUTXOs[types.OutPoint{TxID: txids[1], Vout: 0}] = UtxoEntry{
+		ValueAtoms: spend.Base.Outputs[0].ValueAtoms,
+		PubKey:     spend.Base.Outputs[0].PubKey,
+	}
+	nextUTXOs[types.OutPoint{TxID: txids[0], Vout: 0}] = UtxoEntry{
+		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
+		PubKey:     coinbase.Base.Outputs[0].PubKey,
+	}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: txRoot,
+			MerkleAuthRoot: authRoot,
+			UTXORoot:       ComputedUTXORoot(nextUTXOs),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: txs,
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	uncached, err := ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), cloneUtxos(utxos), params, DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("uncached validate block: %v", err)
+	}
+	if got, want := uncached.SignatureChecks, 1; got != want {
+		t.Fatalf("uncached signature checks = %d, want %d", got, want)
+	}
+
+	rules := DefaultConsensusRules()
+	rules.ValidatedAuthCache = func(txid, authid [32]byte, gotParams ChainParams) bool {
+		return gotParams.SighashTag() == params.SighashTag() && txid == txids[1] && authid == authids[1]
+	}
+	cached, err := ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), cloneUtxos(utxos), params, rules)
+	if err != nil {
+		t.Fatalf("cached validate block: %v", err)
+	}
+	if got, want := cached.SignatureChecks, 0; got != want {
+		t.Fatalf("cached signature checks = %d, want %d", got, want)
 	}
 }
 

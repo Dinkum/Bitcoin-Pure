@@ -63,10 +63,14 @@ Core benches:
   - mempool package selection for a block candidate
 - `BenchmarkBlockBuild`
   - block-template build on a live mempool
+- `BenchmarkSteadyStateBlockCycle`
+  - repeated capped block build plus local accept/removal after a preloaded mempool
 - `BenchmarkBlockApply`
   - block acceptance/apply on a fresh follower
 
 All of these benches run on one process with a fresh benchmark-only chain and synthetic mining enabled for setup only. The timed section stays focused on the hot path being measured.
+
+`BenchmarkSteadyStateBlockCycle` also accepts `BPU_BENCH_INNER_CPU_PROFILE=/tmp/profile.pprof` to capture CPU only after fixture signing and mempool admission complete.
 
 `bench micro` writes reports under `benchmarks/reports/micro/YYYYMMDD/HHMMSS/` by default:
 
@@ -74,6 +78,33 @@ All of these benches run on one process with a fresh benchmark-only chain and sy
 - `report.md`
 
 It shells out to the same `go test ./benchmarks -run '^$' -bench ... -benchmem` command you would run manually, so it stays a convenience wrapper rather than a second benchmark system.
+
+## Performance Gate
+
+Performance gating reuses the same benchmark surfaces instead of maintaining a separate CI-only runner.
+
+- Budget file: `benchmarks/perf-gate.json`
+- Micro gate: `BenchmarkTxAdmission`, `BenchmarkTxValidation`, `BenchmarkMempoolSelection`, `BenchmarkBlockApply`
+- End-to-end gate: one fixed synthetic `bench e2e` run on `benchnet`
+
+The gate compares the current branch against a base commit on the same machine or CI runner. That keeps the contract stable across different hardware classes while still failing fast on meaningful regressions.
+
+Run the current tree and archive gate reports:
+
+```bash
+go run ./cmd/bpu-cli bench gate run --budget benchmarks/perf-gate.json --out-dir /tmp/bpu-gate-current
+```
+
+Compare two archived gate runs:
+
+```bash
+go run ./cmd/bpu-cli bench gate compare \
+  --budget benchmarks/perf-gate.json \
+  --baseline-dir /tmp/bpu-gate-base \
+  --candidate-dir /tmp/bpu-gate-current
+```
+
+CI uses `scripts/ci-bench-gate.sh`, which checks out a base ref in a sibling worktree, runs the same micro and synthetic e2e commands in both trees, and then enforces the regression budget with `bench gate compare`.
 
 ## End-to-End
 
@@ -162,6 +193,11 @@ block relay instead of inferring it from convergence alone:
 - `erlay_rounds`
 - `erlay_requested_txs`
 - `compact_block_plans`
+- `compact_blocks_received`
+- `compact_blocks_recovered`
+- `compact_block_missing_txs`
+- `compact_block_tx_requests`
+- `compact_block_fallbacks`
 - `graphene_extended_plans`
 - `graphene_decode_failures`
 - `graphene_extended_recoveries`

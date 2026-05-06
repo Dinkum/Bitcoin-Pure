@@ -16,11 +16,17 @@ type TxInput struct {
 }
 
 type TxOutput struct {
+	Type       uint64
 	ValueAtoms uint64
-	PubKey     [32]byte
+	Payload32  [32]byte
+	// PubKey is a compatibility alias for x-only outputs while the codebase
+	// finishes migrating to typed payloads. PQ outputs leave this zeroed.
+	PubKey [32]byte
 }
 
 type TxAuthEntry struct {
+	AuthPayload []byte
+	// Signature is a compatibility alias for fixed-width x-only auth entries.
 	Signature [64]byte
 }
 
@@ -70,6 +76,11 @@ const (
 const (
 	CoinbaseExtraNonceLen = 16
 	BlockHeaderEncodedLen = 152
+
+	OutputXOnlyP2PK = uint64(0x00)
+	OutputPQLock32  = uint64(0x01)
+
+	AlgMLDSA65 = uint64(0x01)
 )
 
 func ParseChainProfile(raw string) (ChainProfile, error) {
@@ -297,6 +308,32 @@ func writeVarInt(out *[]byte, v uint64) {
 	}
 }
 
+func varIntEncodedLen(v uint64) int {
+	switch {
+	case v <= 0xfc:
+		return 1
+	case v <= 0xffff:
+		return 3
+	case v <= 0xffff_ffff:
+		return 5
+	default:
+		return 9
+	}
+}
+
+func CanonicalVarIntLen(v uint64) int {
+	return varIntEncodedLen(v)
+}
+
+func AppendCanonicalVarInt(dst []byte, v uint64) []byte {
+	writeVarInt(&dst, v)
+	return dst
+}
+
+func CanonicalVarIntBytes(v uint64) []byte {
+	return AppendCanonicalVarInt(nil, v)
+}
+
 func readCount(r *reader, max int, field string) (int, error) {
 	raw, err := r.readVarInt()
 	if err != nil {
@@ -311,6 +348,10 @@ func readCount(r *reader, max int, field string) (int, error) {
 func (o OutPoint) Encode(out *[]byte) {
 	*out = append(*out, o.TxID[:]...)
 	writeU32LE(out, o.Vout)
+}
+
+func (o OutPoint) EncodedLen() int {
+	return 36
 }
 
 func decodeOutPoint(r *reader) (OutPoint, error) {
@@ -329,6 +370,10 @@ func (i TxInput) Encode(out *[]byte) {
 	i.PrevOut.Encode(out)
 }
 
+func (i TxInput) EncodedLen() int {
+	return i.PrevOut.EncodedLen()
+}
+
 func decodeTxInput(r *reader) (TxInput, error) {
 	prevOut, err := decodeOutPoint(r)
 	if err != nil {
@@ -338,32 +383,74 @@ func decodeTxInput(r *reader) (TxInput, error) {
 }
 
 func (o TxOutput) Encode(out *[]byte) {
+	writeVarInt(out, o.Type)
 	writeU64LE(out, o.ValueAtoms)
-	*out = append(*out, o.PubKey[:]...)
+	payload32 := o.Payload32
+	if payload32 == ([32]byte{}) && o.Type == OutputXOnlyP2PK {
+		payload32 = o.PubKey
+	}
+	*out = append(*out, payload32[:]...)
+}
+
+func (o TxOutput) EncodedLen() int {
+	return varIntEncodedLen(o.Type) + 8 + 32
 }
 
 func decodeTxOutput(r *reader) (TxOutput, error) {
+	outputType, err := r.readVarInt()
+	if err != nil {
+		return TxOutput{}, err
+	}
 	value, err := r.readU64LE()
 	if err != nil {
 		return TxOutput{}, err
 	}
-	pubKey, err := r.readArray32()
+	payload32, err := r.readArray32()
 	if err != nil {
 		return TxOutput{}, err
 	}
-	return TxOutput{ValueAtoms: value, PubKey: pubKey}, nil
+	output := TxOutput{Type: outputType, ValueAtoms: value}
+	if outputType == OutputXOnlyP2PK {
+		output.PubKey = payload32
+	} else {
+		output.Payload32 = payload32
+	}
+	return output, nil
 }
 
 func (e TxAuthEntry) Encode(out *[]byte) {
-	*out = append(*out, e.Signature[:]...)
+	authPayload := e.AuthPayload
+	if len(authPayload) == 0 && e.Signature != ([64]byte{}) {
+		authPayload = e.Signature[:]
+	}
+	writeVarInt(out, uint64(len(authPayload)))
+	*out = append(*out, authPayload...)
+}
+
+func (e TxAuthEntry) EncodedLen() int {
+	authLen := len(e.AuthPayload)
+	if authLen == 0 && e.Signature != ([64]byte{}) {
+		authLen = len(e.Signature)
+	}
+	return varIntEncodedLen(uint64(authLen)) + authLen
 }
 
 func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
-	signature, err := r.readArray64()
+	authLen, err := r.readVarInt()
 	if err != nil {
 		return TxAuthEntry{}, err
 	}
-	return TxAuthEntry{Signature: signature}, nil
+	authPayload, err := r.take(int(authLen))
+	if err != nil {
+		return TxAuthEntry{}, err
+	}
+	entry := TxAuthEntry{}
+	if len(authPayload) == len(entry.Signature) {
+		copy(entry.Signature[:], authPayload)
+	} else {
+		entry.AuthPayload = append([]byte(nil), authPayload...)
+	}
+	return entry, nil
 }
 
 func (b TxBase) Encode(out *[]byte) {
@@ -383,6 +470,24 @@ func (b TxBase) Encode(out *[]byte) {
 	for _, output := range b.Outputs {
 		output.Encode(out)
 	}
+}
+
+func (b TxBase) EncodedLen() int {
+	size := 4 + varIntEncodedLen(uint64(len(b.Inputs)))
+	if len(b.Inputs) == 0 {
+		if b.CoinbaseHeight != nil {
+			size += varIntEncodedLen(*b.CoinbaseHeight)
+		}
+		size += CoinbaseExtraNonceLen
+	}
+	for _, input := range b.Inputs {
+		size += input.EncodedLen()
+	}
+	size += varIntEncodedLen(uint64(len(b.Outputs)))
+	for _, output := range b.Outputs {
+		size += output.EncodedLen()
+	}
+	return size
 }
 
 func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
@@ -446,6 +551,14 @@ func (a TxAuth) Encode(out *[]byte) {
 	}
 }
 
+func (a TxAuth) EncodedLen() int {
+	size := varIntEncodedLen(uint64(len(a.Entries)))
+	for _, entry := range a.Entries {
+		size += entry.EncodedLen()
+	}
+	return size
+}
+
 func decodeTxAuth(r *reader, maxEntries int) (TxAuth, error) {
 	count, err := readCount(r, maxEntries, "tx.auth")
 	if err != nil {
@@ -467,21 +580,26 @@ func (t Transaction) IsCoinbase() bool {
 }
 
 func (t Transaction) EncodeBase() []byte {
-	out := make([]byte, 0)
+	out := make([]byte, 0, t.Base.EncodedLen())
 	t.Base.Encode(&out)
 	return out
 }
 
 func (t Transaction) EncodeAuth() []byte {
-	out := make([]byte, 0)
+	out := make([]byte, 0, t.Auth.EncodedLen())
 	t.Auth.Encode(&out)
 	return out
 }
 
 func (t Transaction) Encode() []byte {
-	out := t.EncodeBase()
+	out := make([]byte, 0, t.EncodedLen())
+	t.Base.Encode(&out)
 	t.Auth.Encode(&out)
 	return out
+}
+
+func (t Transaction) EncodedLen() int {
+	return t.Base.EncodedLen() + t.Auth.EncodedLen()
 }
 
 func decodeTransactionFromReader(r *reader, limits CodecLimits) (Transaction, error) {
@@ -618,6 +736,14 @@ func (b Block) Encode() []byte {
 	return out
 }
 
+func (b Block) EncodedLen() int {
+	size := BlockHeaderEncodedLen + varIntEncodedLen(uint64(len(b.Txs)))
+	for _, tx := range b.Txs {
+		size += tx.EncodedLen()
+	}
+	return size
+}
+
 func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
 	r := newReader(buf)
 	header, err := decodeBlockHeader(r)
@@ -651,4 +777,53 @@ func DecodeBlockHex(raw string, limits CodecLimits) (Block, error) {
 		return Block{}, err
 	}
 	return DecodeBlockWithLimits(buf, limits)
+}
+
+func NewXOnlyOutput(valueAtoms uint64, pubKey [32]byte) TxOutput {
+	return TxOutput{
+		Type:       OutputXOnlyP2PK,
+		ValueAtoms: valueAtoms,
+		Payload32:  pubKey,
+		PubKey:     pubKey,
+	}
+}
+
+func NewPQLockOutput(valueAtoms uint64, pqLock [32]byte) TxOutput {
+	return TxOutput{
+		Type:       OutputPQLock32,
+		ValueAtoms: valueAtoms,
+		Payload32:  pqLock,
+	}
+}
+
+func NewXOnlyAuthEntry(signature [64]byte) TxAuthEntry {
+	payload := make([]byte, len(signature))
+	copy(payload, signature[:])
+	return TxAuthEntry{AuthPayload: payload, Signature: signature}
+}
+
+func (o TxOutput) XOnlyPubKey() ([32]byte, bool) {
+	if o.Type != OutputXOnlyP2PK {
+		return [32]byte{}, false
+	}
+	return o.Payload32, true
+}
+
+func (o TxOutput) PQLock() ([32]byte, bool) {
+	if o.Type != OutputPQLock32 {
+		return [32]byte{}, false
+	}
+	return o.Payload32, true
+}
+
+func (e TxAuthEntry) XOnlySignature() ([64]byte, bool) {
+	var signature [64]byte
+	if len(e.AuthPayload) == 0 && e.Signature != ([64]byte{}) {
+		return e.Signature, true
+	}
+	if len(e.AuthPayload) != len(signature) {
+		return signature, false
+	}
+	copy(signature[:], e.AuthPayload)
+	return signature, true
 }

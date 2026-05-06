@@ -23,10 +23,15 @@ type Filter struct {
 	Hash      [32]byte
 }
 
+type WatchItem struct {
+	Type      uint64
+	Payload32 [32]byte
+}
+
 func Type() string { return filterType }
 
-// Build deterministically encodes the block's created output pubkeys and the
-// consumed prevout pubkeys captured in undo data into a compact probabilistic
+// Build deterministically encodes the block's created typed watch items and the
+// consumed prevout watch items captured in undo data into a compact probabilistic
 // filter. The filter is non-consensus and keyed by block hash.
 func Build(blockHash [32]byte, block *types.Block, undo []storage.BlockUndoEntry) Filter {
 	fingerprints := collectFingerprints(blockHash, block, undo)
@@ -49,11 +54,18 @@ func Header(filterHash [32]byte, prevHeader [32]byte) [32]byte {
 }
 
 func Match(blockHash [32]byte, encoded []byte, pubKey [32]byte) (bool, error) {
+	return MatchWatchItem(blockHash, encoded, WatchItem{
+		Type:      types.OutputXOnlyP2PK,
+		Payload32: pubKey,
+	})
+}
+
+func MatchWatchItem(blockHash [32]byte, encoded []byte, item WatchItem) (bool, error) {
 	fingerprints, err := decodeFingerprints(encoded)
 	if err != nil {
 		return false, err
 	}
-	target := fingerprintForPubKey(blockHash, pubKey)
+	target := fingerprintForWatchItem(blockHash, item)
 	index := sort.Search(len(fingerprints), func(i int) bool { return fingerprints[i] >= target })
 	return index < len(fingerprints) && fingerprints[index] == target, nil
 }
@@ -62,28 +74,37 @@ func collectFingerprints(blockHash [32]byte, block *types.Block, undo []storage.
 	if block == nil {
 		return nil
 	}
-	unique := make(map[[32]byte]struct{})
+	unique := make(map[WatchItem]struct{})
 	for i := range block.Txs {
 		for _, output := range block.Txs[i].Base.Outputs {
-			unique[output.PubKey] = struct{}{}
+			item := WatchItem{Type: output.Type, Payload32: output.Payload32}
+			if item.Payload32 == ([32]byte{}) && item.Type == types.OutputXOnlyP2PK {
+				item.Payload32 = output.PubKey
+			}
+			unique[item] = struct{}{}
 		}
 	}
 	for _, spent := range undo {
-		unique[spent.Entry.PubKey] = struct{}{}
+		item := WatchItem{Type: spent.Entry.Type, Payload32: spent.Entry.Payload32}
+		if item.Payload32 == ([32]byte{}) && item.Type == types.OutputXOnlyP2PK {
+			item.Payload32 = spent.Entry.PubKey
+		}
+		unique[item] = struct{}{}
 	}
 	values := make([]uint64, 0, len(unique))
-	for pubKey := range unique {
-		values = append(values, fingerprintForPubKey(blockHash, pubKey))
+	for item := range unique {
+		values = append(values, fingerprintForWatchItem(blockHash, item))
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
 	return values
 }
 
-func fingerprintForPubKey(blockHash [32]byte, pubKey [32]byte) uint64 {
-	var payload [64]byte
-	copy(payload[:32], blockHash[:])
-	copy(payload[32:], pubKey[:])
-	hash := crypto.TaggedHash(itemTag, payload[:])
+func fingerprintForWatchItem(blockHash [32]byte, item WatchItem) uint64 {
+	payload := make([]byte, 0, 73)
+	payload = append(payload, blockHash[:]...)
+	payload = appendCanonicalVarInt(payload, item.Type)
+	payload = append(payload, item.Payload32[:]...)
+	hash := crypto.TaggedHash(itemTag, payload)
 	return binary.BigEndian.Uint64(hash[:8])
 }
 
@@ -130,4 +151,26 @@ func decodeFingerprints(encoded []byte) ([]uint64, error) {
 		return nil, errors.New("unexpected trailing compact filter data")
 	}
 	return values, nil
+}
+
+func appendCanonicalVarInt(dst []byte, v uint64) []byte {
+	switch {
+	case v <= 0xfc:
+		return append(dst, byte(v))
+	case v <= 0xffff:
+		return append(dst, 0xfd, byte(v), byte(v>>8))
+	case v <= 0xffff_ffff:
+		return append(dst, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	default:
+		return append(dst, 0xff,
+			byte(v),
+			byte(v>>8),
+			byte(v>>16),
+			byte(v>>24),
+			byte(v>>32),
+			byte(v>>40),
+			byte(v>>48),
+			byte(v>>56),
+		)
+	}
 }

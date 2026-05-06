@@ -151,6 +151,63 @@ func TestAccumulatorApplyMatchesBulkRootAfterUpdates(t *testing.T) {
 	}
 }
 
+func TestAccumulatorApplyMatchesSequentialUpdatesOnLargeBatch(t *testing.T) {
+	original := make([]UtxoLeaf, 0, 512)
+	for i := 0; i < 512; i++ {
+		original = append(original, testLeaf(byte(i), uint32(i), uint64(i+1), byte(i+17)))
+	}
+	acc, err := NewAccumulatorFromLeaves(original)
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	spent := make([]types.OutPoint, 0, 128)
+	created := make([]UtxoLeaf, 0, 128)
+	for i := 0; i < 128; i++ {
+		spent = append(spent, original[i*2].OutPoint)
+		created = append(created, testLeaf(byte(i), uint32(10_000+i), uint64(1_000+i), byte(i+91)))
+	}
+	batched, err := acc.Apply(spent, created)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	sequential := acc
+	for _, outPoint := range spent {
+		sequential, err = sequential.Delete(outPoint)
+		if err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	}
+	for _, leaf := range created {
+		sequential, err = sequential.Add(leaf)
+		if err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	if got, want := batched.Root(), sequential.Root(); got != want {
+		t.Fatalf("batched root = %x, want %x", got, want)
+	}
+	if batched.Count() != sequential.Count() {
+		t.Fatalf("batched count = %d, want %d", batched.Count(), sequential.Count())
+	}
+}
+
+func TestAccumulatorApplyRejectsDuplicateSpentOutPoint(t *testing.T) {
+	acc, err := NewAccumulatorFromLeaves([]UtxoLeaf{testLeaf(1, 0, 10, 11)})
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	_, err = acc.Apply(
+		[]types.OutPoint{
+			{TxID: [32]byte{1}, Vout: 0},
+			{TxID: [32]byte{1}, Vout: 0},
+		},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected duplicate spent outpoint error")
+	}
+}
+
 func TestAccumulatorRejectsMissingDelete(t *testing.T) {
 	acc, err := NewAccumulatorFromLeaves([]UtxoLeaf{testLeaf(1, 0, 10, 11)})
 	if err != nil {

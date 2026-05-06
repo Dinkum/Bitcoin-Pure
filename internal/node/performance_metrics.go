@@ -16,32 +16,37 @@ type PerformanceMetrics struct {
 }
 
 type PerformanceCounters struct {
-	AdmittedTxs           uint64 `json:"admitted_txs"`
-	OrphanPromotions      uint64 `json:"orphan_promotions"`
-	RelayedTxItems        uint64 `json:"relayed_tx_items"`
-	RelayedBlockItems     uint64 `json:"relayed_block_items"`
-	BlocksAccepted        uint64 `json:"blocks_accepted"`
-	BlockSigChecks        uint64 `json:"block_sig_checks"`
-	BlockSigFallbacks     uint64 `json:"block_sig_fallbacks"`
-	TemplateRebuilds      uint64 `json:"template_rebuilds"`
-	TemplateInterruptions uint64 `json:"template_interruptions"`
-	ErlayRounds           uint64 `json:"erlay_rounds"`
-	ErlayRequestedTxs     uint64 `json:"erlay_requested_txs"`
-	CompactBlockPlans     uint64 `json:"compact_block_plans"`
-	GrapheneExtendedPlans uint64 `json:"graphene_extended_plans"`
-	GrapheneDecodeFails   uint64 `json:"graphene_decode_failures"`
-	GrapheneExtRecoveries uint64 `json:"graphene_extended_recoveries"`
-	LegacyRelayFallbacks  uint64 `json:"legacy_relay_fallbacks"`
-	PeerStallEvents       uint64 `json:"peer_stall_events"`
-	TxReconRetries        uint64 `json:"tx_recon_retries"`
-	DirectFallbackBatches uint64 `json:"direct_fallback_batches"`
-	DirectFallbackTxs     uint64 `json:"direct_fallback_txs"`
-	TxRequestsReceived    uint64 `json:"tx_requests_received"`
-	TxNotFoundSent        uint64 `json:"tx_not_found_sent"`
-	TxNotFoundReceived    uint64 `json:"tx_not_found_received"`
-	KnownTxClears         uint64 `json:"known_tx_clears"`
-	DuplicateSuppressions uint64 `json:"duplicate_suppressions"`
-	WriterStarvation      uint64 `json:"writer_starvation_events"`
+	AdmittedTxs            uint64 `json:"admitted_txs"`
+	OrphanPromotions       uint64 `json:"orphan_promotions"`
+	RelayedTxItems         uint64 `json:"relayed_tx_items"`
+	RelayedBlockItems      uint64 `json:"relayed_block_items"`
+	BlocksAccepted         uint64 `json:"blocks_accepted"`
+	BlockSigChecks         uint64 `json:"block_sig_checks"`
+	BlockSigFallbacks      uint64 `json:"block_sig_fallbacks"`
+	TemplateRebuilds       uint64 `json:"template_rebuilds"`
+	TemplateInterruptions  uint64 `json:"template_interruptions"`
+	ErlayRounds            uint64 `json:"erlay_rounds"`
+	ErlayRequestedTxs      uint64 `json:"erlay_requested_txs"`
+	CompactBlockPlans      uint64 `json:"compact_block_plans"`
+	CompactBlocksReceived  uint64 `json:"compact_blocks_received"`
+	CompactBlocksRecovered uint64 `json:"compact_blocks_recovered"`
+	CompactBlockMissingTxs uint64 `json:"compact_block_missing_txs"`
+	CompactBlockTxRequests uint64 `json:"compact_block_tx_requests"`
+	CompactBlockFallbacks  uint64 `json:"compact_block_fallbacks"`
+	GrapheneExtendedPlans  uint64 `json:"graphene_extended_plans"`
+	GrapheneDecodeFails    uint64 `json:"graphene_decode_failures"`
+	GrapheneExtRecoveries  uint64 `json:"graphene_extended_recoveries"`
+	LegacyRelayFallbacks   uint64 `json:"legacy_relay_fallbacks"`
+	PeerStallEvents        uint64 `json:"peer_stall_events"`
+	TxReconRetries         uint64 `json:"tx_recon_retries"`
+	DirectFallbackBatches  uint64 `json:"direct_fallback_batches"`
+	DirectFallbackTxs      uint64 `json:"direct_fallback_txs"`
+	TxRequestsReceived     uint64 `json:"tx_requests_received"`
+	TxNotFoundSent         uint64 `json:"tx_not_found_sent"`
+	TxNotFoundReceived     uint64 `json:"tx_not_found_received"`
+	KnownTxClears          uint64 `json:"known_tx_clears"`
+	DuplicateSuppressions  uint64 `json:"duplicate_suppressions"`
+	WriterStarvation       uint64 `json:"writer_starvation_events"`
 }
 
 type PerformanceGauges struct {
@@ -222,32 +227,37 @@ func (s *Service) PerformanceMetrics() PerformanceMetrics {
 	return PerformanceMetrics{
 		GeneratedAt: now,
 		Counters: PerformanceCounters{
-			AdmittedTxs:           s.throughput.admittedTxs.Load(),
-			OrphanPromotions:      s.throughput.orphanPromotions.Load(),
-			RelayedTxItems:        s.throughput.relayedTxItems.Load(),
-			RelayedBlockItems:     s.throughput.relayedBlockItems.Load(),
-			BlocksAccepted:        s.throughput.blocksAccepted.Load(),
-			BlockSigChecks:        s.throughput.blockSigChecks.Load(),
-			BlockSigFallbacks:     s.throughput.blockSigFallbacks.Load(),
-			TemplateRebuilds:      s.throughput.templateRebuilds.Load(),
-			TemplateInterruptions: s.throughput.templateInterruptions.Load(),
-			ErlayRounds:           s.throughput.erlayRounds.Load(),
-			ErlayRequestedTxs:     s.throughput.erlayRequestedTxs.Load(),
-			CompactBlockPlans:     s.throughput.compactBlockPlans.Load(),
-			GrapheneExtendedPlans: s.throughput.grapheneExtPlans.Load(),
-			GrapheneDecodeFails:   s.throughput.grapheneDecodeFails.Load(),
-			GrapheneExtRecoveries: s.throughput.grapheneExtRecoveries.Load(),
-			LegacyRelayFallbacks:  s.throughput.legacyRelayFallbacks.Load(),
-			PeerStallEvents:       stallEvents,
-			TxReconRetries:        s.throughput.txReconRetries.Load(),
-			DirectFallbackBatches: s.throughput.directFallbackBatches.Load(),
-			DirectFallbackTxs:     s.throughput.directFallbackTxs.Load(),
-			TxRequestsReceived:    s.throughput.txRequestsReceived.Load(),
-			TxNotFoundSent:        s.throughput.txNotFoundSent.Load(),
-			TxNotFoundReceived:    s.throughput.txNotFoundReceived.Load(),
-			KnownTxClears:         s.throughput.knownTxClears.Load(),
-			DuplicateSuppressions: s.throughput.duplicateSuppressions.Load(),
-			WriterStarvation:      s.throughput.writerStarvation.Load(),
+			AdmittedTxs:            s.throughput.admittedTxs.Load(),
+			OrphanPromotions:       s.throughput.orphanPromotions.Load(),
+			RelayedTxItems:         s.throughput.relayedTxItems.Load(),
+			RelayedBlockItems:      s.throughput.relayedBlockItems.Load(),
+			BlocksAccepted:         s.throughput.blocksAccepted.Load(),
+			BlockSigChecks:         s.throughput.blockSigChecks.Load(),
+			BlockSigFallbacks:      s.throughput.blockSigFallbacks.Load(),
+			TemplateRebuilds:       s.throughput.templateRebuilds.Load(),
+			TemplateInterruptions:  s.throughput.templateInterruptions.Load(),
+			ErlayRounds:            s.throughput.erlayRounds.Load(),
+			ErlayRequestedTxs:      s.throughput.erlayRequestedTxs.Load(),
+			CompactBlockPlans:      s.throughput.compactBlockPlans.Load(),
+			CompactBlocksReceived:  s.throughput.compactBlocksReceived.Load(),
+			CompactBlocksRecovered: s.throughput.compactBlocksRecovered.Load(),
+			CompactBlockMissingTxs: s.throughput.compactBlockMissingTxs.Load(),
+			CompactBlockTxRequests: s.throughput.compactBlockTxRequests.Load(),
+			CompactBlockFallbacks:  s.throughput.compactBlockFallbacks.Load(),
+			GrapheneExtendedPlans:  s.throughput.grapheneExtPlans.Load(),
+			GrapheneDecodeFails:    s.throughput.grapheneDecodeFails.Load(),
+			GrapheneExtRecoveries:  s.throughput.grapheneExtRecoveries.Load(),
+			LegacyRelayFallbacks:   s.throughput.legacyRelayFallbacks.Load(),
+			PeerStallEvents:        stallEvents,
+			TxReconRetries:         s.throughput.txReconRetries.Load(),
+			DirectFallbackBatches:  s.throughput.directFallbackBatches.Load(),
+			DirectFallbackTxs:      s.throughput.directFallbackTxs.Load(),
+			TxRequestsReceived:     s.throughput.txRequestsReceived.Load(),
+			TxNotFoundSent:         s.throughput.txNotFoundSent.Load(),
+			TxNotFoundReceived:     s.throughput.txNotFoundReceived.Load(),
+			KnownTxClears:          s.throughput.knownTxClears.Load(),
+			DuplicateSuppressions:  s.throughput.duplicateSuppressions.Load(),
+			WriterStarvation:       s.throughput.writerStarvation.Load(),
 		},
 		Gauges: PerformanceGauges{
 			MempoolTxs:           mempoolInfo.Count,

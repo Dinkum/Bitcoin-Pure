@@ -18,7 +18,6 @@ import (
 )
 
 const (
-	SighashTag                = "BPU/SigHashV1"
 	MaxFutureBlockTimeSeconds = 7200
 )
 
@@ -37,6 +36,7 @@ var (
 
 type ChainParams struct {
 	Profile             types.ChainProfile
+	ChainLineage        string
 	TargetSpacingSecs   int64
 	AsertHalfLifeSecs   int64
 	HalvingInterval     uint64
@@ -50,6 +50,7 @@ type ChainParams struct {
 func MainnetParams() ChainParams {
 	return ChainParams{
 		Profile:             types.Mainnet,
+		ChainLineage:        "c1",
 		TargetSpacingSecs:   600,
 		AsertHalfLifeSecs:   86_400,
 		HalvingInterval:     2_500_000,
@@ -62,6 +63,12 @@ func MainnetParams() ChainParams {
 		// it so genesis remains valid under the chain's compact target bounds.
 		GenesisBits: 0x1d0f930c,
 	}
+}
+
+// SighashTag returns the consensus-critical tagged-hash domain used for input
+// authorization on this chain profile and lineage.
+func (p ChainParams) SighashTag() string {
+	return fmt.Sprintf("BPU/%s/%s/SigHashV1", p.Profile, p.ChainLineage)
 }
 
 func RegtestParams() ChainParams {
@@ -147,6 +154,15 @@ type ConsensusRules struct {
 	// SkipPow is benchmark/testing-only. It must stay off for real consensus
 	// validation so header acceptance continues to depend on actual work.
 	SkipPow bool
+	// ValidatedAuthCache is an implementation cache hook, not a consensus rule.
+	// It may return true only for exact txid/authid pairs whose authorizations
+	// were already fully verified under the same chain parameters.
+	ValidatedAuthCache func(txid, authid [32]byte, params ChainParams) bool
+	// ValidatedTxCache is a stronger implementation cache hook for exact
+	// txid/authid pairs that already passed full transaction validation under
+	// the same chain parameters. Block validation still checks contextual state:
+	// UTXO availability, duplicate spends, fees, ordering, and roots.
+	ValidatedTxCache func(txid, authid [32]byte, params ChainParams) bool
 }
 
 func DefaultConsensusRules() ConsensusRules {
@@ -158,7 +174,9 @@ func DefaultConsensusRules() ConsensusRules {
 }
 
 type UtxoEntry struct {
+	Type       uint64
 	ValueAtoms uint64
+	Payload32  [32]byte
 	PubKey     [32]byte
 }
 
@@ -169,7 +187,9 @@ func UtxoLeaves(utxos UtxoSet) []utreexo.UtxoLeaf {
 	for outPoint, coin := range utxos {
 		leaves = append(leaves, utreexo.UtxoLeaf{
 			OutPoint:   outPoint,
+			Type:       coin.Type,
 			ValueAtoms: coin.ValueAtoms,
+			Payload32:  canonicalUtxoPayload32(coin),
 			PubKey:     coin.PubKey,
 		})
 	}
@@ -190,14 +210,18 @@ func utxoLeavesFromOverlay(overlay *UtxoOverlay) []utreexo.UtxoLeaf {
 		}
 		leaves = append(leaves, utreexo.UtxoLeaf{
 			OutPoint:   outPoint,
+			Type:       coin.Type,
 			ValueAtoms: coin.ValueAtoms,
+			Payload32:  canonicalUtxoPayload32(coin),
 			PubKey:     coin.PubKey,
 		})
 	}
 	for outPoint, coin := range overlay.created {
 		leaves = append(leaves, utreexo.UtxoLeaf{
 			OutPoint:   outPoint,
+			Type:       coin.Type,
 			ValueAtoms: coin.ValueAtoms,
+			Payload32:  canonicalUtxoPayload32(coin),
 			PubKey:     coin.PubKey,
 		})
 	}
@@ -244,9 +268,16 @@ type TxValidationSummary struct {
 	Fee       uint64
 }
 
+type PQVerifyCheck struct {
+	VerificationKey []byte
+	Signature       []byte
+	Msg             [32]byte
+}
+
 type PreparedTxValidation struct {
 	Summary         TxValidationSummary
 	SignatureChecks []crypto.SchnorrBatchItem
+	PQChecks        []PQVerifyCheck
 }
 
 type UtxoLookup func(types.OutPoint) (UtxoEntry, bool)
@@ -371,7 +402,9 @@ func (o *UtxoOverlay) ApplyTx(tx types.Transaction, txid [32]byte) {
 	}
 	for vout, output := range tx.Base.Outputs {
 		o.Set(types.OutPoint{TxID: txid, Vout: uint32(vout)}, UtxoEntry{
+			Type:       output.Type,
 			ValueAtoms: output.ValueAtoms,
+			Payload32:  output.Payload32,
 			PubKey:     output.PubKey,
 		})
 	}
@@ -389,6 +422,21 @@ func (o *UtxoOverlay) Materialize() UtxoSet {
 		out[outPoint] = entry
 	}
 	return out
+}
+
+// ApplyToSet mutates an existing materialized UTXO map with the overlay delta
+// instead of cloning the whole base set first. Callers must ensure the target
+// map is an owned mutable instance, not a shared published view.
+func (o *UtxoOverlay) ApplyToSet(dst UtxoSet) {
+	if o == nil || dst == nil {
+		return
+	}
+	for outPoint := range o.deleted {
+		delete(dst, outPoint)
+	}
+	for outPoint, entry := range o.created {
+		dst[outPoint] = entry
+	}
 }
 
 // Err reports the first backend lookup failure observed through Lookup.
@@ -462,6 +510,9 @@ var (
 	ErrDuplicateInput        = errors.New("duplicate input prevout")
 	ErrMissingUTXO           = errors.New("missing UTXO")
 	ErrInvalidOutputPubKey   = errors.New("invalid output pubkey")
+	ErrUnsupportedOutputType = errors.New("unsupported output type")
+	ErrInvalidAuthPayload    = errors.New("invalid auth payload")
+	ErrInvalidPQLock         = errors.New("invalid PQ lock")
 	ErrInvalidSignature      = errors.New("invalid signature")
 	ErrAmountOverflow        = errors.New("integer overflow")
 	ErrInputsLessThanOutputs = errors.New("inputs less than outputs")
@@ -729,16 +780,22 @@ func varIntLen(v uint64) int {
 }
 
 type sighashContext struct {
+	tag            string
 	version        uint32
 	prevoutsHash   [32]byte
 	outputsHash    [32]byte
 	spentCoinsHash [32]byte
 }
 
+type pqAuthV1 struct {
+	VerificationKey []byte
+	Signature       []byte
+}
+
 // newSighashContext precomputes the tx-wide hashes shared by every input so
 // multi-input validation does not rebuild identical prevout/output/spent-coin
 // commitments for each signature check.
-func newSighashContext(tx *types.Transaction, spentCoins []UtxoEntry) (sighashContext, error) {
+func newSighashContextWithParams(tx *types.Transaction, spentCoins []UtxoEntry, params ChainParams) (sighashContext, error) {
 	if len(spentCoins) != len(tx.Base.Inputs) {
 		return sighashContext{}, fmt.Errorf("invalid sighash: spent coins length mismatch")
 	}
@@ -757,21 +814,22 @@ func newSighashContext(tx *types.Transaction, spentCoins []UtxoEntry) (sighashCo
 		)
 	}
 
-	outputs := make([]byte, 0, varIntLen(uint64(len(tx.Base.Outputs)))+len(tx.Base.Outputs)*40)
+	outputs := make([]byte, 0, varIntLen(uint64(len(tx.Base.Outputs)))+len(tx.Base.Outputs)*49)
 	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
 	for _, output := range tx.Base.Outputs {
-		outputs = appendValuePubKeyEncoding(outputs, output.ValueAtoms, output.PubKey)
+		outputs = appendTypedCoinEncoding(outputs, output.Type, output.ValueAtoms, canonicalOutputPayload32(output))
 	}
 
 	// Sighash commits to the full spent-coin encoding, not just amounts, so the
 	// authorization domain stays aligned with the canonical UTXO object layout.
-	spentCoinPayload := make([]byte, 0, varIntLen(uint64(len(spentCoins)))+len(spentCoins)*40)
+	spentCoinPayload := make([]byte, 0, varIntLen(uint64(len(spentCoins)))+len(spentCoins)*49)
 	writeVarInt(&spentCoinPayload, uint64(len(spentCoins)))
 	for _, coin := range spentCoins {
-		spentCoinPayload = appendValuePubKeyEncoding(spentCoinPayload, coin.ValueAtoms, coin.PubKey)
+		spentCoinPayload = appendTypedCoinEncoding(spentCoinPayload, coin.Type, coin.ValueAtoms, canonicalUtxoPayload32(coin))
 	}
 
 	return sighashContext{
+		tag:            params.SighashTag(),
 		version:        tx.Base.Version,
 		prevoutsHash:   crypto.Sha256d(prevouts),
 		outputsHash:    crypto.Sha256d(outputs),
@@ -804,18 +862,27 @@ func (ctx sighashContext) hash(inputIndex int, inputCount int) ([32]byte, error)
 	preimage = append(preimage, ctx.prevoutsHash[:]...)
 	preimage = append(preimage, ctx.outputsHash[:]...)
 	preimage = append(preimage, ctx.spentCoinsHash[:]...)
-	return crypto.TaggedHash(SighashTag, preimage), nil
+	return crypto.TaggedHash(ctx.tag, preimage), nil
 }
 
-func Sighash(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry) ([32]byte, error) {
-	ctx, err := newSighashContext(tx, spentCoins)
+// SighashWithParams computes the consensus sighash for the supplied chain
+// profile and lineage.
+func SighashWithParams(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry, params ChainParams) ([32]byte, error) {
+	ctx, err := newSighashContextWithParams(tx, spentCoins, params)
 	if err != nil {
 		return [32]byte{}, err
 	}
 	return ctx.hash(inputIndex, len(tx.Base.Inputs))
 }
 
-func appendValuePubKeyEncoding(dst []byte, valueAtoms uint64, pubKey [32]byte) []byte {
+// Sighash preserves the legacy mainnet-default helper for callers that have
+// not yet threaded explicit chain params.
+func Sighash(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry) ([32]byte, error) {
+	return SighashWithParams(tx, inputIndex, spentCoins, MainnetParams())
+}
+
+func appendTypedCoinEncoding(dst []byte, outputType uint64, valueAtoms uint64, payload32 [32]byte) []byte {
+	dst = types.AppendCanonicalVarInt(dst, outputType)
 	dst = append(dst,
 		byte(valueAtoms),
 		byte(valueAtoms>>8),
@@ -826,7 +893,55 @@ func appendValuePubKeyEncoding(dst []byte, valueAtoms uint64, pubKey [32]byte) [
 		byte(valueAtoms>>48),
 		byte(valueAtoms>>56),
 	)
-	return append(dst, pubKey[:]...)
+	return append(dst, payload32[:]...)
+}
+
+// appendValuePubKeyEncoding is a compatibility shim for x-only test helpers
+// while the codebase migrates to typed committed coin payloads.
+func appendValuePubKeyEncoding(dst []byte, valueAtoms uint64, pubKey [32]byte) []byte {
+	return appendTypedCoinEncoding(dst, types.OutputXOnlyP2PK, valueAtoms, pubKey)
+}
+
+func canonicalOutputPayload32(output types.TxOutput) [32]byte {
+	if output.Type == types.OutputXOnlyP2PK && output.Payload32 == ([32]byte{}) {
+		return output.PubKey
+	}
+	return output.Payload32
+}
+
+func canonicalUtxoPayload32(entry UtxoEntry) [32]byte {
+	if entry.Type == types.OutputXOnlyP2PK && entry.Payload32 == ([32]byte{}) {
+		return entry.PubKey
+	}
+	return entry.Payload32
+}
+
+func validateOutputPayload(output types.TxOutput) error {
+	switch output.Type {
+	case types.OutputXOnlyP2PK:
+		payload32 := canonicalOutputPayload32(output)
+		if !crypto.IsValidXOnlyPubKey(&payload32) {
+			return ErrInvalidOutputPubKey
+		}
+		return nil
+	case types.OutputPQLock32:
+		return nil
+	default:
+		return ErrUnsupportedOutputType
+	}
+}
+
+func parsePQAuthPayload(payload []byte) (pqAuthV1, error) {
+	const payloadLen = crypto.MLDSA65VerificationKeySize + crypto.MLDSA65SignatureSize
+	if len(payload) != payloadLen {
+		return pqAuthV1{}, ErrInvalidAuthPayload
+	}
+	verificationKey := append([]byte(nil), payload[:crypto.MLDSA65VerificationKeySize]...)
+	signature := append([]byte(nil), payload[crypto.MLDSA65VerificationKeySize:]...)
+	return pqAuthV1{
+		VerificationKey: verificationKey,
+		Signature:       signature,
+	}, nil
 }
 
 func ValidateTx(tx *types.Transaction, utxos UtxoSet, rules ConsensusRules) (TxValidationSummary, error) {
@@ -836,97 +951,178 @@ func ValidateTx(tx *types.Transaction, utxos UtxoSet, rules ConsensusRules) (TxV
 	}, rules)
 }
 
+func ValidateTxWithParams(tx *types.Transaction, utxos UtxoSet, params ChainParams, rules ConsensusRules) (TxValidationSummary, error) {
+	return ValidateTxWithLookupAndParams(tx, func(out types.OutPoint) (UtxoEntry, bool) {
+		utxo, ok := utxos[out]
+		return utxo, ok
+	}, params, rules)
+}
+
 // PrepareTxValidationWithLookup resolves the tx against a lookup view and
 // computes all signature statements without actually verifying them. Consensus
 // callers should still verify each statement exactly before acceptance, while
 // non-consensus callers may batch the prepared checks as an optimization.
-func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, _ ConsensusRules) (PreparedTxValidation, error) {
+func PrepareTxValidationWithLookup(tx *types.Transaction, lookup UtxoLookup, rules ConsensusRules) (PreparedTxValidation, error) {
+	return PrepareTxValidationWithLookupAndParams(tx, lookup, MainnetParams(), rules)
+}
+
+func PrepareTxValidationWithLookupAndParams(tx *types.Transaction, lookup UtxoLookup, params ChainParams, _ ConsensusRules) (PreparedTxValidation, error) {
+	summary, signatureChecks, pqChecks, err := prepareTxValidationWithLookupAndParams(tx, lookup, params, nil, nil, false, false)
+	if err != nil {
+		return PreparedTxValidation{}, err
+	}
+	return PreparedTxValidation{
+		Summary:         summary,
+		SignatureChecks: signatureChecks,
+		PQChecks:        pqChecks,
+	}, nil
+}
+
+func prepareTxValidationWithLookupAndParams(tx *types.Transaction, lookup UtxoLookup, params ChainParams, signatureChecks []crypto.SchnorrBatchItem, pqChecks []PQVerifyCheck, skipAuthChecks bool, skipOutputPayloadChecks bool) (TxValidationSummary, []crypto.SchnorrBatchItem, []PQVerifyCheck, error) {
 	if len(tx.Base.Inputs) == 0 {
-		return PreparedTxValidation{}, ErrEmptyInputs
+		return TxValidationSummary{}, signatureChecks, pqChecks, ErrEmptyInputs
 	}
 	if len(tx.Base.Outputs) == 0 {
-		return PreparedTxValidation{}, ErrEmptyOutputs
+		return TxValidationSummary{}, signatureChecks, pqChecks, ErrEmptyOutputs
 	}
 	if len(tx.Auth.Entries) != len(tx.Base.Inputs) {
-		return PreparedTxValidation{}, ErrAuthCountMismatch
+		return TxValidationSummary{}, signatureChecks, pqChecks, ErrAuthCountMismatch
 	}
 
-	seen := make(map[types.OutPoint]struct{}, len(tx.Base.Inputs))
-	resolvedInputs := make([]UtxoEntry, 0, len(tx.Base.Inputs))
-	signatureChecks := make([]crypto.SchnorrBatchItem, 0, len(tx.Base.Inputs))
+	var seen map[types.OutPoint]struct{}
+	if len(tx.Base.Inputs) > 1 {
+		seen = make(map[types.OutPoint]struct{}, len(tx.Base.Inputs))
+	}
+	var singleResolved [1]UtxoEntry
+	resolvedInputs := singleResolved[:0]
+	if len(tx.Base.Inputs) > 1 {
+		resolvedInputs = make([]UtxoEntry, len(tx.Base.Inputs))
+	} else {
+		resolvedInputs = singleResolved[:1]
+	}
 	var inputSum uint64
 	var outputSum uint64
 
-	for _, input := range tx.Base.Inputs {
-		if _, ok := seen[input.PrevOut]; ok {
-			return PreparedTxValidation{}, ErrDuplicateInput
+	for i, input := range tx.Base.Inputs {
+		if seen != nil {
+			if _, ok := seen[input.PrevOut]; ok {
+				return TxValidationSummary{}, signatureChecks, pqChecks, ErrDuplicateInput
+			}
+			seen[input.PrevOut] = struct{}{}
 		}
-		seen[input.PrevOut] = struct{}{}
 		utxo, ok := lookup(input.PrevOut)
 		if !ok {
-			return PreparedTxValidation{}, ErrMissingUTXO
+			return TxValidationSummary{}, signatureChecks, pqChecks, ErrMissingUTXO
 		}
 		next := inputSum + utxo.ValueAtoms
 		if next < inputSum {
-			return PreparedTxValidation{}, ErrAmountOverflow
+			return TxValidationSummary{}, signatureChecks, pqChecks, ErrAmountOverflow
 		}
 		inputSum = next
-		resolvedInputs = append(resolvedInputs, utxo)
+		resolvedInputs[i] = utxo
 	}
 
 	for _, output := range tx.Base.Outputs {
-		if !crypto.IsValidXOnlyPubKey(&output.PubKey) {
-			return PreparedTxValidation{}, ErrInvalidOutputPubKey
+		if !skipOutputPayloadChecks {
+			if err := validateOutputPayload(output); err != nil {
+				return TxValidationSummary{}, signatureChecks, pqChecks, err
+			}
 		}
 		next := outputSum + output.ValueAtoms
 		if next < outputSum {
-			return PreparedTxValidation{}, ErrAmountOverflow
+			return TxValidationSummary{}, signatureChecks, pqChecks, ErrAmountOverflow
 		}
 		outputSum = next
 	}
 	if inputSum < outputSum {
-		return PreparedTxValidation{}, ErrInputsLessThanOutputs
+		return TxValidationSummary{}, signatureChecks, pqChecks, ErrInputsLessThanOutputs
+	}
+	summary := TxValidationSummary{
+		InputSum:  inputSum,
+		OutputSum: outputSum,
+		Fee:       inputSum - outputSum,
+	}
+	if skipAuthChecks {
+		return summary, signatureChecks, pqChecks, nil
 	}
 
-	sighashCtx, err := newSighashContext(tx, resolvedInputs)
+	sighashCtx, err := newSighashContextWithParams(tx, resolvedInputs, params)
 	if err != nil {
-		return PreparedTxValidation{}, err
+		return TxValidationSummary{}, signatureChecks, pqChecks, err
 	}
 	for i := range tx.Base.Inputs {
 		utxo := resolvedInputs[i]
 		auth := tx.Auth.Entries[i]
 		msg, err := sighashCtx.hash(i, len(tx.Base.Inputs))
 		if err != nil {
-			return PreparedTxValidation{}, err
+			return TxValidationSummary{}, signatureChecks, pqChecks, err
 		}
-		signatureChecks = append(signatureChecks, crypto.SchnorrBatchItem{
-			PubKey:    utxo.PubKey,
-			Signature: auth.Signature,
-			Msg:       msg,
-		})
+		switch utxo.Type {
+		case types.OutputXOnlyP2PK:
+			signature, ok := auth.XOnlySignature()
+			if !ok {
+				return TxValidationSummary{}, signatureChecks, pqChecks, ErrInvalidAuthPayload
+			}
+			signatureChecks = append(signatureChecks, crypto.SchnorrBatchItem{
+				PubKey:    canonicalUtxoPayload32(utxo),
+				Signature: signature,
+				Msg:       msg,
+			})
+		case types.OutputPQLock32:
+			parsedAuth, err := parsePQAuthPayload(auth.AuthPayload)
+			if err != nil {
+				return TxValidationSummary{}, signatureChecks, pqChecks, err
+			}
+			if len(parsedAuth.VerificationKey) != crypto.MLDSA65VerificationKeySize || len(parsedAuth.Signature) != crypto.MLDSA65SignatureSize {
+				return TxValidationSummary{}, signatureChecks, pqChecks, ErrInvalidAuthPayload
+			}
+			if crypto.PQLock(parsedAuth.VerificationKey) != canonicalUtxoPayload32(utxo) {
+				return TxValidationSummary{}, signatureChecks, pqChecks, ErrInvalidPQLock
+			}
+			pqChecks = append(pqChecks, PQVerifyCheck{
+				VerificationKey: parsedAuth.VerificationKey,
+				Signature:       parsedAuth.Signature,
+				Msg:             msg,
+			})
+		default:
+			return TxValidationSummary{}, signatureChecks, pqChecks, ErrUnsupportedOutputType
+		}
 	}
 
-	return PreparedTxValidation{
-		Summary: TxValidationSummary{
-			InputSum:  inputSum,
-			OutputSum: outputSum,
-			Fee:       inputSum - outputSum,
-		},
-		SignatureChecks: signatureChecks,
-	}, nil
+	return summary, signatureChecks, pqChecks, nil
 }
 
-// ValidatePreparedTx reuses a previously prepared validation bundle and only
-// executes the exact Schnorr verification step.
+// ValidatePreparedTx reuses a previously prepared validation bundle and verifies
+// every signature independently. Consensus paths must not use probabilistic
+// batch verification for acceptance decisions.
 func ValidatePreparedTx(prepared PreparedTxValidation) (TxValidationSummary, error) {
-	if !crypto.VerifySchnorrBatchXOnlyWithFallback(prepared.SignatureChecks) {
+	return validatePreparedTxWithSchnorrVerifier(prepared, crypto.VerifySchnorrXOnlyItems)
+}
+
+// ValidatePreparedTxBatchOptimized preserves the batch accelerator for policy
+// paths such as mempool admission. Do not use it for block consensus.
+func ValidatePreparedTxBatchOptimized(prepared PreparedTxValidation) (TxValidationSummary, error) {
+	return validatePreparedTxWithSchnorrVerifier(prepared, crypto.VerifySchnorrBatchXOnlyWithFallback)
+}
+
+func validatePreparedTxWithSchnorrVerifier(prepared PreparedTxValidation, verify func([]crypto.SchnorrBatchItem) bool) (TxValidationSummary, error) {
+	if !verify(prepared.SignatureChecks) {
 		return TxValidationSummary{}, ErrInvalidSignature
+	}
+	for _, check := range prepared.PQChecks {
+		if !crypto.VerifyMLDSA65(check.VerificationKey, check.Signature, check.Msg[:]) {
+			return TxValidationSummary{}, ErrInvalidSignature
+		}
 	}
 	return prepared.Summary, nil
 }
 
 func ValidateTxWithLookup(tx *types.Transaction, lookup UtxoLookup, rules ConsensusRules) (TxValidationSummary, error) {
-	prepared, err := PrepareTxValidationWithLookup(tx, lookup, rules)
+	return ValidateTxWithLookupAndParams(tx, lookup, MainnetParams(), rules)
+}
+
+func ValidateTxWithLookupAndParams(tx *types.Transaction, lookup UtxoLookup, params ChainParams, rules ConsensusRules) (TxValidationSummary, error) {
+	prepared, err := PrepareTxValidationWithLookupAndParams(tx, lookup, params, rules)
 	if err != nil {
 		return TxValidationSummary{}, err
 	}
@@ -1440,12 +1636,33 @@ func cloneUtxos(utxos UtxoSet) UtxoSet {
 }
 
 func blockUtxoDelta(block *types.Block) ([]types.OutPoint, []utreexo.UtxoLeaf) {
-	spent := make([]types.OutPoint, 0)
-	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf)
-	createdOrder := make([]types.OutPoint, 0)
+	txids := make([][32]byte, len(block.Txs))
+	for i := range block.Txs {
+		txids[i] = TxID(&block.Txs[i])
+	}
+	return blockUtxoDeltaFromIDs(block, txids)
+}
+
+func blockUtxoDeltaFromIDs(block *types.Block, txids [][32]byte) ([]types.OutPoint, []utreexo.UtxoLeaf) {
+	if block == nil || len(block.Txs) == 0 {
+		return nil, nil
+	}
+	spentCap := max(0, len(block.Txs)-1)
+	outputCap := len(block.Txs)
+	for _, tx := range block.Txs {
+		if len(tx.Base.Inputs) > 1 {
+			spentCap += len(tx.Base.Inputs) - 1
+		}
+		if len(tx.Base.Outputs) > 1 {
+			outputCap += len(tx.Base.Outputs) - 1
+		}
+	}
+	spent := make([]types.OutPoint, 0, spentCap)
+	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf, outputCap)
+	createdOrder := make([]types.OutPoint, 0, outputCap)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
-		txid := TxID(tx)
+		txid := txids[i]
 		for _, input := range tx.Base.Inputs {
 			// Outputs created and spent within the same block never exist in the
 			// pre-block accumulator, so they cancel out of the accumulator delta.
@@ -1459,19 +1676,23 @@ func blockUtxoDelta(block *types.Block) ([]types.OutPoint, []utreexo.UtxoLeaf) {
 			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
 			createdByOutPoint[outPoint] = utreexo.UtxoLeaf{
 				OutPoint:   outPoint,
+				Type:       output.Type,
 				ValueAtoms: output.ValueAtoms,
+				Payload32:  canonicalOutputPayload32(output),
 				PubKey:     output.PubKey,
 			}
 			createdOrder = append(createdOrder, outPoint)
 		}
 	}
 	coinbase := &block.Txs[0]
-	coinbaseTxID := TxID(coinbase)
+	coinbaseTxID := txids[0]
 	for vout, output := range coinbase.Base.Outputs {
 		outPoint := types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}
 		createdByOutPoint[outPoint] = utreexo.UtxoLeaf{
 			OutPoint:   outPoint,
+			Type:       output.Type,
 			ValueAtoms: output.ValueAtoms,
+			Payload32:  canonicalOutputPayload32(output),
 			PubKey:     output.PubKey,
 		}
 		createdOrder = append(createdOrder, outPoint)
@@ -1490,7 +1711,7 @@ func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeS
 	if err != nil {
 		return BlockValidationSummary{}, err
 	}
-	replaceUtxoSet(utxos, overlay.Materialize())
+	overlay.ApplyToSet(utxos)
 	return summary, nil
 }
 
@@ -1499,7 +1720,7 @@ func ValidateAndApplyBlockWithAccumulator(block *types.Block, prev PrevBlockCont
 	if err != nil {
 		return BlockValidationSummary{}, nil, err
 	}
-	replaceUtxoSet(utxos, overlay.Materialize())
+	overlay.ApplyToSet(utxos)
 	return summary, nextAcc, nil
 }
 
@@ -1530,12 +1751,12 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 	if len(block.Txs) == 0 {
 		return BlockValidationSummary{}, nil, nil, ErrEmptyBlock
 	}
-	blockSize := uint64(len(block.Encode()))
+	blockSize := uint64(block.EncodedLen())
 	if blockSize > uint64(NextBlockSizeLimit(blockSizeState, params)) {
 		return BlockValidationSummary{}, nil, nil, ErrBlockTooLarge
 	}
 
-	txids, _, txRoot, authRoot := BuildBlockRoots(block.Txs)
+	txids, authids, txRoot, authRoot := BuildBlockRoots(block.Txs)
 	if txRoot != block.Header.MerkleTxIDRoot {
 		return BlockValidationSummary{}, nil, nil, ErrMerkleTxIDMismatch
 	}
@@ -1564,14 +1785,15 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseNoOutputs
 	}
 	for _, output := range coinbase.Base.Outputs {
-		if !crypto.IsValidXOnlyPubKey(&output.PubKey) {
-			return BlockValidationSummary{}, nil, nil, ErrInvalidOutputPubKey
+		if err := validateOutputPayload(output); err != nil {
+			return BlockValidationSummary{}, nil, nil, err
 		}
 	}
 
 	tempUtxos := NewUtxoOverlayWithBaseLookup(base, lookup)
-	claimedInputs := make(map[types.OutPoint]struct{})
-	signatureChecks := make([]crypto.SchnorrBatchItem, 0)
+	claimedInputs := make(map[types.OutPoint]struct{}, max(0, len(block.Txs)-1))
+	signatureChecks := make([]crypto.SchnorrBatchItem, 0, max(0, len(block.Txs)-1))
+	pqChecks := make([]PQVerifyCheck, 0)
 	var totalFees uint64
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
@@ -1587,23 +1809,31 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		// Blocks are validated as an atomic patch to the pre-block UTXO set, so
 		// later transactions must see outputs created by earlier non-coinbase
 		// transactions in the same block.
-		prepared, err := PrepareTxValidationWithLookup(tx, tempUtxos.Lookup, rules)
+		validatedTx := rules.ValidatedTxCache != nil && rules.ValidatedTxCache(txids[i], authids[i], params)
+		skipAuthChecks := validatedTx || (rules.ValidatedAuthCache != nil && rules.ValidatedAuthCache(txids[i], authids[i], params))
+		summary, nextSignatureChecks, nextPQChecks, err := prepareTxValidationWithLookupAndParams(tx, tempUtxos.Lookup, params, signatureChecks, pqChecks, skipAuthChecks, validatedTx)
 		if err != nil {
 			return BlockValidationSummary{}, nil, nil, err
 		}
-		nextFees := totalFees + prepared.Summary.Fee
+		nextFees := totalFees + summary.Fee
 		if nextFees < totalFees {
 			return BlockValidationSummary{}, nil, nil, ErrAmountOverflow
 		}
 		totalFees = nextFees
-		signatureChecks = append(signatureChecks, prepared.SignatureChecks...)
+		signatureChecks = nextSignatureChecks
+		pqChecks = nextPQChecks
 		tempUtxos.ApplyTx(*tx, txids[i])
 	}
 	verifyStartedAt := time.Now()
-	batchResult := verifyBlockSignatureChecks(signatureChecks)
+	schnorrResult := verifyBlockSignatureChecks(signatureChecks)
 	verifyDuration := time.Since(verifyStartedAt)
-	if !batchResult.Valid {
+	if !schnorrResult.Valid {
 		return BlockValidationSummary{}, nil, nil, ErrInvalidSignature
+	}
+	for _, check := range pqChecks {
+		if !crypto.VerifyMLDSA65(check.VerificationKey, check.Signature, check.Msg[:]) {
+			return BlockValidationSummary{}, nil, nil, ErrInvalidSignature
+		}
 	}
 
 	coinbaseValue, err := sumCoinbaseOutputs(coinbase)
@@ -1618,13 +1848,15 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 	coinbaseTxID := TxID(coinbase)
 	for vout, output := range coinbase.Base.Outputs {
 		tempUtxos.Set(types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}, UtxoEntry{
+			Type:       output.Type,
 			ValueAtoms: output.ValueAtoms,
+			Payload32:  output.Payload32,
 			PubKey:     output.PubKey,
 		})
 	}
 	var nextAccumulator *utreexo.Accumulator
 	if accumulator != nil {
-		spent, created := blockUtxoDelta(block)
+		spent, created := blockUtxoDeltaFromIDs(block, txids)
 		nextAccumulator, err = accumulator.Apply(spent, created)
 		if err != nil {
 			return BlockValidationSummary{}, nil, nil, err
@@ -1652,7 +1884,7 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		TotalFees:              totalFees,
 		CoinbaseValue:          coinbaseValue,
 		SignatureChecks:        len(signatureChecks),
-		SignatureBatchFallback: batchResult.Fallback,
+		SignatureBatchFallback: schnorrResult.Fallback,
 		SignatureVerifyTime:    verifyDuration,
 		NextBlockSizeState:     nextState,
 	}, tempUtxos, nextAccumulator, nil
@@ -1660,19 +1892,19 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 
 func verifyBlockSignatureChecks(items []crypto.SchnorrBatchItem) crypto.SchnorrBatchResult {
 	if len(items) < minParallelSigChecks {
-		return crypto.VerifySchnorrBatchXOnlyResult(items)
+		return exactSchnorrResult(items)
 	}
 
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
-		return crypto.VerifySchnorrBatchXOnlyResult(items)
+		return exactSchnorrResult(items)
 	}
 	maxWorkers := (len(items) + minSigChecksPerWorker - 1) / minSigChecksPerWorker
 	if workers > maxWorkers {
 		workers = maxWorkers
 	}
 	if workers < 2 {
-		return crypto.VerifySchnorrBatchXOnlyResult(items)
+		return exactSchnorrResult(items)
 	}
 
 	chunkSize := (len(items) + workers - 1) / workers
@@ -1681,7 +1913,7 @@ func verifyBlockSignatureChecks(items []crypto.SchnorrBatchItem) crypto.SchnorrB
 		end := min(start+chunkSize, len(items))
 		chunk := items[start:end]
 		go func() {
-			results <- crypto.VerifySchnorrBatchXOnlyResult(chunk)
+			results <- exactSchnorrResult(chunk)
 		}()
 	}
 
@@ -1694,6 +1926,10 @@ func verifyBlockSignatureChecks(items []crypto.SchnorrBatchItem) crypto.SchnorrB
 		out.Fallback = out.Fallback || result.Fallback
 	}
 	return out
+}
+
+func exactSchnorrResult(items []crypto.SchnorrBatchItem) crypto.SchnorrBatchResult {
+	return crypto.SchnorrBatchResult{Valid: crypto.VerifySchnorrXOnlyItems(items)}
 }
 
 func replaceUtxoSet(dst UtxoSet, src UtxoSet) {

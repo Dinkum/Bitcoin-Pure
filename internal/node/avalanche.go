@@ -16,7 +16,11 @@ import (
 	"bitcoin-pure/internal/types"
 )
 
-const avalancheConflictTTL = 10 * time.Minute
+const (
+	avalancheConflictTTL      = 10 * time.Minute
+	avalanchePruneInterval    = 30 * time.Second
+	avalancheMaxPollOutpoints = 64
+)
 
 var ErrAvalancheFinalConflict = errors.New("transaction conflicts with avalanche-finalized preference")
 
@@ -48,6 +52,7 @@ type avalancheManager struct {
 	txInputs  map[[32]byte][]types.OutPoint
 	polls     map[uint64]*avalanchePollState
 	stats     avalancheStats
+	nextPrune time.Time
 }
 
 type avalancheConflictSet struct {
@@ -137,11 +142,13 @@ func (m *avalancheManager) rejectionError(tx types.Transaction) error {
 		return nil
 	}
 	txid := consensus.TxID(&tx)
+	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneExpiredIfDueLocked(now)
 	for _, input := range tx.Base.Inputs {
 		set := m.conflicts[input.PrevOut]
-		if set == nil {
+		if set == nil || now.Sub(set.updatedAt) > avalancheConflictTTL {
 			continue
 		}
 		for winner, final := range set.final {
@@ -159,12 +166,13 @@ func (m *avalancheManager) noteAcceptedAdmissions(admissions []mempool.Admission
 	if !m.enabled() {
 		return
 	}
+	now := time.Now()
 	for _, admission := range admissions {
 		if len(admission.Accepted) == 0 {
 			continue
 		}
 		for _, accepted := range admission.Accepted {
-			m.trackTx(accepted.Tx, true, time.Now())
+			m.trackTx(accepted.Tx, true, now)
 		}
 	}
 }
@@ -206,7 +214,7 @@ func (m *avalancheManager) onBlockAccepted(block *types.Block) {
 		}
 		m.txInputs[txid] = inputs
 	}
-	m.pruneExpiredLocked(now)
+	m.pruneExpiredIfDueLocked(now)
 }
 
 func (m *avalancheManager) pollLoop() {
@@ -264,8 +272,8 @@ func (m *avalancheManager) preparePollRound(now time.Time) (uint64, []types.OutP
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pruneExpiredLocked(now)
-	items := make([]types.OutPoint, 0, minInt(len(m.conflicts), 64))
+	m.pruneExpiredIfDueLocked(now)
+	items := make([]types.OutPoint, 0, minInt(len(m.conflicts), avalancheMaxPollOutpoints))
 	for outpoint, set := range m.conflicts {
 		if now.Sub(set.updatedAt) > avalancheConflictTTL {
 			continue
@@ -274,7 +282,7 @@ func (m *avalancheManager) preparePollRound(now time.Time) (uint64, []types.OutP
 			continue
 		}
 		items = append(items, outpoint)
-		if len(items) >= 64 {
+		if len(items) >= avalancheMaxPollOutpoints {
 			break
 		}
 	}
@@ -484,6 +492,7 @@ func (m *avalancheManager) trackTx(tx types.Transaction, preferred bool, now tim
 	txid := consensus.TxID(&tx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneExpiredIfDueLocked(now)
 	inputs := make([]types.OutPoint, 0, len(tx.Base.Inputs))
 	for _, input := range tx.Base.Inputs {
 		inputs = append(inputs, input.PrevOut)
@@ -496,7 +505,6 @@ func (m *avalancheManager) trackTx(tx types.Transaction, preferred bool, now tim
 		set.updatedAt = now
 	}
 	m.txInputs[txid] = inputs
-	m.pruneExpiredLocked(now)
 }
 
 func (m *avalancheManager) ensureConflictSetLocked(outpoint types.OutPoint, now time.Time) *avalancheConflictSet {
@@ -521,6 +529,14 @@ func (m *avalancheManager) pruneExpiredLocked(now time.Time) {
 		}
 		delete(m.conflicts, outpoint)
 	}
+}
+
+func (m *avalancheManager) pruneExpiredIfDueLocked(now time.Time) {
+	if !m.nextPrune.IsZero() && now.Before(m.nextPrune) {
+		return
+	}
+	m.pruneExpiredLocked(now)
+	m.nextPrune = now.Add(avalanchePruneInterval)
 }
 
 func (s *avalancheConflictSet) hasAnyFinal() bool {

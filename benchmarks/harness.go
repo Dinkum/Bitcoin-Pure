@@ -106,6 +106,7 @@ type RunOptions struct {
 	SyntheticBlockInterval time.Duration
 	FindMaxTPS             bool
 	RelayConfirmedBlocks   bool
+	SteadyStateBacklog     bool
 	ProgressWriter         io.Writer
 	ProgressInterval       time.Duration
 }
@@ -147,6 +148,7 @@ type Report struct {
 	RequestedDurationMS           float64         `json:"requested_duration_ms,omitempty"`
 	BlockIntervalMS               float64         `json:"block_interval_ms,omitempty"`
 	TxOriginSpread                string          `json:"tx_origin,omitempty"`
+	SteadyStateBacklog            bool            `json:"steady_state_backlog,omitempty"`
 	SyntheticMining               bool            `json:"synthetic_mining,omitempty"`
 	SyntheticBlockIntervalMS      float64         `json:"synthetic_block_interval_ms,omitempty"`
 	StartedAt                     time.Time       `json:"started_at"`
@@ -190,28 +192,33 @@ type Environment struct {
 }
 
 type NodeReport struct {
-	Name                  string            `json:"name"`
-	RPCAddr               string            `json:"rpc_addr,omitempty"`
-	P2PAddr               string            `json:"p2p_addr,omitempty"`
-	PeerCount             int               `json:"peer_count"`
-	BlockHeight           uint64            `json:"block_height"`
-	HeaderHeight          uint64            `json:"header_height"`
-	MempoolCount          int               `json:"mempool_count"`
-	SubmittedTxs          int               `json:"submitted_txs,omitempty"`
-	BlockSigChecks        uint64            `json:"block_sig_checks,omitempty"`
-	BlockSigFallbacks     uint64            `json:"block_sig_fallbacks,omitempty"`
-	BlockSigVerifyAvgMS   float64           `json:"block_sig_verify_avg_ms,omitempty"`
-	ErlayRounds           uint64            `json:"erlay_rounds,omitempty"`
-	ErlayRequestedTxs     uint64            `json:"erlay_requested_txs,omitempty"`
-	CompactBlockPlans     uint64            `json:"compact_block_plans,omitempty"`
-	GraphenePlans         uint64            `json:"graphene_extended_plans,omitempty"`
-	GrapheneDecodeFails   uint64            `json:"graphene_decode_failures,omitempty"`
-	GrapheneRecoveries    uint64            `json:"graphene_extended_recoveries,omitempty"`
-	TemplateSelectAvgMS   float64           `json:"template_select_avg_ms,omitempty"`
-	TemplateAccAvgMS      float64           `json:"template_accumulate_avg_ms,omitempty"`
-	TemplateAssembleAvgMS float64           `json:"template_assemble_avg_ms,omitempty"`
-	CompletionMS          *float64          `json:"completion_ms,omitempty"`
-	RelayPeers            []PeerRelayReport `json:"relay_peers,omitempty"`
+	Name                   string            `json:"name"`
+	RPCAddr                string            `json:"rpc_addr,omitempty"`
+	P2PAddr                string            `json:"p2p_addr,omitempty"`
+	PeerCount              int               `json:"peer_count"`
+	BlockHeight            uint64            `json:"block_height"`
+	HeaderHeight           uint64            `json:"header_height"`
+	MempoolCount           int               `json:"mempool_count"`
+	SubmittedTxs           int               `json:"submitted_txs,omitempty"`
+	BlockSigChecks         uint64            `json:"block_sig_checks,omitempty"`
+	BlockSigFallbacks      uint64            `json:"block_sig_fallbacks,omitempty"`
+	BlockSigVerifyAvgMS    float64           `json:"block_sig_verify_avg_ms,omitempty"`
+	ErlayRounds            uint64            `json:"erlay_rounds,omitempty"`
+	ErlayRequestedTxs      uint64            `json:"erlay_requested_txs,omitempty"`
+	CompactBlockPlans      uint64            `json:"compact_block_plans,omitempty"`
+	CompactBlocksReceived  uint64            `json:"compact_blocks_received,omitempty"`
+	CompactBlocksRecovered uint64            `json:"compact_blocks_recovered,omitempty"`
+	CompactBlockMissingTxs uint64            `json:"compact_block_missing_txs,omitempty"`
+	CompactBlockTxRequests uint64            `json:"compact_block_tx_requests,omitempty"`
+	CompactBlockFallbacks  uint64            `json:"compact_block_fallbacks,omitempty"`
+	GraphenePlans          uint64            `json:"graphene_extended_plans,omitempty"`
+	GrapheneDecodeFails    uint64            `json:"graphene_decode_failures,omitempty"`
+	GrapheneRecoveries     uint64            `json:"graphene_extended_recoveries,omitempty"`
+	TemplateSelectAvgMS    float64           `json:"template_select_avg_ms,omitempty"`
+	TemplateAccAvgMS       float64           `json:"template_accumulate_avg_ms,omitempty"`
+	TemplateAssembleAvgMS  float64           `json:"template_assemble_avg_ms,omitempty"`
+	CompletionMS           *float64          `json:"completion_ms,omitempty"`
+	RelayPeers             []PeerRelayReport `json:"relay_peers,omitempty"`
 }
 
 type PhaseReport struct {
@@ -704,6 +711,7 @@ func Run(ctx context.Context, opts RunOptions) (*Report, error) {
 		TxCount:                  reportTxCount,
 		BatchSize:                opts.BatchSize,
 		TxOriginSpread:           string(opts.TxOriginSpread),
+		SteadyStateBacklog:       opts.SteadyStateBacklog,
 		SyntheticMining:          opts.SyntheticMining,
 		SyntheticBlockIntervalMS: durationMS(opts.SyntheticBlockInterval),
 		StartedAt:                started,
@@ -849,6 +857,9 @@ func RenderMarkdown(report *Report) string {
 	if report.TxOriginSpread != "" {
 		b.WriteString(fmt.Sprintf("- Tx origin: `%s`\n", report.TxOriginSpread))
 	}
+	if report.SteadyStateBacklog {
+		b.WriteString("- Steady-state backlog: `on`\n")
+	}
 	if report.SyntheticMining {
 		b.WriteString(fmt.Sprintf("- Synthetic mining: `on` (`%.0f ms` cadence)\n", report.SyntheticBlockIntervalMS))
 	}
@@ -923,10 +934,11 @@ func RenderMarkdown(report *Report) string {
 	}
 	if rows := relayMechanismRows(report.Nodes); len(rows) != 0 {
 		b.WriteString("\n## Relay Mechanisms\n\n")
-		b.WriteString("| Node | Erlay Rounds | Erlay Requested | Compact Plans | Graphene Plans | Graphene Decode Fails | Graphene Recoveries |\n")
-		b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+		b.WriteString("| Node | Erlay Rounds | Erlay Requested | Compact Plans | Compact Received | Compact Recovered | Compact Missing Txs | Compact Tx Requests | Compact Fallbacks | Graphene Plans | Graphene Decode Fails | Graphene Recoveries |\n")
+		b.WriteString("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 		for _, row := range rows {
-			b.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s |\n", row[0], row[1], row[2], row[3], row[4], row[5], row[6]))
+			b.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+				row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11]))
 		}
 	}
 	if peers := flattenRelayPeers(report.Nodes); len(peers) != 0 {
@@ -1006,7 +1018,7 @@ func RenderASCIISummary(report *Report) string {
 		fmt.Sprintf("Benchmark   %s%s%s", report.Benchmark, asciiModeSuffix(report.Mode), asciiMiningSuffix(report.Mining)),
 		fmt.Sprintf("Profile     %s", report.Profile),
 		fmt.Sprintf("Layout      %d nodes%s", report.NodeCount, asciiTopologySuffix(report.Topology)),
-		fmt.Sprintf("Workload    %d txs%s%s%s", report.TxCount, asciiBatchSuffix(report.BatchSize), asciiBlockTargetSuffix(report.TxsPerBlock), asciiTxOriginSuffix(report.TxOriginSpread)),
+		fmt.Sprintf("Workload    %d txs%s%s%s%s", report.TxCount, asciiBatchSuffix(report.BatchSize), asciiBlockTargetSuffix(report.TxsPerBlock), asciiTxOriginSuffix(report.TxOriginSpread), asciiBacklogSuffix(report.SteadyStateBacklog)),
 	}
 	switch report.Benchmark {
 	case string(BenchmarkE2E):
@@ -1283,6 +1295,9 @@ func validateOptions(opts RunOptions) error {
 	if opts.FindMaxTPS && (!opts.SyntheticMining || opts.Scenario != ScenarioConfirmedBlocks) {
 		return fmt.Errorf("find_max_tps requires confirmed-blocks with synthetic mining enabled")
 	}
+	if opts.SteadyStateBacklog && opts.Scenario != ScenarioConfirmedBlocks {
+		return fmt.Errorf("steady-state backlog requires confirmed-blocks")
+	}
 	switch opts.Topology {
 	case TopologyLine, TopologyMesh:
 	default:
@@ -1496,11 +1511,11 @@ func openCluster(ctx context.Context, opts RunOptions) ([]*clusterNode, func(), 
 			MaxInboundPeers:  max(32, opts.NodeCount*4),
 			MaxOutboundPeers: maxOutboundPeers,
 			HandshakeTimeout: 5 * time.Second,
-			// Loopback benchmarks should surface relay gaps quickly instead of
-			// spending most of the case timeout waiting on production-oriented
-			// stall thresholds.
-			StallTimeout:       3 * time.Second,
-			MaxMessageBytes:    8 << 20,
+			// Confirmed-block benchmarks need the same large-message headroom as a
+			// normal node; otherwise higher tx-per-block cases can fail at the
+			// transport ceiling before block validation or relay is actually tested.
+			StallTimeout:       15 * time.Second,
+			MaxMessageBytes:    64_000_000,
 			MinRelayFeePerByte: 1,
 			MaxTxSize:          mempoolCfg.maxTxSize,
 			MaxAncestors:       mempoolCfg.maxAncestors,
@@ -1689,6 +1704,9 @@ func executeScenario(ctx context.Context, cluster []*clusterNode, opts RunOption
 		if _, err := waitForMempoolCounts(ctx, cluster, 0, time.Time{}); err != nil {
 			return workloadOutcome{}, err
 		}
+		if opts.SteadyStateBacklog {
+			return runConfirmedBlocksBacklogScenario(ctx, cluster, submitter, submitters, opts, txs)
+		}
 		return runConfirmedBlocksScenario(ctx, cluster, submitter, submitters, opts, txs)
 	case ScenarioUserMix:
 		txs, metrics, err := seedUserMixWorkload(submitter.svc, opts.TxCount)
@@ -1769,6 +1787,169 @@ func benchmarkSubmitters(cluster []*clusterNode, opts RunOptions) []*clusterNode
 	return []*clusterNode{cluster[0]}
 }
 
+func runConfirmedBlocksBacklogScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, submitters []*clusterNode, opts RunOptions, txs []types.Transaction) (workloadOutcome, error) {
+	targetTxsPerBlock := min(opts.TxsPerBlock, len(txs))
+	if targetTxsPerBlock <= 0 {
+		targetTxsPerBlock = len(txs)
+	}
+	initialTargetTxsPerBlock := targetTxsPerBlock
+	metrics := ScenarioMetrics{
+		TargetTxsPerBlock: targetTxsPerBlock,
+	}
+	blockCapacity := targetTxsPerBlock * max(1, opts.BlockCount)
+	preloadTxs := txs
+	if len(preloadTxs) > blockCapacity {
+		preloadTxs = preloadTxs[:blockCapacity]
+	}
+	submittedByNode := make(map[string]int, len(submitters))
+	progressEventf(ctx, "steady-state preload txs=%d target_txs_per_block=%d", len(preloadTxs), targetTxsPerBlock)
+	admitStarted := time.Now()
+	acceptedTxs, _, err := submitConfirmedWave(ctx, submitters, 0, preloadTxs, opts.BatchSize, submittedByNode)
+	if err != nil {
+		return workloadOutcome{}, err
+	}
+	admissionElapsed := time.Since(admitStarted)
+	metrics.AcceptedTxs = acceptedTxs
+	if acceptedTxs == 0 {
+		return workloadOutcome{}, errors.New("steady-state backlog accepted no transactions")
+	}
+	if _, err := waitForMempoolCounts(ctx, cluster, acceptedTxs, time.Time{}); err != nil {
+		return workloadOutcome{}, err
+	}
+	progressEventf(ctx, "steady-state backlog converged txs=%d", acceptedTxs)
+
+	submitStarted := time.Now()
+	currentHeight := submitter.svc.BlockHeight()
+	expectedMempoolTxs := acceptedTxs
+	blockConvergenceSamples := make([]float64, 0, opts.BlockCount)
+	blockRoundSamples := make([]float64, 0, opts.BlockCount)
+	blockBuildSamples := make([]float64, 0, opts.BlockCount)
+	blockSealSamples := make([]float64, 0, opts.BlockCount)
+	scheduleLagSamples := make([]float64, 0, opts.BlockCount)
+	const syntheticCadenceMissThreshold = 5 * time.Millisecond
+	var confirmedProcessing time.Duration
+
+	for metrics.ConfirmedBlocks < opts.BlockCount && expectedMempoolTxs > 0 {
+		roundStarted := time.Now()
+		nextBlock := metrics.ConfirmedBlocks + 1
+		scheduledAt := syntheticE2EBlockTime(submitStarted, opts, nextBlock)
+		preparedBlock, err := buildConfirmedBenchmarkBlock(ctx, submitter.svc, opts)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+		if !scheduledAt.IsZero() {
+			if err := waitUntil(ctx, scheduledAt); err != nil {
+				return workloadOutcome{}, err
+			}
+			if lag := time.Since(scheduledAt); lag > 0 {
+				scheduleLagSamples = append(scheduleLagSamples, durationMS(lag))
+				if lag > syntheticCadenceMissThreshold {
+					metrics.MissedIntervals++
+				}
+			}
+		}
+		blockStarted := time.Now()
+		accepted, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
+			hash, height, err := submitter.svc.AcceptLocalBenchmarkBlock(preparedBlock.block)
+			return acceptedBenchmarkBlock{hash: hash, height: height}, err
+		})
+		if err != nil {
+			return workloadOutcome{}, err
+		}
+		if hex.EncodeToString(accepted.hash[:]) != preparedBlock.hashHex {
+			return workloadOutcome{}, fmt.Errorf("accepted block hash mismatch: got %x want %s", accepted.hash, preparedBlock.hashHex)
+		}
+		if !opts.RelayConfirmedBlocks {
+			if err := submitBlockToFollowers(ctx, cluster[1:], preparedBlock.block); err != nil {
+				return workloadOutcome{}, err
+			}
+		}
+		currentHeight = accepted.height
+		blockProcessing := time.Since(blockStarted)
+		if !(opts.Benchmark == BenchmarkE2E && opts.SyntheticMining) {
+			heightReached, err := waitForHeightsReached(ctx, cluster, currentHeight, blockStarted)
+			if err != nil {
+				return workloadOutcome{}, err
+			}
+			blockProcessing = maxDuration(heightReached)
+		}
+		confirmedProcessing += blockProcessing
+		blockBuildSamples = append(blockBuildSamples, durationMS(preparedBlock.buildDuration))
+		blockSealSamples = append(blockSealSamples, durationMS(preparedBlock.sealDuration))
+		blockConvergenceSamples = append(blockConvergenceSamples, durationMS(blockProcessing))
+		blockRoundSamples = append(blockRoundSamples, durationMS(time.Since(roundStarted)))
+		confirmedInBlock := max(0, len(preparedBlock.block.Txs)-1)
+		metrics.ConfirmedTxs += confirmedInBlock
+		expectedMempoolTxs -= confirmedInBlock
+		if expectedMempoolTxs < 0 {
+			expectedMempoolTxs = 0
+		}
+		metrics.ConfirmedBlocks++
+		progressEventf(ctx, "block=%d accepted height=%d hash=%s max_mempool=%d",
+			metrics.ConfirmedBlocks,
+			accepted.height,
+			shortHash(preparedBlock.hashHex),
+			maxNodeMempoolCount(cluster),
+		)
+	}
+
+	if _, err := waitForHeightsReached(ctx, cluster, currentHeight, submitStarted); err != nil {
+		return workloadOutcome{}, err
+	}
+	completion, err := waitForMempoolCounts(ctx, cluster, expectedMempoolTxs, submitStarted)
+	if err != nil {
+		return workloadOutcome{}, err
+	}
+	if len(blockConvergenceSamples) > 0 {
+		metrics.BlockConvergeAvgMS = averageFloat64(blockConvergenceSamples)
+		metrics.BlockConvergeP95MS = percentileFloat64(blockConvergenceSamples, 95)
+		metrics.BlockConvergeMaxMS = maxFloat64(blockConvergenceSamples)
+	}
+	if len(blockRoundSamples) > 0 {
+		metrics.BlockRoundAvgMS = averageFloat64(blockRoundSamples)
+		metrics.BlockRoundP95MS = percentileFloat64(blockRoundSamples, 95)
+		metrics.BlockRoundMaxMS = maxFloat64(blockRoundSamples)
+	}
+	if len(blockBuildSamples) > 0 {
+		metrics.BlockBuildAvgMS = averageFloat64(blockBuildSamples)
+		metrics.BlockBuildP95MS = percentileFloat64(blockBuildSamples, 95)
+		metrics.BlockBuildMaxMS = maxFloat64(blockBuildSamples)
+	}
+	if len(blockSealSamples) > 0 {
+		metrics.BlockSealAvgMS = averageFloat64(blockSealSamples)
+		metrics.BlockSealP95MS = percentileFloat64(blockSealSamples, 95)
+		metrics.BlockSealMaxMS = maxFloat64(blockSealSamples)
+	}
+	if len(scheduleLagSamples) > 0 {
+		metrics.ScheduleLagAvgMS = averageFloat64(scheduleLagSamples)
+		metrics.ScheduleLagP95MS = percentileFloat64(scheduleLagSamples, 95)
+		metrics.ScheduleLagMaxMS = maxFloat64(scheduleLagSamples)
+	}
+	applyTemplateDiagnostics(&metrics, submitter.svc)
+	metrics.FinalMempoolTxs = maxNodeMempoolCount(cluster)
+	metrics.FinalBlockLag, metrics.FinalHeaderLag = maxNodeChainLag(cluster, currentHeight)
+	completed := time.Now()
+	extraNotes := []string{
+		fmt.Sprintf("Steady-state backlog preloads and converges %d accepted transactions before the measured block cadence starts.", acceptedTxs),
+		fmt.Sprintf("Confirmed-blocks runs then seal one block every %s and counts only transactions actually included in accepted blocks. The starting block target was %d txs.", opts.SyntheticBlockInterval, initialTargetTxsPerBlock),
+	}
+	return workloadOutcome{
+		submitStarted:       submitStarted,
+		submitDone:          admitStarted.Add(admissionElapsed),
+		admissionTime:       admissionElapsed,
+		completed:           completed,
+		propagation:         completion,
+		submittedByNode:     submittedByNode,
+		confirmedProcessing: confirmedProcessing,
+		phases: PhaseReport{
+			ValidateAdmitMS: durationMS(admissionElapsed),
+			ConvergenceMS:   durationMS(maxDuration(completion)),
+		},
+		metrics:    metrics,
+		extraNotes: extraNotes,
+	}, nil
+}
+
 func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, submitters []*clusterNode, opts RunOptions, txs []types.Transaction) (workloadOutcome, error) {
 	submitStarted := time.Now()
 	step := max(1, opts.BatchSize)
@@ -1790,9 +1971,10 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 	var admissionElapsed time.Duration
 	var confirmedProcessing time.Duration
 	submittedByNode := make(map[string]int, len(submitters))
-	currentHeight := uint64(1)
+	currentHeight := submitter.svc.BlockHeight()
 	submitterOffset := 0
 	rampTried := make([]int, 0, cap(blockConvergenceSamples))
+	expectedMempoolTxs := 0
 	for start := 0; start < len(txs); {
 		if opts.Benchmark == BenchmarkThroughput && opts.Duration > 0 && time.Since(submitStarted) >= opts.Duration {
 			break
@@ -1809,44 +1991,39 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 		// Keep each round bounded so the run spans multiple confirmed blocks
 		// instead of collapsing into a single oversized mempool wave.
 		admitStarted := time.Now()
-		for i, tx := range wave {
-			target := submitters[(submitterOffset+i)%len(submitters)]
-			admission, err := callWithContext(ctx, func() (mempool.Admission, error) {
-				return target.svc.SubmitTx(tx)
-			})
-			if err != nil {
-				return workloadOutcome{}, err
-			}
-			metrics.AcceptedTxs += len(admission.Accepted)
-			submittedByNode[target.name]++
+		acceptedTxs, nextOffset, submitErr := submitConfirmedWave(ctx, submitters, submitterOffset, wave, opts.BatchSize, submittedByNode)
+		if submitErr != nil {
+			return workloadOutcome{}, submitErr
 		}
-		submitterOffset = (submitterOffset + len(wave)) % len(submitters)
+		metrics.AcceptedTxs += acceptedTxs
+		expectedMempoolTxs += acceptedTxs
+		submitterOffset = nextOffset
 		admissionElapsed += time.Since(admitStarted)
 		scheduledAt := syntheticE2EBlockTime(submitStarted, opts, metrics.ConfirmedBlocks+1)
 		if scheduledAt.IsZero() {
-			if _, err := waitForMempoolCounts(ctx, cluster, len(wave), time.Time{}); err != nil {
+			if _, err := waitForMempoolCounts(ctx, []*clusterNode{submitter}, expectedMempoolTxs, time.Time{}); err != nil {
 				return workloadOutcome{}, err
 			}
 		} else {
-			if _, _, err := waitForMempoolCountsUntil(ctx, cluster, len(wave), time.Time{}, scheduledAt); err != nil {
+			if _, _, err := waitForMempoolCountsUntil(ctx, []*clusterNode{submitter}, expectedMempoolTxs, time.Time{}, scheduledAt); err != nil {
 				return workloadOutcome{}, err
-			}
-			if err := waitUntil(ctx, scheduledAt); err != nil {
-				return workloadOutcome{}, err
-			}
-			if lag := time.Since(scheduledAt); lag > 0 {
-				scheduleLagSamples = append(scheduleLagSamples, durationMS(lag))
-				if lag > syntheticCadenceMissThreshold {
-					metrics.MissedIntervals++
-				}
 			}
 		}
-		var preparedBlock preparedBenchmarkBlock
-		var err error
 		for {
-			preparedBlock, err = buildConfirmedBenchmarkBlock(ctx, submitter.svc, opts)
+			preparedBlock, err := buildConfirmedBenchmarkBlock(ctx, submitter.svc, opts)
 			if err != nil {
 				return workloadOutcome{}, err
+			}
+			if !scheduledAt.IsZero() {
+				if err := waitUntil(ctx, scheduledAt); err != nil {
+					return workloadOutcome{}, err
+				}
+				if lag := time.Since(scheduledAt); lag > 0 {
+					scheduleLagSamples = append(scheduleLagSamples, durationMS(lag))
+					if lag > syntheticCadenceMissThreshold {
+						metrics.MissedIntervals++
+					}
+				}
 			}
 			blockStarted := time.Now()
 			accepted, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
@@ -1869,7 +2046,7 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 					return workloadOutcome{}, err
 				}
 			}
-			currentHeight++
+			currentHeight = accepted.height
 			blockProcessing := time.Since(blockStarted)
 			if !(opts.Benchmark == BenchmarkE2E && opts.SyntheticMining) {
 				heightReached, err := waitForHeightsReached(ctx, cluster, currentHeight, blockStarted)
@@ -1882,11 +2059,16 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 			blockConvergenceSamples = append(blockConvergenceSamples, durationMS(blockProcessing))
 			roundDuration := time.Since(roundStarted)
 			blockRoundSamples = append(blockRoundSamples, durationMS(roundDuration))
-			metrics.ConfirmedTxs += len(wave)
+			confirmedInBlock := max(0, len(preparedBlock.block.Txs)-1)
+			metrics.ConfirmedTxs += confirmedInBlock
+			expectedMempoolTxs -= confirmedInBlock
+			if expectedMempoolTxs < 0 {
+				expectedMempoolTxs = 0
+			}
 			metrics.ConfirmedBlocks++
 			progressEventf(ctx, "block=%d accepted height=%d hash=%s round=%s max_mempool=%d",
 				metrics.ConfirmedBlocks,
-				currentHeight,
+				accepted.height,
 				shortHash(preparedBlock.hashHex),
 				roundDuration.Round(time.Millisecond),
 				maxNodeMempoolCount(cluster),
@@ -1914,7 +2096,13 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 	completion := make(map[string]time.Duration)
 	var err error
 	if opts.Benchmark == BenchmarkE2E && opts.SyntheticMining {
-		completion = syntheticFinalPropagation(cluster, currentHeight, submitStarted)
+		if _, err := waitForHeightsReached(ctx, cluster, currentHeight, submitStarted); err != nil {
+			return workloadOutcome{}, err
+		}
+		completion, err = waitForMempoolCounts(ctx, cluster, expectedMempoolTxs, submitStarted)
+		if err != nil {
+			return workloadOutcome{}, err
+		}
 	} else {
 		completion, err = waitForMempoolCounts(ctx, cluster, 0, submitStarted)
 		if err != nil {
@@ -1954,7 +2142,7 @@ func runConfirmedBlocksScenario(ctx context.Context, cluster []*clusterNode, sub
 		metrics.TargetTxsPerBlock = metrics.MaxSustainableTxsPerBlock
 	}
 	extraNotes := []string{
-		fmt.Sprintf("Confirmed-blocks runs submit transactions in bounded rounds, waits for mempool convergence, seals one block on node-0, and waits for block-height convergence before the next round. The starting block target was %d txs.", initialTargetTxsPerBlock),
+		fmt.Sprintf("Confirmed-blocks runs submit transactions in bounded rounds, waits for mempool convergence, seals one block on node-0, and counts only transactions actually included in accepted blocks. The starting block target was %d txs.", initialTargetTxsPerBlock),
 	}
 	if opts.FindMaxTPS {
 		sort.Ints(rampTried)
@@ -2019,6 +2207,112 @@ type preparedLaneTx struct {
 	submitter *clusterNode
 }
 
+type batchSubmitResult struct {
+	admissions []mempool.Admission
+	errs       []error
+}
+
+type submitGroupResult struct {
+	nodeName    string
+	submitted   int
+	acceptedTxs int
+	err         error
+}
+
+func submitConfirmedWave(ctx context.Context, submitters []*clusterNode, submitterOffset int, wave []types.Transaction, batchSize int, submittedByNode map[string]int) (int, int, error) {
+	if len(submitters) == 0 {
+		return 0, submitterOffset, errors.New("benchmark has no submitter nodes")
+	}
+	grouped := make([][]types.Transaction, len(submitters))
+	for i, tx := range wave {
+		idx := (submitterOffset + i) % len(submitters)
+		grouped[idx] = append(grouped[idx], tx)
+	}
+	acceptedTxs, err := submitGroupedDecodedTxs(ctx, submitters, grouped, batchSize, submittedByNode)
+	if err != nil {
+		return 0, submitterOffset, err
+	}
+	return acceptedTxs, (submitterOffset + len(wave)) % len(submitters), nil
+}
+
+func submitPreparedLaneWave(ctx context.Context, wave []preparedLaneTx, batchSize int, submittedByNode map[string]int) (int, error) {
+	submitters := make([]*clusterNode, 0)
+	indexes := make(map[*clusterNode]int)
+	for _, prepared := range wave {
+		idx, ok := indexes[prepared.submitter]
+		if !ok {
+			idx = len(submitters)
+			indexes[prepared.submitter] = idx
+			submitters = append(submitters, prepared.submitter)
+		}
+		_ = idx
+	}
+	grouped := make([][]types.Transaction, len(submitters))
+	for _, prepared := range wave {
+		grouped[indexes[prepared.submitter]] = append(grouped[indexes[prepared.submitter]], prepared.tx)
+	}
+	return submitGroupedDecodedTxs(ctx, submitters, grouped, batchSize, submittedByNode)
+}
+
+func submitGroupedDecodedTxs(ctx context.Context, submitters []*clusterNode, grouped [][]types.Transaction, batchSize int, submittedByNode map[string]int) (int, error) {
+	resultCh := make(chan submitGroupResult, len(submitters))
+	started := 0
+	for i, submitter := range submitters {
+		if i >= len(grouped) || len(grouped[i]) == 0 {
+			continue
+		}
+		started++
+		txs := grouped[i]
+		go func(submitter *clusterNode, txs []types.Transaction) {
+			accepted, err := submitDecodedTxBatches(ctx, submitter, txs, batchSize)
+			resultCh <- submitGroupResult{
+				nodeName:    submitter.name,
+				submitted:   len(txs),
+				acceptedTxs: accepted,
+				err:         err,
+			}
+		}(submitter, txs)
+	}
+	acceptedTxs := 0
+	for i := 0; i < started; i++ {
+		result := <-resultCh
+		if result.err != nil {
+			return 0, result.err
+		}
+		acceptedTxs += result.acceptedTxs
+		submittedByNode[result.nodeName] += result.submitted
+	}
+	return acceptedTxs, nil
+}
+
+func submitDecodedTxBatches(ctx context.Context, submitter *clusterNode, txs []types.Transaction, batchSize int) (int, error) {
+	if len(txs) == 0 {
+		return 0, nil
+	}
+	batchSize = max(1, batchSize)
+	acceptedTxs := 0
+	for start := 0; start < len(txs); start += batchSize {
+		end := min(len(txs), start+batchSize)
+		batch := txs[start:end]
+		result, err := callWithContext(ctx, func() (batchSubmitResult, error) {
+			admissions, errs := submitter.svc.SubmitTxBatch(batch)
+			return batchSubmitResult{admissions: admissions, errs: errs}, nil
+		})
+		if err != nil {
+			return 0, err
+		}
+		for i, admitErr := range result.errs {
+			if admitErr != nil {
+				return 0, fmt.Errorf("submit batch tx %d on %s: %w", start+i, submitter.name, admitErr)
+			}
+		}
+		for _, admission := range result.admissions {
+			acceptedTxs += len(admission.Accepted)
+		}
+	}
+	return acceptedTxs, nil
+}
+
 func runConfirmedBlocksMaxRampScenario(ctx context.Context, cluster []*clusterNode, submitter *clusterNode, submitters []*clusterNode, opts RunOptions, lanes []spendableLane) (workloadOutcome, error) {
 	submitStarted := time.Now()
 	step := max(1, opts.BatchSize)
@@ -2060,18 +2354,13 @@ func runConfirmedBlocksMaxRampScenario(ctx context.Context, cluster []*clusterNo
 		}
 		submitterOffset = nextOffset
 		admitStarted := time.Now()
-		for _, prepared := range wave {
-			admission, err := callWithContext(ctx, func() (mempool.Admission, error) {
-				return prepared.submitter.svc.SubmitTx(prepared.tx)
-			})
-			if err != nil {
-				return workloadOutcome{}, err
-			}
-			metrics.AcceptedTxs += len(admission.Accepted)
-			submittedByNode[prepared.submitter.name]++
+		acceptedTxs, err := submitPreparedLaneWave(ctx, wave, opts.BatchSize, submittedByNode)
+		if err != nil {
+			return workloadOutcome{}, err
 		}
+		metrics.AcceptedTxs += acceptedTxs
 		admissionElapsed += time.Since(admitStarted)
-		if _, err := waitForMempoolCounts(ctx, cluster, len(wave), time.Time{}); err != nil {
+		if _, err := waitForMempoolCounts(ctx, []*clusterNode{submitter}, len(wave), time.Time{}); err != nil {
 			return workloadOutcome{}, err
 		}
 		preparedBlock, err := buildConfirmedBenchmarkBlock(ctx, submitter.svc, opts)
@@ -2229,7 +2518,7 @@ func prepareLaneWave(lanes []spendableLane, count int, submitters []*clusterNode
 	offset := submitterOffset
 	for i := 0; i < count; i++ {
 		lane := lanes[i]
-		tx, values, err := buildFanoutTx(lane.SpenderSeed, lane.OutPoint, lane.Value, pubKeyForSeed(lane.SpenderSeed), 2)
+		tx, values, err := buildFanoutTx(lane.SpenderSeed, lane.OutPoint, lane.Value, pubKeyForSeed(lane.SpenderSeed), 2, consensus.ParamsForProfile(submitters[0].svc.Profile()))
 		if err != nil {
 			return nil, nil, submitterOffset, err
 		}
@@ -2289,6 +2578,9 @@ func nextSyntheticRampTarget(current, step int, roundDuration, cadence time.Dura
 func buildConfirmedBenchmarkBlock(ctx context.Context, svc *node.Service, opts RunOptions) (preparedBenchmarkBlock, error) {
 	buildStarted := time.Now()
 	block, err := callWithContext(ctx, func() (types.Block, error) {
+		if opts.SteadyStateBacklog {
+			return svc.BuildBenchmarkBlockTemplate(opts.TxsPerBlock)
+		}
 		return svc.BuildBlockTemplate()
 	})
 	if err != nil {
@@ -2346,21 +2638,34 @@ func submitBlockToFollowers(ctx context.Context, followers []*clusterNode, block
 	}
 	blockHash := consensus.HeaderHash(&block.Header)
 	blockHashHex := hex.EncodeToString(blockHash[:])
+	errCh := make(chan error, len(followers))
 	for _, follower := range followers {
-		_, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
-			hash, height, err := follower.svc.SubmitBenchmarkBlock(block)
-			return acceptedBenchmarkBlock{hash: hash, height: height}, err
-		})
-		if err != nil {
-			if errors.Is(err, node.ErrBlockAlreadyKnown) {
-				continue
-			}
-			if strings.Contains(err.Error(), "stale template") {
-				info := follower.svc.ChainStateInfo()
-				if info.TipHeaderHash == blockHashHex {
-					continue
+		follower := follower
+		go func() {
+			_, err := callWithContext(ctx, func() (acceptedBenchmarkBlock, error) {
+				hash, height, err := follower.svc.SubmitBenchmarkBlock(block)
+				return acceptedBenchmarkBlock{hash: hash, height: height}, err
+			})
+			if err != nil {
+				if errors.Is(err, node.ErrBlockAlreadyKnown) {
+					errCh <- nil
+					return
 				}
+				if strings.Contains(err.Error(), "stale template") {
+					info := follower.svc.ChainStateInfo()
+					if info.TipHeaderHash == blockHashHex {
+						errCh <- nil
+						return
+					}
+				}
+				errCh <- err
+				return
 			}
+			errCh <- nil
+		}()
+	}
+	for range followers {
+		if err := <-errCh; err != nil {
 			return err
 		}
 	}
@@ -2782,27 +3087,32 @@ func buildNodeReports(nodes []*clusterNode, reached map[string]time.Duration, su
 	for _, benchNode := range nodes {
 		perf := benchNode.svc.PerformanceMetrics()
 		report := NodeReport{
-			Name:                  benchNode.name,
-			RPCAddr:               benchNode.rpcAddr,
-			P2PAddr:               benchNode.p2pAddr,
-			PeerCount:             benchNode.svc.PeerCount(),
-			BlockHeight:           benchNode.svc.BlockHeight(),
-			HeaderHeight:          benchNode.svc.HeaderHeight(),
-			MempoolCount:          benchNode.svc.MempoolCount(),
-			SubmittedTxs:          submittedByNode[benchNode.name],
-			BlockSigChecks:        perf.Counters.BlockSigChecks,
-			BlockSigFallbacks:     perf.Counters.BlockSigFallbacks,
-			BlockSigVerifyAvgMS:   perf.Latency.BlockSigVerify.AvgMS,
-			ErlayRounds:           perf.Counters.ErlayRounds,
-			ErlayRequestedTxs:     perf.Counters.ErlayRequestedTxs,
-			CompactBlockPlans:     perf.Counters.CompactBlockPlans,
-			GraphenePlans:         perf.Counters.GrapheneExtendedPlans,
-			GrapheneDecodeFails:   perf.Counters.GrapheneDecodeFails,
-			GrapheneRecoveries:    perf.Counters.GrapheneExtRecoveries,
-			TemplateSelectAvgMS:   perf.Latency.TemplateSelect.AvgMS,
-			TemplateAccAvgMS:      perf.Latency.TemplateAccumulate.AvgMS,
-			TemplateAssembleAvgMS: perf.Latency.TemplateAssemble.AvgMS,
-			RelayPeers:            buildPeerRelayReports(benchNode.svc.RelayPeerStats()),
+			Name:                   benchNode.name,
+			RPCAddr:                benchNode.rpcAddr,
+			P2PAddr:                benchNode.p2pAddr,
+			PeerCount:              benchNode.svc.PeerCount(),
+			BlockHeight:            benchNode.svc.BlockHeight(),
+			HeaderHeight:           benchNode.svc.HeaderHeight(),
+			MempoolCount:           benchNode.svc.MempoolCount(),
+			SubmittedTxs:           submittedByNode[benchNode.name],
+			BlockSigChecks:         perf.Counters.BlockSigChecks,
+			BlockSigFallbacks:      perf.Counters.BlockSigFallbacks,
+			BlockSigVerifyAvgMS:    perf.Latency.BlockSigVerify.AvgMS,
+			ErlayRounds:            perf.Counters.ErlayRounds,
+			ErlayRequestedTxs:      perf.Counters.ErlayRequestedTxs,
+			CompactBlockPlans:      perf.Counters.CompactBlockPlans,
+			CompactBlocksReceived:  perf.Counters.CompactBlocksReceived,
+			CompactBlocksRecovered: perf.Counters.CompactBlocksRecovered,
+			CompactBlockMissingTxs: perf.Counters.CompactBlockMissingTxs,
+			CompactBlockTxRequests: perf.Counters.CompactBlockTxRequests,
+			CompactBlockFallbacks:  perf.Counters.CompactBlockFallbacks,
+			GraphenePlans:          perf.Counters.GrapheneExtendedPlans,
+			GrapheneDecodeFails:    perf.Counters.GrapheneDecodeFails,
+			GrapheneRecoveries:     perf.Counters.GrapheneExtRecoveries,
+			TemplateSelectAvgMS:    perf.Latency.TemplateSelect.AvgMS,
+			TemplateAccAvgMS:       perf.Latency.TemplateAccumulate.AvgMS,
+			TemplateAssembleAvgMS:  perf.Latency.TemplateAssemble.AvgMS,
+			RelayPeers:             buildPeerRelayReports(benchNode.svc.RelayPeerStats()),
 		}
 		if reachedAt, ok := reached[benchNode.name]; ok {
 			ms := durationMS(reachedAt)
@@ -2834,21 +3144,6 @@ func maxNodeChainLag(nodes []*clusterNode, targetHeight uint64) (blockLag uint64
 		}
 	}
 	return blockLag, headerLag
-}
-
-func syntheticFinalPropagation(nodes []*clusterNode, targetHeight uint64, started time.Time) map[string]time.Duration {
-	reached := make(map[string]time.Duration, len(nodes))
-	if started.IsZero() {
-		return reached
-	}
-	now := time.Since(started)
-	for _, benchNode := range nodes {
-		debug := benchNode.svc.SyncDebugSnapshot()
-		if debug.BlockHeight >= targetHeight && debug.MempoolCount == 0 {
-			reached[benchNode.name] = now
-		}
-	}
-	return reached
 }
 
 func reportBenchmark(opts RunOptions) Benchmark {
@@ -3385,6 +3680,13 @@ func asciiTxOriginSuffix(origin string) string {
 	return fmt.Sprintf(" / origin %s", origin)
 }
 
+func asciiBacklogSuffix(enabled bool) string {
+	if !enabled {
+		return ""
+	}
+	return " / backlog"
+}
+
 func formatCountWithCommas(value uint64) string {
 	raw := strconv.FormatUint(value, 10)
 	if len(raw) <= 3 {
@@ -3425,6 +3727,11 @@ func relayMechanismRows(nodes []NodeReport) [][]string {
 		if node.ErlayRounds == 0 &&
 			node.ErlayRequestedTxs == 0 &&
 			node.CompactBlockPlans == 0 &&
+			node.CompactBlocksReceived == 0 &&
+			node.CompactBlocksRecovered == 0 &&
+			node.CompactBlockMissingTxs == 0 &&
+			node.CompactBlockTxRequests == 0 &&
+			node.CompactBlockFallbacks == 0 &&
 			node.GraphenePlans == 0 &&
 			node.GrapheneDecodeFails == 0 &&
 			node.GrapheneRecoveries == 0 {
@@ -3435,6 +3742,11 @@ func relayMechanismRows(nodes []NodeReport) [][]string {
 			formatCountWithCommas(node.ErlayRounds),
 			formatCountWithCommas(node.ErlayRequestedTxs),
 			formatCountWithCommas(node.CompactBlockPlans),
+			formatCountWithCommas(node.CompactBlocksReceived),
+			formatCountWithCommas(node.CompactBlocksRecovered),
+			formatCountWithCommas(node.CompactBlockMissingTxs),
+			formatCountWithCommas(node.CompactBlockTxRequests),
+			formatCountWithCommas(node.CompactBlockFallbacks),
 			formatCountWithCommas(node.GraphenePlans),
 			formatCountWithCommas(node.GrapheneDecodeFails),
 			formatCountWithCommas(node.GrapheneRecoveries),
@@ -3673,11 +3985,11 @@ func pubKeyForSeed(seed byte) [32]byte {
 	return crypto.XOnlyPubKeyFromSecret([32]byte{seed})
 }
 
-func signSingleInputTx(tx types.Transaction, spenderSeed byte, prevValue uint64) (types.Transaction, error) {
-	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+func signSingleInputTx(tx types.Transaction, spenderSeed byte, prevValue uint64, params consensus.ChainParams) (types.Transaction, error) {
+	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{{
 		ValueAtoms: prevValue,
 		PubKey:     pubKeyForSeed(spenderSeed),
-	}})
+	}}, params)
 	if err != nil {
 		return types.Transaction{}, err
 	}
@@ -3686,7 +3998,7 @@ func signSingleInputTx(tx types.Transaction, spenderSeed byte, prevValue uint64)
 	return tx, nil
 }
 
-func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputPubKey [32]byte, outputs int) (types.Transaction, []uint64, error) {
+func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputPubKey [32]byte, outputs int, params consensus.ChainParams) (types.Transaction, []uint64, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
@@ -3697,11 +4009,11 @@ func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, o
 	for i := range tx.Base.Outputs {
 		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, PubKey: outputPubKey}
 	}
-	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err := signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, nil, err
 	}
-	fee := uint64(len(tx.Encode()))
+	fee := uint64(tx.EncodedLen())
 	if prevValue < fee {
 		return types.Transaction{}, nil, consensus.ErrInputsLessThanOutputs
 	}
@@ -3720,14 +4032,14 @@ func buildFanoutTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, o
 		values[i] = value
 		tx.Base.Outputs[i].ValueAtoms = value
 	}
-	tx, err = signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err = signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, nil, err
 	}
 	return tx, values, nil
 }
 
-func buildChildTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputPubKey [32]byte) (types.Transaction, error) {
+func buildChildTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, outputPubKey [32]byte, params consensus.ChainParams) (types.Transaction, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
@@ -3735,16 +4047,16 @@ func buildChildTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, ou
 			Outputs: []types.TxOutput{{ValueAtoms: 1, PubKey: outputPubKey}},
 		},
 	}
-	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err := signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, err
 	}
-	fee := uint64(len(tx.Encode()))
+	fee := uint64(tx.EncodedLen())
 	if prevValue < fee {
 		return types.Transaction{}, consensus.ErrInputsLessThanOutputs
 	}
 	tx.Base.Outputs[0].ValueAtoms = prevValue - fee
-	return signSingleInputTx(tx, spenderSeed, prevValue)
+	return signSingleInputTx(tx, spenderSeed, prevValue, params)
 }
 
 type fundingOutput struct {
@@ -3792,7 +4104,7 @@ func seedFundingOutputs(svc *node.Service, outputCount int, recipientSeed byte) 
 	return outputs, nil
 }
 
-func buildFanoutTxToRecipients(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, recipients [][32]byte) (types.Transaction, []uint64, error) {
+func buildFanoutTxToRecipients(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, recipients [][32]byte, params consensus.ChainParams) (types.Transaction, []uint64, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
@@ -3803,11 +4115,11 @@ func buildFanoutTxToRecipients(spenderSeed byte, prevOut types.OutPoint, prevVal
 	for i, keyHash := range recipients {
 		tx.Base.Outputs[i] = types.TxOutput{ValueAtoms: 1, PubKey: keyHash}
 	}
-	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err := signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, nil, err
 	}
-	fee := uint64(len(tx.Encode()))
+	fee := uint64(tx.EncodedLen())
 	if prevValue < fee {
 		return types.Transaction{}, nil, consensus.ErrInputsLessThanOutputs
 	}
@@ -3826,7 +4138,7 @@ func buildFanoutTxToRecipients(spenderSeed byte, prevOut types.OutPoint, prevVal
 		values[i] = value
 		tx.Base.Outputs[i].ValueAtoms = value
 	}
-	tx, err = signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err = signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, nil, err
 	}
@@ -3874,7 +4186,7 @@ func seedFundingOutputsForUsers(svc *node.Service, outputCount, userCount int) (
 	return outputs, nil
 }
 
-func buildPaymentWithChangeTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, paymentPubKey, changePubKey [32]byte) (types.Transaction, uint64, error) {
+func buildPaymentWithChangeTx(spenderSeed byte, prevOut types.OutPoint, prevValue uint64, paymentPubKey, changePubKey [32]byte, params consensus.ChainParams) (types.Transaction, uint64, error) {
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
@@ -3885,11 +4197,11 @@ func buildPaymentWithChangeTx(spenderSeed byte, prevOut types.OutPoint, prevValu
 			},
 		},
 	}
-	tx, err := signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err := signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, 0, err
 	}
-	fee := uint64(len(tx.Encode()))
+	fee := uint64(tx.EncodedLen())
 	if prevValue <= fee+1 {
 		return types.Transaction{}, 0, consensus.ErrInputsLessThanOutputs
 	}
@@ -3904,7 +4216,7 @@ func buildPaymentWithChangeTx(spenderSeed byte, prevOut types.OutPoint, prevValu
 	changeValue := remaining - paymentValue
 	tx.Base.Outputs[0].ValueAtoms = paymentValue
 	tx.Base.Outputs[1].ValueAtoms = changeValue
-	tx, err = signSingleInputTx(tx, spenderSeed, prevValue)
+	tx, err = signSingleInputTx(tx, spenderSeed, prevValue, params)
 	if err != nil {
 		return types.Transaction{}, 0, err
 	}
@@ -3919,7 +4231,7 @@ func seedSpendableFanout(svc *node.Service, txCount int) ([]types.Transaction, e
 	childPubKey := pubKeyForSeed(3)
 	txs := make([]types.Transaction, 0, txCount)
 	for _, output := range outputs {
-		tx, err := buildChildTx(2, output.OutPoint, output.Value, childPubKey)
+		tx, err := buildChildTx(2, output.OutPoint, output.Value, childPubKey, consensus.ParamsForProfile(svc.Profile()))
 		if err != nil {
 			if errors.Is(err, consensus.ErrInputsLessThanOutputs) {
 				return nil, fmt.Errorf("benchmark funding output %x:%d is too small to build a child transaction; funding batches should keep outputs above the child-tx fee floor", output.OutPoint.TxID, output.OutPoint.Vout)
@@ -3969,7 +4281,7 @@ func seedUserMixWorkload(svc *node.Service, txCount int) ([]types.Transaction, S
 			queue := pendingChanges[output.SpenderSeed]
 			change := queue[0]
 			pendingChanges[output.SpenderSeed] = queue[1:]
-			tx, err := buildChildTx(change.spenderSeed, change.outPoint, change.value, pubKeyForSeed(byte(90+(change.recipientTag%64))))
+			tx, err := buildChildTx(change.spenderSeed, change.outPoint, change.value, pubKeyForSeed(byte(90+(change.recipientTag%64))), consensus.ParamsForProfile(svc.Profile()))
 			if err != nil {
 				return nil, ScenarioMetrics{}, err
 			}
@@ -3979,7 +4291,7 @@ func seedUserMixWorkload(svc *node.Service, txCount int) ([]types.Transaction, S
 		}
 
 		paymentSeed := byte(120 + (output.RecipientTag % 80))
-		tx, changeValue, err := buildPaymentWithChangeTx(output.SpenderSeed, output.OutPoint, output.Value, pubKeyForSeed(paymentSeed), pubKeyForSeed(output.SpenderSeed))
+		tx, changeValue, err := buildPaymentWithChangeTx(output.SpenderSeed, output.OutPoint, output.Value, pubKeyForSeed(paymentSeed), pubKeyForSeed(output.SpenderSeed), consensus.ParamsForProfile(svc.Profile()))
 		if err != nil {
 			return nil, ScenarioMetrics{}, err
 		}
@@ -4010,7 +4322,7 @@ func seedChainedPackages(svc *node.Service, txCount, batchSize int) ([]types.Tra
 		prevOut := output.OutPoint
 		prevValue := output.Value
 		for depth := 0; depth < packageDepth && len(txs) < txCount; depth++ {
-			tx, err := buildChildTx(2, prevOut, prevValue, keyHash)
+			tx, err := buildChildTx(2, prevOut, prevValue, keyHash, consensus.ParamsForProfile(svc.Profile()))
 			if err != nil {
 				return nil, 0, 0, err
 			}
@@ -4031,7 +4343,7 @@ func seedOrphanStorm(svc *node.Service, txCount int) ([]types.Transaction, error
 	parents := make([]types.Transaction, 0, parentCount)
 	children := make([]types.Transaction, 0, txCount/2)
 	for _, output := range outputs {
-		parent, err := buildChildTx(2, output.OutPoint, output.Value, pubKeyForSeed(3))
+		parent, err := buildChildTx(2, output.OutPoint, output.Value, pubKeyForSeed(3), consensus.ParamsForProfile(svc.Profile()))
 		if err != nil {
 			return nil, err
 		}
@@ -4040,7 +4352,7 @@ func seedOrphanStorm(svc *node.Service, txCount int) ([]types.Transaction, error
 			continue
 		}
 		parentOut := types.OutPoint{TxID: consensus.TxID(&parent), Vout: 0}
-		child, err := buildChildTx(3, parentOut, parent.Base.Outputs[0].ValueAtoms, pubKeyForSeed(4))
+		child, err := buildChildTx(3, parentOut, parent.Base.Outputs[0].ValueAtoms, pubKeyForSeed(4), consensus.ParamsForProfile(svc.Profile()))
 		if err != nil {
 			return nil, err
 		}
@@ -4216,7 +4528,7 @@ func canSeedTxCount(txCount int, coinbaseValue uint64) (bool, error) {
 	if perOutput == 0 {
 		return false, nil
 	}
-	_, err := buildChildTx(2, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, perOutput, pubKeyForSeed(3))
+	_, err := buildChildTx(2, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, perOutput, pubKeyForSeed(3), consensus.RegtestParams())
 	if err != nil {
 		if errors.Is(err, consensus.ErrInputsLessThanOutputs) {
 			return false, nil

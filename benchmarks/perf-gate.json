@@ -1,0 +1,51 @@
+{
+  "micro": {
+    "package": "./benchmarks",
+    "bench": "^(BenchmarkTxAdmission|BenchmarkTxValidation|BenchmarkMempoolSelection|BenchmarkBlockApply)$",
+    "count": 1,
+    "benchmarks": [
+      {
+        "name": "BenchmarkTxAdmission",
+        "max_ns_per_op_regression_pct": 15,
+        "max_bytes_per_op_regression_pct": 15,
+        "max_allocs_per_op_regression_pct": 15
+      },
+      {
+        "name": "BenchmarkTxValidation",
+        "max_ns_per_op_regression_pct": 15,
+        "max_bytes_per_op_regression_pct": 15,
+        "max_allocs_per_op_regression_pct": 15
+      },
+      {
+        "name": "BenchmarkMempoolSelection",
+        "max_ns_per_op_regression_pct": 15,
+        "max_bytes_per_op_regression_pct": 15,
+        "max_allocs_per_op_regression_pct": 15
+      },
+      {
+        "name": "BenchmarkBlockApply",
+        "max_ns_per_op_regression_pct": 15,
+        "max_bytes_per_op_regression_pct": 15,
+        "max_allocs_per_op_regression_pct": 15
+      }
+    ]
+  },
+  "e2e": {
+    "profile": "benchnet",
+    "mining": "synthetic",
+    "nodes": 5,
+    "topology": "mesh",
+    "tx_origin": "even",
+    "batch_size": 64,
+    "txs_per_block": 1024,
+    "blocks": 5,
+    "block_interval": "1s",
+    "max_admission_tps_drop_pct": 10,
+    "max_completion_tps_drop_pct": 10,
+    "max_confirmed_wall_tps_drop_pct": 10,
+    "max_schedule_lag_p95_ms_increase_pct": 25,
+    "max_final_mempool_txs_increase_pct": 10,
+    "max_missed_intervals_increase": 0,
+    "max_final_block_lag_increase": 0
+  }
+}

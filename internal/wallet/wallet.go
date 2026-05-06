@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"bitcoin-pure/internal/consensus"
+	bpcrypto "bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -20,6 +22,9 @@ import (
 
 const (
 	StoreFileName = "wallets.json"
+
+	AddressFamilyXOnly = "xonly"
+	AddressFamilyPQ    = "pq"
 )
 
 var (
@@ -30,6 +35,7 @@ var (
 )
 
 type Store struct {
+	profile types.ChainProfile
 	path    string
 	wallets []Wallet
 }
@@ -42,12 +48,17 @@ type Wallet struct {
 }
 
 type Address struct {
-	Index         int       `json:"index"`
-	Change        bool      `json:"change"`
-	CreatedAt     time.Time `json:"created_at"`
-	Address       string    `json:"address"`
-	PubKeyHex     string    `json:"pubkey_hex"`
-	PrivateKeyHex string    `json:"private_key_hex"`
+	Index              int       `json:"index"`
+	Change             bool      `json:"change"`
+	CreatedAt          time.Time `json:"created_at"`
+	Address            string    `json:"address"`
+	Type               uint64    `json:"type,omitempty"`
+	PayloadHex         string    `json:"payload_hex,omitempty"`
+	AlgID              uint64    `json:"alg_id,omitempty"`
+	PubKeyHex          string    `json:"pubkey_hex"`
+	SecretKeyHex       string    `json:"secret_key_hex,omitempty"`
+	PrivateKeyHex      string    `json:"private_key_hex"`
+	VerificationKeyHex string    `json:"verification_key_hex,omitempty"`
 }
 
 type PendingTx struct {
@@ -58,11 +69,13 @@ type PendingTx struct {
 }
 
 type PendingOutput struct {
-	Vout      uint32 `json:"vout"`
-	Value     uint64 `json:"value"`
-	Address   string `json:"address"`
-	PubKeyHex string `json:"pubkey_hex"`
-	Change    bool   `json:"change"`
+	Vout       uint32 `json:"vout"`
+	Value      uint64 `json:"value"`
+	Address    string `json:"address"`
+	Type       uint64 `json:"type,omitempty"`
+	PayloadHex string `json:"payload_hex,omitempty"`
+	PubKeyHex  string `json:"pubkey_hex"`
+	Change     bool   `json:"change"`
 }
 
 type PendingOutPoint struct {
@@ -71,9 +84,11 @@ type PendingOutPoint struct {
 }
 
 type SpendableUTXO struct {
-	OutPoint types.OutPoint
-	Value    uint64
-	PubKey   [32]byte
+	OutPoint  types.OutPoint
+	Value     uint64
+	Type      uint64
+	Payload32 [32]byte
+	PubKey    [32]byte
 }
 
 type SelectedInput struct {
@@ -121,8 +136,75 @@ type BalanceSummary struct {
 	AddressCount int
 }
 
+func ParseAddressFamily(raw string) (uint64, error) {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "", AddressFamilyXOnly, "x-only":
+		return types.OutputXOnlyP2PK, nil
+	case AddressFamilyPQ, "pq-lock", "pq_lock", "pqlock":
+		return types.OutputPQLock32, nil
+	default:
+		return 0, fmt.Errorf("unknown address family %q", raw)
+	}
+}
+
+func AddressFamilyLabel(outputType uint64) string {
+	switch outputType {
+	case types.OutputXOnlyP2PK:
+		return AddressFamilyXOnly
+	case types.OutputPQLock32:
+		return AddressFamilyPQ
+	default:
+		return fmt.Sprintf("type-%d", outputType)
+	}
+}
+
+func (a Address) OutputType() uint64 {
+	if a.Type == types.OutputPQLock32 {
+		return types.OutputPQLock32
+	}
+	return types.OutputXOnlyP2PK
+}
+
+func (a Address) WatchItem() (WatchItem, error) {
+	payload, err := a.payload32()
+	if err != nil {
+		return WatchItem{}, err
+	}
+	return WatchItem{Type: a.OutputType(), Payload32: payload}, nil
+}
+
+func (a Address) payload32() ([32]byte, error) {
+	switch a.OutputType() {
+	case types.OutputPQLock32:
+		return decodeHex32(a.PayloadHex)
+	default:
+		if strings.TrimSpace(a.PayloadHex) != "" {
+			return decodeHex32(a.PayloadHex)
+		}
+		return decodeHex32(a.PubKeyHex)
+	}
+}
+
+func (a Address) signingSecretHex() string {
+	if strings.TrimSpace(a.SecretKeyHex) != "" {
+		return a.SecretKeyHex
+	}
+	return a.PrivateKeyHex
+}
+
+func (u SpendableUTXO) WatchItem() WatchItem {
+	if u.Type == types.OutputXOnlyP2PK && u.Payload32 == ([32]byte{}) {
+		return WatchItem{Type: types.OutputXOnlyP2PK, Payload32: u.PubKey}
+	}
+	return WatchItem{Type: u.Type, Payload32: u.Payload32}
+}
+
 func Open(path string) (*Store, error) {
-	store := &Store{path: filepath.Clean(path)}
+	return OpenWithProfile(path, types.Mainnet)
+}
+
+func OpenWithProfile(path string, profile types.ChainProfile) (*Store, error) {
+	store := &Store{path: filepath.Clean(path), profile: profile}
 	buf, err := os.ReadFile(store.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -137,17 +219,18 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	// Recompute the display address from the canonical stored pubkey so the
-	// wallet surface stays consistent even if only the raw pubkey is persisted.
+	// wallet surface stays consistent even if older wallet files only persisted
+	// x-only keys and newer ones carry typed watch items.
 	for wi := range store.wallets {
 		for ai := range store.wallets[wi].Addresses {
-			pubKey, err := decodeHex32(store.wallets[wi].Addresses[ai].PubKeyHex)
-			if err != nil {
-				continue
-			}
-			store.wallets[wi].Addresses[ai].Address = EncodeAddress(pubKey)
+			normalizeStoredAddress(&store.wallets[wi].Addresses[ai])
 		}
 	}
 	return store, nil
+}
+
+func (s *Store) chainParams() consensus.ChainParams {
+	return consensus.ParamsForProfile(s.profile)
 }
 
 func StorePath(dir string) string {
@@ -161,6 +244,10 @@ func (s *Store) List() []Wallet {
 }
 
 func (s *Store) CreateWallet(name string) (Wallet, Address, error) {
+	return s.CreateWalletWithType(name, types.OutputXOnlyP2PK)
+}
+
+func (s *Store) CreateWalletWithType(name string, outputType uint64) (Wallet, Address, error) {
 	name = normalizeWalletName(name)
 	if name == "" {
 		return Wallet{}, Address{}, errors.New("wallet name is required")
@@ -173,7 +260,7 @@ func (s *Store) CreateWallet(name string) (Wallet, Address, error) {
 		CreatedAt: time.Now().UTC(),
 		Pending:   []PendingTx{},
 	}
-	addr, err := newAddress(0, false)
+	addr, err := newAddress(0, false, outputType)
 	if err != nil {
 		return Wallet{}, Address{}, err
 	}
@@ -194,11 +281,15 @@ func (s *Store) Wallet(name string) (Wallet, error) {
 }
 
 func (s *Store) NewReceiveAddress(name string) (Address, error) {
+	return s.NewReceiveAddressWithType(name, types.OutputXOnlyP2PK)
+}
+
+func (s *Store) NewReceiveAddressWithType(name string, outputType uint64) (Address, error) {
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return Address{}, ErrWalletNotFound
 	}
-	addr, err := newAddress(nextAddressIndex(*wallet), false)
+	addr, err := newAddress(nextAddressIndex(*wallet), false, outputType)
 	if err != nil {
 		return Address{}, err
 	}
@@ -243,7 +334,7 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 	if !ok {
 		return SendPlan{}, ErrWalletNotFound
 	}
-	destPubKey, err := ParseAddress(to)
+	destItem, err := ParseWatchAddress(to)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -257,12 +348,12 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 		return SendPlan{}, err
 	}
 	change := total - required
-	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destPubKey), destPubKey, amount, fee, change)
+	plan, err := s.buildSignedPlan(wallet, selected, to, destItem, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
 	plan.InputTotal = total
-	plan.EstimatedBytes = len(plan.Transaction.Encode())
+	plan.EstimatedBytes = plan.Transaction.EncodedLen()
 	return plan, nil
 }
 
@@ -274,7 +365,7 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if !ok {
 		return SendPlan{}, ErrWalletNotFound
 	}
-	destPubKey, err := ParseAddress(to)
+	destItem, err := ParseWatchAddress(to)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -282,11 +373,11 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if err != nil {
 		return SendPlan{}, err
 	}
-	selected, total, fee, change, estimatedBytes, err := selectCoinsForAutoFee(available, amount, feeRate)
+	selected, total, fee, change, estimatedBytes, err := selectCoinsForAutoFee(available, destItem, amount, feeRate)
 	if err != nil {
 		return SendPlan{}, err
 	}
-	plan, err := s.buildSignedPlan(wallet, selected, EncodeAddress(destPubKey), destPubKey, amount, fee, change)
+	plan, err := s.buildSignedPlan(wallet, selected, to, destItem, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -304,7 +395,7 @@ func (s *Store) BuildCPFP(name string, parentTxID [32]byte, feeRate uint64) (CPF
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	estimatedBytes := estimateSignedTxBytes(1, 1)
+	estimatedBytes := estimateSignedTxBytesForFamilies([]SelectedInput{{Address: input.Address}}, []uint64{input.Address.OutputType()})
 	fee := feeRate * uint64(estimatedBytes)
 	if fee == 0 {
 		return CPFPPlan{}, ErrInsufficientFunds
@@ -320,7 +411,7 @@ func (s *Store) BuildCPFPWithExactFee(name string, parentTxID [32]byte, fee uint
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	estimatedBytes := estimateSignedTxBytes(1, 1)
+	estimatedBytes := estimateSignedTxBytesForFamilies([]SelectedInput{{Address: input.Address}}, []uint64{input.Address.OutputType()})
 	feeRate := fee / uint64(estimatedBytes)
 	if fee%uint64(estimatedBytes) != 0 {
 		feeRate++
@@ -353,7 +444,7 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 	}
 	// Sweep the child output back to a fresh internal address so the bump path
 	// stays wallet-owned and easy to follow in later balance/history views.
-	addr, err := newAddress(nextAddressIndex(*wallet), true)
+	addr, err := newAddress(nextAddressIndex(*wallet), true, input.Address.OutputType())
 	if err != nil {
 		return CPFPPlan{}, err
 	}
@@ -365,25 +456,28 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: input.OutPoint}},
-			Outputs: []types.TxOutput{{
-				ValueAtoms: input.Value - fee,
-				PubKey:     mustParsePubKey(addr.PubKeyHex),
-			}},
+			Outputs: []types.TxOutput{txOutputForWatchItem(input.Value-fee, mustWatchItem(addr))},
 		},
 		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, 1)},
 	}
-	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{{
+	spentWatchItem, err := input.Address.WatchItem()
+	if err != nil {
+		return CPFPPlan{}, err
+	}
+	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{{
+		Type:       spentWatchItem.Type,
 		ValueAtoms: input.Value,
-		PubKey:     mustParsePubKey(input.Address.PubKeyHex),
-	}})
+		Payload32:  spentWatchItem.Payload32,
+		PubKey:     legacyPubKeyForWatchItem(spentWatchItem),
+	}}, s.chainParams())
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	sig, err := signAddress(input.Address, &msg)
+	authEntry, err := signAddressAuthEntry(input.Address, &msg)
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	tx.Auth.Entries[0] = types.TxAuthEntry{Signature: sig}
+	tx.Auth.Entries[0] = authEntry
 	txid := consensus.TxID(&tx)
 	return CPFPPlan{
 		WalletName:     wallet.Name,
@@ -443,14 +537,16 @@ func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]Spen
 			continue
 		}
 		for _, output := range pending.Outputs {
-			pubKey, err := decodeHex32(output.PubKeyHex)
+			item, err := pendingOutputWatchItem(output)
 			if err != nil {
 				continue
 			}
 			out = append(out, SpendableUTXO{
-				OutPoint: types.OutPoint{TxID: txid, Vout: output.Vout},
-				Value:    output.Value,
-				PubKey:   pubKey,
+				OutPoint:  types.OutPoint{TxID: txid, Vout: output.Vout},
+				Value:     output.Value,
+				Type:      item.Type,
+				Payload32: item.Payload32,
+				PubKey:    legacyPubKeyForWatchItem(item),
 			})
 		}
 	}
@@ -458,19 +554,37 @@ func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]Spen
 }
 
 func (s *Store) SpendablePubKeys(name string) ([][32]byte, error) {
+	items, err := s.SpendableWatchItems(name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][32]byte, 0, len(items))
+	for _, item := range items {
+		if item.Type != types.OutputXOnlyP2PK {
+			continue
+		}
+		out = append(out, item.Payload32)
+	}
+	return out, nil
+}
+
+func (s *Store) SpendableWatchItems(name string) ([]WatchItem, error) {
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return nil, ErrWalletNotFound
 	}
-	out := make([][32]byte, 0, len(wallet.Addresses))
-	seen := make(map[[32]byte]struct{}, len(wallet.Addresses))
+	out := make([]WatchItem, 0, len(wallet.Addresses))
+	seen := make(map[WatchItem]struct{}, len(wallet.Addresses))
 	for _, addr := range wallet.Addresses {
-		pubKey := mustParsePubKey(addr.PubKeyHex)
-		if _, ok := seen[pubKey]; ok {
+		item, err := addr.WatchItem()
+		if err != nil {
 			continue
 		}
-		seen[pubKey] = struct{}{}
-		out = append(out, pubKey)
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
 	}
 	return out, nil
 }
@@ -529,45 +643,94 @@ func nextAddressIndex(wallet Wallet) int {
 	return maxIndex + 1
 }
 
-func newAddress(index int, change bool) (Address, error) {
-	privKey, err := btcec.NewPrivateKey()
-	if err != nil {
-		return Address{}, err
+func newAddress(index int, change bool, outputType uint64) (Address, error) {
+	switch outputType {
+	case types.OutputXOnlyP2PK:
+		privKey, err := btcec.NewPrivateKey()
+		if err != nil {
+			return Address{}, err
+		}
+		pubKey := schnorr.SerializePubKey(privKey.PubKey())
+		var xonly [32]byte
+		copy(xonly[:], pubKey)
+		var secret [32]byte
+		copy(secret[:], privKey.Serialize())
+		return Address{
+			Index:         index,
+			Change:        change,
+			CreatedAt:     time.Now().UTC(),
+			Address:       EncodeAddress(xonly),
+			Type:          types.OutputXOnlyP2PK,
+			PayloadHex:    hex.EncodeToString(xonly[:]),
+			PubKeyHex:     hex.EncodeToString(xonly[:]),
+			SecretKeyHex:  hex.EncodeToString(secret[:]),
+			PrivateKeyHex: hex.EncodeToString(secret[:]),
+		}, nil
+	case types.OutputPQLock32:
+		verificationKey, secretKey, err := bpcrypto.GenerateMLDSA65Key(rand.Reader)
+		if err != nil {
+			return Address{}, err
+		}
+		pqLock := bpcrypto.PQLock(verificationKey)
+		return Address{
+			Index:              index,
+			Change:             change,
+			CreatedAt:          time.Now().UTC(),
+			Address:            EncodeTypedAddress(WatchItem{Type: types.OutputPQLock32, Payload32: pqLock}),
+			Type:               types.OutputPQLock32,
+			PayloadHex:         hex.EncodeToString(pqLock[:]),
+			AlgID:              types.AlgMLDSA65,
+			SecretKeyHex:       hex.EncodeToString(secretKey),
+			VerificationKeyHex: hex.EncodeToString(verificationKey),
+		}, nil
+	default:
+		return Address{}, fmt.Errorf("unsupported wallet address type %d", outputType)
 	}
-	pubKey := schnorr.SerializePubKey(privKey.PubKey())
-	var xonly [32]byte
-	copy(xonly[:], pubKey)
-	var secret [32]byte
-	copy(secret[:], privKey.Serialize())
-	return Address{
-		Index:         index,
-		Change:        change,
-		CreatedAt:     time.Now().UTC(),
-		Address:       EncodeAddress(xonly),
-		PubKeyHex:     hex.EncodeToString(xonly[:]),
-		PrivateKeyHex: hex.EncodeToString(secret[:]),
-	}, nil
 }
 
-func signAddress(addr Address, msg *[32]byte) ([64]byte, error) {
-	var sigOut [64]byte
-	secret, err := hex.DecodeString(addr.PrivateKeyHex)
-	if err != nil || len(secret) != 32 {
-		return sigOut, errors.New("wallet private key is invalid")
+func signAddressAuthEntry(addr Address, msg *[32]byte) (types.TxAuthEntry, error) {
+	switch addr.OutputType() {
+	case types.OutputXOnlyP2PK:
+		secret, err := hex.DecodeString(addr.signingSecretHex())
+		if err != nil || len(secret) != 32 {
+			return types.TxAuthEntry{}, errors.New("wallet private key is invalid")
+		}
+		privKey, _ := btcec.PrivKeyFromBytes(secret)
+		sig, err := schnorr.Sign(privKey, msg[:])
+		if err != nil {
+			return types.TxAuthEntry{}, err
+		}
+		var sigOut [64]byte
+		copy(sigOut[:], sig.Serialize())
+		return types.NewXOnlyAuthEntry(sigOut), nil
+	case types.OutputPQLock32:
+		secret, err := hex.DecodeString(addr.signingSecretHex())
+		if err != nil {
+			return types.TxAuthEntry{}, errors.New("wallet PQ secret key is invalid")
+		}
+		verificationKey, err := hex.DecodeString(strings.TrimSpace(addr.VerificationKeyHex))
+		if err != nil || len(verificationKey) == 0 {
+			return types.TxAuthEntry{}, errors.New("wallet PQ verification key is invalid")
+		}
+		signature, err := bpcrypto.SignMLDSA65(secret, msg[:])
+		if err != nil {
+			return types.TxAuthEntry{}, err
+		}
+		payload := buildPQAuthPayload(verificationKey, signature)
+		return types.TxAuthEntry{AuthPayload: payload}, nil
+	default:
+		return types.TxAuthEntry{}, fmt.Errorf("unsupported wallet address type %d", addr.OutputType())
 	}
-	privKey, _ := btcec.PrivKeyFromBytes(secret)
-	sig, err := schnorr.Sign(privKey, msg[:])
-	if err != nil {
-		return sigOut, err
-	}
-	copy(sigOut[:], sig.Serialize())
-	return sigOut, nil
 }
 
 func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, error) {
-	addressesByPubKey := make(map[[32]byte]Address, len(wallet.Addresses))
+	addressesByWatchItem := make(map[WatchItem]Address, len(wallet.Addresses))
 	for _, addr := range wallet.Addresses {
-		addressesByPubKey[mustParsePubKey(addr.PubKeyHex)] = addr
+		item, err := addr.WatchItem()
+		if err != nil {
+			continue
+		}
+		addressesByWatchItem[item] = addr
 	}
 	pendingSpent := make(map[types.OutPoint]struct{})
 	for _, pending := range wallet.Pending {
@@ -581,7 +744,7 @@ func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, erro
 	}
 	out := make([]SelectedInput, 0, len(utxos))
 	for _, utxo := range utxos {
-		addr, ok := addressesByPubKey[utxo.PubKey]
+		addr, ok := addressesByWatchItem[utxo.WatchItem()]
 		if !ok {
 			continue
 		}
@@ -629,24 +792,24 @@ func selectCoins(coins []SelectedInput, required uint64) ([]SelectedInput, uint6
 	return nil, 0, ErrInsufficientFunds
 }
 
-func selectCoinsForAutoFee(coins []SelectedInput, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
+func selectCoinsForAutoFee(coins []SelectedInput, destItem WatchItem, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
 	selected := make([]SelectedInput, 0, len(coins))
 	var total uint64
 	for _, coin := range coins {
 		selected = append(selected, coin)
 		total += coin.Value
-		feeNoChange := feeRate * uint64(estimateSignedTxBytes(len(selected), 1))
+		feeNoChange := feeRate * uint64(estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type}))
 		if total < amount+feeNoChange {
 			continue
 		}
-		feeWithChange := feeRate * uint64(estimateSignedTxBytes(len(selected), 2))
+		feeWithChange := feeRate * uint64(estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type, selected[0].Address.OutputType()}))
 		if total >= amount+feeWithChange {
-			return selected, total, feeWithChange, total - amount - feeWithChange, estimateSignedTxBytes(len(selected), 2), nil
+			return selected, total, feeWithChange, total - amount - feeWithChange, estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type, selected[0].Address.OutputType()}), nil
 		}
 		// If we can fund the payment at the requested fee rate but not a second
 		// wallet-owned change output, collapse the remainder into fee instead of
 		// manufacturing dust-like change that would immediately need another spend.
-		return selected, total, total - amount, 0, estimateSignedTxBytes(len(selected), 1), nil
+		return selected, total, total - amount, 0, estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type}), nil
 	}
 	return nil, 0, 0, 0, 0, ErrInsufficientFunds
 }
@@ -656,35 +819,70 @@ func EstimateSignedTxBytes(inputCount int, outputCount int) int {
 }
 
 func estimateSignedTxBytes(inputCount int, outputCount int) int {
-	return 4 + // version
-		varIntLen(inputCount) +
-		(inputCount * 36) +
-		varIntLen(outputCount) +
-		(outputCount * 40) +
-		varIntLen(inputCount) +
-		(inputCount * 64)
+	selected := make([]SelectedInput, inputCount)
+	for i := range selected {
+		selected[i] = SelectedInput{Address: Address{Type: types.OutputXOnlyP2PK}}
+	}
+	outputTypes := make([]uint64, outputCount)
+	for i := range outputTypes {
+		outputTypes[i] = types.OutputXOnlyP2PK
+	}
+	return estimateSignedTxBytesForFamilies(selected, outputTypes)
 }
 
-func varIntLen(count int) int {
+func estimateSignedTxBytesForFamilies(inputs []SelectedInput, outputTypes []uint64) int {
+	size := 4 // version
+	size += varIntLenU64(uint64(len(inputs)))
+	size += len(inputs) * 36
+	size += varIntLenU64(uint64(len(outputTypes)))
+	for _, outputType := range outputTypes {
+		size += estimatedOutputBytes(outputType)
+	}
+	size += varIntLenU64(uint64(len(inputs)))
+	for _, input := range inputs {
+		size += estimatedAuthEntryBytes(input.Address)
+	}
+	return size
+}
+
+func varIntLenU64(v uint64) int {
 	switch {
-	case count < 0xfd:
+	case v <= 0xfc:
 		return 1
-	case count <= 0xffff:
+	case v <= 0xffff:
 		return 3
-	case uint64(count) <= 0xffff_ffff:
+	case v <= 0xffff_ffff:
 		return 5
 	default:
 		return 9
 	}
 }
 
-func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destPubKey [32]byte, amount uint64, fee uint64, change uint64) (SendPlan, error) {
-	outputs := []types.TxOutput{{ValueAtoms: amount, PubKey: destPubKey}}
+func estimatedOutputBytes(outputType uint64) int {
+	return len(types.CanonicalVarIntBytes(outputType)) + 8 + 32
+}
+
+func estimatedAuthEntryBytes(addr Address) int {
+	payloadLen := 64
+	if addr.OutputType() == types.OutputPQLock32 {
+		vkLen := bpcrypto.MLDSA65VerificationKeySize
+		if raw, err := hex.DecodeString(strings.TrimSpace(addr.VerificationKeyHex)); err == nil && len(raw) > 0 {
+			vkLen = len(raw)
+		}
+		sigLen := bpcrypto.MLDSA65SignatureSize
+		payloadLen = vkLen + sigLen
+	}
+	return varIntLenU64(uint64(payloadLen)) + payloadLen
+}
+
+func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destItem WatchItem, amount uint64, fee uint64, change uint64) (SendPlan, error) {
+	outputs := []types.TxOutput{txOutputForWatchItem(amount, destItem)}
 	var changeAddr *Address
 	if change > 0 {
 		// Persist change addresses before broadcast so a later-confirmed self output is still recoverable
 		// even if the operator loses the pending-send context locally.
-		addr, err := newAddress(nextAddressIndex(*wallet), true)
+		changeType := inputs[0].Address.OutputType()
+		addr, err := newAddress(nextAddressIndex(*wallet), true, changeType)
 		if err != nil {
 			return SendPlan{}, err
 		}
@@ -693,7 +891,7 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 			return SendPlan{}, err
 		}
 		changeAddr = &addr
-		outputs = append(outputs, types.TxOutput{ValueAtoms: change, PubKey: mustParsePubKey(addr.PubKeyHex)})
+		outputs = append(outputs, txOutputForWatchItem(change, mustWatchItem(addr)))
 	}
 	tx := types.Transaction{
 		Base: types.TxBase{
@@ -707,22 +905,28 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 	inputTotal := uint64(0)
 	for i, coin := range inputs {
 		tx.Base.Inputs = append(tx.Base.Inputs, types.TxInput{PrevOut: coin.OutPoint})
+		item, err := coin.Address.WatchItem()
+		if err != nil {
+			return SendPlan{}, err
+		}
 		spentCoins[i] = consensus.UtxoEntry{
+			Type:       item.Type,
 			ValueAtoms: coin.Value,
-			PubKey:     mustParsePubKey(coin.Address.PubKeyHex),
+			Payload32:  item.Payload32,
+			PubKey:     legacyPubKeyForWatchItem(item),
 		}
 		inputTotal += coin.Value
 	}
 	for i, coin := range inputs {
-		msg, err := consensus.Sighash(&tx, i, spentCoins)
+		msg, err := consensus.SighashWithParams(&tx, i, spentCoins, s.chainParams())
 		if err != nil {
 			return SendPlan{}, err
 		}
-		sig, err := signAddress(coin.Address, &msg)
+		authEntry, err := signAddressAuthEntry(coin.Address, &msg)
 		if err != nil {
 			return SendPlan{}, err
 		}
-		tx.Auth.Entries[i] = types.TxAuthEntry{Signature: sig}
+		tx.Auth.Entries[i] = authEntry
 	}
 	txid := consensus.TxID(&tx)
 	return SendPlan{
@@ -741,25 +945,120 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 }
 
 func walletOwnedOutputs(wallet Wallet, tx types.Transaction) []PendingOutput {
-	addressByPubKey := make(map[[32]byte]Address, len(wallet.Addresses))
+	addressByWatchItem := make(map[WatchItem]Address, len(wallet.Addresses))
 	for _, addr := range wallet.Addresses {
-		addressByPubKey[mustParsePubKey(addr.PubKeyHex)] = addr
+		item, err := addr.WatchItem()
+		if err != nil {
+			continue
+		}
+		addressByWatchItem[item] = addr
 	}
 	out := make([]PendingOutput, 0)
 	for vout, output := range tx.Base.Outputs {
-		addr, ok := addressByPubKey[output.PubKey]
+		item := watchItemForOutput(output)
+		addr, ok := addressByWatchItem[item]
 		if !ok {
 			continue
 		}
 		out = append(out, PendingOutput{
-			Vout:      uint32(vout),
-			Value:     output.ValueAtoms,
-			Address:   addr.Address,
-			PubKeyHex: addr.PubKeyHex,
-			Change:    addr.Change,
+			Vout:       uint32(vout),
+			Value:      output.ValueAtoms,
+			Address:    addr.Address,
+			Type:       item.Type,
+			PayloadHex: hex.EncodeToString(item.Payload32[:]),
+			PubKeyHex:  addr.PubKeyHex,
+			Change:     addr.Change,
 		})
 	}
 	return out
+}
+
+func normalizeStoredAddress(addr *Address) {
+	if addr == nil {
+		return
+	}
+	if addr.Type == types.OutputPQLock32 && strings.TrimSpace(addr.PayloadHex) == "" {
+		if item, err := ParseWatchAddress(addr.Address); err == nil && item.Type == types.OutputPQLock32 {
+			addr.PayloadHex = hex.EncodeToString(item.Payload32[:])
+		}
+	}
+	if addr.Type != types.OutputPQLock32 {
+		addr.Type = types.OutputXOnlyP2PK
+		if strings.TrimSpace(addr.PayloadHex) == "" {
+			addr.PayloadHex = addr.PubKeyHex
+		}
+		if strings.TrimSpace(addr.SecretKeyHex) == "" {
+			addr.SecretKeyHex = addr.PrivateKeyHex
+		}
+	}
+	if addr.Type == types.OutputPQLock32 && addr.AlgID == 0 {
+		addr.AlgID = types.AlgMLDSA65
+	}
+	if item, err := addr.WatchItem(); err == nil {
+		addr.Address = EncodeTypedAddress(item)
+	}
+}
+
+func txOutputForWatchItem(value uint64, item WatchItem) types.TxOutput {
+	switch item.Type {
+	case types.OutputPQLock32:
+		return types.NewPQLockOutput(value, item.Payload32)
+	default:
+		return types.NewXOnlyOutput(value, item.Payload32)
+	}
+}
+
+func pendingOutputWatchItem(output PendingOutput) (WatchItem, error) {
+	switch output.Type {
+	case types.OutputPQLock32:
+		payload32, err := decodeHex32(output.PayloadHex)
+		if err != nil {
+			return WatchItem{}, err
+		}
+		return WatchItem{Type: types.OutputPQLock32, Payload32: payload32}, nil
+	default:
+		if strings.TrimSpace(output.PayloadHex) != "" {
+			payload32, err := decodeHex32(output.PayloadHex)
+			if err != nil {
+				return WatchItem{}, err
+			}
+			return WatchItem{Type: types.OutputXOnlyP2PK, Payload32: payload32}, nil
+		}
+		payload32, err := decodeHex32(output.PubKeyHex)
+		if err != nil {
+			return WatchItem{}, err
+		}
+		return WatchItem{Type: types.OutputXOnlyP2PK, Payload32: payload32}, nil
+	}
+}
+
+func watchItemForOutput(output types.TxOutput) WatchItem {
+	if output.Type == types.OutputXOnlyP2PK && output.Payload32 == ([32]byte{}) {
+		return WatchItem{Type: output.Type, Payload32: output.PubKey}
+	}
+	return WatchItem{Type: output.Type, Payload32: output.Payload32}
+}
+
+func legacyPubKeyForWatchItem(item WatchItem) [32]byte {
+	if item.Type == types.OutputXOnlyP2PK {
+		return item.Payload32
+	}
+	return [32]byte{}
+}
+
+func mustWatchItem(addr Address) WatchItem {
+	item, err := addr.WatchItem()
+	if err != nil {
+		panic(fmt.Sprintf("invalid stored wallet address %q: %v", addr.Address, err))
+	}
+	return item
+}
+
+func buildPQAuthPayload(verificationKey []byte, signature []byte) []byte {
+	payload := make([]byte, 0, len(verificationKey)+len(signature))
+	payload = append(payload, verificationKey...)
+	payload = append(payload, signature...)
+	return payload
 }
 
 func mustParsePubKey(raw string) [32]byte {

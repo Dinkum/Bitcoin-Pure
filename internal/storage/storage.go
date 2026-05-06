@@ -29,9 +29,12 @@ var (
 	metaBlockSizeStateKey    = []byte("meta/block_size_state")
 	metaUTXOChecksumKey      = []byte("meta/utxo_checksum")
 	metaFastSyncStateKey     = []byte("meta/fast_sync_state")
+	metaMempoolStateKey      = []byte("meta/mempool_state")
 	metaLocalityNextSeqKey   = []byte("meta/locality_next_seq")
 	metaJournalNextSeqKey    = []byte("meta/journal_next_seq")
 	metaDerivedJournalSeqKey = []byte("meta/derived_journal_seq")
+	mempoolEntryPrefix       = []byte("mempool_entry/")
+	mempoolOrphanPrefix      = []byte("mempool_orphan/")
 	blockPrefix              = []byte("blocks/")
 	blockIndexPrefix         = []byte("block_index/")
 	blockUndoPrefix          = []byte("block_undo/")
@@ -46,11 +49,13 @@ var (
 )
 
 var (
-	knownPeerPrefixEnd    = prefixUpperBound(knownPeerPrefix)
-	utxoPrefixEnd         = prefixUpperBound(utxoPrefix)
-	snapshotUTXOPrefixEnd = prefixUpperBound(snapshotUTXOPrefix)
-	localitySeqPrefixEnd  = prefixUpperBound(localitySeqPrefix)
-	localityMetaPrefixEnd = prefixUpperBound(localityMetaPrefix)
+	knownPeerPrefixEnd     = prefixUpperBound(knownPeerPrefix)
+	mempoolEntryPrefixEnd  = prefixUpperBound(mempoolEntryPrefix)
+	mempoolOrphanPrefixEnd = prefixUpperBound(mempoolOrphanPrefix)
+	utxoPrefixEnd          = prefixUpperBound(utxoPrefix)
+	snapshotUTXOPrefixEnd  = prefixUpperBound(snapshotUTXOPrefix)
+	localitySeqPrefixEnd   = prefixUpperBound(localitySeqPrefix)
+	localityMetaPrefixEnd  = prefixUpperBound(localityMetaPrefix)
 )
 
 var (
@@ -112,6 +117,51 @@ type StoredHeaderState struct {
 	Profile   types.ChainProfile
 	Height    uint64
 	TipHeader types.BlockHeader
+}
+
+// StoredMempoolState keeps restart-only tx relay state out of consensus tables.
+// The encoded transactions are replayed through normal mempool policy when the
+// persisted tip no longer matches the committed chain tip.
+type StoredMempoolState struct {
+	Version   uint32               `json:"version"`
+	Profile   types.ChainProfile   `json:"profile"`
+	TipHeight uint64               `json:"tip_height"`
+	TipHash   [32]byte             `json:"tip_hash"`
+	Entries   []StoredMempoolEntry `json:"entries,omitempty"`
+	Orphans   []StoredMempoolEntry `json:"orphans,omitempty"`
+}
+
+// StoredMempoolStateMeta is the durable checkpoint header for restart-only
+// mempool persistence. The actual accepted/orphan records live under per-tx
+// keys so flushes can upsert or delete only what changed.
+type StoredMempoolStateMeta struct {
+	Version   uint32             `json:"version"`
+	Profile   types.ChainProfile `json:"profile"`
+	TipHeight uint64             `json:"tip_height"`
+	TipHash   [32]byte           `json:"tip_hash"`
+}
+
+type StoredMempoolEntry struct {
+	Tx      []byte                        `json:"tx"`
+	Summary consensus.TxValidationSummary `json:"summary"`
+	AddedAt uint64                        `json:"added_at"`
+	Missing []types.OutPoint              `json:"missing,omitempty"`
+}
+
+type StoredMempoolDeltaEntry struct {
+	TxID  [32]byte
+	Entry StoredMempoolEntry
+}
+
+// StoredMempoolStateDelta applies one atomically visible checkpoint update: a
+// new tip header plus any accepted/orphan record upserts and deletes needed to
+// bring the stored restart cache in sync with the live mempool.
+type StoredMempoolStateDelta struct {
+	Meta          StoredMempoolStateMeta
+	EntryUpserts  []StoredMempoolDeltaEntry
+	EntryDeletes  [][32]byte
+	OrphanUpserts []StoredMempoolDeltaEntry
+	OrphanDeletes [][32]byte
 }
 
 type BlockIndexEntry struct {
@@ -542,6 +592,246 @@ func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
 		Height:    height,
 		TipHeader: header,
 	}, nil
+}
+
+func (s *ChainStore) LoadMempoolState() (*StoredMempoolState, error) {
+	buf, err := s.get(metaMempoolStateKey)
+	if err != nil {
+		return nil, err
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	var meta StoredMempoolStateMeta
+	if err := json.Unmarshal(buf, &meta); err != nil {
+		return nil, err
+	}
+	// Legacy restart checkpoints stored the full mempool in one JSON blob. Keep
+	// decoding that format so reopening an older local data dir does not discard
+	// restart state just because the storage layout changed.
+	if meta.Version < 2 {
+		var legacy StoredMempoolState
+		if err := json.Unmarshal(buf, &legacy); err != nil {
+			return nil, err
+		}
+		return &legacy, nil
+	}
+	entries, err := s.loadMempoolEntries(mempoolEntryPrefix, mempoolEntryPrefixEnd)
+	if err != nil {
+		return nil, err
+	}
+	orphans, err := s.loadMempoolEntries(mempoolOrphanPrefix, mempoolOrphanPrefixEnd)
+	if err != nil {
+		return nil, err
+	}
+	return &StoredMempoolState{
+		Version:   meta.Version,
+		Profile:   meta.Profile,
+		TipHeight: meta.TipHeight,
+		TipHash:   meta.TipHash,
+		Entries:   entries,
+		Orphans:   orphans,
+	}, nil
+}
+
+func (s *ChainStore) WriteMempoolState(state *StoredMempoolState) error {
+	if state == nil {
+		return errors.New("mempool state is required")
+	}
+	version := state.Version
+	if version < 2 {
+		version = 2
+	}
+	delta := StoredMempoolStateDelta{
+		Meta: StoredMempoolStateMeta{
+			// Version 2 switches the on-disk layout to metadata plus per-tx keys.
+			Version:   version,
+			Profile:   state.Profile,
+			TipHeight: state.TipHeight,
+			TipHash:   state.TipHash,
+		},
+		EntryUpserts:  make([]StoredMempoolDeltaEntry, 0, len(state.Entries)),
+		OrphanUpserts: make([]StoredMempoolDeltaEntry, 0, len(state.Orphans)),
+	}
+	for _, entry := range state.Entries {
+		tx, err := types.DecodeTransactionWithLimits(entry.Tx, types.DefaultCodecLimits())
+		if err != nil {
+			return err
+		}
+		delta.EntryUpserts = append(delta.EntryUpserts, StoredMempoolDeltaEntry{
+			TxID:  consensus.TxID(&tx),
+			Entry: entry,
+		})
+	}
+	for _, orphan := range state.Orphans {
+		tx, err := types.DecodeTransactionWithLimits(orphan.Tx, types.DefaultCodecLimits())
+		if err != nil {
+			return err
+		}
+		delta.OrphanUpserts = append(delta.OrphanUpserts, StoredMempoolDeltaEntry{
+			TxID:  consensus.TxID(&tx),
+			Entry: orphan,
+		})
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := s.clearMempoolStateWithBatch(batch); err != nil {
+		return err
+	}
+	if err := applyMempoolStateDeltaWithBatch(batch, delta); err != nil {
+		return err
+	}
+	if err := batch.Commit(bestEffortWriteOptions); err != nil {
+		return err
+	}
+	s.logger.Debug("wrote full mempool state",
+		slog.Uint64("tip_height", delta.Meta.TipHeight),
+		slog.Int("entries", len(delta.EntryUpserts)),
+		slog.Int("orphans", len(delta.OrphanUpserts)),
+	)
+	return nil
+}
+
+func (s *ChainStore) ApplyMempoolStateDelta(delta StoredMempoolStateDelta) error {
+	if delta.Meta.Profile == "" {
+		return errors.New("mempool state profile is required")
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := applyMempoolStateDeltaWithBatch(batch, delta); err != nil {
+		return err
+	}
+	if err := batch.Commit(bestEffortWriteOptions); err != nil {
+		return err
+	}
+	s.logger.Debug("applied mempool state delta",
+		slog.Uint64("tip_height", delta.Meta.TipHeight),
+		slog.Int("entry_upserts", len(delta.EntryUpserts)),
+		slog.Int("entry_deletes", len(delta.EntryDeletes)),
+		slog.Int("orphan_upserts", len(delta.OrphanUpserts)),
+		slog.Int("orphan_deletes", len(delta.OrphanDeletes)),
+	)
+	return nil
+}
+
+func (s *ChainStore) ClearMempoolState() error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := s.clearMempoolStateWithBatch(batch); err != nil {
+		return err
+	}
+	if err := batch.Commit(bestEffortWriteOptions); err != nil {
+		return err
+	}
+	s.logger.Debug("cleared mempool state")
+	return nil
+}
+
+func (s *ChainStore) clearMempoolStateWithBatch(batch *pebble.Batch) error {
+	if batch == nil {
+		return errors.New("mempool clear batch is required")
+	}
+	if err := batch.Delete(metaMempoolStateKey, bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return err
+	}
+	for _, prefixRange := range []struct {
+		lower []byte
+		upper []byte
+	}{
+		{lower: mempoolEntryPrefix, upper: mempoolEntryPrefixEnd},
+		{lower: mempoolOrphanPrefix, upper: mempoolOrphanPrefixEnd},
+	} {
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: prefixRange.lower,
+			UpperBound: prefixRange.upper,
+		})
+		if err != nil {
+			return err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := batch.Delete(append([]byte(nil), iter.Key()...), bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+				_ = iter.Close()
+				return err
+			}
+		}
+		if err := iter.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ChainStore) loadMempoolEntries(lower, upper []byte) ([]StoredMempoolEntry, error) {
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	entries := make([]StoredMempoolEntry, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		var entry StoredMempoolEntry
+		if err := json.Unmarshal(iter.Value(), &entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func applyMempoolStateDeltaWithBatch(batch *pebble.Batch, delta StoredMempoolStateDelta) error {
+	if batch == nil {
+		return errors.New("mempool delta batch is required")
+	}
+	encoded, err := json.Marshal(delta.Meta)
+	if err != nil {
+		return err
+	}
+	if err := batch.Set(metaMempoolStateKey, encoded, bestEffortWriteOptions); err != nil {
+		return err
+	}
+	for _, entry := range delta.EntryUpserts {
+		if err := writeMempoolBatchEntry(batch, mempoolEntryPrefix, entry); err != nil {
+			return err
+		}
+	}
+	for _, txid := range delta.EntryDeletes {
+		if err := batch.Delete(mempoolEntryKey(mempoolEntryPrefix, txid), bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+			return err
+		}
+	}
+	for _, orphan := range delta.OrphanUpserts {
+		if err := writeMempoolBatchEntry(batch, mempoolOrphanPrefix, orphan); err != nil {
+			return err
+		}
+	}
+	for _, txid := range delta.OrphanDeletes {
+		if err := batch.Delete(mempoolEntryKey(mempoolOrphanPrefix, txid), bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeMempoolBatchEntry(batch *pebble.Batch, prefix []byte, entry StoredMempoolDeltaEntry) error {
+	encoded, err := json.Marshal(entry.Entry)
+	if err != nil {
+		return err
+	}
+	return batch.Set(mempoolEntryKey(prefix, entry.TxID), encoded, bestEffortWriteOptions)
+}
+
+func mempoolEntryKey(prefix []byte, txid [32]byte) []byte {
+	key := make([]byte, len(prefix)+len(txid))
+	copy(key, prefix)
+	copy(key[len(prefix):], txid[:])
+	return key
 }
 
 func (s *ChainStore) LoadKnownPeers() (map[string]KnownPeerRecord, error) {
@@ -1789,9 +2079,16 @@ func decodeLocalitySeqFromKey(key []byte) (uint64, error) {
 }
 
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
-	buf := make([]byte, 8, 40)
-	binary.LittleEndian.PutUint64(buf, entry.ValueAtoms)
-	buf = append(buf, entry.PubKey[:]...)
+	buf := make([]byte, 0, 49)
+	buf = append(buf, types.CanonicalVarIntBytes(entry.Type)...)
+	value := make([]byte, 8)
+	binary.LittleEndian.PutUint64(value, entry.ValueAtoms)
+	buf = append(buf, value...)
+	payload32 := entry.Payload32
+	if payload32 == ([32]byte{}) && entry.Type == types.OutputXOnlyP2PK {
+		payload32 = entry.PubKey
+	}
+	buf = append(buf, payload32[:]...)
 	return buf
 }
 
@@ -1883,15 +2180,69 @@ func applyJournalEntryBatch(batch *pebble.Batch, entry chainJournalEntry) error 
 }
 
 func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {
-	if len(buf) != 40 {
-		return consensus.UtxoEntry{}, errors.New("invalid utxo entry encoding")
+	entry, _, err := decodeUTXOEntryWithLen(buf)
+	return entry, err
+}
+
+func decodeUTXOEntryWithLen(buf []byte) (consensus.UtxoEntry, int, error) {
+	outputType, n, err := decodeCanonicalVarInt(buf)
+	if err != nil {
+		return consensus.UtxoEntry{}, 0, err
 	}
-	var pubKey [32]byte
-	copy(pubKey[:], buf[8:])
-	return consensus.UtxoEntry{
-		ValueAtoms: binary.LittleEndian.Uint64(buf[:8]),
-		PubKey:     pubKey,
-	}, nil
+	remaining := buf[n:]
+	if len(remaining) < 40 {
+		return consensus.UtxoEntry{}, 0, errors.New("invalid utxo entry encoding")
+	}
+	var payload32 [32]byte
+	copy(payload32[:], remaining[8:40])
+	entry := consensus.UtxoEntry{
+		Type:       outputType,
+		ValueAtoms: binary.LittleEndian.Uint64(remaining[:8]),
+	}
+	if outputType == types.OutputXOnlyP2PK {
+		entry.PubKey = payload32
+	} else {
+		entry.Payload32 = payload32
+	}
+	return entry, n + 40, nil
+}
+
+func decodeCanonicalVarInt(buf []byte) (uint64, int, error) {
+	if len(buf) == 0 {
+		return 0, 0, errors.New("truncated varint")
+	}
+	first := buf[0]
+	switch {
+	case first <= 0xfc:
+		return uint64(first), 1, nil
+	case first == 0xfd:
+		if len(buf) < 3 {
+			return 0, 0, errors.New("truncated varint")
+		}
+		v := uint64(binary.LittleEndian.Uint16(buf[1:3]))
+		if v <= 0xfc {
+			return 0, 0, errors.New("non-canonical varint")
+		}
+		return v, 3, nil
+	case first == 0xfe:
+		if len(buf) < 5 {
+			return 0, 0, errors.New("truncated varint")
+		}
+		v := uint64(binary.LittleEndian.Uint32(buf[1:5]))
+		if v <= 0xffff {
+			return 0, 0, errors.New("non-canonical varint")
+		}
+		return v, 5, nil
+	default:
+		if len(buf) < 9 {
+			return 0, 0, errors.New("truncated varint")
+		}
+		v := binary.LittleEndian.Uint64(buf[1:9])
+		if v <= 0xffff_ffff {
+			return 0, 0, errors.New("non-canonical varint")
+		}
+		return v, 9, nil
+	}
 }
 
 func encodeBlockIndexEntry(entry BlockIndexEntry) []byte {
@@ -1965,19 +2316,19 @@ func decodeBlockUndo(buf []byte) ([]BlockUndoEntry, error) {
 	buf = buf[8:]
 	entries := make([]BlockUndoEntry, 0, count)
 	for i := uint64(0); i < count; i++ {
-		if len(buf) < 36+40 {
+		if len(buf) < 36 {
 			return nil, errors.New("truncated block undo entry")
 		}
 		outPoint, err := decodeOutPoint(buf[:36])
 		if err != nil {
 			return nil, err
 		}
-		entry, err := decodeUTXOEntry(buf[36 : 36+40])
+		entry, consumed, err := decodeUTXOEntryWithLen(buf[36:])
 		if err != nil {
 			return nil, err
 		}
 		entries = append(entries, BlockUndoEntry{OutPoint: outPoint, Entry: entry})
-		buf = buf[36+40:]
+		buf = buf[36+consumed:]
 	}
 	if len(buf) != 0 {
 		return nil, errors.New("unexpected trailing block undo data")

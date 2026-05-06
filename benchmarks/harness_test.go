@@ -139,8 +139,8 @@ func TestRunP2PRelayMeshShowsErlayTraffic(t *testing.T) {
 	if report.Metrics.TxReconItems == 0 {
 		t.Fatal("expected erlay tx reconciliation items in relay report")
 	}
-	if report.Metrics.TxRequestMessages == 0 {
-		t.Fatal("expected tx requests after erlay announcements")
+	if report.Metrics.TxBatchMessages == 0 || report.Metrics.TxBatchItems == 0 {
+		t.Fatalf("expected full transaction delivery in relay report: batch_msgs=%d batch_items=%d", report.Metrics.TxBatchMessages, report.Metrics.TxBatchItems)
 	}
 }
 
@@ -232,6 +232,45 @@ func TestRunConfirmedBlocksSyntheticMiningReportsFixedCadenceTPS(t *testing.T) {
 	}
 	if !report.SyntheticMining {
 		t.Fatal("expected synthetic mining flag in report")
+	}
+}
+
+func TestRunConfirmedBlocksSteadyStateBacklogStartsCadenceAfterConvergence(t *testing.T) {
+	report, err := RunE2E(context.Background(), RunOptions{
+		Profile:            types.Regtest,
+		NodeCount:          2,
+		Topology:           TopologyLine,
+		TxCount:            16,
+		BatchSize:          4,
+		TxsPerBlock:        8,
+		BlockCount:         2,
+		BlockInterval:      100 * time.Millisecond,
+		MiningMode:         MiningModeSynthetic,
+		TxOriginSpread:     TxOriginOneNode,
+		SteadyStateBacklog: true,
+		Timeout:            20 * time.Second,
+		SuppressLogs:       true,
+	})
+	if err != nil {
+		t.Fatalf("RunE2E() error = %v", err)
+	}
+	if !report.SteadyStateBacklog {
+		t.Fatal("expected steady-state backlog flag in report")
+	}
+	if report.Metrics.AcceptedTxs != 16 {
+		t.Fatalf("accepted_txs = %d, want 16", report.Metrics.AcceptedTxs)
+	}
+	if report.Metrics.ConfirmedTxs != 16 {
+		t.Fatalf("confirmed_txs = %d, want 16", report.Metrics.ConfirmedTxs)
+	}
+	if report.Metrics.ConfirmedBlocks != 2 {
+		t.Fatalf("confirmed_blocks = %d, want 2", report.Metrics.ConfirmedBlocks)
+	}
+	if report.ConfirmedWallDurationMS < 200 {
+		t.Fatalf("confirmed_wall_duration_ms = %.2f, want at least two 100ms intervals", report.ConfirmedWallDurationMS)
+	}
+	if report.Metrics.FinalMempoolTxs != 0 {
+		t.Fatalf("final_mempool_txs = %d, want 0", report.Metrics.FinalMempoolTxs)
 	}
 }
 

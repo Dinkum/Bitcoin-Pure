@@ -25,7 +25,9 @@ const (
 
 type UtxoLeaf struct {
 	OutPoint   types.OutPoint
+	Type       uint64
 	ValueAtoms uint64
+	Payload32  [32]byte
 	PubKey     [32]byte
 }
 
@@ -51,7 +53,9 @@ type accNode struct {
 type OutPointProof struct {
 	OutPoint   types.OutPoint
 	Exists     bool
+	Type       uint64
 	ValueAtoms uint64
+	Payload32  [32]byte
 	PubKey     [32]byte
 	Steps      []ProofStep
 }
@@ -62,18 +66,32 @@ type ProofStep struct {
 }
 
 func LeafHash(leaf UtxoLeaf) [32]byte {
-	buf := make([]byte, 0, outPointBytes+8+32)
+	var scratch [outPointBytes + 9 + 8 + 32]byte
+	buf := scratch[:0]
 	key := leafKey(leaf.OutPoint)
 	buf = append(buf, key[:]...)
-	value := make([]byte, 8)
-	binary.LittleEndian.PutUint64(value, leaf.ValueAtoms)
-	buf = append(buf, value...)
-	buf = append(buf, leaf.PubKey[:]...)
+	buf = appendCanonicalVarInt(buf, leaf.Type)
+	buf = append(buf,
+		byte(leaf.ValueAtoms),
+		byte(leaf.ValueAtoms>>8),
+		byte(leaf.ValueAtoms>>16),
+		byte(leaf.ValueAtoms>>24),
+		byte(leaf.ValueAtoms>>32),
+		byte(leaf.ValueAtoms>>40),
+		byte(leaf.ValueAtoms>>48),
+		byte(leaf.ValueAtoms>>56),
+	)
+	payload32 := leaf.Payload32
+	if payload32 == ([32]byte{}) && leaf.Type == types.OutputXOnlyP2PK {
+		payload32 = leaf.PubKey
+	}
+	buf = append(buf, payload32[:]...)
 	return crypto.TaggedHash(UTXOLeafTag, buf)
 }
 
 func BranchHash(left, right [32]byte) [32]byte {
-	buf := make([]byte, 0, 64)
+	var scratch [64]byte
+	buf := scratch[:0]
 	buf = append(buf, left[:]...)
 	buf = append(buf, right[:]...)
 	return crypto.TaggedHash(UTXOBranchTag, buf)
@@ -166,25 +184,43 @@ func (a *Accumulator) Delete(outPoint types.OutPoint) (*Accumulator, error) {
 	return &Accumulator{root: root, count: a.count - 1}, nil
 }
 
+// Apply batches one template-sized accumulator transition. Mining and block
+// assembly build large spend/create sets, so replaying Delete/Add one leaf at a
+// time wastes trie walks and hash rebuilds on the same prefixes.
 func (a *Accumulator) Apply(spent []types.OutPoint, created []UtxoLeaf) (*Accumulator, error) {
 	if a == nil {
 		a = NewAccumulator()
 	}
-	next := a
-	var err error
-	for _, outPoint := range spent {
-		next, err = next.Delete(outPoint)
-		if err != nil {
-			return nil, err
-		}
+	if len(spent) == 0 && len(created) == 0 {
+		return a, nil
 	}
-	for _, leaf := range created {
-		next, err = next.Add(leaf)
-		if err != nil {
-			return nil, err
-		}
+	sortedSpent, err := sortedSpentKeys(spent)
+	if err != nil {
+		return nil, err
 	}
-	return next, nil
+	sortedCreated := sortedKeyedLeaves(created)
+	if err := ensureUniqueSortedLeaves(sortedCreated); err != nil {
+		return nil, err
+	}
+	if a.root == nil {
+		if len(sortedSpent) != 0 {
+			outPoint := outPointFromKey(sortedSpent[0])
+			return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		if len(sortedCreated) == 0 {
+			return NewAccumulator(), nil
+		}
+		root := buildAccumulatorTree(sortedCreated, 0, parallelBuildBudget())
+		return &Accumulator{root: root, count: root.count}, nil
+	}
+	root, err := applySortedBatch(a.root, sortedSpent, sortedCreated, 0)
+	if err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return NewAccumulator(), nil
+	}
+	return &Accumulator{root: root, count: root.count}, nil
 }
 
 // Prove returns a single-outpoint Merklix proof over the current accumulator
@@ -227,7 +263,9 @@ func (a *Accumulator) Prove(outPoint types.OutPoint) (OutPointProof, error) {
 		return OutPointProof{}, fmt.Errorf("invalid accumulator leaf for %x:%d", outPoint.TxID, outPoint.Vout)
 	}
 	proof.Exists = true
+	proof.Type = node.leaf.utxo.Type
 	proof.ValueAtoms = node.leaf.utxo.ValueAtoms
+	proof.Payload32 = node.leaf.utxo.Payload32
 	proof.PubKey = node.leaf.utxo.PubKey
 	proof.Steps = steps
 	return proof, nil
@@ -245,7 +283,9 @@ func VerifyProof(root [32]byte, proof OutPointProof) bool {
 	if proof.Exists {
 		current = LeafHash(UtxoLeaf{
 			OutPoint:   proof.OutPoint,
+			Type:       proof.Type,
 			ValueAtoms: proof.ValueAtoms,
+			Payload32:  proof.Payload32,
 			PubKey:     proof.PubKey,
 		})
 	} else {
@@ -385,6 +425,28 @@ func parallelBuildBudget() int {
 	return workers - 1
 }
 
+func appendCanonicalVarInt(dst []byte, v uint64) []byte {
+	switch {
+	case v <= 0xfc:
+		return append(dst, byte(v))
+	case v <= 0xffff:
+		return append(dst, 0xfd, byte(v), byte(v>>8))
+	case v <= 0xffff_ffff:
+		return append(dst, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	default:
+		return append(dst, 0xff,
+			byte(v),
+			byte(v>>8),
+			byte(v>>16),
+			byte(v>>24),
+			byte(v>>32),
+			byte(v>>40),
+			byte(v>>48),
+			byte(v>>56),
+		)
+	}
+}
+
 func splitParallelBudget(budget int) (int, int) {
 	if budget <= 1 {
 		return 0, 0
@@ -488,6 +550,102 @@ func splitAtBit(leaves []keyedLeaf, bitIndex int) int {
 		}
 	}
 	return len(leaves)
+}
+
+func splitKeysAtBit(keys [][outPointBytes]byte, bitIndex int) int {
+	for i, key := range keys {
+		if bitSet(key, bitIndex) {
+			return i
+		}
+	}
+	return len(keys)
+}
+
+func sortedSpentKeys(spent []types.OutPoint) ([][outPointBytes]byte, error) {
+	if len(spent) == 0 {
+		return nil, nil
+	}
+	keys := make([][outPointBytes]byte, len(spent))
+	for i, outPoint := range spent {
+		keys[i] = leafKey(outPoint)
+	}
+	slices.SortFunc(keys, func(a, b [outPointBytes]byte) int {
+		return bytes.Compare(a[:], b[:])
+	})
+	for i := 1; i < len(keys); i++ {
+		if keys[i-1] == keys[i] {
+			outPoint := outPointFromKey(keys[i])
+			return nil, fmt.Errorf("duplicate accumulator spend %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+	}
+	return keys, nil
+}
+
+// applySortedBatch descends the trie once for the whole sorted mutation set and
+// only rebuilds the branches touched by that batch.
+func applySortedBatch(node *accNode, spent [][outPointBytes]byte, created []keyedLeaf, bitIndex int) (*accNode, error) {
+	if len(spent) == 0 && len(created) == 0 {
+		return node, nil
+	}
+	if bitIndex == keyBits {
+		return applyLeafBatch(node, spent, created)
+	}
+	var left, right *accNode
+	if node != nil {
+		left = node.left
+		right = node.right
+	}
+	leftSpentSplit := splitKeysAtBit(spent, bitIndex)
+	leftCreatedSplit := splitAtBit(created, bitIndex)
+	newLeft, err := applySortedBatch(left, spent[:leftSpentSplit], created[:leftCreatedSplit], bitIndex+1)
+	if err != nil {
+		return nil, err
+	}
+	newRight, err := applySortedBatch(right, spent[leftSpentSplit:], created[leftCreatedSplit:], bitIndex+1)
+	if err != nil {
+		return nil, err
+	}
+	if newLeft == left && newRight == right {
+		return node, nil
+	}
+	return makeAccNode(newLeft, newRight), nil
+}
+
+func applyLeafBatch(node *accNode, spent [][outPointBytes]byte, created []keyedLeaf) (*accNode, error) {
+	if len(spent) > 1 {
+		outPoint := outPointFromKey(spent[1])
+		return nil, fmt.Errorf("duplicate accumulator spend %x:%d", outPoint.TxID, outPoint.Vout)
+	}
+	if len(created) > 1 {
+		return nil, fmt.Errorf("duplicate outpoint in UTXO commitment")
+	}
+	current := node
+	if len(spent) == 1 {
+		if current == nil || current.leaf == nil || current.leaf.key != spent[0] {
+			outPoint := outPointFromKey(spent[0])
+			return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		current = nil
+	}
+	if len(created) == 0 {
+		return current, nil
+	}
+	if current != nil && current.leaf != nil && current.leaf.key == created[0].key {
+		return nil, fmt.Errorf("duplicate outpoint in UTXO commitment")
+	}
+	leafCopy := created[0]
+	return &accNode{
+		leaf:  &leafCopy,
+		hash:  leafCopy.hash,
+		count: 1,
+	}, nil
+}
+
+func outPointFromKey(key [outPointBytes]byte) types.OutPoint {
+	var outPoint types.OutPoint
+	copy(outPoint.TxID[:], key[:32])
+	outPoint.Vout = binary.LittleEndian.Uint32(key[32:])
+	return outPoint
 }
 
 func bitSet(key [outPointBytes]byte, bitIndex int) bool {

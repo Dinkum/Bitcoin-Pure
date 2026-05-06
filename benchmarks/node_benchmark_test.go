@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
+	runtimepprof "runtime/pprof"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,19 +74,21 @@ func BenchmarkTxValidation(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := consensus.ValidateTx(&txs[i%len(txs)], utxos, consensus.DefaultConsensusRules()); err != nil {
+		if _, err := consensus.ValidateTxWithParams(&txs[i%len(txs)], utxos, consensus.BenchNetParams(), consensus.DefaultConsensusRules()); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 func BenchmarkSignatureVerification(b *testing.B) {
-	checks, cleanup, err := prepareSignatureChecksFixture(b, 64)
+	checkCount := benchmarkSizeFromEnv(b, "BPU_BENCH_SIG_CHECKS", 64)
+	checks, cleanup, err := prepareSignatureChecksFixture(b, checkCount)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer cleanup()
 
+	b.ReportMetric(float64(checkCount), "sig_checks")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -94,7 +100,8 @@ func BenchmarkSignatureVerification(b *testing.B) {
 }
 
 func BenchmarkMempoolSelection(b *testing.B) {
-	_, utxos, txs, cleanup, err := prepareIndependentSpendFixture(b, 2_048)
+	mempoolTxs := benchmarkSizeFromEnv(b, "BPU_BENCH_MEMPOOL_TXS", 2_048)
+	_, utxos, txs, cleanup, err := prepareIndependentSpendFixture(b, mempoolTxs)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -102,7 +109,7 @@ func BenchmarkMempoolSelection(b *testing.B) {
 
 	pool := mempool.New()
 	for _, tx := range txs {
-		if _, err := pool.AcceptTx(tx, utxos, consensus.DefaultConsensusRules()); err != nil {
+		if _, err := pool.AcceptTxWithParams(tx, utxos, consensus.BenchNetParams(), consensus.DefaultConsensusRules()); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -119,7 +126,7 @@ func BenchmarkMempoolSelection(b *testing.B) {
 }
 
 func BenchmarkBlockBuild(b *testing.B) {
-	const prefillTxs = 1_024
+	prefillTxs := benchmarkSizeFromEnv(b, "BPU_BENCH_BLOCK_TXS", 1_024)
 
 	svc, _, txs, cleanup, err := prepareIndependentSpendFixture(b, prefillTxs+max(1, b.N))
 	if err != nil {
@@ -154,8 +161,51 @@ func BenchmarkBlockBuild(b *testing.B) {
 	}
 }
 
+func BenchmarkSteadyStateBlockCycle(b *testing.B) {
+	mempoolTxs := benchmarkSizeFromEnv(b, "BPU_BENCH_MEMPOOL_TXS", 4_096)
+	blockTxs := benchmarkSizeFromEnv(b, "BPU_BENCH_BLOCK_TXS", min(1_024, mempoolTxs))
+	if blockTxs <= 0 || blockTxs*b.N > mempoolTxs {
+		b.Fatalf("need BPU_BENCH_MEMPOOL_TXS >= BPU_BENCH_BLOCK_TXS*b.N, got mempool=%d block=%d n=%d", mempoolTxs, blockTxs, b.N)
+	}
+
+	svc, _, txs, cleanup, err := prepareIndependentSpendFixture(b, mempoolTxs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cleanup()
+
+	for _, tx := range txs {
+		if _, err := svc.SubmitTx(tx); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	stopProfile := startInnerCPUProfile(b)
+	b.ReportMetric(float64(mempoolTxs), "seeded_txs")
+	b.ReportMetric(float64(blockTxs), "target_block_txs")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		block, err := svc.BuildBenchmarkBlockTemplate(blockTxs)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if got := len(block.Txs) - 1; got != blockTxs {
+			b.Fatalf("block selected %d txs, want %d", got, blockTxs)
+		}
+		info := svc.ChainStateInfo()
+		block.Header.Timestamp = info.TipTimestamp + 1
+		if _, _, err := svc.AcceptLocalBenchmarkBlock(block); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	stopProfile()
+}
+
 func BenchmarkBlockApply(b *testing.B) {
-	block, baseState, buildCleanup, err := prepareBenchmarkBlockFixture(b, 256)
+	blockTxs := benchmarkSizeFromEnv(b, "BPU_BENCH_BLOCK_TXS", 256)
+	block, baseState, buildCleanup, err := prepareBenchmarkBlockFixture(b, blockTxs)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -168,6 +218,41 @@ func BenchmarkBlockApply(b *testing.B) {
 		state := baseState.Clone()
 		if _, err := state.ApplyBlock(&block); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkSizeFromEnv(tb testing.TB, key string, fallback int) int {
+	tb.Helper()
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		tb.Fatalf("%s must be a positive integer, got %q", key, raw)
+	}
+	return value
+}
+
+func startInnerCPUProfile(tb testing.TB) func() {
+	tb.Helper()
+	path := strings.TrimSpace(os.Getenv("BPU_BENCH_INNER_CPU_PROFILE"))
+	if path == "" {
+		return func() {}
+	}
+	file, err := os.Create(filepath.Clean(path))
+	if err != nil {
+		tb.Fatalf("create inner cpu profile: %v", err)
+	}
+	if err := runtimepprof.StartCPUProfile(file); err != nil {
+		_ = file.Close()
+		tb.Fatalf("start inner cpu profile: %v", err)
+	}
+	return func() {
+		runtimepprof.StopCPUProfile()
+		if err := file.Close(); err != nil {
+			tb.Fatalf("close inner cpu profile: %v", err)
 		}
 	}
 }
@@ -248,7 +333,7 @@ func prepareIndependentSpendFixture(tb testing.TB, txCount int) (*node.Service, 
 			ValueAtoms: output.Value,
 			PubKey:     pubKeyForSeed(2),
 		}
-		tx, err := buildChildTx(2, output.OutPoint, output.Value, childPubKey)
+		tx, err := buildChildTx(2, output.OutPoint, output.Value, childPubKey, consensus.BenchNetParams())
 		if err != nil {
 			cleanup()
 			return nil, nil, nil, nil, err
@@ -286,7 +371,7 @@ func prepareSignatureChecksFixture(tb testing.TB, inputCount int) ([]crypto.Schn
 		}
 	}
 
-	prepared, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(utxos), consensus.DefaultConsensusRules())
+	prepared, err := consensus.PrepareTxValidationWithLookupAndParams(&tx, consensus.LookupFromSet(utxos), consensus.BenchNetParams(), consensus.DefaultConsensusRules())
 	if err != nil {
 		cleanup()
 		return nil, nil, err
@@ -313,7 +398,7 @@ func prepareBenchmarkBlockFixture(tb testing.TB, txCount int) (types.Block, *nod
 	}
 	txs := make([]types.Transaction, 0, len(outputs))
 	for _, output := range outputs {
-		tx, err := buildChildTx(2, output.OutPoint, output.Value, pubKeyForSeed(3))
+		tx, err := buildChildTx(2, output.OutPoint, output.Value, pubKeyForSeed(3), consensus.BenchNetParams())
 		if err != nil {
 			stopService()
 			return types.Block{}, nil, nil, err
@@ -337,18 +422,18 @@ func prepareBenchmarkBlockFixture(tb testing.TB, txCount int) (types.Block, *nod
 	}
 	stopService()
 
-	chainState, err := node.OpenPersistentChainStateWithRules(dbPath, types.BenchNet, consensus.DefaultConsensusRules())
+	chainState, err := node.OpenPersistentChainStateFromMetaWithRules(dbPath, types.BenchNet, consensus.DefaultConsensusRules())
 	if err != nil {
 		return types.Block{}, nil, nil, err
 	}
 	baseState := chainState.ChainState()
-	if err := chainState.Close(); err != nil {
-		return types.Block{}, nil, nil, err
-	}
 	if baseState == nil {
+		_ = chainState.Close()
 		return types.Block{}, nil, nil, fmt.Errorf("benchmark block fixture missing base chain state")
 	}
-	return block.block, baseState, func() {}, nil
+	return block.block, baseState, func() {
+		_ = chainState.Close()
+	}, nil
 }
 
 func buildAggregateSpendTx(spenderSeed byte, outputs []fundingOutput, outputPubKey [32]byte) (types.Transaction, error) {
@@ -370,22 +455,22 @@ func buildAggregateSpendTx(spenderSeed byte, outputs []fundingOutput, outputPubK
 		inputSum += output.Value
 	}
 
-	tx, err := signMultiInputTx(tx, spenderSeed, spentCoins)
+	tx, err := signMultiInputTx(tx, spenderSeed, spentCoins, consensus.BenchNetParams())
 	if err != nil {
 		return types.Transaction{}, err
 	}
-	fee := uint64(len(tx.Encode()))
+	fee := uint64(tx.EncodedLen())
 	if inputSum < fee {
 		return types.Transaction{}, consensus.ErrInputsLessThanOutputs
 	}
 	tx.Base.Outputs[0].ValueAtoms = inputSum - fee
-	return signMultiInputTx(tx, spenderSeed, spentCoins)
+	return signMultiInputTx(tx, spenderSeed, spentCoins, consensus.BenchNetParams())
 }
 
-func signMultiInputTx(tx types.Transaction, spenderSeed byte, spentCoins []consensus.UtxoEntry) (types.Transaction, error) {
+func signMultiInputTx(tx types.Transaction, spenderSeed byte, spentCoins []consensus.UtxoEntry, params consensus.ChainParams) (types.Transaction, error) {
 	auth := make([]types.TxAuthEntry, len(tx.Base.Inputs))
 	for i := range tx.Base.Inputs {
-		msg, err := consensus.Sighash(&tx, i, spentCoins)
+		msg, err := consensus.SighashWithParams(&tx, i, spentCoins, params)
 		if err != nil {
 			return types.Transaction{}, err
 		}

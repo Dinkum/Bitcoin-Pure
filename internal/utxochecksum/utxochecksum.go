@@ -109,12 +109,21 @@ func leafElement(outPoint types.OutPoint, entry consensus.UtxoEntry) *big.Int {
 }
 
 func encodeLeaf(outPoint types.OutPoint, entry consensus.UtxoEntry) []byte {
-	var buf [32 + 4 + 8 + 32]byte
-	copy(buf[:32], outPoint.TxID[:])
-	binary.LittleEndian.PutUint32(buf[32:36], outPoint.Vout)
-	binary.LittleEndian.PutUint64(buf[36:44], entry.ValueAtoms)
-	copy(buf[44:], entry.PubKey[:])
-	return buf[:]
+	buf := make([]byte, 0, 32+4+9+8+32)
+	buf = append(buf, outPoint.TxID[:]...)
+	var vout [4]byte
+	binary.LittleEndian.PutUint32(vout[:], outPoint.Vout)
+	buf = append(buf, vout[:]...)
+	buf = appendCanonicalVarInt(buf, entry.Type)
+	var value [8]byte
+	binary.LittleEndian.PutUint64(value[:], entry.ValueAtoms)
+	buf = append(buf, value[:]...)
+	payload32 := entry.Payload32
+	if payload32 == ([32]byte{}) && entry.Type == types.OutputXOnlyP2PK {
+		payload32 = entry.PubKey
+	}
+	buf = append(buf, payload32[:]...)
+	return buf
 }
 
 func mustParseBigInt(hex string) *big.Int {
@@ -123,4 +132,26 @@ func mustParseBigInt(hex string) *big.Int {
 		panic("invalid big integer constant")
 	}
 	return v
+}
+
+func appendCanonicalVarInt(dst []byte, v uint64) []byte {
+	switch {
+	case v <= 0xfc:
+		return append(dst, byte(v))
+	case v <= 0xffff:
+		return append(dst, 0xfd, byte(v), byte(v>>8))
+	case v <= 0xffff_ffff:
+		return append(dst, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	default:
+		return append(dst, 0xff,
+			byte(v),
+			byte(v>>8),
+			byte(v>>16),
+			byte(v>>24),
+			byte(v>>32),
+			byte(v>>40),
+			byte(v>>48),
+			byte(v>>56),
+		)
+	}
 }

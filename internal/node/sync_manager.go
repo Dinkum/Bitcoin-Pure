@@ -167,7 +167,11 @@ func (p *peerConn) noteStall(class syncRequestClass, at time.Time) peerSyncSnaps
 		misses = p.syncState.blockStalls
 	case syncRequestTxs:
 		p.syncState.txStalls++
-		misses = p.syncState.txStalls
+		// Transaction reconciliation stalls are noisy during large mempool waves.
+		// Penalize the peer's download score, but do not put it into the global
+		// header/block cooldown path; doing so delays urgent block catch-up behind
+		// unrelated relay misses.
+		misses = 0
 	}
 	cooldown := stallCooldownForMisses(misses)
 	until := at.Add(cooldown)
@@ -276,9 +280,9 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 	}
 	items := make([]p2p.InvVector, 0, len(hashes))
 	for _, hash := range hashes {
-		// Catch-up requests prefer full blocks. Compact/short-ID relay is still
-		// useful for steady-state propagation, but explicit sync recovery should
-		// bias toward deterministic block delivery over relay efficiency.
+		// Explicit sync recovery prefers full blocks. Compact/short-ID relay is
+		// still useful for steady-state propagation, but catch-up should bias
+		// toward deterministic delivery over relay efficiency.
 		items = append(items, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: hash})
 	}
 	if err := peer.send(p2p.GetDataMessage{Items: items}); err != nil {
@@ -304,8 +308,8 @@ func (m *syncManager) requestBlocks(peer *peerConn) error {
 
 func (m *syncManager) blockRequestTimeout() time.Duration {
 	timeout := m.syncStallThreshold()
-	if timeout < 10*time.Second {
-		timeout = 10 * time.Second
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
 	}
 	return timeout
 }

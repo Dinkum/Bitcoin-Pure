@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -133,10 +135,12 @@ func runBench(args []string) error {
 		return runBenchE2E(args[1:])
 	case "micro":
 		return runBenchMicro(args[1:])
+	case "gate":
+		return runBenchGate(args[1:])
 	case "sim":
 		return runBenchSim(args[1:])
 	default:
-		return errors.New("unknown bench subcommand (supported: e2e, micro, sim; use `go test ./benchmarks -run '^$' -bench ...` for the raw in-process throughput loop)")
+		return errors.New("unknown bench subcommand (supported: e2e, micro, gate, sim; use `go test ./benchmarks -run '^$' -bench ...` for the raw in-process throughput loop)")
 	}
 }
 
@@ -153,6 +157,7 @@ func runBenchE2E(args []string) error {
 	blockInterval := fs.Duration("block-interval", defaults.BlockInterval, "")
 	miningRaw := fs.String("mining", string(defaults.MiningMode), "")
 	txOrigin := fs.String("tx-origin", string(defaults.TxOriginSpread), "")
+	steadyStateBacklog := fs.Bool("steady-state-backlog", defaults.SteadyStateBacklog, "")
 	timeout := fs.Duration("timeout", defaults.Timeout, "")
 	reportPath := fs.String("report", "", "")
 	markdownPath := fs.String("markdown", "", "")
@@ -168,20 +173,21 @@ func runBenchE2E(args []string) error {
 		return err
 	}
 	opts := benchmarks.RunOptions{
-		Profile:        profile,
-		NodeCount:      *nodes,
-		Topology:       benchmarks.Topology(*topologyRaw),
-		BatchSize:      *batchSize,
-		TxsPerBlock:    *txsPerBlock,
-		BlockCount:     *blocks,
-		BlockInterval:  *blockInterval,
-		MiningMode:     benchmarks.MiningMode(*miningRaw),
-		TxOriginSpread: benchmarks.TxOriginSpread(*txOrigin),
-		Timeout:        *timeout,
-		DBRoot:         *dbRoot,
-		ProfileDir:     *profileDir,
-		SuppressLogs:   *suppressLogs,
-		ProgressWriter: os.Stderr,
+		Profile:            profile,
+		NodeCount:          *nodes,
+		Topology:           benchmarks.Topology(*topologyRaw),
+		BatchSize:          *batchSize,
+		TxsPerBlock:        *txsPerBlock,
+		BlockCount:         *blocks,
+		BlockInterval:      *blockInterval,
+		MiningMode:         benchmarks.MiningMode(*miningRaw),
+		TxOriginSpread:     benchmarks.TxOriginSpread(*txOrigin),
+		SteadyStateBacklog: *steadyStateBacklog,
+		Timeout:            *timeout,
+		DBRoot:             *dbRoot,
+		ProfileDir:         *profileDir,
+		SuppressLogs:       *suppressLogs,
+		ProgressWriter:     os.Stderr,
 	}
 
 	report, err := benchmarks.RunE2E(context.Background(), opts)
@@ -241,6 +247,70 @@ func runBenchMicro(args []string) error {
 	}
 	printMicroBenchReport(report, *reportPath, *markdownPath)
 	return nil
+}
+
+func runBenchGate(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing bench gate subcommand")
+	}
+	switch args[0] {
+	case "run":
+		return runBenchGateRun(args[1:])
+	case "compare":
+		return runBenchGateCompare(args[1:])
+	default:
+		return errors.New("unknown bench gate subcommand (supported: run, compare)")
+	}
+}
+
+func runBenchGateRun(args []string) error {
+	fs := flag.NewFlagSet("bench gate run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	budgetPath := fs.String("budget", benchmarks.DefaultPerfGateBudgetPath, "")
+	outDir := fs.String("out-dir", filepath.Join("benchmarks", "reports", "gate", time.Now().UTC().Format("20060102-150405")), "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	budget, err := benchmarks.LoadPerfGateBudget(*budgetPath)
+	if err != nil {
+		return err
+	}
+	reports, err := budget.Run(context.Background(), *outDir)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "perf_gate_budget: %s\n", filepath.Clean(*budgetPath))
+	fmt.Fprintf(os.Stdout, "micro_report_json: %s\n", reports.MicroJSON)
+	fmt.Fprintf(os.Stdout, "micro_report_markdown: %s\n", reports.MicroMD)
+	fmt.Fprintf(os.Stdout, "e2e_report_json: %s\n", reports.E2EJSON)
+	fmt.Fprintf(os.Stdout, "e2e_report_markdown: %s\n", reports.E2EMD)
+	return nil
+}
+
+func runBenchGateCompare(args []string) error {
+	fs := flag.NewFlagSet("bench gate compare", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	budgetPath := fs.String("budget", benchmarks.DefaultPerfGateBudgetPath, "")
+	baselineDir := fs.String("baseline-dir", "", "")
+	candidateDir := fs.String("candidate-dir", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*baselineDir) == "" || strings.TrimSpace(*candidateDir) == "" {
+		return errors.New("usage: bpu-cli bench gate compare --baseline-dir PATH --candidate-dir PATH [--budget PATH]")
+	}
+
+	budget, err := benchmarks.LoadPerfGateBudget(*budgetPath)
+	if err != nil {
+		return err
+	}
+	comparison, err := benchmarks.ComparePerfGateReports(budget, *baselineDir, *candidateDir)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, benchmarks.RenderPerfGateComparison(comparison))
+	return comparison.Error()
 }
 
 func runBenchSim(args []string) error {
@@ -883,11 +953,12 @@ func runWalletCreate(args []string) error {
 	fs.SetOutput(os.Stderr)
 	configPath := fs.String("config", "", "")
 	walletDir := fs.String("wallet-dir", "", "")
+	family := fs.String("family", wallet.AddressFamilyXOnly, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: bpu-cli wallet create [--config PATH] [--wallet-dir DIR] <name>")
+		return errors.New("usage: bpu-cli wallet create [--family xonly|pq] [--config PATH] [--wallet-dir DIR] <name>")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
@@ -897,14 +968,19 @@ func runWalletCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	entry, addr, err := store.CreateWallet(fs.Arg(0))
+	outputType, err := wallet.ParseAddressFamily(*family)
+	if err != nil {
+		return err
+	}
+	entry, addr, err := store.CreateWalletWithType(fs.Arg(0), outputType)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("wallet: %s\n", entry.Name)
 	fmt.Printf("created_at: %s\n", entry.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("family: %s\n", wallet.AddressFamilyLabel(addr.OutputType()))
 	fmt.Printf("receive_address: %s\n", addr.Address)
-	fmt.Printf("pubkey: %s\n", addr.PubKeyHex)
+	printWalletAddressDetails(addr)
 	return nil
 }
 
@@ -964,11 +1040,11 @@ func runWalletBalance(args []string) error {
 	if err := reconcileWalletPending(store, client, fs.Arg(0)); err != nil {
 		return err
 	}
-	pubKeys, err := store.SpendablePubKeys(fs.Arg(0))
+	watchItems, err := store.SpendableWatchItems(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	utxos, err := rpcUTXOsByPubKeys(client, pubKeys)
+	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
 	if err != nil {
 		return err
 	}
@@ -1007,12 +1083,12 @@ func runWalletHistory(args []string) error {
 	if err != nil {
 		return err
 	}
-	pubKeys, err := store.SpendablePubKeys(fs.Arg(0))
+	watchItems, err := store.SpendableWatchItems(fs.Arg(0))
 	if err != nil {
 		return err
 	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
-	activity, err := rpcWalletActivityByPubKeys(client, pubKeys, *limit)
+	activity, err := rpcWalletActivityByWatchItems(client, watchItems, *limit)
 	if err != nil {
 		return err
 	}
@@ -1069,11 +1145,12 @@ func runWalletReceive(args []string) error {
 	fs.SetOutput(os.Stderr)
 	configPath := fs.String("config", "", "")
 	walletDir := fs.String("wallet-dir", "", "")
+	family := fs.String("family", wallet.AddressFamilyXOnly, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: bpu-cli wallet receive [--config PATH] [--wallet-dir DIR] <wallet>")
+		return errors.New("usage: bpu-cli wallet receive [--family xonly|pq] [--config PATH] [--wallet-dir DIR] <wallet>")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
@@ -1083,13 +1160,18 @@ func runWalletReceive(args []string) error {
 	if err != nil {
 		return err
 	}
-	addr, err := store.NewReceiveAddress(fs.Arg(0))
+	outputType, err := wallet.ParseAddressFamily(*family)
+	if err != nil {
+		return err
+	}
+	addr, err := store.NewReceiveAddressWithType(fs.Arg(0), outputType)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("wallet: %s\n", fs.Arg(0))
+	fmt.Printf("family: %s\n", wallet.AddressFamilyLabel(addr.OutputType()))
 	fmt.Printf("receive_address: %s\n", addr.Address)
-	fmt.Printf("pubkey: %s\n", addr.PubKeyHex)
+	printWalletAddressDetails(addr)
 	return nil
 }
 
@@ -1105,12 +1187,14 @@ func runWalletSend(args []string) error {
 	amount := fs.Uint64("amount", 0, "")
 	fee := fs.Uint64("fee", 0, "")
 	targetBlocks := fs.Int("target-blocks", 1, "")
+	targetMinutes := fs.Int("target-minutes", 0, "")
+	priority := fs.String("priority", "", "")
 	yes := fs.Bool("yes", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *from == "" || *to == "" || *amount == 0 {
-		return errors.New("usage: bpu-cli wallet send --from NAME --to ADDRESS --amount ATOMS [--fee ATOMS] [--target-blocks N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+		return errors.New("usage: bpu-cli wallet send --from NAME --to ADDRESS --amount ATOMS [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
@@ -1124,31 +1208,44 @@ func runWalletSend(args []string) error {
 	if err := reconcileWalletPending(store, client, *from); err != nil {
 		return err
 	}
-	pubKeys, err := store.SpendablePubKeys(*from)
+	watchItems, err := store.SpendableWatchItems(*from)
 	if err != nil {
 		return err
 	}
-	utxos, err := rpcUTXOsByPubKeys(client, pubKeys)
+	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
 	if err != nil {
 		return err
 	}
 	plan := wallet.SendPlan{}
+	var feeQuote *walletFeeQuote
 	if *fee > 0 {
+		if flagWasPassed(fs, "target-blocks") || flagWasPassed(fs, "target-minutes") || flagWasPassed(fs, "priority") {
+			return errors.New("--fee cannot be combined with --target-blocks, --target-minutes, or --priority")
+		}
 		plan, err = store.BuildSend(*from, *to, *amount, *fee, utxos)
 		if err != nil {
 			return err
 		}
 	} else {
-		feeRate, err := rpcEstimateFee(client, *targetBlocks)
+		quote, err := resolveWalletFeeQuote(client, walletFeeRequest{
+			TargetBlocks:          *targetBlocks,
+			TargetBlocksExplicit:  flagWasPassed(fs, "target-blocks"),
+			TargetMinutes:         *targetMinutes,
+			TargetMinutesExplicit: flagWasPassed(fs, "target-minutes"),
+			Priority:              *priority,
+			PriorityExplicit:      flagWasPassed(fs, "priority"),
+			AllowInteractive:      stdinLooksInteractive() && !*yes,
+		})
 		if err != nil {
 			return err
 		}
-		plan, err = store.BuildSendAuto(*from, *to, *amount, feeRate, utxos)
+		feeQuote = &quote
+		plan, err = store.BuildSendAuto(*from, *to, *amount, quote.FeeRate, utxos)
 		if err != nil {
 			return err
 		}
 	}
-	if err := maybeConfirmWalletAction(renderSendPreview(plan), *yes); err != nil {
+	if err := maybeConfirmWalletAction(renderSendPreview(plan, feeQuote), *yes); err != nil {
 		return err
 	}
 	var result struct {
@@ -1168,7 +1265,7 @@ func runWalletSend(args []string) error {
 	if err := store.MarkSubmitted(*from, reportedTxID, plan.Transaction, plan.Inputs); err != nil {
 		return err
 	}
-	printWalletAction(renderSendResult(plan, result.TxID))
+	printWalletAction(renderSendResult(plan, result.TxID, feeQuote))
 	return nil
 }
 
@@ -1183,12 +1280,14 @@ func runWalletCPFP(args []string) error {
 	parent := fs.String("txid", "", "")
 	fee := fs.Uint64("fee", 0, "")
 	targetBlocks := fs.Int("target-blocks", 1, "")
+	targetMinutes := fs.Int("target-minutes", 0, "")
+	priority := fs.String("priority", "", "")
 	yes := fs.Bool("yes", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *from == "" || *parent == "" {
-		return errors.New("usage: bpu-cli wallet cpfp --from NAME --txid PARENT_TXID [--fee ATOMS] [--target-blocks N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+		return errors.New("usage: bpu-cli wallet cpfp --from NAME --txid PARENT_TXID [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
 	}
 	parentTxID, err := decodeHex32(*parent)
 	if err != nil {
@@ -1207,22 +1306,35 @@ func runWalletCPFP(args []string) error {
 		return err
 	}
 	var plan wallet.CPFPPlan
+	var feeQuote *walletFeeQuote
 	if *fee > 0 {
+		if flagWasPassed(fs, "target-blocks") || flagWasPassed(fs, "target-minutes") || flagWasPassed(fs, "priority") {
+			return errors.New("--fee cannot be combined with --target-blocks, --target-minutes, or --priority")
+		}
 		plan, err = store.BuildCPFPWithExactFee(*from, parentTxID, *fee)
 		if err != nil {
 			return err
 		}
 	} else {
-		feeRate, err := rpcEstimateFee(client, *targetBlocks)
+		quote, err := resolveWalletFeeQuote(client, walletFeeRequest{
+			TargetBlocks:          *targetBlocks,
+			TargetBlocksExplicit:  flagWasPassed(fs, "target-blocks"),
+			TargetMinutes:         *targetMinutes,
+			TargetMinutesExplicit: flagWasPassed(fs, "target-minutes"),
+			Priority:              *priority,
+			PriorityExplicit:      flagWasPassed(fs, "priority"),
+			AllowInteractive:      stdinLooksInteractive() && !*yes,
+		})
 		if err != nil {
 			return err
 		}
-		plan, err = store.BuildCPFP(*from, parentTxID, feeRate)
+		feeQuote = &quote
+		plan, err = store.BuildCPFP(*from, parentTxID, quote.FeeRate)
 		if err != nil {
 			return err
 		}
 	}
-	if err := maybeConfirmWalletAction(renderCPFPPreview(plan), *yes); err != nil {
+	if err := maybeConfirmWalletAction(renderCPFPPreview(plan, feeQuote), *yes); err != nil {
 		return err
 	}
 	var result struct {
@@ -1242,7 +1354,7 @@ func runWalletCPFP(args []string) error {
 	if err := store.MarkSubmitted(*from, reportedTxID, plan.Transaction, []wallet.SelectedInput{plan.Input}); err != nil {
 		return err
 	}
-	printWalletAction(renderCPFPResult(plan, result.TxID))
+	printWalletAction(renderCPFPResult(plan, result.TxID, feeQuote))
 	return nil
 }
 
@@ -1810,7 +1922,11 @@ func openWalletStore(walletDir string, cfg config.Config) (*wallet.Store, string
 		dir = filepath.Join(filepath.Dir(filepath.Clean(cfg.DBPath)), "wallets")
 	}
 	path := wallet.StorePath(dir)
-	store, err := wallet.Open(path)
+	profile, err := types.ParseChainProfile(cfg.Profile)
+	if err != nil {
+		return nil, "", err
+	}
+	store, err := wallet.OpenWithProfile(path, profile)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1889,21 +2005,42 @@ func reconcileWalletPending(store *wallet.Store, client *cliRPCClient, walletNam
 }
 
 func rpcUTXOsByPubKeys(client *cliRPCClient, pubKeys [][32]byte) ([]wallet.SpendableUTXO, error) {
-	params := struct {
-		PubKeys []string `json:"pubkeys"`
-	}{PubKeys: make([]string, 0, len(pubKeys))}
+	items := make([]wallet.WatchItem, 0, len(pubKeys))
 	for _, pubKey := range pubKeys {
-		params.PubKeys = append(params.PubKeys, hex.EncodeToString(pubKey[:]))
+		items = append(items, wallet.WatchItem{Type: types.OutputXOnlyP2PK, Payload32: pubKey})
+	}
+	return rpcUTXOsByWatchItems(client, items)
+}
+
+func rpcUTXOsByWatchItems(client *cliRPCClient, items []wallet.WatchItem) ([]wallet.SpendableUTXO, error) {
+	params := struct {
+		WatchItems []struct {
+			Type      uint64 `json:"type"`
+			Payload32 string `json:"payload32"`
+		} `json:"watchitems"`
+	}{WatchItems: make([]struct {
+		Type      uint64 `json:"type"`
+		Payload32 string `json:"payload32"`
+	}, 0, len(items))}
+	for _, item := range items {
+		params.WatchItems = append(params.WatchItems, struct {
+			Type      uint64 `json:"type"`
+			Payload32 string `json:"payload32"`
+		}{
+			Type:      item.Type,
+			Payload32: hex.EncodeToString(item.Payload32[:]),
+		})
 	}
 	var result struct {
 		UTXOs []struct {
-			TxID   string `json:"txid"`
-			Vout   uint32 `json:"vout"`
-			Value  uint64 `json:"value"`
-			PubKey string `json:"pubkey"`
+			TxID      string `json:"txid"`
+			Vout      uint32 `json:"vout"`
+			Value     uint64 `json:"value"`
+			Type      uint64 `json:"type"`
+			Payload32 string `json:"payload32"`
 		} `json:"utxos"`
 	}
-	if err := client.Call("getutxosbypubkeys", params, &result); err != nil {
+	if err := client.Call("getutxosbywatchitems", params, &result); err != nil {
 		return nil, err
 	}
 	out := make([]wallet.SpendableUTXO, 0, len(result.UTXOs))
@@ -1912,14 +2049,16 @@ func rpcUTXOsByPubKeys(client *cliRPCClient, pubKeys [][32]byte) ([]wallet.Spend
 		if err != nil {
 			return nil, err
 		}
-		pubKey, err := decodeHex32(item.PubKey)
+		payload32, err := decodeHex32(item.Payload32)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, wallet.SpendableUTXO{
-			OutPoint: types.OutPoint{TxID: txid, Vout: item.Vout},
-			Value:    item.Value,
-			PubKey:   pubKey,
+			OutPoint:  types.OutPoint{TxID: txid, Vout: item.Vout},
+			Value:     item.Value,
+			Type:      item.Type,
+			Payload32: payload32,
+			PubKey:    legacyWalletPubKey(item.Type, payload32),
 		})
 	}
 	return out, nil
@@ -1938,20 +2077,47 @@ type walletActivityRPCItem struct {
 }
 
 func rpcWalletActivityByPubKeys(client *cliRPCClient, pubKeys [][32]byte, limit int) ([]walletActivityRPCItem, error) {
-	params := struct {
-		PubKeys []string `json:"pubkeys"`
-		Limit   int      `json:"limit"`
-	}{PubKeys: make([]string, 0, len(pubKeys)), Limit: limit}
+	items := make([]wallet.WatchItem, 0, len(pubKeys))
 	for _, pubKey := range pubKeys {
-		params.PubKeys = append(params.PubKeys, hex.EncodeToString(pubKey[:]))
+		items = append(items, wallet.WatchItem{Type: types.OutputXOnlyP2PK, Payload32: pubKey})
+	}
+	return rpcWalletActivityByWatchItems(client, items, limit)
+}
+
+func rpcWalletActivityByWatchItems(client *cliRPCClient, items []wallet.WatchItem, limit int) ([]walletActivityRPCItem, error) {
+	params := struct {
+		WatchItems []struct {
+			Type      uint64 `json:"type"`
+			Payload32 string `json:"payload32"`
+		} `json:"watchitems"`
+		Limit int `json:"limit"`
+	}{WatchItems: make([]struct {
+		Type      uint64 `json:"type"`
+		Payload32 string `json:"payload32"`
+	}, 0, len(items)), Limit: limit}
+	for _, item := range items {
+		params.WatchItems = append(params.WatchItems, struct {
+			Type      uint64 `json:"type"`
+			Payload32 string `json:"payload32"`
+		}{
+			Type:      item.Type,
+			Payload32: hex.EncodeToString(item.Payload32[:]),
+		})
 	}
 	var result struct {
 		Activity []walletActivityRPCItem `json:"activity"`
 	}
-	if err := client.Call("getwalletactivitybypubkeys", params, &result); err != nil {
+	if err := client.Call("getwalletactivitybywatchitems", params, &result); err != nil {
 		return nil, err
 	}
 	return result.Activity, nil
+}
+
+func legacyWalletPubKey(outputType uint64, payload32 [32]byte) [32]byte {
+	if outputType == types.OutputXOnlyP2PK {
+		return payload32
+	}
+	return [32]byte{}
 }
 
 func rpcEstimateFee(client *cliRPCClient, targetBlocks int) (uint64, error) {
@@ -1964,6 +2130,24 @@ func rpcEstimateFee(client *cliRPCClient, targetBlocks int) (uint64, error) {
 	return result.FeePerByte, nil
 }
 
+func rpcMempoolInfo(client *cliRPCClient) (*node.MempoolInfo, error) {
+	var result node.MempoolInfo
+	if err := client.Call("getmempoolinfo", nil, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func printWalletAddressDetails(addr wallet.Address) {
+	switch addr.OutputType() {
+	case types.OutputPQLock32:
+		fmt.Printf("pq_lock: %s\n", addr.PayloadHex)
+		fmt.Printf("alg: ml-dsa-65\n")
+	default:
+		fmt.Printf("pubkey: %s\n", addr.PubKeyHex)
+	}
+}
+
 type walletActionRow struct {
 	label string
 	value string
@@ -1974,59 +2158,83 @@ type walletActionView struct {
 	rows  []walletActionRow
 }
 
-func renderSendPreview(plan wallet.SendPlan) walletActionView {
+type walletFeeRequest struct {
+	TargetBlocks          int
+	TargetBlocksExplicit  bool
+	TargetMinutes         int
+	TargetMinutesExplicit bool
+	Priority              string
+	PriorityExplicit      bool
+	AllowInteractive      bool
+}
+
+type walletFeeQuote struct {
+	Label         string
+	TargetBlocks  int
+	TargetMinutes int
+	FeeRate       uint64
+	Mempool       *node.MempoolInfo
+}
+
+func renderSendPreview(plan wallet.SendPlan, feeQuote *walletFeeQuote) walletActionView {
 	rows := []walletActionRow{
 		{label: "wallet", value: plan.WalletName},
 		{label: "to", value: plan.ToAddress},
 		{label: "amount", value: fmt.Sprintf("%d atoms", plan.Amount)},
-		{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
-		{label: "inputs", value: fmt.Sprintf("%d (%d atoms)", len(plan.Inputs), plan.InputTotal)},
-		{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
 	}
+	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
+	rows = append(rows,
+		walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+		walletActionRow{label: "inputs", value: fmt.Sprintf("%d (%d atoms)", len(plan.Inputs), plan.InputTotal)},
+		walletActionRow{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
+	)
 	if plan.Change > 0 && plan.ChangeAddress != nil {
 		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%d atoms -> %s", plan.Change, plan.ChangeAddress.Address)})
 	}
 	return walletActionView{title: "send", rows: rows}
 }
 
-func renderSendResult(plan wallet.SendPlan, txid string) walletActionView {
+func renderSendResult(plan wallet.SendPlan, txid string, feeQuote *walletFeeQuote) walletActionView {
 	rows := []walletActionRow{
 		{label: "wallet", value: plan.WalletName},
 		{label: "txid", value: txid},
 		{label: "amount", value: fmt.Sprintf("%d atoms", plan.Amount)},
-		{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
 	}
+	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
+	rows = append(rows,
+		walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+	)
 	if plan.Change > 0 && plan.ChangeAddress != nil {
 		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%d atoms -> %s", plan.Change, plan.ChangeAddress.Address)})
 	}
 	return walletActionView{title: "submitted", rows: rows}
 }
 
-func renderCPFPPreview(plan wallet.CPFPPlan) walletActionView {
-	return walletActionView{
-		title: "cpfp",
-		rows: []walletActionRow{
-			{label: "wallet", value: plan.WalletName},
-			{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
-			{label: "source", value: fmt.Sprintf("%x:%d (%d atoms)", plan.Input.OutPoint.TxID, plan.Input.OutPoint.Vout, plan.Input.Value)},
-			{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
-			{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
-			{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
-		},
+func renderCPFPPreview(plan wallet.CPFPPlan, feeQuote *walletFeeQuote) walletActionView {
+	rows := []walletActionRow{
+		{label: "wallet", value: plan.WalletName},
+		{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
+		{label: "source", value: fmt.Sprintf("%x:%d (%d atoms)", plan.Input.OutPoint.TxID, plan.Input.OutPoint.Vout, plan.Input.Value)},
+		{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
 	}
+	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
+	rows = append(rows,
+		walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
+		walletActionRow{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
+	)
+	return walletActionView{title: "cpfp", rows: rows}
 }
 
-func renderCPFPResult(plan wallet.CPFPPlan, txid string) walletActionView {
-	return walletActionView{
-		title: "submitted",
-		rows: []walletActionRow{
-			{label: "wallet", value: plan.WalletName},
-			{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
-			{label: "txid", value: txid},
-			{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
-			{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
-		},
+func renderCPFPResult(plan wallet.CPFPPlan, txid string, feeQuote *walletFeeQuote) walletActionView {
+	rows := []walletActionRow{
+		{label: "wallet", value: plan.WalletName},
+		{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
+		{label: "txid", value: txid},
+		{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
 	}
+	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
+	rows = append(rows, walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)})
+	return walletActionView{title: "submitted", rows: rows}
 }
 
 func formatWalletFee(fee uint64, feeRate uint64, estimatedBytes int) string {
@@ -2034,6 +2242,257 @@ func formatWalletFee(fee uint64, feeRate uint64, estimatedBytes int) string {
 		return fmt.Sprintf("%d atoms", fee)
 	}
 	return fmt.Sprintf("%d atoms (%d atoms/B, %d B)", fee, feeRate, estimatedBytes)
+}
+
+func resolveWalletFeeQuote(client *cliRPCClient, req walletFeeRequest) (walletFeeQuote, error) {
+	selectors := 0
+	if req.TargetBlocksExplicit {
+		selectors++
+	}
+	if req.TargetMinutesExplicit {
+		selectors++
+	}
+	if req.PriorityExplicit && strings.TrimSpace(req.Priority) != "" {
+		selectors++
+	}
+	if selectors > 1 {
+		return walletFeeQuote{}, errors.New("choose only one of --priority, --target-blocks, or --target-minutes")
+	}
+	info, err := rpcMempoolInfo(client)
+	if err != nil {
+		info = nil
+	}
+	estimate := func(targetBlocks int) (uint64, error) {
+		return rpcEstimateFee(client, targetBlocks)
+	}
+	switch {
+	case req.PriorityExplicit && strings.TrimSpace(req.Priority) != "":
+		label, blocks, err := parseWalletFeePriority(req.Priority)
+		if err != nil {
+			return walletFeeQuote{}, err
+		}
+		return buildWalletFeeQuote(label, blocks, blocks*10, info, estimate)
+	case req.TargetMinutesExplicit:
+		if req.TargetMinutes <= 0 {
+			return walletFeeQuote{}, errors.New("--target-minutes must be positive")
+		}
+		return buildWalletFeeQuote("custom", minutesToTargetBlocks(req.TargetMinutes), req.TargetMinutes, info, estimate)
+	case req.TargetBlocksExplicit:
+		if req.TargetBlocks <= 0 {
+			return walletFeeQuote{}, errors.New("--target-blocks must be positive")
+		}
+		return buildWalletFeeQuote("custom", req.TargetBlocks, req.TargetBlocks*10, info, estimate)
+	case req.AllowInteractive:
+		return promptWalletFeeQuoteInteractive(os.Stdin, os.Stdout, info, estimate)
+	default:
+		return buildWalletFeeQuote("now", 1, 10, info, estimate)
+	}
+}
+
+func buildWalletFeeQuote(label string, targetBlocks int, targetMinutes int, info *node.MempoolInfo, estimate func(int) (uint64, error)) (walletFeeQuote, error) {
+	if targetBlocks <= 0 {
+		return walletFeeQuote{}, errors.New("target blocks must be positive")
+	}
+	feeRate, err := estimate(targetBlocks)
+	if err != nil {
+		return walletFeeQuote{}, err
+	}
+	if targetMinutes <= 0 {
+		targetMinutes = targetBlocks * 10
+	}
+	return walletFeeQuote{
+		Label:         label,
+		TargetBlocks:  targetBlocks,
+		TargetMinutes: targetMinutes,
+		FeeRate:       feeRate,
+		Mempool:       info,
+	}, nil
+}
+
+func promptWalletFeeQuoteInteractive(in io.Reader, out io.Writer, info *node.MempoolInfo, estimate func(int) (uint64, error)) (walletFeeQuote, error) {
+	presets := []struct {
+		label  string
+		blocks int
+	}{
+		{label: "now", blocks: 1},
+		{label: "soon", blocks: 2},
+		{label: "relaxed", blocks: 3},
+		{label: "cheap", blocks: 6},
+	}
+	quotes := make([]walletFeeQuote, 0, len(presets))
+	for _, preset := range presets {
+		quote, err := buildWalletFeeQuote(preset.label, preset.blocks, preset.blocks*10, info, estimate)
+		if err != nil {
+			return walletFeeQuote{}, err
+		}
+		quotes = append(quotes, quote)
+	}
+	defaultIndex := 1
+	recommended := recommendedWalletFeeLabel(info)
+	for i := range quotes {
+		if quotes[i].Label == recommended {
+			defaultIndex = i
+			break
+		}
+	}
+	reader := bufio.NewReader(in)
+	fmt.Fprintln(out, "fee target")
+	if info != nil {
+		fmt.Fprintf(out, "  mempool  %s\n", formatWalletMempoolSummary(*info))
+	}
+	for i, quote := range quotes {
+		suffix := ""
+		if i == defaultIndex {
+			suffix = " (recommended)"
+		}
+		fmt.Fprintf(out, "  %d) %-7s %s  %d atoms/B%s\n", i+1, quote.Label, formatWalletTargetSummary(&quote), quote.FeeRate, suffix)
+	}
+	fmt.Fprintln(out, "  5) blocks   custom block target")
+	fmt.Fprintln(out, "  6) minutes  custom minute target")
+	for {
+		fmt.Fprintf(out, "choose fee target [%d]: ", defaultIndex+1)
+		raw, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return walletFeeQuote{}, err
+		}
+		choice := strings.TrimSpace(raw)
+		if choice == "" {
+			return quotes[defaultIndex], nil
+		}
+		switch choice {
+		case "1", "2", "3", "4":
+			return quotes[int(choice[0]-'1')], nil
+		case "5":
+			blocks, err := promptPositiveInt(reader, out, "confirm in how many blocks? ")
+			if err != nil {
+				return walletFeeQuote{}, err
+			}
+			return buildWalletFeeQuote("custom", blocks, blocks*10, info, estimate)
+		case "6":
+			minutes, err := promptPositiveInt(reader, out, "confirm in roughly how many minutes? ")
+			if err != nil {
+				return walletFeeQuote{}, err
+			}
+			return buildWalletFeeQuote("custom", minutesToTargetBlocks(minutes), minutes, info, estimate)
+		default:
+			fmt.Fprintln(out, "choose 1-6, or press enter for the recommended target")
+			if errors.Is(err, io.EOF) {
+				return walletFeeQuote{}, errors.New("fee target selection cancelled")
+			}
+		}
+	}
+}
+
+func promptPositiveInt(reader *bufio.Reader, out io.Writer, prompt string) (int, error) {
+	for {
+		fmt.Fprint(out, prompt)
+		raw, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		value, convErr := strconv.Atoi(strings.TrimSpace(raw))
+		if convErr == nil && value > 0 {
+			return value, nil
+		}
+		fmt.Fprintln(out, "enter a positive integer")
+		if errors.Is(err, io.EOF) {
+			return 0, errors.New("fee target selection cancelled")
+		}
+	}
+}
+
+func parseWalletFeePriority(raw string) (string, int, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "now", "fast", "asap":
+		return "now", 1, nil
+	case "soon", "normal":
+		return "soon", 2, nil
+	case "relaxed", "standard":
+		return "relaxed", 3, nil
+	case "cheap", "slow":
+		return "cheap", 6, nil
+	default:
+		return "", 0, errors.New("unknown --priority value (expected: now, soon, relaxed, cheap)")
+	}
+}
+
+func minutesToTargetBlocks(minutes int) int {
+	if minutes <= 0 {
+		return 1
+	}
+	return (minutes + 9) / 10
+}
+
+func recommendedWalletFeeLabel(info *node.MempoolInfo) string {
+	if info == nil {
+		return "soon"
+	}
+	switch classifyWalletMempoolPressure(*info) {
+	case "high":
+		return "now"
+	case "active":
+		return "soon"
+	case "idle":
+		return "cheap"
+	default:
+		return "relaxed"
+	}
+}
+
+func classifyWalletMempoolPressure(info node.MempoolInfo) string {
+	maxBytes := info.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 64 << 20
+	}
+	switch {
+	case info.Count == 0 && info.Orphans == 0 && info.Bytes == 0:
+		return "idle"
+	case info.Bytes >= (maxBytes*8)/10 || info.Count >= 10_000 || info.Orphans >= walletMaxInt(32, 128/2):
+		return "high"
+	case info.Bytes >= walletMaxInt(16<<20, maxBytes/4) || info.Count >= 1_000 || info.Orphans > 0:
+		return "active"
+	default:
+		return "normal"
+	}
+}
+
+func walletMaxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func formatWalletTargetSummary(quote *walletFeeQuote) string {
+	if quote == nil {
+		return ""
+	}
+	blockWord := "blocks"
+	if quote.TargetBlocks == 1 {
+		blockWord = "block"
+	}
+	return fmt.Sprintf("~%d min / %d %s", quote.TargetMinutes, quote.TargetBlocks, blockWord)
+}
+
+func formatWalletMempoolSummary(info node.MempoolInfo) string {
+	pressure := classifyWalletMempoolPressure(info)
+	if info.Count == 0 && info.Orphans == 0 && info.Bytes == 0 {
+		return fmt.Sprintf("%s, empty, min relay %d atoms/B", pressure, info.MinRelayFeePerByte)
+	}
+	return fmt.Sprintf("%s, %d tx, median %d atoms/B, range %d-%d", pressure, info.Count, info.MedianFee, info.LowFee, info.HighFee)
+}
+
+func walletFeeQuoteRows(quote *walletFeeQuote) []walletActionRow {
+	if quote == nil {
+		return nil
+	}
+	rows := []walletActionRow{
+		{label: "target", value: fmt.Sprintf("%s (%s)", quote.Label, formatWalletTargetSummary(quote))},
+	}
+	if quote.Mempool != nil {
+		rows = append(rows, walletActionRow{label: "market", value: formatWalletMempoolSummary(*quote.Mempool)})
+	}
+	return rows
 }
 
 func printWalletAction(view walletActionView) {
@@ -2070,6 +2529,16 @@ func stdinLooksInteractive() bool {
 		return false
 	}
 	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func flagWasPassed(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func decodeHex32(raw string) ([32]byte, error) {

@@ -12,6 +12,23 @@ func TestTaggedHashIsStable(t *testing.T) {
 	}
 }
 
+func TestPQLockMatchesSpecTagAndPayload(t *testing.T) {
+	verificationKey := make([]byte, MLDSA65VerificationKeySize)
+	for i := range verificationKey {
+		verificationKey[i] = byte(i)
+	}
+
+	want := TaggedHash("BPU/PQLOCK/MLDSA65/v1", verificationKey)
+	if got := PQLock(verificationKey); got != want {
+		t.Fatalf("PQLock = %x, want %x", got, want)
+	}
+
+	legacyPayload := append([]byte{0x01}, verificationKey...)
+	if got := PQLock(verificationKey); got == TaggedHash("BPU/PQLOCK/v1", legacyPayload) {
+		t.Fatal("PQLock unexpectedly matches legacy algID-prefixed derivation")
+	}
+}
+
 func TestSchnorrRoundtrip(t *testing.T) {
 	msg := Sha256([]byte("hello"))
 	pubKey, sig := RandomSignSchnorrForTest(&msg)
@@ -46,6 +63,26 @@ func TestSchnorrBatchRoundtrip(t *testing.T) {
 	}
 }
 
+func TestSchnorrExactItemsRejectsTamperedSignature(t *testing.T) {
+	items := make([]SchnorrBatchItem, 0, 4)
+	for i := 0; i < 4; i++ {
+		msg := Sha256([]byte{byte(30 + i), byte(40 + i)})
+		pubKey, sig := RandomSignSchnorrForTest(&msg)
+		items = append(items, SchnorrBatchItem{
+			PubKey:    pubKey,
+			Signature: sig,
+			Msg:       msg,
+		})
+	}
+	if !VerifySchnorrXOnlyItems(items) {
+		t.Fatal("valid exact signature set unexpectedly failed")
+	}
+	items[1].Signature[9] ^= 0x01
+	if VerifySchnorrXOnlyItems(items) {
+		t.Fatal("tampered exact signature set unexpectedly verified")
+	}
+}
+
 func TestSchnorrBatchRejectsTamperedSignature(t *testing.T) {
 	items := make([]SchnorrBatchItem, 0, 4)
 	for i := 0; i < 4; i++ {
@@ -75,6 +112,6 @@ func BenchmarkTaggedHash(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = TaggedHash("BPU/SigHashV1", payload)
+		_ = TaggedHash("BPU/mainnet/c1/SigHashV1", payload)
 	}
 }

@@ -50,7 +50,7 @@ contains exactly:
 Initial interpretations of the canonical committed coin record are:
 
 - `(OUTPUT_XONLY_P2PK, value_atoms, xonly_pubkey32)`
-- `(OUTPUT_PQ_LOCK32, value_atoms, pq_lock32)`
+- `(OUTPUT_PQ_MLDSA65_LOCK32, value_atoms, mldsa65_lock32)`
 
 Coinbase maturity and other chain semantics may depend on data maintained by
 the validating node, but they are not part of the committed `utxo_root` leaf

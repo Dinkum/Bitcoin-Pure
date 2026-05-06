@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"bitcoin-pure/internal/consensus"
+	bpcrypto "bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
 )
 
@@ -65,6 +66,28 @@ func TestCreateWalletAndReceiveAddress(t *testing.T) {
 	}
 	if latest := loaded.LatestReceiveAddress(); latest == nil || latest.Index != 1 {
 		t.Fatalf("latest receive address = %+v, want index 1", latest)
+	}
+}
+
+func TestBuildPQAuthPayloadUsesSpecFixedLayout(t *testing.T) {
+	verificationKey := make([]byte, bpcrypto.MLDSA65VerificationKeySize)
+	signature := make([]byte, bpcrypto.MLDSA65SignatureSize)
+	for i := range verificationKey {
+		verificationKey[i] = byte(i)
+	}
+	for i := range signature {
+		signature[i] = byte(255 - i)
+	}
+
+	payload := buildPQAuthPayload(verificationKey, signature)
+	if len(payload) != bpcrypto.MLDSA65VerificationKeySize+bpcrypto.MLDSA65SignatureSize {
+		t.Fatalf("payload len = %d, want %d", len(payload), bpcrypto.MLDSA65VerificationKeySize+bpcrypto.MLDSA65SignatureSize)
+	}
+	if got := hex.EncodeToString(payload[:len(verificationKey)]); got != hex.EncodeToString(verificationKey) {
+		t.Fatal("payload does not begin with the raw verification key")
+	}
+	if got := hex.EncodeToString(payload[len(verificationKey):]); got != hex.EncodeToString(signature) {
+		t.Fatal("payload does not end with the raw signature")
 	}
 }
 
@@ -136,12 +159,12 @@ func TestBuildSendCreatesSignedTransactionAndChange(t *testing.T) {
 		{
 			OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 			Value:    50,
-			PubKey:  keyHash,
+			PubKey:   keyHash,
 		},
 		{
 			OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 1},
 			Value:    30,
-			PubKey:  keyHash,
+			PubKey:   keyHash,
 		},
 	})
 	if err != nil {
@@ -160,7 +183,7 @@ func TestBuildSendCreatesSignedTransactionAndChange(t *testing.T) {
 		plan.Inputs[0].OutPoint: {ValueAtoms: plan.Inputs[0].Value, PubKey: mustParsePubKey(plan.Inputs[0].Address.PubKeyHex)},
 		plan.Inputs[1].OutPoint: {ValueAtoms: plan.Inputs[1].Value, PubKey: mustParsePubKey(plan.Inputs[1].Address.PubKeyHex)},
 	}
-	if _, err := consensus.ValidateTx(&plan.Transaction, view, consensus.DefaultConsensusRules()); err != nil {
+	if _, err := consensus.ValidateTxWithParams(&plan.Transaction, view, consensus.MainnetParams(), consensus.DefaultConsensusRules()); err != nil {
 		t.Fatalf("ValidateTx: %v", err)
 	}
 	loaded, err := store.Wallet("alice")
@@ -191,7 +214,7 @@ func TestReconcilePendingDropsMissingMempoolTransactions(t *testing.T) {
 	plan, err := store.BuildSend("alice", first.Address, 10, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    50,
-		PubKey:  keyHash,
+		PubKey:   keyHash,
 	}})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
@@ -231,7 +254,7 @@ func TestBuildSendRejectsInsufficientFunds(t *testing.T) {
 	_, err = store.BuildSend("alice", first.Address, 100, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    50,
-		PubKey:  keyHash,
+		PubKey:   keyHash,
 	}})
 	if !errors.Is(err, ErrInsufficientFunds) {
 		t.Fatalf("BuildSend err = %v, want ErrInsufficientFunds", err)
@@ -339,7 +362,7 @@ func TestMarkSubmittedTracksWalletOwnedOutputsForCPFP(t *testing.T) {
 	plan, err := store.BuildSend("alice", dest.Address, 10, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    50,
-		PubKey:  keyHash,
+		PubKey:   keyHash,
 	}})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
@@ -376,7 +399,7 @@ func TestBuildCPFPUsesPendingWalletOutput(t *testing.T) {
 	parent, err := store.BuildSend("alice", dest.Address, 10, 1, []SpendableUTXO{{
 		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
 		Value:    1_000,
-		PubKey:  keyHash,
+		PubKey:   keyHash,
 	}})
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)

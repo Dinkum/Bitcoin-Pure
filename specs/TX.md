@@ -132,7 +132,7 @@ with no additional wrapper or outer framing.
 - Type: canonical varint
 - Meaning:
   - `OUTPUT_XONLY_P2PK = 0x00`
-  - `OUTPUT_PQ_LOCK32  = 0x01`
+  - `OUTPUT_PQ_MLDSA65_LOCK32 = 0x01`
 
 ### 6.6 `payload32`
 
@@ -141,8 +141,8 @@ with no additional wrapper or outer framing.
 - Meaning depends on `type`:
   - if `type == OUTPUT_XONLY_P2PK`
     - `payload32` is a 32-byte x-only secp256k1 public key
-  - if `type == OUTPUT_PQ_LOCK32`
-    - `payload32` is a 32-byte PQ lock commitment
+  - if `type == OUTPUT_PQ_MLDSA65_LOCK32`
+    - `payload32` is a 32-byte ML-DSA-65 lock commitment
 
 ### 6.7 `auth_len`
 
@@ -249,9 +249,6 @@ The only miner-controlled coinbase payload field is the fixed-width `coinbase_ex
 - counts encode as canonical varints
 - `type` encodes as canonical varint
 - `auth_len` encodes as canonical varint
-- `alg_id` encodes as canonical varint
-- `vk_len` encodes as canonical varint
-- `sig_len` encodes as canonical varint
 - `coinbase_height` encodes as canonical varint
 - `coinbase_extra_nonce` encodes as exactly 16 raw bytes
 - byte arrays encode as raw bytes with no prefix unless explicitly stated
@@ -357,13 +354,10 @@ If the referenced output type is `OUTPUT_XONLY_P2PK`, the interpreted `auth_payl
 
 1. `signature` as 64 raw bytes
 
-If the referenced output type is `OUTPUT_PQ_LOCK32`, the interpreted `auth_payload` layout is exactly:
+If the referenced output type is `OUTPUT_PQ_MLDSA65_LOCK32`, the interpreted `auth_payload` layout is exactly:
 
-1. `alg_id` as canonical varint
-2. `vk_len` as canonical varint
-3. `vk` as exactly `vk_len` raw bytes
-4. `sig_len` as canonical varint
-5. `sig` as exactly `sig_len` raw bytes
+1. `vk` as exactly 1952 raw bytes
+2. `sig` as exactly 3309 raw bytes
 
 For a supported family layout, the interpreted layout MUST consume the entire `auth_payload`; trailing bytes are invalid.
 
