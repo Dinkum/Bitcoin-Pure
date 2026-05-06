@@ -9,9 +9,9 @@ Note - Additional, more technical specs can be found in /specs/:
 Bitcoin Pure is a minimalist, payments-only proof-of-work chain. The goal is to make a lean, cash focused version of Bitcoin that cleans up problamatic parts of the original protocol. We aim to better manifest the spirit of Bitcion, not change it. Bitcoin can scale to cheap, fast, secure, scarce, online cash for the entire world if we let it.
 
 - Scriptless UTXO model with typed outputs and typed locking payloads.
-- Default transaction family: x-only secp256k1 outputs with Schnorr authorization.
-- Optional post-quantum transaction family: PQ lock outputs with ML-DSA-65 authorization.
-- Mixed-family compatibility: x-only secp256k1 outputs and PQ lock outputs may coexist, and mixed-family transactions are valid.
+- Default transaction family: x-only secp256k1 outputs with BIP340 Schnorr authorization.
+- Optional post-quantum transaction family: ML-DSA-65 lock outputs with ML-DSA-65 authorization.
+- Mixed-family compatibility: x-only secp256k1 outputs and ML-DSA-65 lock outputs may coexist, and mixed-family transactions are valid.
 - No scripts, no smart contracts, no timelocks, no OP_RETURN.
 - 10-minute blocks, SHA256d PoW, ASERT difficulty with a 1-day half-life.
 - Dynamic block size cap with a 32 MB floor, growing slowly with real usage.
@@ -48,15 +48,16 @@ Outputs:
 - Each output:
   - type: canonical varint,
   - value: uint64 integer number of atoms,
+  - value MUST be greater than 0 atoms; zero-value outputs are consensus-invalid, including coinbase outputs.
   - payload32: 32-byte payload.
 - Initial output types:
   - OUTPUT_XONLY_P2PK = 0x00
-  - OUTPUT_PQ_LOCK32  = 0x01
+  - OUTPUT_PQ_MLDSA65_LOCK32 = 0x01
 - Interpretation:
   - if `type == OUTPUT_XONLY_P2PK`
     - `payload32` is a 32-byte x-only secp256k1 public key.
-  - if `type == OUTPUT_PQ_LOCK32`
-    - `payload32` is a 32-byte PQ lock commitment.
+  - if `type == OUTPUT_PQ_MLDSA65_LOCK32`
+    - `payload32` is a 32-byte ML-DSA-65 lock commitment.
 - Design rationale: see Appendix A.1.
 
 Inputs / spends:
@@ -87,26 +88,21 @@ Auth entries are ordered to correspond exactly to non-coinbase inputs in input o
 
 Raw transaction decoding of `Auth` is length-delimited only. Family-specific interpretation of `auth_payload` occurs when validating an input against the referenced output type.
 
-Any non-canonical varint encoding in consensus serialization is invalid. In this section, that includes `auth_len`, `alg_id`, `vk_len`, and `sig_len`.
+Any non-canonical varint encoding in consensus serialization is invalid. In this section, that includes `auth_len`.
 
 Family-specific interpretation of `auth_payload`:
 - if the referenced output type is `OUTPUT_XONLY_P2PK`
-  - `auth_payload` MUST be exactly one 64-byte Schnorr signature.
-- if the referenced output type is `OUTPUT_PQ_LOCK32`
-  - `auth_payload` MUST be parsed as PQ auth v1:
-    - `alg_id`: canonical varint,
-    - `vk_len`: canonical varint,
-    - `vk`: exactly `vk_len` raw bytes,
-    - `sig_len`: canonical varint,
-    - `sig`: exactly `sig_len` raw bytes.
+  - `auth_payload` MUST be exactly one 64-byte BIP340 Schnorr signature.
+- if the referenced output type is `OUTPUT_PQ_MLDSA65_LOCK32`
+  - `auth_payload` MUST be exactly 5261 raw bytes:
+    - `vk`: the first 1952 raw bytes,
+    - `sig`: the following 3309 raw bytes.
 
 Parser and validity rules:
 - For every supported output family, the family-specific auth parser MUST consume the entire `auth_payload`; trailing bytes render the transaction invalid.
 - Too-short auth payloads are invalid.
 - Too-long auth payloads are invalid.
-- For PQ auth v1, malformed inner length fields are invalid.
 - If the referenced output type is not a supported output type, the input is invalid.
-- Unknown PQ algorithms are invalid.
 
 
 3. Signatures and Sighash (What Is Signed)
@@ -116,25 +112,20 @@ Cryptography:
 - Default spend family:
   - curve: secp256k1,
   - public keys: 32-byte x-only,
-  - signatures: 64-byte Schnorr.
-- PQ spend family:
-  - output payload: 32-byte PQ lock commitment,
-  - auth payload: revealed PQ verification material plus PQ signature.
+  - signatures: 64-byte BIP340 Schnorr signatures.
+- ML-DSA-65 spend family:
+  - output payload: 32-byte ML-DSA-65 lock commitment,
+  - auth payload: revealed ML-DSA-65 verification key plus ML-DSA-65 signature.
 
-PQ auth v1 constants:
-- `ALG_MLDSA65 = 0x01`
+ML-DSA-65 auth restrictions:
+- `vk` MUST be interpreted as the exact raw ML-DSA-65 verification-key byte string of length 1952 bytes.
+- `sig` MUST be interpreted as the exact raw ML-DSA-65 signature byte string of length 3309 bytes.
+- `OUTPUT_PQ_MLDSA65_LOCK32` uses pure ML-DSA-65 verification with empty context.
 
-PQ auth v1 restrictions:
-- `alg_id` MUST equal `ALG_MLDSA65`.
-- `vk_len` MUST equal `1952`.
-- `sig_len` MUST equal `3309`.
-- `vk` and `sig` MUST be interpreted as the exact raw ML-DSA-65 verification-key and signature byte strings for PQ auth v1.
-
-PQ lock derivation:
-- `pq_lock32 = TaggedHash("BPU/PQLOCK/v1", canonical_alg_id_bytes || vk)`
+ML-DSA-65 lock derivation:
+- `mldsa65_lock32 = TaggedHash("BPU/PQLOCK/MLDSA65/v1", vk)`
 
 where:
-- `canonical_alg_id_bytes` is the shortest canonical varint encoding of `alg_id`,
 - `vk` is the exact verification-key byte string carried in the auth payload.
 
 Conceptual sighash:
@@ -151,6 +142,16 @@ For each input i, the family-specific authorization check is performed over a ha
 
 The spent-coin encoding is identical to the canonical output encoding used by consensus for a transaction output.
 
+The 32-byte BPU sighash digest is computed as:
+
+- `TaggedHash("BPU/<profile_id>/<chain_lineage>/SigHashV1", sighash_preimage)`
+
+where:
+
+- `profile_id` is the active chain profile identifier defined in `specs/PARAMS.md`,
+- `chain_lineage` is the replay-domain identifier defined in `specs/PARAMS.md`,
+- `sighash_preimage` is the canonical serialization of the fields listed above.
+
 In words:
 “Input i authorizes this exact set of inputs and outputs while committing to the exact typed coins being spent.”
 
@@ -159,16 +160,18 @@ Properties:
 - All inputs share the same global context, differing only by the index i.
 - Implementations may pre-hash shared components for efficiency; in particular, the shared prevout list, output list, and spent-coin list may be hashed once per transaction and reused across all inputs.
 - The output type tag is part of the committed output encoding and part of the committed spent-coin encoding.
+- `chain_lineage` is not a software version and changes only when a chain intentionally enters a new replay domain after a persistent split.
 
 Validation semantics:
 - If the referenced output type is `OUTPUT_XONLY_P2PK`:
-  - `auth_payload` MUST be exactly one 64-byte Schnorr signature,
-  - the signature is verified against `payload32` interpreted as an x-only secp256k1 public key and the sighash message defined above.
-- If the referenced output type is `OUTPUT_PQ_LOCK32`:
-  - `auth_payload` MUST be valid PQ auth v1,
-  - `alg_id` MUST equal `ALG_MLDSA65`,
-  - `TaggedHash("BPU/PQLOCK/v1", canonical_alg_id_bytes || vk)` MUST equal the referenced output `payload32`,
-  - the PQ signature MUST verify over the same BPU sighash message.
+  - `auth_payload` MUST be exactly one 64-byte BIP340 Schnorr signature,
+  - `payload32` MUST be interpreted as a BIP340 x-only secp256k1 public key,
+  - the signature MUST verify using the BIP340 verification algorithm over the exact 32-byte BPU sighash digest defined above.
+- If the referenced output type is `OUTPUT_PQ_MLDSA65_LOCK32`:
+  - `auth_payload` MUST be exactly 5261 raw bytes parsed as `vk || sig`,
+  - `TaggedHash("BPU/PQLOCK/MLDSA65/v1", vk)` MUST equal the referenced output `payload32`,
+  - `vk` and `sig` MUST be interpreted under pure ML-DSA-65 with empty context,
+  - the PQ signature MUST verify using the ML-DSA-65 verification algorithm over the exact 32-byte BPU sighash digest defined above.
 
 
 ### txid vs Auth (Malleability & Commitment)
@@ -245,7 +248,12 @@ Proof-of-Work:
 - PoW hash = SHA256(SHA256(serialized header)).
 - PoW hash must be ≤ target derived from nBits.
 - Miners vary `header.nonce` first.
-- After exhausting the `header.nonce` space for a candidate block, miners MAY vary the coinbase transaction's fixed-width `coinbase_extra_nonce`, recompute the dependent `tx_root`, and continue hashing.
+- After exhausting the `header.nonce` space for a candidate block, miners MAY vary the coinbase transaction's fixed-width `coinbase_extra_nonce`.
+- Because `coinbase_extra_nonce` is part of the coinbase `txid`, changing it changes the coinbase outpoints created by the candidate block.
+- Therefore miners MUST recompute all dependent commitments before continuing PoW:
+  - `tx_root`, and
+  - `utxo_root`.
+- `auth_root` is unchanged unless transaction auth data changes.
 - No other miner-controlled arbitrary coinbase payload exists in consensus encoding.
 
 
@@ -332,8 +340,8 @@ Approximate behavior:
 - …
 - ~10 halvings (~480 years): ≈ 0.9765625 BPU/block (~1 BPU/block).
 - ~20 halvings (~950 years): ≈ 0.00095367431 BPU/block.
-- Subsidy reaches 0 atoms after 47 halvings (~2235 years), then fee-only forever.
-- Subsidy never reaches 0; after the main schedule falls below 1 atom, issuance continues at a permanent floor of 1 atom per block forever.
+- The main halving schedule falls below 1 atom after roughly 47 halvings (~2235 years).
+- Because `subsidy_atoms(h) = max(1, main_subsidy_atoms(h))`, subsidy never reaches 0 and instead remains fixed at 1 atom per block forever.
 - At 1 atom per block, annual tail issuance is ~52,560 atoms/year = 0.00005256 BPU/year.
 
 Coinbase constraint:
@@ -414,7 +422,7 @@ Meaning:
     - payload32.
   - Initial interpretations of the committed coin payload are:
     - `(OUTPUT_XONLY_P2PK, value, xonly_pubkey32)`
-    - `(OUTPUT_PQ_LOCK32, value, pq_lock32)`
+    - `(OUTPUT_PQ_MLDSA65_LOCK32, value, mldsa65_lock32)`
   - The outpoint-keyed live UTXO map remains unchanged; only the committed coin payload changes.
   - Internal nodes commit to child hashes using fixed tagged hashing.
   - Empty branches, path compression rules, key encoding, leaf encoding,
@@ -503,8 +511,8 @@ Addresses:
   - CashAddr checksum committed to the human-readable prefix.
 - Initial address families:
   - `OUTPUT_XONLY_P2PK` with `payload32 = xonly_pubkey32`,
-  - `OUTPUT_PQ_LOCK32` with `payload32 = pq_lock32`.
-- PQ addresses encode the 32-byte lock commitment, not the raw PQ verification key.
+  - `OUTPUT_PQ_MLDSA65_LOCK32` with `payload32 = mldsa65_lock32`.
+- ML-DSA-65 addresses encode the 32-byte lock commitment, not the raw ML-DSA-65 verification key.
 
 P2P / relay architecture:
 - Transport encryption is not required by spec; nodes MAY use plaintext transport by default.
@@ -579,7 +587,7 @@ Transaction relay:
 - Transaction relay mode is non-consensus.
 
 Batch Schnorr verification:
-- Nodes SHOULD use BIP340-style batch Schnorr verification as a local validation accelerator when many signatures are checked together.
+- Nodes SHOULD use batch verification of BIP340 Schnorr signatures as a local validation accelerator when many signatures are checked together.
 - Batch verification is non-consensus only and MUST NOT change transaction or block validity.
 - If a probabilistic batch verifier is used, implementations SHOULD fall back to exact per-signature verification before treating a batch failure as final.
 
@@ -689,11 +697,11 @@ Validation requirement:
 12. Wallet Behavior 
 ---------------------------------
 - Generate a fresh address (key) per receive; use HD derivation for UX.
-- Support typed address generation for both the default x-only secp256k1 family and the PQ lock family.
+- Support typed address generation for both the default x-only secp256k1 family and the ML-DSA-65 lock family.
 - Display balances in BPU with decimals; store and transmit values as atoms.
 - Fee estimation:
   - Use recent block fullness and mempool pressure.
-  - Account for materially larger PQ auth sizes when estimating transaction size and fees.
+  - Account for materially larger ML-DSA-65 auth sizes when estimating transaction size and fees.
 - Use CPFP for fee-bumping stuck txs.
 - Wallets SHOULD support mixed-family transactions when both output families are in use.
 - Multi-party custody MAY be implemented off-chain via key/signature aggregation, but consensus remains unchanged: each input presents exactly one auth object and spends exactly one typed output.
@@ -719,7 +727,7 @@ Meaning:
   previously controlled by that watch item.
 - Initial watch-item interpretations are:
   - `(OUTPUT_XONLY_P2PK, xonly_pubkey32)` for the default x-only secp256k1 family,
-  - `(OUTPUT_PQ_LOCK32, pq_lock32)` for the PQ lock family.
+  - `(OUTPUT_PQ_MLDSA65_LOCK32, mldsa65_lock32)` for the ML-DSA-65 lock family.
 - This is the typed-output scriptless analogue of script-based compact block filters.
 
 Lite clients:
@@ -858,13 +866,13 @@ A.1 Output Locking Design
 
 BPU uses two output-locking forms:
 - direct 32-byte x-only public keys for the x-only spend family,
-- 32-byte PQ lock commitments for the PQ spend family.
+- 32-byte ML-DSA-65 lock commitments for the ML-DSA-65 spend family.
 
 Reasoning:
 - Direct x-only public-key outputs remove the need to carry a 32-byte public key again in every x-only-family spend.
 - The result is smaller x-only-family inputs and better cash efficiency.
 - Hashed public-key outputs offer only a partial hedge against long-exposure quantum risk.
-- PQ outputs use 32-byte lock commitments derived from PQ verification material rather than storing raw PQ verification keys directly in outputs.
+- ML-DSA-65 outputs use 32-byte lock commitments derived from ML-DSA-65 verification material rather than storing raw ML-DSA-65 verification keys directly in outputs.
 - This keeps outputs, addresses, committed coin payloads, and lite-client watch items compact across both transaction families.
-- Larger PQ verification material is carried at spend time in `Auth` rather than being permanently stored in every PQ output and live UTXO entry.
-- This preserves efficient x-only-family transactions while providing a scriptless PQ transaction family.
+- Larger ML-DSA-65 verification material is carried at spend time in `Auth` rather than being permanently stored in every ML-DSA-65 output and live UTXO entry.
+- This preserves efficient x-only-family transactions while providing a scriptless ML-DSA-65 transaction family.

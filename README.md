@@ -16,7 +16,7 @@ Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to pre
 
 ## Post-Quantum Direction
 
-Bitcoin Pure no longer treats post-quantum safety as a distant problem. Recent public moves by Google and Cloudflare, including 2029 migration targets and an explicit focus on authentication and signatures, reinforce that long-lived signature systems need a transition plan now, not later.
+Bitcoin Pure no longer treats post-quantum resistance as a distant problem. Recent public moves by Google and Cloudflare, including 2029 migration targets and an explicit focus on authentication and signatures, reinforce that long-lived signature systems need a transition plan now, not later.
 
 See:
 - [Google: Quantum frontiers may be closer than they appear](https://blog.google/innovation-and-ai/technology/safety-security/cryptography-migration-timeline/)

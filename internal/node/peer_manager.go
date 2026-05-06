@@ -516,19 +516,23 @@ func (m *peerManager) peerWriteLoop(peer *peerConn) {
 	for {
 		// Drain in strict priority order with bounded bursts so tx fanout cannot
 		// indefinitely starve control traffic or block-relay announcements.
-		if drained, stop := m.drainPeerQueue(peer, peer.controlQ, controlQueueBurstLimit); stop {
+		drained := 0
+		if n, stop := m.drainPeerQueue(peer, peer.controlQ, controlQueueBurstLimit); stop {
 			return
-		} else if drained > 0 {
-			continue
+		} else {
+			drained += n
 		}
-		if drained, stop := m.drainPeerQueue(peer, peer.relayPriorityQ, priorityQueueBurstLimit); stop {
+		if n, stop := m.drainPeerQueue(peer, peer.relayPriorityQ, priorityQueueBurstLimit); stop {
 			return
-		} else if drained > 0 {
-			continue
+		} else {
+			drained += n
 		}
-		if drained, stop := m.drainPeerQueue(peer, peer.sendQ, sendQueueBurstLimit); stop {
+		if n, stop := m.drainPeerQueue(peer, peer.sendQ, sendQueueBurstLimit); stop {
 			return
-		} else if drained > 0 {
+		} else {
+			drained += n
+		}
+		if drained > 0 {
 			continue
 		}
 		if !m.waitAndWriteNextPeerEnvelope(peer) {

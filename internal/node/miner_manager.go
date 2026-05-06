@@ -92,6 +92,15 @@ func (m *minerManager) BuildBlockTemplate() (types.Block, error) {
 	return block, err
 }
 
+func (m *minerManager) BuildBenchmarkBlockTemplate(maxTxs int) (types.Block, error) {
+	snapshot, err := m.chainSelectionSnapshot()
+	if err != nil {
+		return types.Block{}, err
+	}
+	block, _, _, _, _, _, _, _, _, _, err := m.buildBlockCandidate(snapshot, maxTxs)
+	return block, err
+}
+
 func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, error) {
 	startedAt := time.Now()
 	if m.svc.cfg.MinerPubKey == ([32]byte{}) {
@@ -112,7 +121,7 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 			slog.Int("txs", len(cached.Txs)),
 			slog.Duration("template_duration", time.Since(startedAt)),
 		)
-		return cloneBlock(cached), generation, nil
+		return cached, generation, nil
 	}
 	if block, generation, ok, err := m.extendBlockTemplate(ctx, mempoolEpoch); err != nil {
 		return types.Block{}, 0, err
@@ -127,13 +136,13 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 			slog.Int("txs", len(block.Txs)),
 			slog.Duration("template_duration", time.Since(startedAt)),
 		)
-		return cloneBlock(block), generation, nil
+		return block, generation, nil
 	}
 	snapshot, err := m.chainSelectionSnapshot()
 	if err != nil {
 		return types.Block{}, 0, err
 	}
-	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot)
+	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot, 0)
 	if err != nil {
 		return types.Block{}, 0, err
 	}
@@ -148,7 +157,7 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 		slog.Int("txs", len(block.Txs)),
 		slog.Duration("template_duration", time.Since(startedAt)),
 	)
-	return cloneBlock(block), generation, nil
+	return block, generation, nil
 }
 
 func (m *minerManager) minerLoop(workerID int) {
@@ -205,7 +214,7 @@ func (m *minerManager) mineOneBlock() ([32]byte, error) {
 	}
 }
 
-func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (types.Block, []mempool.SnapshotEntry, []types.Transaction, [][32]byte, [][32]byte, uint64, int, consensus.UtxoLookup, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
+func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxTxs int) (types.Block, []mempool.SnapshotEntry, []types.Transaction, [][32]byte, [][32]byte, uint64, int, consensus.UtxoLookup, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
 	startedAt := time.Now()
 	baseLookup := snapshot.utxoLookup
 	maxTemplateBytes := int(consensus.NextBlockSizeLimit(snapshot.blockSizeState, consensus.ParamsForProfile(m.svc.cfg.Profile)))
@@ -213,7 +222,7 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot) (typ
 		maxTemplateBytes -= 1024
 	}
 	selectStartedAt := time.Now()
-	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlayWithLookup(baseLookup, consensus.DefaultConsensusRules(), maxTemplateBytes)
+	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlayWithLookupLimit(baseLookup, consensus.DefaultConsensusRules(), maxTemplateBytes, maxTxs)
 	m.svc.perf.noteTemplateSelectDuration(time.Since(selectStartedAt))
 	selectedTxs, selectedTxIDs, selectedAuthIDs, usedTxBytes := buildSelectedTemplateVectors(selectedEntries)
 	selectedSpends, selectedLeaves := selectedEntryAccumulatorDeltas(selectedEntries)

@@ -325,6 +325,149 @@ func TestFastSyncStateRoundtripAndClear(t *testing.T) {
 	}
 }
 
+func TestMempoolStateRoundtripAndClear(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	tx := testCoinbase(0, []types.TxOutput{{ValueAtoms: 50, PubKey: [32]byte{7}}})
+	state := &StoredMempoolState{
+		Version:   1,
+		Profile:   types.Regtest,
+		TipHeight: 3,
+		TipHash:   [32]byte{9},
+		Entries: []StoredMempoolEntry{{
+			Tx:      tx.Encode(),
+			Summary: consensus.TxValidationSummary{Fee: 11},
+			AddedAt: 4,
+		}},
+		Orphans: []StoredMempoolEntry{{
+			Tx:      tx.Encode(),
+			AddedAt: 5,
+			Missing: []types.OutPoint{{TxID: [32]byte{8}, Vout: 1}},
+		}},
+	}
+	if err := store.WriteMempoolState(state); err != nil {
+		t.Fatalf("WriteMempoolState: %v", err)
+	}
+
+	loaded, err := store.LoadMempoolState()
+	if err != nil {
+		t.Fatalf("LoadMempoolState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected persisted mempool state")
+	}
+	if loaded.Version != 2 || loaded.Profile != state.Profile || loaded.TipHeight != state.TipHeight || loaded.TipHash != state.TipHash {
+		t.Fatalf("loaded mempool meta = %+v, want %+v", loaded, state)
+	}
+	if len(loaded.Entries) != 1 || len(loaded.Orphans) != 1 {
+		t.Fatalf("loaded entries/orphans = %d/%d, want 1/1", len(loaded.Entries), len(loaded.Orphans))
+	}
+	if string(loaded.Entries[0].Tx) != string(state.Entries[0].Tx) || loaded.Entries[0].Summary != state.Entries[0].Summary {
+		t.Fatalf("loaded entry = %+v, want %+v", loaded.Entries[0], state.Entries[0])
+	}
+	if len(loaded.Orphans[0].Missing) != 1 || loaded.Orphans[0].Missing[0] != state.Orphans[0].Missing[0] {
+		t.Fatalf("loaded orphan missing = %+v, want %+v", loaded.Orphans[0].Missing, state.Orphans[0].Missing)
+	}
+	if err := store.ClearMempoolState(); err != nil {
+		t.Fatalf("ClearMempoolState: %v", err)
+	}
+	loaded, err = store.LoadMempoolState()
+	if err != nil {
+		t.Fatalf("LoadMempoolState after clear: %v", err)
+	}
+	if loaded != nil {
+		t.Fatalf("expected cleared mempool state, got %+v", loaded)
+	}
+}
+
+func TestApplyMempoolStateDeltaRoundtrip(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	txA := testCoinbase(0, []types.TxOutput{{ValueAtoms: 11, PubKey: [32]byte{1}}})
+	txB := testCoinbase(1, []types.TxOutput{{ValueAtoms: 12, PubKey: [32]byte{2}}})
+	txC := testCoinbase(2, []types.TxOutput{{ValueAtoms: 13, PubKey: [32]byte{3}}})
+	txAID := consensus.TxID(&txA)
+	txBID := consensus.TxID(&txB)
+	txCID := consensus.TxID(&txC)
+
+	first := StoredMempoolStateDelta{
+		Meta: StoredMempoolStateMeta{
+			Version:   2,
+			Profile:   types.Regtest,
+			TipHeight: 7,
+			TipHash:   [32]byte{7},
+		},
+		EntryUpserts: []StoredMempoolDeltaEntry{{
+			TxID: txAID,
+			Entry: StoredMempoolEntry{
+				Tx:      txA.Encode(),
+				Summary: consensus.TxValidationSummary{Fee: 3},
+				AddedAt: 10,
+			},
+		}},
+		OrphanUpserts: []StoredMempoolDeltaEntry{{
+			TxID: txBID,
+			Entry: StoredMempoolEntry{
+				Tx:      txB.Encode(),
+				AddedAt: 11,
+				Missing: []types.OutPoint{{TxID: [32]byte{9}, Vout: 1}},
+			},
+		}},
+	}
+	if err := store.ApplyMempoolStateDelta(first); err != nil {
+		t.Fatalf("ApplyMempoolStateDelta first: %v", err)
+	}
+
+	second := StoredMempoolStateDelta{
+		Meta: StoredMempoolStateMeta{
+			Version:   2,
+			Profile:   types.Regtest,
+			TipHeight: 8,
+			TipHash:   [32]byte{8},
+		},
+		EntryDeletes: [][32]byte{txAID},
+		EntryUpserts: []StoredMempoolDeltaEntry{{
+			TxID: txCID,
+			Entry: StoredMempoolEntry{
+				Tx:      txC.Encode(),
+				Summary: consensus.TxValidationSummary{Fee: 4},
+				AddedAt: 12,
+			},
+		}},
+		OrphanDeletes: [][32]byte{txBID},
+	}
+	if err := store.ApplyMempoolStateDelta(second); err != nil {
+		t.Fatalf("ApplyMempoolStateDelta second: %v", err)
+	}
+
+	loaded, err := store.LoadMempoolState()
+	if err != nil {
+		t.Fatalf("LoadMempoolState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected persisted mempool state")
+	}
+	if loaded.Version != 2 || loaded.TipHeight != 8 || loaded.TipHash != ([32]byte{8}) {
+		t.Fatalf("loaded meta = %+v, want version 2 height 8 tip 08", loaded)
+	}
+	if len(loaded.Entries) != 1 || len(loaded.Orphans) != 0 {
+		t.Fatalf("loaded entries/orphans = %d/%d, want 1/0", len(loaded.Entries), len(loaded.Orphans))
+	}
+	if string(loaded.Entries[0].Tx) != string(txC.Encode()) || loaded.Entries[0].Summary.Fee != 4 || loaded.Entries[0].AddedAt != 12 {
+		t.Fatalf("loaded entry = %+v, want txC fee 4 added_at 12", loaded.Entries[0])
+	}
+}
+
 func TestLocalityIndexTracksAppendAndRewrite(t *testing.T) {
 	path := t.TempDir()
 	store, err := Open(path)

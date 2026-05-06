@@ -51,6 +51,41 @@ func TestTransactionRoundtrip(t *testing.T) {
 	}
 }
 
+func TestEncodedLenMatchesCanonicalEncoding(t *testing.T) {
+	coinbase := Transaction{
+		Base: TxBase{
+			Version:            1,
+			CoinbaseHeight:     testCoinbaseHeight(253),
+			CoinbaseExtraNonce: testCoinbaseExtraNonce(3),
+			Outputs: []TxOutput{{
+				ValueAtoms: 50,
+				PubKey:     [32]byte{5},
+			}},
+		},
+	}
+	tx := sampleTx()
+	pqTx := sampleTx()
+	pqTx.Base.Outputs = []TxOutput{{
+		Type:       OutputPQLock32,
+		ValueAtoms: 7,
+		Payload32:  [32]byte{8},
+	}}
+	pqTx.Auth.Entries = []TxAuthEntry{{AuthPayload: bytes.Repeat([]byte{9}, 128)}}
+	block := Block{
+		Header: BlockHeader{Version: 1},
+		Txs:    []Transaction{coinbase, tx, pqTx},
+	}
+	cases := []Transaction{coinbase, tx, pqTx}
+	for i, item := range cases {
+		if got, want := item.EncodedLen(), len(item.Encode()); got != want {
+			t.Fatalf("tx %d encoded len = %d, want %d", i, got, want)
+		}
+	}
+	if got, want := block.EncodedLen(), len(block.Encode()); got != want {
+		t.Fatalf("block encoded len = %d, want %d", got, want)
+	}
+}
+
 func TestBlockRoundtrip(t *testing.T) {
 	block := Block{
 		Header: BlockHeader{

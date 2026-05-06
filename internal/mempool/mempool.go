@@ -25,6 +25,16 @@ var (
 	ErrTooManyDescendants = errors.New("transaction exceeds mempool descendant limit")
 )
 
+var selectionScratchPool = sync.Pool{
+	New: func() any {
+		return &selectionScratch{
+			included:          make(map[[32]byte]struct{}),
+			claimed:           make(map[types.OutPoint]struct{}),
+			seenPackageClaims: make(map[types.OutPoint]struct{}),
+		}
+	},
+}
+
 type PoolConfig struct {
 	MinRelayFeePerByte uint64
 	MaxTxSize          int
@@ -98,9 +108,16 @@ type SnapshotEntry struct {
 type AcceptedTx struct {
 	Tx      types.Transaction
 	TxID    [32]byte
+	AuthID  [32]byte
 	Summary consensus.TxValidationSummary
 	Fee     uint64
 	Size    int
+}
+
+type RejectedTx struct {
+	Tx   types.Transaction
+	TxID [32]byte
+	Err  error
 }
 
 type AdmissionSnapshot struct {
@@ -148,6 +165,25 @@ type Stats struct {
 	MedianFee uint64
 	LowFee    uint64
 	HighFee   uint64
+}
+
+// PersistedEntry is the restart-only subset needed to rebuild package state
+// without paying full validation cost when the persisted tip still matches the
+// committed chain tip.
+type PersistedEntry struct {
+	TxID    [32]byte
+	AuthID  [32]byte
+	Tx      types.Transaction
+	Summary consensus.TxValidationSummary
+	AddedAt uint64
+}
+
+type PersistedOrphan struct {
+	TxID    [32]byte
+	AuthID  [32]byte
+	Tx      types.Transaction
+	AddedAt uint64
+	Missing []types.OutPoint
 }
 
 type Pool struct {
@@ -221,6 +257,67 @@ type selectionCache struct {
 	epoch    uint64
 	frontier candidateHeap
 	snapshot *selectionSnapshot
+}
+
+// selectionScratch reuses the transient working sets needed while walking the
+// cached package frontier. The selection algorithm revisits many candidates per
+// block build, so pooling these buffers removes a large amount of short-lived
+// map and slice churn without changing ordering or policy behavior.
+type selectionScratch struct {
+	filtered              []SnapshotEntry
+	queue                 []int
+	queued                []bool
+	completed             []bool
+	included              map[[32]byte]struct{}
+	claimed               map[types.OutPoint]struct{}
+	seenPackageClaims     map[types.OutPoint]struct{}
+	seenPackageClaimOrder []types.OutPoint
+}
+
+func borrowSelectionScratch() *selectionScratch {
+	scratch := selectionScratchPool.Get().(*selectionScratch)
+	clear(scratch.included)
+	clear(scratch.claimed)
+	scratch.filtered = scratch.filtered[:0]
+	scratch.queue = scratch.queue[:0]
+	scratch.seenPackageClaimOrder = scratch.seenPackageClaimOrder[:0]
+	return scratch
+}
+
+func releaseSelectionScratch(scratch *selectionScratch) {
+	if scratch == nil {
+		return
+	}
+	scratch.resetSeenPackageClaims()
+	clear(scratch.included)
+	clear(scratch.claimed)
+	scratch.filtered = scratch.filtered[:0]
+	scratch.queue = scratch.queue[:0]
+	selectionScratchPool.Put(scratch)
+}
+
+func (s *selectionScratch) prepareWakeState(candidateCount int) ([]bool, []bool, []int) {
+	if cap(s.queued) < candidateCount {
+		s.queued = make([]bool, candidateCount)
+	} else {
+		s.queued = s.queued[:candidateCount]
+		clear(s.queued)
+	}
+	if cap(s.completed) < candidateCount {
+		s.completed = make([]bool, candidateCount)
+	} else {
+		s.completed = s.completed[:candidateCount]
+		clear(s.completed)
+	}
+	s.queue = s.queue[:0]
+	return s.queued, s.completed, s.queue
+}
+
+func (s *selectionScratch) resetSeenPackageClaims() {
+	for _, spent := range s.seenPackageClaimOrder {
+		delete(s.seenPackageClaims, spent)
+	}
+	s.seenPackageClaimOrder = s.seenPackageClaimOrder[:0]
 }
 
 // candidateHeap keeps the package frontier incrementally ordered without
@@ -354,6 +451,141 @@ func (p *Pool) SnapshotShared() []SnapshotEntry {
 		p.snapshot = p.snapshotLocked()
 	}
 	return p.snapshot
+}
+
+func (p *Pool) PersistedEntries() []PersistedEntry {
+	snapshot := p.SnapshotShared()
+	if len(snapshot) == 0 {
+		return nil
+	}
+	out := make([]PersistedEntry, 0, len(snapshot))
+	for _, entry := range snapshot {
+		out = append(out, PersistedEntry{
+			TxID:    entry.TxID,
+			AuthID:  entry.AuthID,
+			Tx:      entry.Tx,
+			Summary: entry.Summary,
+			AddedAt: entry.AddedAt,
+		})
+	}
+	return out
+}
+
+func (p *Pool) PersistedOrphans() []PersistedOrphan {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.orphans) == 0 {
+		return nil
+	}
+	out := make([]PersistedOrphan, 0, len(p.orphans))
+	for _, orphan := range p.orphans {
+		out = append(out, PersistedOrphan{
+			TxID:    orphan.TxID,
+			AuthID:  consensus.AuthID(&orphan.Tx),
+			Tx:      orphan.Tx,
+			AddedAt: orphan.AddedAt,
+			Missing: outPointSetKeys(orphan.Missing),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AddedAt != out[j].AddedAt {
+			return out[i].AddedAt < out[j].AddedAt
+		}
+		left := consensus.TxID(&out[i].Tx)
+		right := consensus.TxID(&out[j].Tx)
+		return bytes.Compare(left[:], right[:]) < 0
+	})
+	return out
+}
+
+func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []PersistedOrphan) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.entries) != 0 || len(p.orphans) != 0 {
+		return errors.New("mempool restore requires an empty pool")
+	}
+	p.sequence = 0
+	p.epoch = 0
+	p.selection = nil
+	p.snapshot = nil
+	p.topByFee = nil
+	p.topDirty = true
+	p.stats = poolStats{feeCounts: make(map[uint64]int)}
+	p.cachedStats = Stats{}
+	p.statsDirty = true
+	p.entries = make(map[[32]byte]*Entry, len(entries))
+	p.spent = make(map[types.OutPoint][32]byte)
+	p.orphans = make(map[[32]byte]*orphanEntry, len(orphans))
+	p.orphanDeps = make(map[types.OutPoint][][32]byte)
+
+	sortedEntries := append([]PersistedEntry(nil), entries...)
+	sort.Slice(sortedEntries, func(i, j int) bool {
+		if sortedEntries[i].AddedAt != sortedEntries[j].AddedAt {
+			return sortedEntries[i].AddedAt < sortedEntries[j].AddedAt
+		}
+		left := consensus.TxID(&sortedEntries[i].Tx)
+		right := consensus.TxID(&sortedEntries[j].Tx)
+		return bytes.Compare(left[:], right[:]) < 0
+	})
+	for _, persisted := range sortedEntries {
+		txid := consensus.TxID(&persisted.Tx)
+		size := persisted.Tx.EncodedLen()
+		entry := &Entry{
+			Tx:             persisted.Tx,
+			TxID:           txid,
+			AuthID:         consensus.AuthID(&persisted.Tx),
+			Summary:        persisted.Summary,
+			SpentOutPoints: spentOutPointsForInputs(persisted.Tx.Base.Inputs),
+			CreatedLeaves:  createdLeavesForOutputs(txid, persisted.Tx.Base.Outputs),
+			Fee:            persisted.Summary.Fee,
+			Size:           size,
+			AddedAt:        persisted.AddedAt,
+			Parents:        make(map[[32]byte]struct{}),
+			Children:       make(map[[32]byte]struct{}),
+		}
+		p.entries[txid] = entry
+		p.noteEntryAddedLocked(entry)
+		if entry.AddedAt > p.sequence {
+			p.sequence = entry.AddedAt
+		}
+	}
+
+	sortedOrphans := append([]PersistedOrphan(nil), orphans...)
+	sort.Slice(sortedOrphans, func(i, j int) bool {
+		if sortedOrphans[i].AddedAt != sortedOrphans[j].AddedAt {
+			return sortedOrphans[i].AddedAt < sortedOrphans[j].AddedAt
+		}
+		left := consensus.TxID(&sortedOrphans[i].Tx)
+		right := consensus.TxID(&sortedOrphans[j].Tx)
+		return bytes.Compare(left[:], right[:]) < 0
+	})
+	for _, persisted := range sortedOrphans {
+		txid := consensus.TxID(&persisted.Tx)
+		missing := make(map[types.OutPoint]struct{}, len(persisted.Missing))
+		for _, outPoint := range persisted.Missing {
+			missing[outPoint] = struct{}{}
+		}
+		p.orphans[txid] = &orphanEntry{
+			Tx:           persisted.Tx,
+			TxID:         txid,
+			Size:         persisted.Tx.EncodedLen(),
+			AddedAt:      persisted.AddedAt,
+			Missing:      missing,
+			MissingCount: len(missing),
+		}
+		for _, outPoint := range persisted.Missing {
+			p.orphanDeps[outPoint] = append(p.orphanDeps[outPoint], txid)
+		}
+		if persisted.AddedAt > p.sequence {
+			p.sequence = persisted.AddedAt
+		}
+	}
+	p.reindex()
+	p.topByFee = nil
+	p.topDirty = true
+	p.snapshot = nil
+	p.statsDirty = true
+	return nil
 }
 
 func (p *Pool) Stats() Stats {
@@ -513,18 +745,34 @@ func (v SharedAdmissionView) Release() {
 }
 
 func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.PrepareAdmissionWithLookup(tx, snapshot, consensus.LookupFromSet(chainUtxos), rules)
+	return p.PrepareAdmissionWithParams(tx, snapshot, chainUtxos, consensus.MainnetParams(), rules)
 }
 
 func (p *Pool) PrepareAdmissionWithLookup(tx types.Transaction, snapshot AdmissionSnapshot, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.prepareAdmission(tx, snapshot.Epoch, snapshot.Entries, snapshot.Spent, snapshot.Orphans, chainLookup, rules)
+	return p.PrepareAdmissionWithLookupAndParams(tx, snapshot, chainLookup, consensus.MainnetParams(), rules)
+}
+
+func (p *Pool) PrepareAdmissionWithParams(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.PrepareAdmissionWithLookupAndParams(tx, snapshot, consensus.LookupFromSet(chainUtxos), params, rules)
+}
+
+func (p *Pool) PrepareAdmissionWithLookupAndParams(tx types.Transaction, snapshot AdmissionSnapshot, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.prepareAdmission(tx, snapshot.Epoch, snapshot.Entries, snapshot.Spent, snapshot.Orphans, chainLookup, params, rules)
 }
 
 func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmissionView, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.PrepareAdmissionSharedWithLookup(tx, view, consensus.LookupFromSet(chainUtxos), rules)
+	return p.PrepareAdmissionSharedWithParams(tx, view, chainUtxos, consensus.MainnetParams(), rules)
 }
 
 func (p *Pool) PrepareAdmissionSharedWithLookup(tx types.Transaction, view SharedAdmissionView, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.PrepareAdmissionSharedWithLookupAndParams(tx, view, chainLookup, consensus.MainnetParams(), rules)
+}
+
+func (p *Pool) PrepareAdmissionSharedWithParams(tx types.Transaction, view SharedAdmissionView, chainUtxos consensus.UtxoSet, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+	return p.PrepareAdmissionSharedWithLookupAndParams(tx, view, consensus.LookupFromSet(chainUtxos), params, rules)
+}
+
+func (p *Pool) PrepareAdmissionSharedWithLookupAndParams(tx types.Transaction, view SharedAdmissionView, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	if view.pool != p {
 		return PreparedAdmission{}, errors.New("shared admission view belongs to different mempool")
 	}
@@ -539,7 +787,7 @@ func (p *Pool) PrepareAdmissionSharedWithLookup(tx types.Transaction, view Share
 		return PreparedAdmission{}, ErrCoinbaseTx
 	}
 
-	size := len(tx.Encode())
+	size := tx.EncodedLen()
 	if p.cfg.MaxTxSize > 0 && size > p.cfg.MaxTxSize {
 		return PreparedAdmission{}, ErrTxTooLarge
 	}
@@ -561,11 +809,11 @@ func (p *Pool) PrepareAdmissionSharedWithLookup(tx types.Transaction, view Share
 		return prepared, nil
 	}
 
-	txValidation, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(liveView), rules)
+	txValidation, err := consensus.PrepareTxValidationWithLookupAndParams(&tx, consensus.LookupFromSet(liveView), params, rules)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
-	summary, err := consensus.ValidatePreparedTx(txValidation)
+	summary, err := consensus.ValidatePreparedTxBatchOptimized(txValidation)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -591,7 +839,7 @@ func (p *Pool) PrepareAdmissionSharedWithLookup(tx types.Transaction, view Share
 	return prepared, nil
 }
 
-func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte, orphans map[[32]byte]struct{}, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
+func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte, orphans map[[32]byte]struct{}, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	txid := consensus.TxID(&tx)
 	if _, ok := entries[txid]; ok {
 		return PreparedAdmission{}, ErrTxAlreadyExists
@@ -603,7 +851,7 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 		return PreparedAdmission{}, ErrCoinbaseTx
 	}
 
-	size := len(tx.Encode())
+	size := tx.EncodedLen()
 	if p.cfg.MaxTxSize > 0 && size > p.cfg.MaxTxSize {
 		return PreparedAdmission{}, ErrTxTooLarge
 	}
@@ -625,11 +873,11 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 		return prepared, nil
 	}
 
-	txValidation, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(view), rules)
+	txValidation, err := consensus.PrepareTxValidationWithLookupAndParams(&tx, consensus.LookupFromSet(view), params, rules)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
-	summary, err := consensus.ValidatePreparedTx(txValidation)
+	summary, err := consensus.ValidatePreparedTxBatchOptimized(txValidation)
 	if err != nil {
 		return PreparedAdmission{}, err
 	}
@@ -656,10 +904,18 @@ func (p *Pool) prepareAdmission(tx types.Transaction, epoch uint64, entries map[
 }
 
 func (p *Pool) CommitPrepared(prepared PreparedAdmission, chainUtxos consensus.UtxoSet, chainTipHash [32]byte, rules consensus.ConsensusRules) (Admission, error) {
-	return p.CommitPreparedWithLookup(prepared, consensus.LookupFromSet(chainUtxos), chainTipHash, rules)
+	return p.CommitPreparedWithParams(prepared, chainUtxos, chainTipHash, consensus.MainnetParams(), rules)
 }
 
 func (p *Pool) CommitPreparedWithLookup(prepared PreparedAdmission, chainLookup consensus.UtxoLookup, chainTipHash [32]byte, rules consensus.ConsensusRules) (Admission, error) {
+	return p.CommitPreparedWithLookupAndParams(prepared, chainLookup, chainTipHash, consensus.MainnetParams(), rules)
+}
+
+func (p *Pool) CommitPreparedWithParams(prepared PreparedAdmission, chainUtxos consensus.UtxoSet, chainTipHash [32]byte, params consensus.ChainParams, rules consensus.ConsensusRules) (Admission, error) {
+	return p.CommitPreparedWithLookupAndParams(prepared, consensus.LookupFromSet(chainUtxos), chainTipHash, params, rules)
+}
+
+func (p *Pool) CommitPreparedWithLookupAndParams(prepared PreparedAdmission, chainLookup consensus.UtxoLookup, chainTipHash [32]byte, params consensus.ChainParams, rules consensus.ConsensusRules) (Admission, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.entries[prepared.TxID]; ok {
@@ -690,7 +946,8 @@ func (p *Pool) CommitPreparedWithLookup(prepared PreparedAdmission, chainLookup 
 			Summary:  accepted.Summary,
 			Accepted: []AcceptedTx{accepted},
 		}
-		admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainLookup, rules)...)
+		promoted, _ := p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainLookup, params, rules)
+		admission.Accepted = append(admission.Accepted, promoted...)
 		p.bumpEpochLocked()
 		return admission, nil
 	}
@@ -705,7 +962,7 @@ func (p *Pool) CommitPreparedWithLookup(prepared PreparedAdmission, chainLookup 
 		return Admission{TxID: prepared.TxID, Orphaned: true, EvictedOrphans: evicted}, nil
 	}
 
-	accepted, err := p.insertPreparedLocked(prepared, view, parents, rules)
+	accepted, err := p.insertPreparedLocked(prepared, view, parents, params, rules)
 	if err != nil {
 		return Admission{}, err
 	}
@@ -714,16 +971,25 @@ func (p *Pool) CommitPreparedWithLookup(prepared PreparedAdmission, chainLookup 
 		Summary:  accepted.Summary,
 		Accepted: []AcceptedTx{accepted},
 	}
-	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainLookup, rules)...)
+	promoted, _ := p.promoteReadyOrphans(outputsForTx(prepared.TxID, prepared.Tx), chainLookup, params, rules)
+	admission.Accepted = append(admission.Accepted, promoted...)
 	p.bumpEpochLocked()
 	return admission, nil
 }
 
 func (p *Pool) AcceptTx(tx types.Transaction, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (Admission, error) {
-	return p.AcceptTxWithLookup(tx, consensus.LookupFromSet(chainUtxos), rules)
+	return p.AcceptTxWithParams(tx, chainUtxos, consensus.MainnetParams(), rules)
+}
+
+func (p *Pool) AcceptTxWithParams(tx types.Transaction, chainUtxos consensus.UtxoSet, params consensus.ChainParams, rules consensus.ConsensusRules) (Admission, error) {
+	return p.AcceptTxWithLookupAndParams(tx, consensus.LookupFromSet(chainUtxos), params, rules)
 }
 
 func (p *Pool) AcceptTxWithLookup(tx types.Transaction, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (Admission, error) {
+	return p.AcceptTxWithLookupAndParams(tx, chainLookup, consensus.MainnetParams(), rules)
+}
+
+func (p *Pool) AcceptTxWithLookupAndParams(tx types.Transaction, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) (Admission, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	txid := consensus.TxID(&tx)
@@ -737,7 +1003,7 @@ func (p *Pool) AcceptTxWithLookup(tx types.Transaction, chainLookup consensus.Ut
 		return Admission{}, ErrCoinbaseTx
 	}
 
-	size := len(tx.Encode())
+	size := tx.EncodedLen()
 	if p.cfg.MaxTxSize > 0 && size > p.cfg.MaxTxSize {
 		return Admission{}, ErrTxTooLarge
 	}
@@ -752,7 +1018,7 @@ func (p *Pool) AcceptTxWithLookup(tx types.Transaction, chainLookup consensus.Ut
 		return Admission{TxID: txid, Orphaned: true, EvictedOrphans: evicted}, nil
 	}
 
-	accepted, err := p.insertResolved(tx, txid, size, view, parents, rules)
+	accepted, err := p.insertResolved(tx, txid, size, view, parents, params, rules)
 	if err != nil {
 		return Admission{}, err
 	}
@@ -762,7 +1028,8 @@ func (p *Pool) AcceptTxWithLookup(tx types.Transaction, chainLookup consensus.Ut
 		Summary:  accepted.Summary,
 		Accepted: []AcceptedTx{accepted},
 	}
-	admission.Accepted = append(admission.Accepted, p.promoteReadyOrphans(outputsForTx(txid, tx), chainLookup, rules)...)
+	promoted, _ := p.promoteReadyOrphans(outputsForTx(txid, tx), chainLookup, params, rules)
+	admission.Accepted = append(admission.Accepted, promoted...)
 	p.bumpEpochLocked()
 	return admission, nil
 }
@@ -792,28 +1059,37 @@ func (p *Pool) SelectForBlockOverlay(baseUtxos consensus.UtxoSet, rules consensu
 // SelectForBlockOverlayWithLookup builds block candidates against a generic
 // committed-chain lookup and returns the post-selection overlay.
 func (p *Pool) SelectForBlockOverlayWithLookup(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
+	return p.SelectForBlockOverlayWithLookupLimit(baseLookup, rules, maxTxBytes, 0)
+}
+
+// SelectForBlockOverlayWithLookupLimit is used by benchmark-only template
+// builders that need a stable transaction count per synthetic block. A zero
+// maxTxs preserves normal miner selection behavior.
+func (p *Pool) SelectForBlockOverlayWithLookupLimit(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int, maxTxs int) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
 	p.mu.Lock()
 	snapshot := p.selectionSnapshotLocked()
 	p.mu.Unlock()
-	return p.selectForBlockWithLookup(baseLookup, rules, maxTxBytes, snapshot)
+	return p.selectForBlockWithLookup(baseLookup, rules, maxTxBytes, maxTxs, snapshot)
 }
 
 func (p *Pool) selectForBlock(baseUtxos consensus.UtxoSet, rules consensus.ConsensusRules, maxTxBytes int, snapshot selectionSnapshot) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
 	preBlockUtxos := consensus.LookupFromSet(baseUtxos)
 	overlay := consensus.NewUtxoOverlay(baseUtxos)
+	scratch := borrowSelectionScratch()
+	defer releaseSelectionScratch(scratch)
 	selected := make([]SnapshotEntry, 0, len(snapshot.candidates))
-	included := make(map[[32]byte]struct{}, len(snapshot.candidates))
-	claimed := make(map[types.OutPoint]struct{})
+	included := scratch.included
+	claimed := scratch.claimed
 	usedBytes := 0
 	var totalFees uint64
-	p.runSelectionSnapshot(snapshot, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+	p.runSelectionSnapshot(snapshot, scratch, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
 		if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
 			return false
 		}
 		if !p.meetsRelayFloor(filteredFee, filteredSize) {
 			return false
 		}
-		packageFees, ok := applyCandidatePackageSnapshot(preBlockUtxos, overlay, claimed, filtered, rules)
+		packageFees, ok := applyCandidatePackageSnapshot(preBlockUtxos, overlay, claimed, filtered, scratch, rules)
 		if !ok {
 			return false
 		}
@@ -830,22 +1106,27 @@ func (p *Pool) selectForBlock(baseUtxos consensus.UtxoSet, rules consensus.Conse
 	return selected, totalFees, overlay
 }
 
-func (p *Pool) selectForBlockWithLookup(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int, snapshot selectionSnapshot) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
+func (p *Pool) selectForBlockWithLookup(baseLookup consensus.UtxoLookup, rules consensus.ConsensusRules, maxTxBytes int, maxTxs int, snapshot selectionSnapshot) ([]SnapshotEntry, uint64, *consensus.UtxoOverlay) {
 	preBlockUtxos := baseLookup
 	overlay := consensus.NewUtxoOverlayWithLookup(consensus.LookupWithErrFromLookup(baseLookup))
+	scratch := borrowSelectionScratch()
+	defer releaseSelectionScratch(scratch)
 	selected := make([]SnapshotEntry, 0, len(snapshot.candidates))
-	included := make(map[[32]byte]struct{}, len(snapshot.candidates))
-	claimed := make(map[types.OutPoint]struct{})
+	included := scratch.included
+	claimed := scratch.claimed
 	usedBytes := 0
 	var totalFees uint64
-	p.runSelectionSnapshot(snapshot, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+	p.runSelectionSnapshot(snapshot, scratch, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+		if maxTxs > 0 && len(selected)+len(filtered) > maxTxs {
+			return false
+		}
 		if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
 			return false
 		}
 		if !p.meetsRelayFloor(filteredFee, filteredSize) {
 			return false
 		}
-		packageFees, ok := applyCandidatePackageSnapshot(preBlockUtxos, overlay, claimed, filtered, rules)
+		packageFees, ok := applyCandidatePackageSnapshot(preBlockUtxos, overlay, claimed, filtered, scratch, rules)
 		if !ok {
 			return false
 		}
@@ -875,24 +1156,29 @@ func (p *Pool) AppendForBlockOverlayWithLookup(preBlockLookup consensus.UtxoLook
 	p.mu.Lock()
 	snapshot := p.selectionSnapshotLocked()
 	p.mu.Unlock()
+	scratch := borrowSelectionScratch()
+	defer releaseSelectionScratch(scratch)
 	appendOnly := make([]SnapshotEntry, 0, len(snapshot.candidates))
-	included := make(map[[32]byte]struct{}, len(selected))
-	claimed := claimedOutPointsForSnapshots(selected)
+	included := scratch.included
+	claimed := scratch.claimed
 	usedBytes := 0
 	for _, entry := range selected {
 		included[entry.TxID] = struct{}{}
 		usedBytes += entry.Size
+		for _, spent := range entry.SpentOutPoints {
+			claimed[spent] = struct{}{}
+		}
 	}
 	var totalFees uint64
 
-	p.runSelectionSnapshot(snapshot, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
+	p.runSelectionSnapshot(snapshot, scratch, included, func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool {
 		if maxTxBytes > 0 && usedBytes+filteredSize > maxTxBytes {
 			return false
 		}
 		if !p.meetsRelayFloor(filteredFee, filteredSize) {
 			return false
 		}
-		packageFees, ok := applyCandidatePackageSnapshot(preBlockLookup, currentUtxos, claimed, filtered, rules)
+		packageFees, ok := applyCandidatePackageSnapshot(preBlockLookup, currentUtxos, claimed, filtered, scratch, rules)
 		if !ok {
 			return false
 		}
@@ -966,14 +1252,27 @@ func (p *Pool) RemoveConfirmed(block *types.Block) {
 // PromoteReadyOrphansForBlock rechecks orphan transactions that were waiting on
 // outputs created by the newly accepted block.
 func (p *Pool) PromoteReadyOrphansForBlock(block *types.Block, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) []AcceptedTx {
-	return p.PromoteReadyOrphansForBlockWithLookup(block, consensus.LookupFromSet(chainUtxos), rules)
+	return p.PromoteReadyOrphansForBlockWithParams(block, chainUtxos, consensus.MainnetParams(), rules)
 }
 
 func (p *Pool) PromoteReadyOrphansForBlockWithLookup(block *types.Block, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) []AcceptedTx {
+	return p.PromoteReadyOrphansForBlockWithLookupAndParams(block, chainLookup, consensus.MainnetParams(), rules)
+}
+
+func (p *Pool) PromoteReadyOrphansForBlockWithParams(block *types.Block, chainUtxos consensus.UtxoSet, params consensus.ChainParams, rules consensus.ConsensusRules) []AcceptedTx {
+	return p.PromoteReadyOrphansForBlockWithLookupAndParams(block, consensus.LookupFromSet(chainUtxos), params, rules)
+}
+
+func (p *Pool) PromoteReadyOrphansForBlockWithLookupAndParams(block *types.Block, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) []AcceptedTx {
+	promoted, _ := p.PromoteReadyOrphansDetailedForBlockWithLookupAndParams(block, chainLookup, params, rules)
+	return promoted
+}
+
+func (p *Pool) PromoteReadyOrphansDetailedForBlockWithLookupAndParams(block *types.Block, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) ([]AcceptedTx, []RejectedTx) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if block == nil {
-		return nil
+		return nil, nil
 	}
 	outputs := make([]types.OutPoint, 0)
 	for _, tx := range block.Txs {
@@ -981,36 +1280,36 @@ func (p *Pool) PromoteReadyOrphansForBlockWithLookup(block *types.Block, chainLo
 		outputs = append(outputs, outputsForTx(txid, tx)...)
 	}
 	if len(outputs) == 0 {
-		return nil
+		return nil, nil
 	}
-	promoted := p.promoteReadyOrphans(outputs, chainLookup, rules)
+	promoted, rejected := p.promoteReadyOrphans(outputs, chainLookup, params, rules)
 	if len(promoted) > 0 {
 		p.bumpEpochLocked()
 	}
-	return promoted
+	return promoted, rejected
 }
 
-func (p *Pool) insertResolved(tx types.Transaction, txid [32]byte, size int, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, rules consensus.ConsensusRules) (AcceptedTx, error) {
-	txValidation, err := consensus.PrepareTxValidationWithLookup(&tx, consensus.LookupFromSet(utxos), rules)
+func (p *Pool) insertResolved(tx types.Transaction, txid [32]byte, size int, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, params consensus.ChainParams, rules consensus.ConsensusRules) (AcceptedTx, error) {
+	txValidation, err := consensus.PrepareTxValidationWithLookupAndParams(&tx, consensus.LookupFromSet(utxos), params, rules)
 	if err != nil {
 		return AcceptedTx{}, err
 	}
-	summary, err := consensus.ValidatePreparedTx(txValidation)
+	summary, err := consensus.ValidatePreparedTxBatchOptimized(txValidation)
 	if err != nil {
 		return AcceptedTx{}, err
 	}
 	return p.insertValidatedLocked(tx, txid, size, summary, append([]crypto.SchnorrBatchItem(nil), txValidation.SignatureChecks...), parents)
 }
 
-func (p *Pool) insertPreparedLocked(prepared PreparedAdmission, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, rules consensus.ConsensusRules) (AcceptedTx, error) {
+func (p *Pool) insertPreparedLocked(prepared PreparedAdmission, utxos consensus.UtxoSet, parents map[[32]byte]struct{}, params consensus.ChainParams, rules consensus.ConsensusRules) (AcceptedTx, error) {
 	summary := prepared.Summary
 	signatureChecks := prepared.SignatureChecks
 	if len(prepared.Missing) != 0 || !sameTxIDSets(prepared.Parents, parents) || !sameUtxoSets(prepared.View, utxos) || len(signatureChecks) == 0 {
-		validated, err := consensus.PrepareTxValidationWithLookup(&prepared.Tx, consensus.LookupFromSet(utxos), rules)
+		validated, err := consensus.PrepareTxValidationWithLookupAndParams(&prepared.Tx, consensus.LookupFromSet(utxos), params, rules)
 		if err != nil {
 			return AcceptedTx{}, err
 		}
-		summary, err = consensus.ValidatePreparedTx(validated)
+		summary, err = consensus.ValidatePreparedTxBatchOptimized(validated)
 		if err != nil {
 			return AcceptedTx{}, err
 		}
@@ -1052,10 +1351,11 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 	}
 
 	p.sequence++
+	authID := consensus.AuthID(&tx)
 	entry := &Entry{
 		Tx:              tx,
 		TxID:            txid,
-		AuthID:          consensus.AuthID(&tx),
+		AuthID:          authID,
 		Summary:         summary,
 		SignatureChecks: append([]crypto.SchnorrBatchItem(nil), signatureChecks...),
 		SpentOutPoints:  spentOutPointsForInputs(tx.Base.Inputs),
@@ -1064,7 +1364,6 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 		Size:            size,
 		AddedAt:         p.sequence,
 		Parents:         copyTxIDSet(parents),
-		Children:        make(map[[32]byte]struct{}),
 		AncestorCount:   len(ancestorIDs) + 1,
 		AncestorSize:    ancestorSize,
 		AncestorFees:    ancestorFees,
@@ -1082,6 +1381,9 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 		if parent == nil {
 			continue
 		}
+		if parent.Children == nil {
+			parent.Children = make(map[[32]byte]struct{})
+		}
 		parent.Children[txid] = struct{}{}
 	}
 	for ancestorID := range ancestorIDs {
@@ -1097,14 +1399,16 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 	return AcceptedTx{
 		Tx:      tx,
 		TxID:    txid,
+		AuthID:  authID,
 		Summary: summary,
 		Fee:     summary.Fee,
 		Size:    size,
 	}, nil
 }
 
-func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) []AcceptedTx {
+func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) ([]AcceptedTx, []RejectedTx) {
 	promoted := make([]AcceptedTx, 0)
+	rejected := make([]RejectedTx, 0)
 	ready := make([][32]byte, 0)
 	ready = p.enqueueReadyOrphansForOutputs(ready, outputs)
 	for i := 0; i < len(ready); i++ {
@@ -1115,6 +1419,7 @@ func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainLookup consens
 		}
 		view, parents, missing, err := p.resolveInputs(orphan.Tx, chainLookup)
 		if err != nil {
+			rejected = append(rejected, RejectedTx{Tx: orphan.Tx, TxID: txid, Err: err})
 			p.deleteOrphan(txid)
 			continue
 		}
@@ -1124,15 +1429,16 @@ func (p *Pool) promoteReadyOrphans(outputs []types.OutPoint, chainLookup consens
 		}
 
 		p.deleteOrphan(txid)
-		accepted, err := p.insertResolved(orphan.Tx, txid, orphan.Size, view, parents, rules)
+		accepted, err := p.insertResolved(orphan.Tx, txid, orphan.Size, view, parents, params, rules)
 		if err != nil {
+			rejected = append(rejected, RejectedTx{Tx: orphan.Tx, TxID: txid, Err: err})
 			continue
 		}
 		promoted = append(promoted, accepted)
 		ready = p.enqueueReadyOrphansForOutputs(ready, outputsForTx(txid, orphan.Tx))
 	}
 
-	return promoted
+	return promoted, rejected
 }
 
 func (p *Pool) enqueueReadyOrphansForOutputs(ready [][32]byte, outputs []types.OutPoint) [][32]byte {
@@ -1162,8 +1468,8 @@ func (p *Pool) enqueueReadyOrphansForOutputs(ready [][32]byte, outputs []types.O
 
 func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLookup) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
 	view := make(consensus.UtxoSet, len(tx.Base.Inputs))
-	parents := make(map[[32]byte]struct{})
-	missing := make(map[types.OutPoint]struct{})
+	var parents map[[32]byte]struct{}
+	var missing map[types.OutPoint]struct{}
 
 	for _, input := range tx.Base.Inputs {
 		if _, ok := p.spent[input.PrevOut]; ok {
@@ -1176,10 +1482,18 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLoo
 
 		parent := p.entries[input.PrevOut.TxID]
 		if parent == nil {
+			if missing == nil {
+				// Independent spends dominate admission benchmarks, so keep the
+				// missing-set nil until this tx actually becomes an orphan.
+				missing = make(map[types.OutPoint]struct{})
+			}
 			missing[input.PrevOut] = struct{}{}
 			continue
 		}
 		if input.PrevOut.Vout >= uint32(len(parent.Tx.Base.Outputs)) {
+			if missing == nil {
+				missing = make(map[types.OutPoint]struct{})
+			}
 			missing[input.PrevOut] = struct{}{}
 			continue
 		}
@@ -1189,6 +1503,11 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLoo
 			ValueAtoms: output.ValueAtoms,
 			PubKey:     output.PubKey,
 		}
+		if parents == nil {
+			// Parent tracking is only needed for package accounting when a tx
+			// spends a mempool output, not for the common chain-only spend path.
+			parents = make(map[[32]byte]struct{})
+		}
 		parents[parent.TxID] = struct{}{}
 	}
 
@@ -1197,8 +1516,8 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLoo
 
 func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLookup, entries map[[32]byte]admissionEntry, spent map[types.OutPoint][32]byte) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
 	view := make(consensus.UtxoSet, len(tx.Base.Inputs))
-	parents := make(map[[32]byte]struct{})
-	missing := make(map[types.OutPoint]struct{})
+	var parents map[[32]byte]struct{}
+	var missing map[types.OutPoint]struct{}
 
 	for _, input := range tx.Base.Inputs {
 		if _, ok := spent[input.PrevOut]; ok {
@@ -1211,10 +1530,16 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 
 		parent, ok := entries[input.PrevOut.TxID]
 		if !ok {
+			if missing == nil {
+				missing = make(map[types.OutPoint]struct{})
+			}
 			missing[input.PrevOut] = struct{}{}
 			continue
 		}
 		if input.PrevOut.Vout >= uint32(len(parent.Tx.Base.Outputs)) {
+			if missing == nil {
+				missing = make(map[types.OutPoint]struct{})
+			}
 			missing[input.PrevOut] = struct{}{}
 			continue
 		}
@@ -1224,6 +1549,9 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 			ValueAtoms: output.ValueAtoms,
 			PubKey:     output.PubKey,
 		}
+		if parents == nil {
+			parents = make(map[[32]byte]struct{})
+		}
 		parents[parent.TxID] = struct{}{}
 	}
 
@@ -1232,8 +1560,8 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 
 func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup consensus.UtxoLookup) (consensus.UtxoSet, map[[32]byte]struct{}, map[types.OutPoint]struct{}, error) {
 	view := make(consensus.UtxoSet, len(tx.Base.Inputs))
-	parents := make(map[[32]byte]struct{})
-	missing := make(map[types.OutPoint]struct{})
+	var parents map[[32]byte]struct{}
+	var missing map[types.OutPoint]struct{}
 
 	for _, input := range tx.Base.Inputs {
 		if _, ok := p.spent[input.PrevOut]; ok {
@@ -1246,10 +1574,16 @@ func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup co
 
 		parent := p.entries[input.PrevOut.TxID]
 		if parent == nil {
+			if missing == nil {
+				missing = make(map[types.OutPoint]struct{})
+			}
 			missing[input.PrevOut] = struct{}{}
 			continue
 		}
 		if input.PrevOut.Vout >= uint32(len(parent.Tx.Base.Outputs)) {
+			if missing == nil {
+				missing = make(map[types.OutPoint]struct{})
+			}
 			missing[input.PrevOut] = struct{}{}
 			continue
 		}
@@ -1258,6 +1592,9 @@ func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup co
 		view[input.PrevOut] = consensus.UtxoEntry{
 			ValueAtoms: output.ValueAtoms,
 			PubKey:     output.PubKey,
+		}
+		if parents == nil {
+			parents = make(map[[32]byte]struct{})
 		}
 		parents[parent.TxID] = struct{}{}
 	}
@@ -1722,8 +2059,8 @@ func (p *Pool) candidateForTxLocked(txid [32]byte) packageCandidate {
 	return candidate
 }
 
-func filterCandidateEntries(candidate packageCandidateView, included map[[32]byte]struct{}) ([]SnapshotEntry, int, uint64) {
-	filtered := make([]SnapshotEntry, 0, len(candidate.Entries))
+func filterCandidateEntriesInto(scratch *selectionScratch, candidate packageCandidateView, included map[[32]byte]struct{}) ([]SnapshotEntry, int, uint64) {
+	filtered := scratch.filtered[:0]
 	size := 0
 	var fee uint64
 	for _, entry := range candidate.Entries {
@@ -1734,20 +2071,22 @@ func filterCandidateEntries(candidate packageCandidateView, included map[[32]byt
 		size += entry.Size
 		fee += entry.Fee
 	}
+	scratch.filtered = filtered
 	return filtered, size, fee
 }
 
-func applyCandidatePackageSnapshot(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []SnapshotEntry, _ consensus.ConsensusRules) (uint64, bool) {
-	seenPackageClaims := make(map[types.OutPoint]struct{}, len(entries))
+func applyCandidatePackageSnapshot(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []SnapshotEntry, scratch *selectionScratch, _ consensus.ConsensusRules) (uint64, bool) {
+	defer scratch.resetSeenPackageClaims()
 	for _, entry := range entries {
 		for _, spent := range entry.SpentOutPoints {
 			if _, ok := claimed[spent]; ok {
 				return 0, false
 			}
-			if _, ok := seenPackageClaims[spent]; ok {
+			if _, ok := scratch.seenPackageClaims[spent]; ok {
 				return 0, false
 			}
-			seenPackageClaims[spent] = struct{}{}
+			scratch.seenPackageClaims[spent] = struct{}{}
+			scratch.seenPackageClaimOrder = append(scratch.seenPackageClaimOrder, spent)
 			if _, ok := preBlockUtxos(spent); !ok {
 				return 0, false
 			}
@@ -1848,8 +2187,8 @@ func gatherAncestorsForView(entries map[[32]byte]admissionEntry, parents map[[32
 func (p *Pool) reindex() {
 	p.spent = make(map[types.OutPoint][32]byte, len(p.entries))
 	for _, entry := range p.entries {
-		entry.Parents = make(map[[32]byte]struct{})
-		entry.Children = make(map[[32]byte]struct{})
+		entry.Parents = nil
+		entry.Children = nil
 		entry.AncestorCount = 1
 		entry.AncestorSize = entry.Size
 		entry.AncestorFees = entry.Fee
@@ -1868,7 +2207,13 @@ func (p *Pool) reindex() {
 			if input.PrevOut.Vout >= uint32(len(parent.Tx.Base.Outputs)) {
 				continue
 			}
+			if entry.Parents == nil {
+				entry.Parents = make(map[[32]byte]struct{})
+			}
 			entry.Parents[parent.TxID] = struct{}{}
+			if parent.Children == nil {
+				parent.Children = make(map[[32]byte]struct{})
+			}
 			parent.Children[entry.TxID] = struct{}{}
 		}
 	}
@@ -1966,18 +2311,21 @@ func snapshotForEntry(entry *Entry) SnapshotEntry {
 
 func selectionSnapshotForEntry(entry *Entry) SnapshotEntry {
 	snapshot := snapshotForEntry(entry)
-	snapshot.SpentOutPoints = append([]types.OutPoint(nil), entry.SpentOutPoints...)
-	snapshot.CreatedLeaves = append([]utreexo.UtxoLeaf(nil), entry.CreatedLeaves...)
+	// Admission prepares these deltas once and treats them as immutable for the
+	// lifetime of the entry. Selection snapshots can therefore share the backing
+	// slices instead of cloning every spend/create vector on each frontier rebuild.
+	snapshot.SpentOutPoints = entry.SpentOutPoints
+	snapshot.CreatedLeaves = entry.CreatedLeaves
 	return snapshot
 }
 
-func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, included map[[32]byte]struct{}, tryInclude func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool) {
+func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, scratch *selectionScratch, included map[[32]byte]struct{}, tryInclude func(filtered []SnapshotEntry, filteredSize int, filteredFee uint64) bool) {
 	if len(snapshot.candidates) == 0 {
 		return
 	}
 	if !snapshot.hasSharedEntries {
 		for _, candidate := range snapshot.candidates {
-			filtered, filteredSize, filteredFee := filterCandidateEntries(candidate, included)
+			filtered, filteredSize, filteredFee := filterCandidateEntriesInto(scratch, candidate, included)
 			if len(filtered) == 0 {
 				continue
 			}
@@ -1987,9 +2335,7 @@ func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, included map[[32
 		}
 		return
 	}
-	queued := make([]bool, len(snapshot.candidates))
-	completed := make([]bool, len(snapshot.candidates))
-	queue := make([]int, 0, len(snapshot.candidates))
+	queued, completed, queue := scratch.prepareWakeState(len(snapshot.candidates))
 	for idx := range snapshot.candidates {
 		queue = append(queue, idx)
 		queued[idx] = true
@@ -2001,7 +2347,7 @@ func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, included map[[32
 			continue
 		}
 		candidate := snapshot.candidates[idx]
-		filtered, filteredSize, filteredFee := filterCandidateEntries(candidate, included)
+		filtered, filteredSize, filteredFee := filterCandidateEntriesInto(scratch, candidate, included)
 		if len(filtered) == 0 {
 			completed[idx] = true
 			continue
@@ -2020,6 +2366,7 @@ func (p *Pool) runSelectionSnapshot(snapshot selectionSnapshot, included map[[32
 			}
 		}
 	}
+	scratch.queue = queue
 }
 
 func candidateLess(left, right packageCandidate) bool {
@@ -2129,16 +2476,6 @@ func cloneUtxos(utxos consensus.UtxoSet) consensus.UtxoSet {
 	return out
 }
 
-func claimedOutPointsForSnapshots(entries []SnapshotEntry) map[types.OutPoint]struct{} {
-	claimed := make(map[types.OutPoint]struct{}, len(entries))
-	for _, entry := range entries {
-		for _, spent := range entry.SpentOutPoints {
-			claimed[spent] = struct{}{}
-		}
-	}
-	return claimed
-}
-
 func spentOutPointsForInputs(inputs []types.TxInput) []types.OutPoint {
 	if len(inputs) == 0 {
 		return nil
@@ -2156,9 +2493,15 @@ func createdLeavesForOutputs(txid [32]byte, outputs []types.TxOutput) []utreexo.
 	}
 	created := make([]utreexo.UtxoLeaf, 0, len(outputs))
 	for vout, output := range outputs {
+		payload32 := output.Payload32
+		if output.Type == types.OutputXOnlyP2PK && payload32 == ([32]byte{}) {
+			payload32 = output.PubKey
+		}
 		created = append(created, utreexo.UtxoLeaf{
 			OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
+			Type:       output.Type,
 			ValueAtoms: output.ValueAtoms,
+			Payload32:  payload32,
 			PubKey:     output.PubKey,
 		})
 	}
@@ -2166,6 +2509,9 @@ func createdLeavesForOutputs(txid [32]byte, outputs []types.TxOutput) []utreexo.
 }
 
 func copyOutPointSet(in map[types.OutPoint]struct{}) map[types.OutPoint]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
 	out := make(map[types.OutPoint]struct{}, len(in))
 	for item := range in {
 		out[item] = struct{}{}
@@ -2173,7 +2519,24 @@ func copyOutPointSet(in map[types.OutPoint]struct{}) map[types.OutPoint]struct{}
 	return out
 }
 
+func outPointSetKeys(in map[types.OutPoint]struct{}) []types.OutPoint {
+	out := make([]types.OutPoint, 0, len(in))
+	for item := range in {
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if cmp := bytes.Compare(out[i].TxID[:], out[j].TxID[:]); cmp != 0 {
+			return cmp < 0
+		}
+		return out[i].Vout < out[j].Vout
+	})
+	return out
+}
+
 func copyTxIDSet(in map[[32]byte]struct{}) map[[32]byte]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
 	out := make(map[[32]byte]struct{}, len(in))
 	for item := range in {
 		out[item] = struct{}{}

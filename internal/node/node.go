@@ -81,6 +81,7 @@ type ChainState struct {
 	recentTimes    []uint64
 	blockSizeState consensus.BlockSizeState
 	utxos          consensus.UtxoSet
+	utxosShared    bool
 	utxoLookup     consensus.UtxoLookupWithErr
 	utxoScan       func(func(types.OutPoint, consensus.UtxoEntry) error) error
 	utxoCount      int
@@ -178,11 +179,7 @@ func buildAccumulatorFromStore(store *storage.ChainStore) (*utreexo.Accumulator,
 	leaves := make([]utreexo.UtxoLeaf, 0)
 	utxoCount := 0
 	if err := store.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
-		leaves = append(leaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			ValueAtoms: entry.ValueAtoms,
-			PubKey:     entry.PubKey,
-		})
+		leaves = append(leaves, utxoLeafForEntry(outPoint, entry))
 		utxoCount++
 		return nil
 	}); err != nil {
@@ -256,7 +253,7 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 		}
 	}
 	seededBlockSizeState := consensus.NewBlockSizeState(c.params)
-	seededBlockSizeState.BlockSize = uint64(len(genesis.Encode()))
+	seededBlockSizeState.BlockSize = uint64(genesis.EncodedLen())
 	acc, err := consensus.UtxoAccumulator(utxos)
 	if err != nil {
 		return GenesisBootstrapSummary{}, err
@@ -337,7 +334,9 @@ func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail,
 	c.recentTimes = appendRecentTime(c.recentTimes, block.Header.Timestamp)
 	c.blockSizeState = summary.NextBlockSizeState
 	if c.utxos != nil {
-		c.replaceMaterializedUTXOs(overlay.Materialize())
+		c.ensureOwnedMaterializedUTXOs()
+		overlay.ApplyToSet(c.utxos)
+		c.utxoCount += len(createdUTXO) - len(spentUTXO)
 	} else {
 		c.utxoCount += len(createdUTXO) - len(spentUTXO)
 	}
@@ -582,6 +581,7 @@ func openPersistentChainState(path string, profile types.ChainProfile, rules con
 		}
 		state.recentTimes = recentTimes
 		state.WithRules(rules)
+		state.bindCommittedUTXOBackend(store.UTXOLookupWithErr(), store.ForEachUTXO, len(stored.UTXOs))
 		chainLogger.Info("loaded persisted chain state",
 			slog.Uint64("height", stored.Height),
 			slog.Int("utxo_count", len(stored.UTXOs)),
@@ -686,6 +686,10 @@ func (p *PersistentChainState) InitializeFromGenesisBlock(genesis *types.Block) 
 	if err := p.store.RewriteActiveHeights(0, 0, []storage.BlockIndexEntry{*entry}); err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
+	// The persistent node should stay on the metadata-first/store-backed UTXO
+	// path after bootstrap instead of carrying the compatibility map until the
+	// next restart.
+	p.state.bindCommittedUTXOBackend(p.store.UTXOLookupWithErr(), p.store.ForEachUTXO, summary.UTXOCount)
 	p.logger.Info("persisted genesis block",
 		slog.String("hash", fmt.Sprintf("%x", summary.HeaderHash)),
 		slog.Int("utxo_count", summary.UTXOCount),
@@ -778,10 +782,30 @@ func (c *ChainState) replaceMaterializedUTXOs(utxos consensus.UtxoSet) {
 	// Keep the compatibility map, lookup adapter, and scalar count in lockstep
 	// while the on-disk cutover is still removing map-based callers.
 	c.utxos = utxos
+	c.utxosShared = false
 	if c.utxos != nil {
 		c.utxoLookup = consensus.LookupWithErrFromSet(c.utxos)
+		c.utxoCount = len(c.utxos)
+		return
 	}
-	c.utxoCount = len(c.utxos)
+	c.utxoCount = 0
+}
+
+func (c *ChainState) bindCommittedUTXOBackend(lookup consensus.UtxoLookupWithErr, scan func(func(types.OutPoint, consensus.UtxoEntry) error) error, utxoCount int) {
+	c.utxos = nil
+	c.utxosShared = false
+	c.utxoLookup = lookup
+	c.utxoScan = scan
+	c.utxoCount = utxoCount
+}
+
+func (c *ChainState) ensureOwnedMaterializedUTXOs() {
+	if c.utxos == nil || !c.utxosShared {
+		return
+	}
+	c.utxos = cloneUtxos(c.utxos)
+	c.utxosShared = false
+	c.utxoLookup = consensus.LookupWithErrFromSet(c.utxos)
 }
 
 func (c *ChainState) materializeUTXOs() (consensus.UtxoSet, error) {

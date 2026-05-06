@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,21 +15,29 @@ import (
 
 func TestRunSnapshotRoot(t *testing.T) {
 	fixturePath := filepath.Join("..", "..", "fixtures", "snapshots", "regtest_bootstrap_tip.json")
+	loaded, err := node.LoadUTXOSnapshotFixture(fixturePath)
+	if err != nil {
+		t.Fatalf("LoadUTXOSnapshotFixture: %v", err)
+	}
 	output := captureStdout(t, func() {
 		if err := runSnapshot([]string{"root", "--file", fixturePath}); err != nil {
 			t.Fatalf("runSnapshot root: %v", err)
 		}
 	})
-	if !strings.Contains(output, "utxo_root: 89937c242d821c308952134a0822e1f5ddc94cb5022ad49f8f35448e09a45b16") {
+	if !strings.Contains(output, fmt.Sprintf("utxo_root: %x", loaded.ExpectedUTXORoot)) {
 		t.Fatalf("snapshot root output missing expected root:\n%s", output)
 	}
-	if !strings.Contains(output, "utxo_checksum: 4977f782656d4092e6b47122db4ae985a402445a2daea761b50e08df4575f863") {
+	if !strings.Contains(output, fmt.Sprintf("utxo_checksum: %x", loaded.ExpectedChecksum)) {
 		t.Fatalf("snapshot root output missing expected checksum:\n%s", output)
 	}
 }
 
 func TestRunSnapshotVerify(t *testing.T) {
 	fixturePath := filepath.Join("..", "..", "fixtures", "snapshots", "regtest_bootstrap_tip.json")
+	loaded, err := node.LoadUTXOSnapshotFixture(fixturePath)
+	if err != nil {
+		t.Fatalf("LoadUTXOSnapshotFixture: %v", err)
+	}
 	output := captureStdout(t, func() {
 		if err := runSnapshot([]string{"verify", "--file", fixturePath}); err != nil {
 			t.Fatalf("runSnapshot verify: %v", err)
@@ -40,7 +49,7 @@ func TestRunSnapshotVerify(t *testing.T) {
 	if !strings.Contains(output, "utxo_count: 3") {
 		t.Fatalf("snapshot verify output missing utxo count:\n%s", output)
 	}
-	if !strings.Contains(output, "utxo_checksum: 4977f782656d4092e6b47122db4ae985a402445a2daea761b50e08df4575f863") {
+	if !strings.Contains(output, fmt.Sprintf("utxo_checksum: %x", loaded.ExpectedChecksum)) {
 		t.Fatalf("snapshot verify output missing checksum:\n%s", output)
 	}
 }
@@ -51,7 +60,11 @@ func TestRunSnapshotVerifyRejectsMismatchedExpectation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	bad := strings.Replace(string(buf), "89937c242d821c308952134a0822e1f5ddc94cb5022ad49f8f35448e09a45b16", "0000000000000000000000000000000000000000000000000000000000000000", 1)
+	loaded, err := node.LoadUTXOSnapshotFixture(fixturePath)
+	if err != nil {
+		t.Fatalf("LoadUTXOSnapshotFixture: %v", err)
+	}
+	bad := strings.Replace(string(buf), fmt.Sprintf("%x", loaded.ExpectedUTXORoot), strings.Repeat("0", 64), 1)
 	path := t.TempDir() + "/bad_snapshot.json"
 	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)

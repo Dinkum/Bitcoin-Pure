@@ -4,25 +4,25 @@
   "genesis_fixture": "../genesis/regtest.json",
   "chain_fixture": "../chains/regtest_bootstrap.json",
   "height": 2,
-  "expected_header_hash_hex": "7b1c19b47fda73a8f1257201b465b8f253627b54d6679ea7a7237d648faebb48",
-  "expected_utxo_root_hex": "89937c242d821c308952134a0822e1f5ddc94cb5022ad49f8f35448e09a45b16",
-  "expected_utxo_checksum_hex": "4977f782656d4092e6b47122db4ae985a402445a2daea761b50e08df4575f863",
+  "expected_header_hash_hex": "70e9c6f0c87c01e5b0914277c3cf9b3badf8130c18704febe43c1d4fb680082a",
+  "expected_utxo_root_hex": "fd300b8ce01a983d5a2b87d9612b6e1ea01f1a49d011e3e4cab771097c580b89",
+  "expected_utxo_checksum_hex": "09ed4e5032ffa9d94c165c56536864d6baf4f819a93bb3a4a6e8de3b6934e36f",
   "expected_utxo_count": 3,
   "utxos": [
     {
-      "txid_hex": "2e4dd108b54c5475266d9b94ff6bda88b86ba46c6d2cf32b18ee8d69184bdc30",
-      "vout": 0,
-      "value_atoms": 1,
-      "pubkey_hex": "4444444444444444444444444444444444444444444444444444444444444444"
-    },
-    {
-      "txid_hex": "66b55727392f16cbed91f9cfbee0ea184bb011dda4fe29bbbbd1c51f1745f2da",
+      "txid_hex": "8059dd87cc30c5d7e63310471041e3556f271e48a6275b911a332bc8e878e149",
       "vout": 0,
       "value_atoms": 1000000000000,
       "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     {
-      "txid_hex": "bf18fab685cbd65d5a1b4bcf389027819a72c16cb80d9d9164da8a736858e263",
+      "txid_hex": "8500745bb104c87afdba9316cf8df8d3b762d03e5923fd407763e409866fa814",
+      "vout": 0,
+      "value_atoms": 1,
+      "pubkey_hex": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    {
+      "txid_hex": "bc8abbb4b41ac089415af1ef7d34ac9da3a41c1d2d0fcaef0d8583c0ccd5bc10",
       "vout": 0,
       "value_atoms": 1,
       "pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333"

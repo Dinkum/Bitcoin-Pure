@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -22,6 +23,16 @@ type branchStep struct {
 	entry storage.BlockIndexEntry
 }
 
+// committedBranchTransition is the runtime-facing branch delta published by a
+// successful active-tip advance or winner-branch reorg. Connected blocks are in
+// commit order. Disconnected transactions exclude coinbase and are ordered by
+// block height from fork+1 upward so mempool reprocessing sees the same
+// dependency ordering as the previous storage-reread path.
+type committedBranchTransition struct {
+	Connected       []types.Block
+	DisconnectedTxs []types.Transaction
+}
+
 func (c *ChainState) Clone() *ChainState {
 	out := NewChainState(c.params.Profile).WithRules(c.rules).WithLogger(c.logger)
 	if c.height != nil && c.tipHeader != nil {
@@ -36,6 +47,10 @@ func (c *ChainState) Clone() *ChainState {
 	// let subsequent apply/disconnect steps materialize fresh maps only when the
 	// branch actually mutates state.
 	out.utxos = c.utxos
+	out.utxosShared = c.utxos != nil
+	if c.utxos != nil {
+		c.utxosShared = true
+	}
 	out.utxoLookup = c.utxoLookup
 	out.utxoScan = c.utxoScan
 	out.utxoCount = c.utxoCount
@@ -78,53 +93,58 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 }
 
 func (p *PersistentChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSummary, error) {
-	summary, _, err := p.ApplyBlockWithTiming(block)
+	summary, _, _, err := p.ApplyBlockWithTiming(block)
 	return summary, err
 }
 
-func (p *PersistentChainState) ApplyBlockWithTiming(block *types.Block) (consensus.BlockValidationSummary, time.Duration, error) {
-	if summary, wait, committed, err := p.tryApplyActiveTipExtension(block); committed || err != nil {
-		return summary, wait, err
+func (p *PersistentChainState) ApplyBlockWithTransition(block *types.Block) (consensus.BlockValidationSummary, committedBranchTransition, error) {
+	summary, _, transition, err := p.ApplyBlockWithTiming(block)
+	return summary, transition, err
+}
+
+func (p *PersistentChainState) ApplyBlockWithTiming(block *types.Block) (consensus.BlockValidationSummary, time.Duration, committedBranchTransition, error) {
+	if summary, wait, transition, committed, err := p.tryApplyActiveTipExtension(block); committed || err != nil {
+		return summary, wait, transition, err
 	}
 	waitStarted := time.Now()
 	p.mu.Lock()
 	wait := time.Since(waitStarted)
 	defer p.mu.Unlock()
-	summary, err := p.applyBlockLocked(block)
-	return summary, wait, err
+	summary, transition, err := p.applyBlockLocked(block)
+	return summary, wait, transition, err
 }
 
-func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (consensus.BlockValidationSummary, time.Duration, bool, error) {
+func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (consensus.BlockValidationSummary, time.Duration, committedBranchTransition, bool, error) {
 	p.mu.RLock()
 	if p.state == nil || p.state.height == nil || p.state.tipHeader == nil {
 		p.mu.RUnlock()
-		return consensus.BlockValidationSummary{}, 0, false, nil
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, false, nil
 	}
 	snapshot := p.state.Clone()
 	tipHash := consensus.HeaderHash(snapshot.tipHeader)
 	p.mu.RUnlock()
 
 	if block.Header.PrevBlockHash != tipHash {
-		return consensus.BlockValidationSummary{}, 0, false, nil
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, false, nil
 	}
 
 	blockHash := consensus.HeaderHash(&block.Header)
 	existing, err := p.store.GetBlockIndex(&blockHash)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, true, err
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
 	if existing != nil && existing.Validated {
-		return consensus.BlockValidationSummary{}, 0, true, ErrBlockAlreadyKnown
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, ErrBlockAlreadyKnown
 	}
 	parentEntry, err := p.store.GetBlockIndex(&tipHash)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, true, err
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
 	if parentEntry == nil {
-		return consensus.BlockValidationSummary{}, 0, true, ErrUnknownParent
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, ErrUnknownParent
 	}
 	if !parentEntry.Validated {
-		return consensus.BlockValidationSummary{}, 0, true, ErrParentStateUnavailable
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, ErrParentStateUnavailable
 	}
 
 	// Validate against an immutable snapshot without holding the write lock. If
@@ -132,19 +152,19 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	// general locked path.
 	undo, err := captureUndoEntries(block, snapshot.utxoLookup)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, true, err
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
 	detail, err := snapshot.applyBlockDetailed(block)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, true, err
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
 	nextStateMeta, err := snapshot.StoredStateMeta()
 	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, true, err
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
 	work, err := consensus.BlockWork(block.Header.NBits)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, true, err
+		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
 	entry := storage.BlockIndexEntry{
 		Height:         detail.summary.Height,
@@ -162,69 +182,70 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	defer p.mu.Unlock()
 
 	if p.state == nil || p.state.height == nil || p.state.tipHeader == nil {
-		return consensus.BlockValidationSummary{}, wait, false, nil
+		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, false, nil
 	}
 	if consensus.HeaderHash(p.state.tipHeader) != tipHash {
-		return consensus.BlockValidationSummary{}, wait, false, nil
+		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, false, nil
 	}
 	existing, err = p.store.GetBlockIndex(&blockHash)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, wait, true, err
+		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, err
 	}
 	if existing != nil && existing.Validated {
-		return consensus.BlockValidationSummary{}, wait, true, ErrBlockAlreadyKnown
+		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, ErrBlockAlreadyKnown
 	}
 	if err := p.store.AppendValidatedBlock(nextStateMeta, block, &entry, undo, spent, created); err != nil {
-		return consensus.BlockValidationSummary{}, wait, true, err
+		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, err
 	}
+	snapshot.bindCommittedUTXOBackend(p.store.UTXOLookupWithErr(), p.store.ForEachUTXO, snapshot.UTXOCount())
 	p.state = snapshot
-	return detail.summary, wait, true, nil
+	return detail.summary, wait, committedBranchTransition{Connected: []types.Block{*block}}, true, nil
 }
 
-func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.BlockValidationSummary, error) {
+func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.BlockValidationSummary, committedBranchTransition, error) {
 	if p.state.height == nil || p.state.tipHeader == nil {
-		return consensus.BlockValidationSummary{}, ErrNoTip
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, ErrNoTip
 	}
 
 	blockHash := consensus.HeaderHash(&block.Header)
 	existing, err := p.store.GetBlockIndex(&blockHash)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
 	if existing != nil && existing.Validated {
-		return consensus.BlockValidationSummary{}, ErrBlockAlreadyKnown
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, ErrBlockAlreadyKnown
 	}
 
 	parentEntry, err := p.store.GetBlockIndex(&block.Header.PrevBlockHash)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
 	if parentEntry == nil {
-		return consensus.BlockValidationSummary{}, ErrUnknownParent
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, ErrUnknownParent
 	}
 	if !parentEntry.Validated {
-		return consensus.BlockValidationSummary{}, ErrParentStateUnavailable
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, ErrParentStateUnavailable
 	}
 
 	steps, forkHeight, err := p.branchSteps(parentEntry, block, existing)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
 	if err := p.rejectDeepReorgWhileFastSyncPending(forkHeight); err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
-	tempState, reorgOverlay, connectedEntries, undoByHash, createdByHash, summary, err := p.evaluateBranch(steps, forkHeight)
+	tempState, reorgOverlay, connectedEntries, undoByHash, createdByHash, transition, summary, err := p.evaluateBranch(steps, forkHeight)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
 
 	bestTipHash := consensus.HeaderHash(p.state.TipHeader())
 	bestTipEntry, err := p.store.GetBlockIndex(&bestTipHash)
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
 	if bestTipEntry == nil {
-		return consensus.BlockValidationSummary{}, fmt.Errorf("missing best-tip entry for %x", bestTipHash)
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, fmt.Errorf("missing best-tip entry for %x", bestTipHash)
 	}
 	newTipEntry := connectedEntries[len(connectedEntries)-1]
 	connectedEntryIndex := indexBranchEntries(connectedEntries)
@@ -233,19 +254,19 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 			hash := consensus.HeaderHash(&step.block.Header)
 			entryIndex, ok := connectedEntryIndex[hash]
 			if !ok {
-				return consensus.BlockValidationSummary{}, fmt.Errorf("missing connected entry for block %x", hash)
+				return consensus.BlockValidationSummary{}, committedBranchTransition{}, fmt.Errorf("missing connected entry for block %x", hash)
 			}
 			entry := &connectedEntries[entryIndex]
 			if err := p.store.PutValidatedBlock(&step.block, entry, undoByHash[hash]); err != nil {
-				return consensus.BlockValidationSummary{}, err
+				return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 			}
 		}
-		return summary, nil
+		return summary, committedBranchTransition{}, nil
 	}
 
 	nextStateMeta, err := tempState.StoredStateMeta()
 	if err != nil {
-		return consensus.BlockValidationSummary{}, err
+		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
 	isActiveTipExtension := forkHeight == oldTipHeightForState(p.state) && len(steps) == 1 && parentEntry.Height == bestTipEntry.Height &&
 		consensus.HeaderHash(&parentEntry.Header) == bestTipHash
@@ -254,18 +275,18 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 		undo := undoByHash[blockHash]
 		spent, created := activeTipDelta(undo, createdByHash[blockHash])
 		if err := p.store.AppendValidatedBlock(nextStateMeta, block, &newTipEntry, undo, spent, created); err != nil {
-			return consensus.BlockValidationSummary{}, err
+			return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 		}
 	} else {
 		for _, step := range steps {
 			hash := consensus.HeaderHash(&step.block.Header)
 			entryIndex, ok := connectedEntryIndex[hash]
 			if !ok {
-				return consensus.BlockValidationSummary{}, fmt.Errorf("missing connected entry for block %x", hash)
+				return consensus.BlockValidationSummary{}, committedBranchTransition{}, fmt.Errorf("missing connected entry for block %x", hash)
 			}
 			entry := &connectedEntries[entryIndex]
 			if err := p.store.PutValidatedBlock(&step.block, entry, undoByHash[hash]); err != nil {
-				return consensus.BlockValidationSummary{}, err
+				return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 			}
 		}
 		if err := p.store.CommitReorgDelta(
@@ -276,11 +297,12 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 			oldTipHeight,
 			connectedEntries,
 		); err != nil {
-			return consensus.BlockValidationSummary{}, err
+			return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 		}
 	}
+	tempState.bindCommittedUTXOBackend(p.store.UTXOLookupWithErr(), p.store.ForEachUTXO, tempState.UTXOCount())
 	p.state = tempState
-	return summary, nil
+	return summary, transition, nil
 }
 
 func (p *PersistentChainState) rejectDeepReorgWhileFastSyncPending(forkHeight uint64) error {
@@ -368,25 +390,26 @@ func (p *PersistentChainState) currentEntryForBlock(parentEntry *storage.BlockIn
 	}, nil
 }
 
-func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uint64) (*ChainState, *consensus.UtxoOverlay, []storage.BlockIndexEntry, map[[32]byte][]storage.BlockUndoEntry, map[[32]byte]map[types.OutPoint]consensus.UtxoEntry, consensus.BlockValidationSummary, error) {
+func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uint64) (*ChainState, *consensus.UtxoOverlay, []storage.BlockIndexEntry, map[[32]byte][]storage.BlockUndoEntry, map[[32]byte]map[types.OutPoint]consensus.UtxoEntry, committedBranchTransition, consensus.BlockValidationSummary, error) {
 	tempState := p.state.Clone()
-	reorgOverlay, err := p.disconnectToHeight(tempState, forkHeight)
+	reorgOverlay, disconnectedBlocks, err := p.disconnectToHeight(tempState, forkHeight)
 	if err != nil {
-		return nil, nil, nil, nil, nil, consensus.BlockValidationSummary{}, err
+		return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
 	}
 
 	entries := make([]storage.BlockIndexEntry, 0, len(steps))
 	undoByHash := make(map[[32]byte][]storage.BlockUndoEntry, len(steps))
 	createdByHash := make(map[[32]byte]map[types.OutPoint]consensus.UtxoEntry, len(steps))
+	connectedBlocks := make([]types.Block, 0, len(steps))
 	var summary consensus.BlockValidationSummary
 	for _, step := range steps {
 		undo, err := captureUndoEntries(&step.block, tempState.utxoLookup)
 		if err != nil {
-			return nil, nil, nil, nil, nil, consensus.BlockValidationSummary{}, err
+			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
 		}
 		detail, err := tempState.applyBlockDetailed(&step.block)
 		if err != nil {
-			return nil, nil, nil, nil, nil, consensus.BlockValidationSummary{}, err
+			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
 		}
 		mergeOverlayDelta(reorgOverlay, detail.overlay)
 		summary = detail.summary
@@ -396,16 +419,20 @@ func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uin
 		entry.BlockSizeState = tempState.BlockSizeState()
 		hash := consensus.HeaderHash(&step.block.Header)
 		entries = append(entries, entry)
+		connectedBlocks = append(connectedBlocks, step.block)
 		undoByHash[hash] = undo
 		createdByHash[hash] = detail.createdUTXO
 	}
-	return tempState, reorgOverlay, entries, undoByHash, createdByHash, summary, nil
+	return tempState, reorgOverlay, entries, undoByHash, createdByHash, committedBranchTransition{
+		Connected:       connectedBlocks,
+		DisconnectedTxs: disconnectedBranchTransactions(disconnectedBlocks),
+	}, summary, nil
 }
 
-func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeight uint64) (*consensus.UtxoOverlay, error) {
+func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeight uint64) (*consensus.UtxoOverlay, []types.Block, error) {
 	baseUtxos, err := state.materializeUTXOs()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	workingUtxos := consensus.NewUtxoOverlay(baseUtxos)
 	workingAcc := state.utxoAcc
@@ -415,42 +442,44 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 	if workingAcc == nil {
 		workingAcc, err = consensus.UtxoAccumulator(baseUtxos)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
+	disconnected := make([]types.Block, 0)
 	for state.TipHeight() != nil && *state.TipHeight() > targetHeight {
 		height := *state.TipHeight()
 		hash, err := p.store.GetBlockHashByHeight(height)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if hash == nil {
-			return nil, fmt.Errorf("missing active hash at height %d", height)
+			return nil, nil, fmt.Errorf("missing active hash at height %d", height)
 		}
 		block, err := p.store.GetBlock(hash)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if block == nil {
-			return nil, fmt.Errorf("missing active block %x", *hash)
+			return nil, nil, fmt.Errorf("missing active block %x", *hash)
 		}
+		disconnected = append(disconnected, *block)
 		undo, err := p.store.GetUndo(hash)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		parentEntry, err := p.store.GetBlockIndex(&block.Header.PrevBlockHash)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if parentEntry == nil {
-			return nil, fmt.Errorf("missing parent entry for active block %x", *hash)
+			return nil, nil, fmt.Errorf("missing parent entry for active block %x", *hash)
 		}
 		checksumSpent := survivingBlockOutputs(workingUtxos.Lookup, block)
 		checksumRestored := undoEntriesToUtxoMap(undo)
 		state.utxoChecksum = utxochecksum.ApplyDelta(state.utxoChecksum, checksumSpent, checksumRestored)
 		workingAcc, err = disconnectBlockOverlay(workingUtxos, workingAcc, block, undo)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		parentHeight := parentEntry.Height
 		parentHeader := parentEntry.Header
@@ -463,11 +492,29 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 	if state.tipHeader != nil {
 		recentTimes, err := loadIndexedAncestorTimestamps(p.store, consensus.HeaderHash(state.tipHeader), 11)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		state.recentTimes = recentTimes
 	}
-	return workingUtxos, nil
+	slices.Reverse(disconnected)
+	return workingUtxos, disconnected, nil
+}
+
+func disconnectedBranchTransactions(blocks []types.Block) []types.Transaction {
+	total := 0
+	for _, block := range blocks {
+		if len(block.Txs) > 1 {
+			total += len(block.Txs) - 1
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	txs := make([]types.Transaction, 0, total)
+	for _, block := range blocks {
+		txs = append(txs, block.Txs[1:]...)
+	}
+	return txs
 }
 
 func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utreexo.Accumulator, block *types.Block, undo []storage.BlockUndoEntry) (*utreexo.Accumulator, error) {
@@ -510,11 +557,7 @@ func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utr
 				return nil, fmt.Errorf("undo outpoint mismatch for input %v", input.PrevOut)
 			}
 			currentUtxos.Restore(input.PrevOut, entry.Entry)
-			restoredLeaves = append(restoredLeaves, utreexo.UtxoLeaf{
-				OutPoint:   entry.OutPoint,
-				ValueAtoms: entry.Entry.ValueAtoms,
-				PubKey:     entry.Entry.PubKey,
-			})
+			restoredLeaves = append(restoredLeaves, utxoLeafForEntry(entry.OutPoint, entry.Entry))
 		}
 		txid := consensus.TxID(&block.Txs[i])
 		for vout := range block.Txs[i].Base.Outputs {
@@ -529,34 +572,52 @@ func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utr
 }
 
 func captureUndoEntries(block *types.Block, lookup consensus.UtxoLookupWithErr) ([]storage.BlockUndoEntry, error) {
-	undo := make([]storage.BlockUndoEntry, 0)
-	tempUtxos := consensus.NewUtxoOverlayWithLookup(lookup)
+	if block == nil || len(block.Txs) <= 1 {
+		return nil, nil
+	}
+	inputCap := max(0, len(block.Txs)-1)
+	outputCap := len(block.Txs)
+	for i := 1; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
+		if len(tx.Base.Inputs) > 1 {
+			inputCap += len(tx.Base.Inputs) - 1
+		}
+		if len(tx.Base.Outputs) > 1 {
+			outputCap += len(tx.Base.Outputs) - 1
+		}
+	}
+	undo := make([]storage.BlockUndoEntry, 0, inputCap)
+	spent := make(map[types.OutPoint]struct{}, inputCap)
+	created := make(map[types.OutPoint]consensus.UtxoEntry, outputCap)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		txid := consensus.TxID(tx)
 		for _, input := range block.Txs[i].Base.Inputs {
-			entry, ok := tempUtxos.Lookup(input.PrevOut)
-			if !ok {
+			if _, duplicate := spent[input.PrevOut]; duplicate {
 				return nil, fmt.Errorf("missing utxo for undo capture: %v", input.PrevOut)
 			}
+			spent[input.PrevOut] = struct{}{}
 			// Only spends that reach into the pre-block UTXO set need an undo record.
 			// Same-block dependency edges are rewound by deleting this block's outputs.
-			if _, existed, err := lookup(input.PrevOut); err != nil {
+			if entry, existed, err := lookup(input.PrevOut); err != nil {
 				return nil, fmt.Errorf("undo capture lookup failed: %w", err)
 			} else if existed {
 				undo = append(undo, storage.BlockUndoEntry{OutPoint: input.PrevOut, Entry: entry})
+				continue
 			}
-			tempUtxos.Spend(input.PrevOut)
+			if _, ok := created[input.PrevOut]; !ok {
+				return nil, fmt.Errorf("missing utxo for undo capture: %v", input.PrevOut)
+			}
+			delete(created, input.PrevOut)
 		}
 		for vout, output := range tx.Base.Outputs {
-			tempUtxos.Set(types.OutPoint{TxID: txid, Vout: uint32(vout)}, consensus.UtxoEntry{
+			created[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
+				Type:       output.Type,
 				ValueAtoms: output.ValueAtoms,
+				Payload32:  output.Payload32,
 				PubKey:     output.PubKey,
-			})
+			}
 		}
-	}
-	if err := tempUtxos.Err(); err != nil {
-		return nil, fmt.Errorf("undo capture overlay lookup failed: %w", err)
 	}
 	return undo, nil
 }

@@ -14,31 +14,36 @@ import (
 const minimumUsefulPeerWindow = time.Minute
 
 type throughputSummaryTelemetry struct {
-	admittedTxs           atomic.Uint64
-	orphanPromotions      atomic.Uint64
-	relayedTxItems        atomic.Uint64
-	relayedBlockItems     atomic.Uint64
-	blocksAccepted        atomic.Uint64
-	blockSigChecks        atomic.Uint64
-	blockSigFallbacks     atomic.Uint64
-	templateRebuilds      atomic.Uint64
-	templateInterruptions atomic.Uint64
-	erlayRounds           atomic.Uint64
-	erlayRequestedTxs     atomic.Uint64
-	compactBlockPlans     atomic.Uint64
-	grapheneExtPlans      atomic.Uint64
-	grapheneDecodeFails   atomic.Uint64
-	grapheneExtRecoveries atomic.Uint64
-	legacyRelayFallbacks  atomic.Uint64
-	txReconRetries        atomic.Uint64
-	directFallbackBatches atomic.Uint64
-	directFallbackTxs     atomic.Uint64
-	txRequestsReceived    atomic.Uint64
-	txNotFoundSent        atomic.Uint64
-	txNotFoundReceived    atomic.Uint64
-	knownTxClears         atomic.Uint64
-	duplicateSuppressions atomic.Uint64
-	writerStarvation      atomic.Uint64
+	admittedTxs            atomic.Uint64
+	orphanPromotions       atomic.Uint64
+	relayedTxItems         atomic.Uint64
+	relayedBlockItems      atomic.Uint64
+	blocksAccepted         atomic.Uint64
+	blockSigChecks         atomic.Uint64
+	blockSigFallbacks      atomic.Uint64
+	templateRebuilds       atomic.Uint64
+	templateInterruptions  atomic.Uint64
+	erlayRounds            atomic.Uint64
+	erlayRequestedTxs      atomic.Uint64
+	compactBlockPlans      atomic.Uint64
+	compactBlocksReceived  atomic.Uint64
+	compactBlocksRecovered atomic.Uint64
+	compactBlockMissingTxs atomic.Uint64
+	compactBlockTxRequests atomic.Uint64
+	compactBlockFallbacks  atomic.Uint64
+	grapheneExtPlans       atomic.Uint64
+	grapheneDecodeFails    atomic.Uint64
+	grapheneExtRecoveries  atomic.Uint64
+	legacyRelayFallbacks   atomic.Uint64
+	txReconRetries         atomic.Uint64
+	directFallbackBatches  atomic.Uint64
+	directFallbackTxs      atomic.Uint64
+	txRequestsReceived     atomic.Uint64
+	txNotFoundSent         atomic.Uint64
+	txNotFoundReceived     atomic.Uint64
+	knownTxClears          atomic.Uint64
+	duplicateSuppressions  atomic.Uint64
+	writerStarvation       atomic.Uint64
 
 	mu   sync.Mutex
 	last throughputCounterSnapshot
@@ -73,6 +78,7 @@ func (s *Service) throughputSummaryLoop() {
 func (s *Service) noteAcceptedAdmissions(admissions []mempool.Admission) {
 	accepted := 0
 	promoted := 0
+	s.rememberValidAuthAdmissions(admissions)
 	for _, admission := range admissions {
 		accepted += len(admission.Accepted)
 		if len(admission.Accepted) > 1 {
@@ -121,6 +127,28 @@ func (s *Service) noteBlockRelayPlan(plan blockRelayPlan) {
 	default:
 		s.throughput.legacyRelayFallbacks.Add(1)
 	}
+}
+
+func (s *Service) noteCompactBlockReceived() {
+	s.throughput.compactBlocksReceived.Add(1)
+}
+
+func (s *Service) noteCompactBlockRecovered() {
+	s.throughput.compactBlocksRecovered.Add(1)
+}
+
+func (s *Service) noteCompactBlockMissingTxs(count int) {
+	if count > 0 {
+		s.throughput.compactBlockMissingTxs.Add(uint64(count))
+	}
+}
+
+func (s *Service) noteCompactBlockTxRequest() {
+	s.throughput.compactBlockTxRequests.Add(1)
+}
+
+func (s *Service) noteCompactBlockFallback() {
+	s.throughput.compactBlockFallbacks.Add(1)
 }
 
 func (s *Service) noteGrapheneDecodeFailure() {

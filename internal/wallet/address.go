@@ -4,12 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"bitcoin-pure/internal/types"
 )
 
 const (
 	AddressPrefix      = "bpu"
 	cashAddrSeparator  = ':'
 	cashAddrTypeP2PK   = 0
+	cashAddrTypePQLock = 1
 	cashAddrChecksumSz = 8
 )
 
@@ -23,8 +26,24 @@ var (
 	cashAddrPolymodGen    = [5]uint64{0x98f2bc8e61, 0x79b76d99e2, 0xf33e5fb3c4, 0xae2eabe2a8, 0x1e4f43e470}
 )
 
+type WatchItem struct {
+	Type      uint64
+	Payload32 [32]byte
+}
+
 func EncodeAddress(pubKey [32]byte) string {
-	encoded, err := encodeCashAddress(AddressPrefix, cashAddrTypeP2PK, pubKey[:])
+	return EncodeTypedAddress(WatchItem{
+		Type:      types.OutputXOnlyP2PK,
+		Payload32: pubKey,
+	})
+}
+
+func EncodeTypedAddress(item WatchItem) string {
+	addrType, err := cashAddrTypeForOutputType(item.Type)
+	if err != nil {
+		panic(fmt.Sprintf("encode wallet address: %v", err))
+	}
+	encoded, err := encodeCashAddress(AddressPrefix, addrType, item.Payload32[:])
 	if err != nil {
 		panic(fmt.Sprintf("encode wallet address: %v", err))
 	}
@@ -33,15 +52,51 @@ func EncodeAddress(pubKey [32]byte) string {
 
 func ParseAddress(raw string) ([32]byte, error) {
 	var pubKey [32]byte
+	item, err := ParseWatchAddress(raw)
+	if err != nil {
+		return pubKey, err
+	}
+	if item.Type != types.OutputXOnlyP2PK {
+		return pubKey, ErrInvalidAddress
+	}
+	return item.Payload32, nil
+}
+
+func ParseWatchAddress(raw string) (WatchItem, error) {
+	var item WatchItem
 	_, addrType, payload, err := decodeCashAddress(raw, AddressPrefix)
 	if err != nil {
-		return pubKey, ErrInvalidAddress
+		return item, ErrInvalidAddress
 	}
-	if addrType != cashAddrTypeP2PK || len(payload) != len(pubKey) {
-		return pubKey, ErrInvalidAddress
+	outputType, err := outputTypeForCashAddrType(addrType)
+	if err != nil || len(payload) != len(item.Payload32) {
+		return item, ErrInvalidAddress
 	}
-	copy(pubKey[:], payload)
-	return pubKey, nil
+	item.Type = outputType
+	copy(item.Payload32[:], payload)
+	return item, nil
+}
+
+func cashAddrTypeForOutputType(outputType uint64) (byte, error) {
+	switch outputType {
+	case types.OutputXOnlyP2PK:
+		return cashAddrTypeP2PK, nil
+	case types.OutputPQLock32:
+		return cashAddrTypePQLock, nil
+	default:
+		return 0, errInvalidCashAddr
+	}
+}
+
+func outputTypeForCashAddrType(addrType byte) (uint64, error) {
+	switch addrType {
+	case cashAddrTypeP2PK:
+		return types.OutputXOnlyP2PK, nil
+	case cashAddrTypePQLock:
+		return types.OutputPQLock32, nil
+	default:
+		return 0, errInvalidCashAddr
+	}
 }
 
 func encodeCashAddress(prefix string, addrType byte, payload []byte) (string, error) {

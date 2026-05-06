@@ -92,7 +92,7 @@ func BuildSnapshotChainMaterial(profile types.ChainProfile, genesis *types.Block
 		return SnapshotChainMaterial{}, err
 	}
 	blockSizeState := consensus.NewBlockSizeState(params)
-	blockSizeState.BlockSize = uint64(len(genesis.Encode()))
+	blockSizeState.BlockSize = uint64(genesis.EncodedLen())
 	entries := make([]storage.BlockIndexEntry, 0, height+1)
 	entries = append(entries, storage.BlockIndexEntry{
 		Height:         0,
@@ -115,7 +115,7 @@ func BuildSnapshotChainMaterial(profile types.ChainProfile, genesis *types.Block
 			return SnapshotChainMaterial{}, err
 		}
 		chainWork = consensus.AddChainWork(chainWork, work)
-		blockSizeState = consensus.AdvanceBlockSizeState(blockSizeState, uint64(len(block.Encode())), params)
+		blockSizeState = consensus.AdvanceBlockSizeState(blockSizeState, uint64(block.EncodedLen()), params)
 		entry := storage.BlockIndexEntry{
 			Height:         i + 1,
 			ParentHash:     block.Header.PrevBlockHash,

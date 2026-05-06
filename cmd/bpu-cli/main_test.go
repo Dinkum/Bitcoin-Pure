@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"bitcoin-pure/internal/config"
+	"bitcoin-pure/internal/node"
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/wallet"
 )
@@ -258,6 +260,87 @@ func TestLoadGenesisFixtureSupportsRegtestMediumAndHard(t *testing.T) {
 	}
 	if loadedHard.Fixture.Profile != string(types.RegtestHard) {
 		t.Fatalf("fixture profile = %q, want %q", loadedHard.Fixture.Profile, types.RegtestHard)
+	}
+}
+
+func TestParseWalletFeePriority(t *testing.T) {
+	tests := []struct {
+		raw        string
+		wantLabel  string
+		wantBlocks int
+	}{
+		{raw: "now", wantLabel: "now", wantBlocks: 1},
+		{raw: "soon", wantLabel: "soon", wantBlocks: 2},
+		{raw: "relaxed", wantLabel: "relaxed", wantBlocks: 3},
+		{raw: "cheap", wantLabel: "cheap", wantBlocks: 6},
+		{raw: "normal", wantLabel: "soon", wantBlocks: 2},
+		{raw: "slow", wantLabel: "cheap", wantBlocks: 6},
+	}
+	for _, test := range tests {
+		label, blocks, err := parseWalletFeePriority(test.raw)
+		if err != nil {
+			t.Fatalf("parseWalletFeePriority(%q): %v", test.raw, err)
+		}
+		if label != test.wantLabel || blocks != test.wantBlocks {
+			t.Fatalf("parseWalletFeePriority(%q) = (%q, %d), want (%q, %d)", test.raw, label, blocks, test.wantLabel, test.wantBlocks)
+		}
+	}
+	if _, _, err := parseWalletFeePriority("mystery"); err == nil {
+		t.Fatal("expected unknown priority to fail")
+	}
+}
+
+func TestMinutesToTargetBlocksRoundsUp(t *testing.T) {
+	tests := []struct {
+		minutes int
+		want    int
+	}{
+		{minutes: 1, want: 1},
+		{minutes: 10, want: 1},
+		{minutes: 11, want: 2},
+		{minutes: 25, want: 3},
+		{minutes: 60, want: 6},
+	}
+	for _, test := range tests {
+		if got := minutesToTargetBlocks(test.minutes); got != test.want {
+			t.Fatalf("minutesToTargetBlocks(%d) = %d, want %d", test.minutes, got, test.want)
+		}
+	}
+}
+
+func TestPromptWalletFeeQuoteInteractiveUsesRecommendedDefault(t *testing.T) {
+	var out bytes.Buffer
+	info := &node.MempoolInfo{}
+	quote, err := promptWalletFeeQuoteInteractive(strings.NewReader("\n"), &out, info, func(targetBlocks int) (uint64, error) {
+		return uint64(targetBlocks * 10), nil
+	})
+	if err != nil {
+		t.Fatalf("promptWalletFeeQuoteInteractive: %v", err)
+	}
+	if quote.Label != "cheap" || quote.TargetBlocks != 6 || quote.FeeRate != 60 {
+		t.Fatalf("default quote = %+v, want cheap / 6 blocks / 60 atoms-B", quote)
+	}
+	if !strings.Contains(out.String(), "recommended") {
+		t.Fatalf("prompt output missing recommendation hint: %s", out.String())
+	}
+}
+
+func TestPromptWalletFeeQuoteInteractiveSupportsCustomMinutes(t *testing.T) {
+	var out bytes.Buffer
+	quote, err := promptWalletFeeQuoteInteractive(strings.NewReader("6\n25\n"), &out, nil, func(targetBlocks int) (uint64, error) {
+		return uint64(targetBlocks * 7), nil
+	})
+	if err != nil {
+		t.Fatalf("promptWalletFeeQuoteInteractive custom minutes: %v", err)
+	}
+	if quote.Label != "custom" {
+		t.Fatalf("quote label = %q, want custom", quote.Label)
+	}
+	if quote.TargetMinutes != 25 || quote.TargetBlocks != 3 {
+		t.Fatalf("quote target = %d minutes / %d blocks, want 25 / 3", quote.TargetMinutes, quote.TargetBlocks)
+	}
+	if quote.FeeRate != 21 {
+		t.Fatalf("quote fee rate = %d, want 21", quote.FeeRate)
 	}
 }
 

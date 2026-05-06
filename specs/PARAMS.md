@@ -39,6 +39,7 @@ use:
 - `block_size_floor = 32_000_000`
 - `coinbase_maturity = 100`
 - `address_prefix = "bpu"`
+- `chain_lineage = "c1"`
 - `recommended_tx_version = 1`
 - `recommended_block_version = 1`
 
