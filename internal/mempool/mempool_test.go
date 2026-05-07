@@ -643,6 +643,52 @@ func TestRemoveConfirmedEvictsConflictsAndDescendants(t *testing.T) {
 	}
 }
 
+func TestRemoveConfirmedPreservesUnconfirmedDescendants(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	prevOut := types.OutPoint{TxID: [32]byte{14}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: signerPubKey(1)},
+	}
+
+	parent := spendTx(t, 1, prevOut, 50, 2, 1)
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept parent: %v", err)
+	}
+	child := spendTx(t, 2, types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}, 49, 3, 1)
+	childAdmission, err := pool.AcceptTx(child, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept child: %v", err)
+	}
+
+	block := &types.Block{
+		Txs: []types.Transaction{
+			testCoinbase(1, []types.TxOutput{{ValueAtoms: 1, PubKey: signerPubKey(9)}}),
+			parent,
+		},
+	}
+	pool.RemoveConfirmed(block)
+	if pool.Count() != 1 {
+		t.Fatalf("mempool count = %d, want 1", pool.Count())
+	}
+	entry := pool.entries[childAdmission.TxID]
+	if entry == nil {
+		t.Fatalf("child missing from mempool after parent confirmed")
+	}
+	if len(entry.Parents) != 0 {
+		t.Fatalf("child parents = %d, want 0 after parent moved to chain", len(entry.Parents))
+	}
+	if entry.AncestorCount != 1 || entry.DescendantCount != 1 {
+		t.Fatalf("child counts ancestor=%d descendant=%d, want 1/1", entry.AncestorCount, entry.DescendantCount)
+	}
+}
+
 func TestRemoveRecursiveUpdatesAncestorStatsIncrementally(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,

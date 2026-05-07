@@ -54,6 +54,7 @@ required_go_version() {
 }
 
 current_go_version() {
+	export PATH="/usr/local/go/bin:${PATH}"
 	if ! command -v go >/dev/null 2>&1; then
 		return 1
 	fi

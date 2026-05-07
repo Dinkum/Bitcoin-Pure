@@ -49,7 +49,6 @@ type avalancheManager struct {
 	mu        sync.Mutex
 	rng       *rand.Rand
 	conflicts map[types.OutPoint]*avalancheConflictSet
-	txInputs  map[[32]byte][]types.OutPoint
 	polls     map[uint64]*avalanchePollState
 	stats     avalancheStats
 	nextPrune time.Time
@@ -84,7 +83,6 @@ func newAvalancheManager(svc *Service) *avalancheManager {
 		svc:       svc,
 		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		conflicts: make(map[types.OutPoint]*avalancheConflictSet),
-		txInputs:  make(map[[32]byte][]types.OutPoint),
 		polls:     make(map[uint64]*avalanchePollState),
 	}
 }
@@ -128,7 +126,7 @@ func (m *avalancheManager) info() AvalancheInfo {
 		PollIntervalMS:         m.svc.cfg.AvalanchePollInterval.Milliseconds(),
 		TrackedConflictSets:    len(m.conflicts),
 		FinalizedConflictSets:  finalized,
-		TrackedTransactions:    len(m.txInputs),
+		TrackedTransactions:    m.trackedTransactionCountLocked(),
 		InFlightPolls:          len(m.polls),
 		PollsStarted:           m.stats.pollsStarted,
 		PollsFinalized:         m.stats.pollsFinalized,
@@ -200,9 +198,7 @@ func (m *avalancheManager) onBlockAccepted(block *types.Block) {
 	for i := 1; i < len(block.Txs); i++ {
 		tx := block.Txs[i]
 		txid := consensus.TxID(&tx)
-		inputs := make([]types.OutPoint, 0, len(tx.Base.Inputs))
 		for _, input := range tx.Base.Inputs {
-			inputs = append(inputs, input.PrevOut)
 			set := m.ensureConflictSetLocked(input.PrevOut, now)
 			set.members = map[[32]byte]struct{}{txid: {}}
 			set.pref = txid
@@ -212,7 +208,6 @@ func (m *avalancheManager) onBlockAccepted(block *types.Block) {
 			set.lastSuccess = false
 			set.updatedAt = now
 		}
-		m.txInputs[txid] = inputs
 	}
 	m.pruneExpiredIfDueLocked(now)
 }
@@ -493,9 +488,7 @@ func (m *avalancheManager) trackTx(tx types.Transaction, preferred bool, now tim
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pruneExpiredIfDueLocked(now)
-	inputs := make([]types.OutPoint, 0, len(tx.Base.Inputs))
 	for _, input := range tx.Base.Inputs {
-		inputs = append(inputs, input.PrevOut)
 		set := m.ensureConflictSetLocked(input.PrevOut, now)
 		set.members[txid] = struct{}{}
 		if !set.hasPref || preferred {
@@ -504,7 +497,6 @@ func (m *avalancheManager) trackTx(tx types.Transaction, preferred bool, now tim
 		}
 		set.updatedAt = now
 	}
-	m.txInputs[txid] = inputs
 }
 
 func (m *avalancheManager) ensureConflictSetLocked(outpoint types.OutPoint, now time.Time) *avalancheConflictSet {
@@ -546,6 +538,16 @@ func (s *avalancheConflictSet) hasAnyFinal() bool {
 		}
 	}
 	return false
+}
+
+func (m *avalancheManager) trackedTransactionCountLocked() int {
+	seen := make(map[[32]byte]struct{})
+	for _, set := range m.conflicts {
+		for txid := range set.members {
+			seen[txid] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 func (m *avalancheManager) metricsForMempool() (int, int) {

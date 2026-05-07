@@ -261,6 +261,32 @@ func TestBuildSendRejectsInsufficientFunds(t *testing.T) {
 	}
 }
 
+func TestBuildSendSkipsImmatureCoinbase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	_, err = store.BuildSend("alice", first.Address, 10, 1, []SpendableUTXO{{
+		OutPoint:      types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+		Value:         50,
+		PubKey:        keyHash,
+		Coinbase:      true,
+		Confirmations: 12,
+		Mature:        false,
+	}})
+	if !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("BuildSend err = %v, want ErrInsufficientFunds", err)
+	}
+}
+
 func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
 	if err != nil {
@@ -302,6 +328,119 @@ func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 	}
 	if summary.PendingCount != 1 {
 		t.Fatalf("pending count = %d, want 1", summary.PendingCount)
+	}
+}
+
+func TestBalanceSeparatesImmatureCoinbase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	summary, err := store.Balance("alice", []SpendableUTXO{
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: 50, PubKey: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 0}, Value: 25, PubKey: keyHash, Coinbase: true, Confirmations: 12, Mature: false},
+	})
+	if err != nil {
+		t.Fatalf("Balance: %v", err)
+	}
+	if summary.Confirmed != 75 || summary.Mature != 50 || summary.Immature != 25 || summary.Available != 50 {
+		t.Fatalf("summary = %+v, want confirmed=75 mature=50 immature=25 available=50", summary)
+	}
+}
+
+func TestParseAndFormatBPUAmounts(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want uint64
+	}{
+		{raw: "1", want: AtomsPerBPU},
+		{raw: "1.25", want: 1_250_000_000},
+		{raw: "0.000000001 BPU", want: 1},
+		{raw: "42 atoms", want: 42},
+	}
+	for _, test := range tests {
+		got, err := ParseAmount(test.raw)
+		if err != nil {
+			t.Fatalf("ParseAmount(%q): %v", test.raw, err)
+		}
+		if got != test.want {
+			t.Fatalf("ParseAmount(%q) = %d, want %d", test.raw, got, test.want)
+		}
+	}
+	if got := FormatAmount(1_250_000_000); got != "1.25 BPU" {
+		t.Fatalf("FormatAmount = %q, want 1.25 BPU", got)
+	}
+	if _, err := ParseAmount("0.0000000001"); err == nil {
+		t.Fatal("expected too many BPU decimals to fail")
+	}
+}
+
+func TestBackupRestoreExportImportWallet(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, _, err := store.CreateWallet("alice"); err != nil {
+		t.Fatalf("CreateWallet alice: %v", err)
+	}
+	if _, _, err := store.CreateWallet("bob"); err != nil {
+		t.Fatalf("CreateWallet bob: %v", err)
+	}
+
+	backupPath := filepath.Join(root, "backup.json")
+	if err := store.Backup(backupPath); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	mode, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("Stat backup: %v", err)
+	}
+	if mode.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode = %o, want 600", mode.Mode().Perm())
+	}
+
+	restored, err := Open(filepath.Join(root, "restored.json"))
+	if err != nil {
+		t.Fatalf("Open restored: %v", err)
+	}
+	if err := restored.RestoreBackup(backupPath); err != nil {
+		t.Fatalf("RestoreBackup: %v", err)
+	}
+	if wallets := restored.List(); len(wallets) != 2 {
+		t.Fatalf("restored wallets = %d, want 2", len(wallets))
+	}
+
+	export, err := store.ExportWallet("alice")
+	if err != nil {
+		t.Fatalf("ExportWallet: %v", err)
+	}
+	exportPath := filepath.Join(root, "alice-export.json")
+	if err := SaveExportFile(exportPath, export); err != nil {
+		t.Fatalf("SaveExportFile: %v", err)
+	}
+	loadedExport, err := LoadExportFile(exportPath)
+	if err != nil {
+		t.Fatalf("LoadExportFile: %v", err)
+	}
+	importedStore, err := Open(filepath.Join(root, "imported.json"))
+	if err != nil {
+		t.Fatalf("Open imported: %v", err)
+	}
+	imported, err := importedStore.ImportWallet(loadedExport, "carol")
+	if err != nil {
+		t.Fatalf("ImportWallet: %v", err)
+	}
+	if imported.Name != "carol" || len(imported.Addresses) == 0 {
+		t.Fatalf("imported wallet = %+v", imported)
 	}
 }
 

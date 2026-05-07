@@ -447,6 +447,12 @@ func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
 	entry := TxAuthEntry{}
 	if len(authPayload) == len(entry.Signature) {
 		copy(entry.Signature[:], authPayload)
+		if entry.Signature == ([64]byte{}) {
+			// A zero-filled 64-byte payload is still a present payload. Without
+			// this preservation, compatibility encoding would collapse it to a
+			// zero-length auth entry.
+			entry.AuthPayload = append([]byte(nil), authPayload...)
+		}
 	} else {
 		entry.AuthPayload = append([]byte(nil), authPayload...)
 	}

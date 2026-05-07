@@ -29,9 +29,7 @@ func newValidAuthCache(max int) *validAuthCache {
 		max = validAuthCacheCapacity
 	}
 	return &validAuthCache{
-		max:   max,
-		order: make([]validAuthCacheKey, 0, max),
-		items: make(map[validAuthCacheKey]struct{}, max),
+		max: max,
 	}
 }
 
@@ -46,6 +44,9 @@ func (c *validAuthCache) remember(txid, authid [32]byte, params consensus.ChainP
 	key := validAuthCacheKey{txid: txid, authid: authid, paramTag: validAuthParamTag(params)}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.items == nil {
+		c.items = make(map[validAuthCacheKey]struct{})
+	}
 	if _, ok := c.items[key]; ok {
 		return
 	}

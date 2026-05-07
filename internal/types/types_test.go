@@ -164,6 +164,19 @@ func TestBlockHeaderRoundtripPreservesUint64Nonce(t *testing.T) {
 	}
 }
 
+func TestDecodeTransactionPreservesZeroLength64AuthPayload(t *testing.T) {
+	tx := sampleTx()
+	tx.Auth.Entries[0] = TxAuthEntry{AuthPayload: make([]byte, 64)}
+	encoded := tx.Encode()
+	got, err := DecodeTransactionWithLimits(encoded, DefaultCodecLimits())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !bytes.Equal(got.Encode(), encoded) {
+		t.Fatal("zero-filled 64-byte auth payload was not preserved")
+	}
+}
+
 func TestDecodeTransactionRejectsCoinbaseMissingExtraNonce(t *testing.T) {
 	raw := []byte{
 		0x01, 0x00, 0x00, 0x00, // version

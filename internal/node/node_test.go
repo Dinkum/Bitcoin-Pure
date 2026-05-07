@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2916,6 +2917,59 @@ func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
 	}
 }
 
+func TestMineBlockSearchSpaceStopsOnServiceShutdown(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: nodeSignerPubKey(9),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	view, ok := svc.chainState.CommittedView()
+	if !ok {
+		t.Fatal("missing committed chain view")
+	}
+	block := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 9, view.TipHeader.Timestamp+600)
+	svc.mineHeaderFn = func(header types.BlockHeader, params consensus.ChainParams, shouldContinue func(uint64) bool) (types.BlockHeader, bool, error) {
+		svc.stopOnce.Do(func() { close(svc.stopCh) })
+		if shouldContinue(0) {
+			return types.BlockHeader{}, false, errors.New("mining should stop when the service is shutting down")
+		}
+		return types.BlockHeader{}, false, nil
+	}
+
+	_, fresh, err := svc.mineBlockSearchSpace(block, consensus.RegtestParams(), view.UTXOAcc, nil)
+	if err != nil {
+		t.Fatalf("mineBlockSearchSpace: %v", err)
+	}
+	if fresh {
+		t.Fatal("expected mining to stop without a fresh block")
+	}
+}
+
+func TestBuildBlockTemplateStopsOnServiceShutdown(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: nodeSignerPubKey(9),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	svc.stopOnce.Do(func() { close(svc.stopCh) })
+	_, _, err = svc.minerManager().buildBlockTemplateWithGeneration()
+	if !errors.Is(err, ErrServiceStopping) {
+		t.Fatalf("expected ErrServiceStopping, got %v", err)
+	}
+}
+
 func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
 	minerKey := nodeSignerPubKey(9)
 	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
@@ -3265,6 +3319,67 @@ func TestConnectPeerReconnectsAfterDisconnect(t *testing.T) {
 	got := accepts
 	mu.Unlock()
 	t.Fatalf("accepted connections = %d, want at least 2", got)
+}
+
+func TestAutomaticOutboundHandshakeFailuresEvictTarget(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:          types.Regtest,
+		DBPath:           t.TempDir(),
+		MaxOutboundPeers: 1,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var accepts atomic.Int64
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			_ = conn.Close()
+		}
+	}()
+
+	if err := svc.peerManager().connectPeer(ln.Addr().String(), false); err != nil {
+		t.Fatalf("connectPeer: %v", err)
+	}
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.outboundPeerCount() == 0 && accepts.Load() >= autoPeerFailureCeiling {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("outbound target was not evicted after handshake failures; accepts=%d outbound=%d", accepts.Load(), svc.outboundPeerCount())
+}
+
+func TestInboundHandshakeTimeoutIsExpectedFailure(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	_ = server.SetReadDeadline(time.Now().Add(-time.Second))
+	_, err := server.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected read timeout")
+	}
+	if !isExpectedInboundHandshakeFailure(err) {
+		t.Fatalf("inbound handshake timeout should be expected: %v", err)
+	}
+	if isExpectedPeerCloseError(err) {
+		t.Fatalf("plain peer close classifier should not hide established peer timeout: %v", err)
+	}
 }
 
 func TestScheduleBlockRequestsReassignsExpiredInflight(t *testing.T) {
@@ -4739,6 +4854,18 @@ func TestRenderCandidateBlockSectionUsesDedicatedLabels(t *testing.T) {
 		if !strings.Contains(section, want) {
 			t.Fatalf("expected %q in candidate block section:\n%s", want, section)
 		}
+	}
+}
+
+func TestTemplateTelemetryCandidateFrontierIsCurrent(t *testing.T) {
+	var telemetry templateBuildTelemetry
+	telemetry.noteFullBuild(30)
+	if got := telemetry.snapshot().FrontierCandidates; got != 30 {
+		t.Fatalf("frontier candidates after build = %d, want 30", got)
+	}
+	telemetry.noteNoChangeRefresh(0)
+	if got := telemetry.snapshot().FrontierCandidates; got != 0 {
+		t.Fatalf("frontier candidates after empty refresh = %d, want 0", got)
 	}
 }
 
@@ -7678,6 +7805,43 @@ func TestAvalancheFinalizesAndRejectsConflicts(t *testing.T) {
 	}
 }
 
+func TestAvalancheTrackedTransactionsFollowActiveConflictSets(t *testing.T) {
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	svc, err := OpenService(ServiceConfig{
+		Profile:                   types.Regtest,
+		DBPath:                    t.TempDir(),
+		AvalancheKSample:          3,
+		AvalancheBeta:             2,
+		AvalanchePollInterval:     50 * time.Millisecond,
+		AvalancheAlphaNumerator:   1,
+		AvalancheAlphaDenominator: 2,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	preferred := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
+	conflict := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 9, 1)
+	now := time.Now()
+	svc.avalancheManager().trackTx(preferred, true, now)
+	svc.avalancheManager().trackTx(conflict, false, now)
+
+	if got := svc.avalancheManager().info().TrackedTransactions; got != 2 {
+		t.Fatalf("tracked transactions = %d, want 2", got)
+	}
+
+	svc.avalancheManager().mu.Lock()
+	svc.avalancheManager().pruneExpiredLocked(now.Add(avalancheConflictTTL + time.Second))
+	svc.avalancheManager().mu.Unlock()
+
+	info := svc.avalancheManager().info()
+	if info.TrackedConflictSets != 0 || info.TrackedTransactions != 0 {
+		t.Fatalf("tracked after prune = conflict_sets:%d transactions:%d, want 0/0", info.TrackedConflictSets, info.TrackedTransactions)
+	}
+}
+
 func TestPeerConnPendingTxStoreMaterializesRelayBatchOnce(t *testing.T) {
 	peer := &peerConn{
 		queuedTx: make(map[[32]byte]int),
@@ -7895,7 +8059,13 @@ func TestAcceptedAdmissionsPopulateValidAuthCache(t *testing.T) {
 		cfg:       ServiceConfig{Profile: types.Regtest},
 		validAuth: newValidAuthCache(8),
 	}
+	if svc.validAuth.items != nil || svc.validAuth.order != nil {
+		t.Fatal("valid auth cache should allocate backing storage lazily")
+	}
 	svc.noteAcceptedAdmissions([]mempool.Admission{admission})
+	if svc.validAuth.items == nil || svc.validAuth.order == nil {
+		t.Fatal("valid auth cache did not allocate on first insert")
+	}
 
 	accepted := admission.Accepted[0]
 	if !svc.hasValidTxAuth(accepted.TxID, accepted.AuthID, consensus.RegtestParams()) {

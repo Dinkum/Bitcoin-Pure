@@ -40,6 +40,7 @@ type ChainParams struct {
 	TargetSpacingSecs   int64
 	AsertHalfLifeSecs   int64
 	HalvingInterval     uint64
+	CoinbaseMaturity    uint64
 	InitialSubsidyAtoms uint64
 	BlockSizeFloor      uint64
 	PowLimitBits        uint32
@@ -54,6 +55,7 @@ func MainnetParams() ChainParams {
 		TargetSpacingSecs:   600,
 		AsertHalfLifeSecs:   86_400,
 		HalvingInterval:     2_500_000,
+		CoinbaseMaturity:    100,
 		InitialSubsidyAtoms: 1_000_000_000_000,
 		BlockSizeFloor:      32_000_000,
 		PowLimitBits:        0x1d0f930c,

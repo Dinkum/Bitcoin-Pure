@@ -180,11 +180,15 @@ type MiningInfo struct {
 }
 
 type PubKeyUTXO struct {
-	OutPoint  types.OutPoint
-	Value     uint64
-	Type      uint64
-	Payload32 [32]byte
-	PubKey    [32]byte
+	OutPoint      types.OutPoint
+	Value         uint64
+	Type          uint64
+	Payload32     [32]byte
+	PubKey        [32]byte
+	Height        uint64
+	Confirmations uint64
+	Coinbase      bool
+	Mature        bool
 }
 
 type WalletActivity struct {
@@ -2493,6 +2497,10 @@ func (s *Service) UTXOsByWatchItems(items []compactfilter.WatchItem) []PubKeyUTX
 		s.logger.Warn("scan utxos by watch item failed", slog.Any("error", err))
 		return nil
 	}
+	if err := s.annotateWalletUTXOOrigins(out); err != nil {
+		s.logger.Warn("annotate wallet utxos failed", slog.Any("error", err))
+		return nil
+	}
 	slices.SortFunc(out, func(a, b PubKeyUTXO) int {
 		switch {
 		case a.Type < b.Type:
@@ -2516,6 +2524,63 @@ func (s *Service) UTXOsByWatchItems(items []compactfilter.WatchItem) []PubKeyUTX
 		}
 	})
 	return out
+}
+
+func (s *Service) annotateWalletUTXOOrigins(utxos []PubKeyUTXO) error {
+	if len(utxos) == 0 {
+		return nil
+	}
+	s.stateMu.RLock()
+	view, ok := s.chainState.sharedCommittedView()
+	s.stateMu.RUnlock()
+	if !ok {
+		return ErrNoTip
+	}
+	remaining := make(map[types.OutPoint]int, len(utxos))
+	for i := range utxos {
+		remaining[utxos[i].OutPoint] = i
+	}
+	params := consensus.ParamsForProfile(s.cfg.Profile)
+	for height := view.Height + 1; height > 0 && len(remaining) > 0; height-- {
+		blockHeight := height - 1
+		hash, err := s.chainState.Store().GetBlockHashByHeight(blockHeight)
+		if err != nil {
+			return err
+		}
+		if hash == nil {
+			continue
+		}
+		block, err := s.chainState.Store().GetBlock(hash)
+		if err != nil {
+			return err
+		}
+		if block == nil {
+			continue
+		}
+		for txIndex := range block.Txs {
+			txid := consensus.TxID(&block.Txs[txIndex])
+			for vout := range block.Txs[txIndex].Base.Outputs {
+				outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+				utxoIndex, ok := remaining[outPoint]
+				if !ok {
+					continue
+				}
+				confirmations := view.Height - blockHeight + 1
+				utxos[utxoIndex].Height = blockHeight
+				utxos[utxoIndex].Confirmations = confirmations
+				utxos[utxoIndex].Coinbase = txIndex == 0
+				utxos[utxoIndex].Mature = txIndex != 0 || confirmations >= params.CoinbaseMaturity
+				delete(remaining, outPoint)
+			}
+		}
+	}
+	// If an output was found in the UTXO set but its creating block could not be
+	// located, keep it unavailable rather than letting the wallet spend a coin
+	// whose maturity status is unknown.
+	for _, utxoIndex := range remaining {
+		utxos[utxoIndex].Mature = false
+	}
+	return nil
 }
 
 func (s *Service) UTXOsByPubKeys(pubKeys [][32]byte) []PubKeyUTXO {
@@ -3474,8 +3539,16 @@ func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.Chain
 	if len(block.Txs) == 0 || !block.Txs[0].IsCoinbase() {
 		return types.Block{}, false, errors.New("mining requires coinbase-first block")
 	}
+	continueMining := func(nonce uint64) bool {
+		select {
+		case <-s.stopCh:
+			return false
+		default:
+		}
+		return shouldContinue == nil || shouldContinue(nonce)
+	}
 	for {
-		minedHeader, ok, err := mineHeader(block.Header, params, shouldContinue)
+		minedHeader, ok, err := mineHeader(block.Header, params, continueMining)
 		if err == nil && ok {
 			block.Header = minedHeader
 			return block, true, nil
@@ -3484,6 +3557,9 @@ func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.Chain
 			return types.Block{}, false, err
 		}
 		if !ok && err == nil {
+			return types.Block{}, false, nil
+		}
+		if !continueMining(0) {
 			return types.Block{}, false, nil
 		}
 		nextExtraNonce, wrapped := incrementCoinbaseExtraNonce(*block.Txs[0].Base.CoinbaseExtraNonce)
@@ -5275,13 +5351,20 @@ func (s *Service) buildPublicDashboardView() (*publicDashboardView, error) {
 		blocks = blocks[:5]
 	}
 	mempoolInfo := s.MempoolInfo()
+	template.FrontierCandidates = mempoolInfo.CandidateFrontier
 	mempoolEntries := s.pool.Snapshot()
 	mempoolTop := s.pool.TopByFee(8)
 	performance := s.PerformanceMetrics()
 	pow := s.dashboardPowSummary(blockWindow.recent)
-	fees := s.dashboardFeeSummary(blockWindow.chart, mempoolInfo.Count, pow, s.cachedCandidateFeeLine(), mempoolEntries)
+	candidateFeeLine := s.cachedCandidateFeeLine()
+	candidateTxCount := s.cachedCandidateBlockTxCount()
+	if mempoolInfo.CandidateFrontier == 0 {
+		candidateFeeLine = dashboardCandidateFeeLine{}
+		candidateTxCount = -1
+	}
+	fees := s.dashboardFeeSummary(blockWindow.chart, mempoolInfo.Count, pow, candidateFeeLine, mempoolEntries)
 	mining := s.dashboardMiningSummary(blocks, pow)
-	tpsChart := s.dashboardTPSChartFromBlocks(blockWindow.recent, pow, s.cachedCandidateBlockTxCount())
+	tpsChart := s.dashboardTPSChartFromBlocks(blockWindow.recent, pow, candidateTxCount)
 	mempool := s.dashboardMempoolSummary(mempoolInfo, mempoolEntries, mempoolTop, fees.Clear.Time)
 	peerHosts := s.dashboardPeerHosts(now, info)
 	return &publicDashboardView{
@@ -5860,10 +5943,14 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		out := make([]map[string]any, 0, len(utxos))
 		for _, utxo := range utxos {
 			out = append(out, map[string]any{
-				"txid":   hex.EncodeToString(utxo.OutPoint.TxID[:]),
-				"vout":   utxo.OutPoint.Vout,
-				"value":  utxo.Value,
-				"pubkey": hex.EncodeToString(utxo.PubKey[:]),
+				"txid":          hex.EncodeToString(utxo.OutPoint.TxID[:]),
+				"vout":          utxo.OutPoint.Vout,
+				"value":         utxo.Value,
+				"pubkey":        hex.EncodeToString(utxo.PubKey[:]),
+				"height":        utxo.Height,
+				"confirmations": utxo.Confirmations,
+				"coinbase":      utxo.Coinbase,
+				"mature":        utxo.Mature,
 			})
 		}
 		return map[string]any{"utxos": out, "count": len(out)}, nil
@@ -5889,11 +5976,15 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		out := make([]map[string]any, 0, len(utxos))
 		for _, utxo := range utxos {
 			out = append(out, map[string]any{
-				"txid":      hex.EncodeToString(utxo.OutPoint.TxID[:]),
-				"vout":      utxo.OutPoint.Vout,
-				"value":     utxo.Value,
-				"type":      utxo.Type,
-				"payload32": hex.EncodeToString(utxo.Payload32[:]),
+				"txid":          hex.EncodeToString(utxo.OutPoint.TxID[:]),
+				"vout":          utxo.OutPoint.Vout,
+				"value":         utxo.Value,
+				"type":          utxo.Type,
+				"payload32":     hex.EncodeToString(utxo.Payload32[:]),
+				"height":        utxo.Height,
+				"confirmations": utxo.Confirmations,
+				"coinbase":      utxo.Coinbase,
+				"mature":        utxo.Mature,
 			})
 		}
 		return map[string]any{"utxos": out, "count": len(out)}, nil

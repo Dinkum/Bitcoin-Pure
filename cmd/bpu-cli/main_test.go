@@ -344,6 +344,22 @@ func TestPromptWalletFeeQuoteInteractiveSupportsCustomMinutes(t *testing.T) {
 	}
 }
 
+func TestRenderFanoutPreviewShowsBatchShape(t *testing.T) {
+	view := renderFanoutPreview("miner", []string{"bpu:qone", "bpu:qtwo"}, 1_250_000_000, 3, 500, 0, nil)
+	var out strings.Builder
+	out.WriteString(view.title)
+	for _, row := range view.rows {
+		out.WriteString(row.label)
+		out.WriteString(row.value)
+	}
+	text := out.String()
+	for _, want := range []string{"fanout", "miner", "3", "2 addresses", "1.25 BPU", "3.75 BPU", "500 atoms each"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("fanout preview missing %q: %#v", want, view)
+		}
+	}
+}
+
 func TestLoadGenesisFixtureSupportsMainnet(t *testing.T) {
 	loaded, err := loadGenesisFixtureFromPath(filepath.Join("..", "..", "fixtures", "genesis", "mainnet.json"))
 	if err != nil {
@@ -370,8 +386,28 @@ func TestValidateLoopbackListenAddr(t *testing.T) {
 	if err := validateLoopbackListenAddr("localhost:6060"); err != nil {
 		t.Fatalf("validate localhost: %v", err)
 	}
+	if err := validateLoopbackListenAddr(":6060"); err == nil {
+		t.Fatal("expected wildcard pprof addr rejection")
+	}
 	if err := validateLoopbackListenAddr("0.0.0.0:6060"); err == nil {
 		t.Fatal("expected non-loopback addr rejection")
+	}
+}
+
+func TestNormalizePprofListenAddrUsesLoopbackShorthands(t *testing.T) {
+	tests := map[string]string{
+		"auto":  "127.0.0.1:6060",
+		"6061":  "127.0.0.1:6061",
+		":6062": "127.0.0.1:6062",
+	}
+	for raw, want := range tests {
+		got, err := normalizePprofListenAddr(raw)
+		if err != nil {
+			t.Fatalf("normalizePprofListenAddr(%q): %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("normalizePprofListenAddr(%q) = %q, want %q", raw, got, want)
+		}
 	}
 }
 

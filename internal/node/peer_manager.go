@@ -339,16 +339,29 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 			}
 			continue
 		}
+		if !m.handlePeer(conn, true, addr) {
+			consecutiveFailures++
+			if consecutiveFailures >= autoPeerFailureCeiling && m.evictUnhealthyAutoPeer(addr) {
+				return
+			}
+			if !m.svc.sleepUntilStop(jitterDuration(backoff)) {
+				return
+			}
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			continue
+		}
 		consecutiveFailures = 0
 		backoff = time.Second
-		m.handlePeer(conn, true, addr)
 		if !m.svc.sleepUntilStop(time.Second) {
 			return
 		}
 	}
 }
 
-func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string) {
+func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string) (established bool) {
 	remoteAddr := conn.RemoteAddr().String()
 	addr := remoteAddr
 	if outbound && targetAddr != "" {
@@ -374,8 +387,9 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 			slog.Any("error", err),
 		)
 		_ = conn.Close()
-		return
+		return false
 	}
+	established = true
 	peer := &peerConn{
 		svc:            m.svc,
 		addr:           addr,
@@ -466,7 +480,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 					slog.Time("peer_last_progress", unixTimeOrZero(peer.snapshotProgressUnix())),
 				)
 			}
-			return
+			return established
 		}
 		peer.noteProgress(time.Now())
 		if err := m.svc.onPeerMessage(peer, msg); err != nil {
@@ -482,7 +496,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 				slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 				slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 			)
-			return
+			return established
 		}
 	}
 }
@@ -1457,11 +1471,19 @@ func (m *peerManager) isSelfPeerAddr(addr string) bool {
 }
 
 func logPeerHandshakeFailure(logger *slog.Logger, outbound bool, err error, msg string, attrs ...any) {
-	if outbound || !isExpectedPeerCloseError(err) {
+	if outbound || !isExpectedInboundHandshakeFailure(err) {
 		logger.Warn(msg, attrs...)
 		return
 	}
 	logger.Debug(msg, attrs...)
+}
+
+func isExpectedInboundHandshakeFailure(err error) bool {
+	if isExpectedPeerCloseError(err) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func logPeerReadFailure(svc *Service, err error, msg string, attrs ...any) {

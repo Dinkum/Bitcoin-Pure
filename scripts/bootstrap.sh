@@ -357,7 +357,7 @@ wait_for_http() {
 	base="$(loopback_http_base)"
 	deadline=$((SECONDS + 30))
 	while (( SECONDS < deadline )); do
-		if curl -fsS -o /dev/null "${base}/"; then
+		if curl -fs -o /dev/null "${base}/"; then
 			return 0
 		fi
 		sleep 1
@@ -382,7 +382,7 @@ wait_for_rpc() {
 	base="$(loopback_http_base)"
 	deadline=$((SECONDS + 30))
 	while (( SECONDS < deadline )); do
-		response="$(curl -fsS -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' --data '{"method":"getinfo","params":{}}' "${base}/" || true)"
+		response="$(curl -fs -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' --data '{"method":"getinfo","params":{}}' "${base}/" || true)"
 		if python3 - "${response}" <<'PY'
 import json, sys
 raw = sys.argv[1]

@@ -762,8 +762,8 @@ func runServe(args []string) error {
 	if cfg.P2PAddr != "" {
 		fmt.Printf("p2p: %s\n", cfg.P2PAddr)
 	}
-	if cfg.PprofAddr != "" {
-		fmt.Printf("pprof: %s\n", cfg.PprofAddr)
+	if pprofServer != nil {
+		fmt.Printf("pprof: %s\n", pprofServer.addr)
 	}
 	fmt.Printf("log: %s\n", cfg.LogPath)
 	fmt.Printf("log_format: %s\n", cfg.LogFormat)
@@ -782,10 +782,14 @@ func runServe(args []string) error {
 type pprofServer struct {
 	server *http.Server
 	ln     net.Listener
+	addr   string
 }
 
 func maybeStartPprofServer(addr string, logger *slog.Logger) (*pprofServer, error) {
-	addr = strings.TrimSpace(addr)
+	addr, err := normalizePprofListenAddr(addr)
+	if err != nil {
+		return nil, err
+	}
 	if addr == "" {
 		return nil, nil
 	}
@@ -825,7 +829,7 @@ func maybeStartPprofServer(addr string, logger *slog.Logger) (*pprofServer, erro
 	if logger != nil {
 		logger.Info("pprof server listening", slog.String("addr", addr))
 	}
-	return &pprofServer{server: srv, ln: ln}, nil
+	return &pprofServer{server: srv, ln: ln, addr: ln.Addr().String()}, nil
 }
 
 func (s *pprofServer) Close() error {
@@ -845,7 +849,10 @@ func validateLoopbackListenAddr(addr string) error {
 	if err != nil {
 		return err
 	}
-	if host == "" || strings.EqualFold(host, "localhost") {
+	if host == "" {
+		return fmt.Errorf("pprof listen addr must use explicit loopback host: %s", addr)
+	}
+	if strings.EqualFold(host, "localhost") {
 		return nil
 	}
 	ip, err := netip.ParseAddr(host)
@@ -856,6 +863,26 @@ func validateLoopbackListenAddr(addr string) error {
 		return fmt.Errorf("pprof listen addr must use loopback host: %s", addr)
 	}
 	return nil
+}
+
+func normalizePprofListenAddr(addr string) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", nil
+	}
+	if strings.EqualFold(addr, "auto") {
+		return "127.0.0.1:6060", nil
+	}
+	if _, err := strconv.Atoi(addr); err == nil {
+		return "127.0.0.1:" + addr, nil
+	}
+	if strings.HasPrefix(addr, ":") {
+		if _, err := strconv.Atoi(strings.TrimPrefix(addr, ":")); err != nil {
+			return "", fmt.Errorf("invalid pprof port: %s", addr)
+		}
+		return "127.0.0.1" + addr, nil
+	}
+	return addr, nil
 }
 
 func runValidateTx(args []string) error {
@@ -941,6 +968,16 @@ func runWallet(args []string) error {
 		return runWalletReceive(args[1:])
 	case "send":
 		return runWalletSend(args[1:])
+	case "fanout":
+		return runWalletFanout(args[1:])
+	case "backup":
+		return runWalletBackup(args[1:])
+	case "restore":
+		return runWalletRestore(args[1:])
+	case "export":
+		return runWalletExport(args[1:])
+	case "import":
+		return runWalletImport(args[1:])
 	case "cpfp":
 		return runWalletCPFP(args[1:])
 	default:
@@ -1053,9 +1090,11 @@ func runWalletBalance(args []string) error {
 		return err
 	}
 	fmt.Printf("wallet: %s\n", fs.Arg(0))
-	fmt.Printf("confirmed: %d\n", balance.Confirmed)
-	fmt.Printf("available: %d\n", balance.Available)
-	fmt.Printf("reserved: %d\n", balance.Reserved)
+	fmt.Printf("confirmed: %s (%d atoms)\n", wallet.FormatAmount(balance.Confirmed), balance.Confirmed)
+	fmt.Printf("mature: %s (%d atoms)\n", wallet.FormatAmount(balance.Mature), balance.Mature)
+	fmt.Printf("available: %s (%d atoms)\n", wallet.FormatAmount(balance.Available), balance.Available)
+	fmt.Printf("immature: %s (%d atoms)\n", wallet.FormatAmount(balance.Immature), balance.Immature)
+	fmt.Printf("reserved: %s (%d atoms)\n", wallet.FormatAmount(balance.Reserved), balance.Reserved)
 	fmt.Printf("pending_txs: %d\n", balance.PendingCount)
 	fmt.Printf("addresses: %d\n", balance.AddressCount)
 	return nil
@@ -1097,14 +1136,14 @@ func runWalletHistory(args []string) error {
 		return nil
 	}
 	for _, item := range activity {
-		fmt.Printf("%d  %s  tx=%s  received=%d  sent=%d  fee=%d  net=%d  %s\n",
+		fmt.Printf("%d  %s  tx=%s  received=%s  sent=%s  fee=%s  net=%s  %s\n",
 			item.Height,
 			item.Timestamp,
 			item.TxID,
-			item.Received,
-			item.Sent,
-			item.Fee,
-			item.Net,
+			wallet.FormatAmount(item.Received),
+			wallet.FormatAmount(item.Sent),
+			wallet.FormatAmount(item.Fee),
+			formatSignedWalletAmount(item.Net),
 			item.BlockHash,
 		)
 	}
@@ -1136,7 +1175,8 @@ func runWalletFee(args []string) error {
 	}
 	fmt.Printf("target_blocks: %d\n", *targetBlocks)
 	fmt.Printf("fee_per_byte: %d\n", feePerByte)
-	fmt.Printf("estimated_fee: %d\n", feePerByte*uint64(*txBytes))
+	estimatedFee := feePerByte * uint64(*txBytes)
+	fmt.Printf("estimated_fee: %s (%d atoms)\n", wallet.FormatAmount(estimatedFee), estimatedFee)
 	return nil
 }
 
@@ -1175,6 +1215,150 @@ func runWalletReceive(args []string) error {
 	return nil
 }
 
+func runWalletBackup(args []string) error {
+	fs := flag.NewFlagSet("wallet backup", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	out := fs.String("out", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: bpu-cli wallet backup [--out PATH] [--config PATH] [--wallet-dir DIR]")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, walletPath, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	backupPath := strings.TrimSpace(*out)
+	if backupPath == "" {
+		stamp := time.Now().UTC().Format("20060102T150405Z")
+		backupPath = filepath.Join(filepath.Dir(walletPath), "wallets-"+stamp+".backup.json")
+	}
+	if err := store.Backup(backupPath); err != nil {
+		return err
+	}
+	fmt.Printf("backup: %s\n", backupPath)
+	return nil
+}
+
+func runWalletRestore(args []string) error {
+	fs := flag.NewFlagSet("wallet restore", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	from := fs.String("from", "", "")
+	yes := fs.Bool("yes", false, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 1 && *from == "" {
+		*from = fs.Arg(0)
+	}
+	if *from == "" || fs.NArg() > 1 {
+		return errors.New("usage: bpu-cli wallet restore --from PATH [--yes] [--config PATH] [--wallet-dir DIR]")
+	}
+	if !*yes && !stdinLooksInteractive() {
+		return errors.New("wallet restore requires --yes when stdin is not interactive")
+	}
+	if !*yes {
+		fmt.Printf("replace local wallet store with %s? [y/N]: ", *from)
+		var response string
+		if _, err := fmt.Fscanln(os.Stdin, &response); err != nil {
+			return errors.New("restore cancelled")
+		}
+		if strings.ToLower(strings.TrimSpace(response)) != "y" && strings.ToLower(strings.TrimSpace(response)) != "yes" {
+			return errors.New("restore cancelled")
+		}
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, walletPath, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	if err := store.RestoreBackup(*from); err != nil {
+		return err
+	}
+	fmt.Printf("restored: %s\n", walletPath)
+	return nil
+}
+
+func runWalletExport(args []string) error {
+	fs := flag.NewFlagSet("wallet export", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	out := fs.String("out", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli wallet export [--out PATH] [--config PATH] [--wallet-dir DIR] <wallet>")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, walletPath, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	export, err := store.ExportWallet(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	outPath := strings.TrimSpace(*out)
+	if outPath == "" {
+		outPath = filepath.Join(filepath.Dir(walletPath), safeWalletFileStem(fs.Arg(0))+"-wallet-export.json")
+	}
+	if err := wallet.SaveExportFile(outPath, export); err != nil {
+		return err
+	}
+	fmt.Printf("export: %s\n", outPath)
+	return nil
+}
+
+func runWalletImport(args []string) error {
+	fs := flag.NewFlagSet("wallet import", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	name := fs.String("name", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli wallet import [--name NAME] [--config PATH] [--wallet-dir DIR] <export-file>")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	export, err := wallet.LoadExportFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	imported, err := store.ImportWallet(export, *name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wallet: %s\n", imported.Name)
+	fmt.Printf("addresses: %d\n", len(imported.Addresses))
+	return nil
+}
+
 func runWalletSend(args []string) error {
 	fs := flag.NewFlagSet("wallet send", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -1184,7 +1368,8 @@ func runWalletSend(args []string) error {
 	rpcAuthToken := fs.String("rpc-auth-token", "", "")
 	from := fs.String("from", "", "")
 	to := fs.String("to", "", "")
-	amount := fs.Uint64("amount", 0, "")
+	amountRaw := fs.String("amount", "", "")
+	amountAtoms := fs.Uint64("amount-atoms", 0, "")
 	fee := fs.Uint64("fee", 0, "")
 	targetBlocks := fs.Int("target-blocks", 1, "")
 	targetMinutes := fs.Int("target-minutes", 0, "")
@@ -1193,14 +1378,30 @@ func runWalletSend(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *from == "" || *to == "" || *amount == 0 {
-		return errors.New("usage: bpu-cli wallet send --from NAME --to ADDRESS --amount ATOMS [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	switch fs.NArg() {
+	case 0:
+	case 2:
+		if *to == "" {
+			*to = fs.Arg(0)
+		}
+		if *amountRaw == "" && *amountAtoms == 0 {
+			*amountRaw = fs.Arg(1)
+		}
+	default:
+		return errors.New("usage: bpu-cli wallet send [ADDRESS AMOUNT] [--from NAME] [--amount BPU | --amount-atoms ATOMS] [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
 		return err
 	}
 	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	if err := completeWalletSendInputs(store, from, to, amountRaw, amountAtoms, *yes); err != nil {
+		return err
+	}
+	amount, err := resolveWalletAmount(*amountRaw, *amountAtoms)
 	if err != nil {
 		return err
 	}
@@ -1222,7 +1423,7 @@ func runWalletSend(args []string) error {
 		if flagWasPassed(fs, "target-blocks") || flagWasPassed(fs, "target-minutes") || flagWasPassed(fs, "priority") {
 			return errors.New("--fee cannot be combined with --target-blocks, --target-minutes, or --priority")
 		}
-		plan, err = store.BuildSend(*from, *to, *amount, *fee, utxos)
+		plan, err = store.BuildSend(*from, *to, amount, *fee, utxos)
 		if err != nil {
 			return err
 		}
@@ -1240,7 +1441,7 @@ func runWalletSend(args []string) error {
 			return err
 		}
 		feeQuote = &quote
-		plan, err = store.BuildSendAuto(*from, *to, *amount, quote.FeeRate, utxos)
+		plan, err = store.BuildSendAuto(*from, *to, amount, quote.FeeRate, utxos)
 		if err != nil {
 			return err
 		}
@@ -1248,24 +1449,126 @@ func runWalletSend(args []string) error {
 	if err := maybeConfirmWalletAction(renderSendPreview(plan, feeQuote), *yes); err != nil {
 		return err
 	}
-	var result struct {
-		TxID string `json:"txid"`
-		Fee  uint64 `json:"fee"`
-	}
-	if err := client.Call("submittx", map[string]string{"hex": plan.TransactionHex}, &result); err != nil {
-		return err
-	}
-	reportedTxID, err := decodeHex32(result.TxID)
+	result, err := submitWalletSendPlan(store, client, *from, plan)
 	if err != nil {
 		return err
 	}
-	if reportedTxID != plan.TransactionID {
-		return fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
-	}
-	if err := store.MarkSubmitted(*from, reportedTxID, plan.Transaction, plan.Inputs); err != nil {
+	printWalletAction(renderSendResult(plan, result.TxID, feeQuote))
+	return nil
+}
+
+func runWalletFanout(args []string) error {
+	fs := flag.NewFlagSet("wallet fanout", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	walletDir := fs.String("wallet-dir", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	from := fs.String("from", "", "")
+	toRaw := fs.String("to", "", "")
+	amountRaw := fs.String("amount", "", "")
+	amountAtoms := fs.Uint64("amount-atoms", 0, "")
+	count := fs.Int("count", 0, "")
+	fee := fs.Uint64("fee", 0, "")
+	targetBlocks := fs.Int("target-blocks", 1, "")
+	targetMinutes := fs.Int("target-minutes", 0, "")
+	priority := fs.String("priority", "", "")
+	yes := fs.Bool("yes", false, "")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	printWalletAction(renderSendResult(plan, result.TxID, feeQuote))
+	if fs.NArg() != 0 {
+		return errors.New("usage: bpu-cli wallet fanout --to ADDRESS[,ADDRESS...] --amount BPU --count N [--from NAME] [--amount-atoms ATOMS] [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	}
+	if strings.TrimSpace(*toRaw) == "" || *count <= 0 {
+		return errors.New("wallet fanout requires --to ADDRESS[,ADDRESS...] and --count N")
+	}
+	amount, err := resolveWalletAmount(*amountRaw, *amountAtoms)
+	if err != nil {
+		return err
+	}
+	destinations := splitCSV(*toRaw)
+	if len(destinations) == 0 {
+		return errors.New("wallet fanout requires at least one destination")
+	}
+	if amount > ^uint64(0)/uint64(*count) {
+		return errors.New("wallet fanout total amount overflows atoms")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	store, _, err := openWalletStore(*walletDir, cfg)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*from) == "" {
+		name, err := defaultWalletName(store, stdinLooksInteractive() && !*yes)
+		if err != nil {
+			return err
+		}
+		*from = name
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken))
+	if err := reconcileWalletPending(store, client, *from); err != nil {
+		return err
+	}
+	watchItems, err := store.SpendableWatchItems(*from)
+	if err != nil {
+		return err
+	}
+	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
+	if err != nil {
+		return err
+	}
+	var feeQuote *walletFeeQuote
+	feeRate := uint64(0)
+	if *fee > 0 {
+		if flagWasPassed(fs, "target-blocks") || flagWasPassed(fs, "target-minutes") || flagWasPassed(fs, "priority") {
+			return errors.New("--fee cannot be combined with --target-blocks, --target-minutes, or --priority")
+		}
+	} else {
+		quote, err := resolveWalletFeeQuote(client, walletFeeRequest{
+			TargetBlocks:          *targetBlocks,
+			TargetBlocksExplicit:  flagWasPassed(fs, "target-blocks"),
+			TargetMinutes:         *targetMinutes,
+			TargetMinutesExplicit: flagWasPassed(fs, "target-minutes"),
+			Priority:              *priority,
+			PriorityExplicit:      flagWasPassed(fs, "priority"),
+			AllowInteractive:      stdinLooksInteractive() && !*yes,
+		})
+		if err != nil {
+			return err
+		}
+		feeQuote = &quote
+		feeRate = quote.FeeRate
+	}
+	preview := renderFanoutPreview(*from, destinations, amount, *count, *fee, feeRate, feeQuote)
+	if err := maybeConfirmWalletAction(preview, *yes); err != nil {
+		return err
+	}
+	results := make([]walletFanoutResult, 0, *count)
+	for i := 0; i < *count; i++ {
+		to := destinations[i%len(destinations)]
+		var plan wallet.SendPlan
+		if *fee > 0 {
+			plan, err = store.BuildSend(*from, to, amount, *fee, utxos)
+		} else {
+			plan, err = store.BuildSendAuto(*from, to, amount, feeRate, utxos)
+		}
+		if err != nil {
+			return fmt.Errorf("fanout tx %d/%d: %w", i+1, *count, err)
+		}
+		result, err := submitWalletSendPlan(store, client, *from, plan)
+		if err != nil {
+			return fmt.Errorf("fanout tx %d/%d: %w", i+1, *count, err)
+		}
+		if pendingUTXOs, err := store.PendingSpendableUTXOs(*from, &plan.TransactionID); err == nil && len(pendingUTXOs) > 0 {
+			utxos = append(utxos, pendingUTXOs...)
+		}
+		results = append(results, walletFanoutResult{Plan: plan, TxID: result.TxID})
+	}
+	printWalletFanoutResult(*from, results, feeQuote)
 	return nil
 }
 
@@ -2033,11 +2336,15 @@ func rpcUTXOsByWatchItems(client *cliRPCClient, items []wallet.WatchItem) ([]wal
 	}
 	var result struct {
 		UTXOs []struct {
-			TxID      string `json:"txid"`
-			Vout      uint32 `json:"vout"`
-			Value     uint64 `json:"value"`
-			Type      uint64 `json:"type"`
-			Payload32 string `json:"payload32"`
+			TxID          string `json:"txid"`
+			Vout          uint32 `json:"vout"`
+			Value         uint64 `json:"value"`
+			Type          uint64 `json:"type"`
+			Payload32     string `json:"payload32"`
+			Height        uint64 `json:"height"`
+			Confirmations uint64 `json:"confirmations"`
+			Coinbase      bool   `json:"coinbase"`
+			Mature        bool   `json:"mature"`
 		} `json:"utxos"`
 	}
 	if err := client.Call("getutxosbywatchitems", params, &result); err != nil {
@@ -2054,11 +2361,15 @@ func rpcUTXOsByWatchItems(client *cliRPCClient, items []wallet.WatchItem) ([]wal
 			return nil, err
 		}
 		out = append(out, wallet.SpendableUTXO{
-			OutPoint:  types.OutPoint{TxID: txid, Vout: item.Vout},
-			Value:     item.Value,
-			Type:      item.Type,
-			Payload32: payload32,
-			PubKey:    legacyWalletPubKey(item.Type, payload32),
+			OutPoint:      types.OutPoint{TxID: txid, Vout: item.Vout},
+			Value:         item.Value,
+			Type:          item.Type,
+			Payload32:     payload32,
+			PubKey:        legacyWalletPubKey(item.Type, payload32),
+			Height:        item.Height,
+			Confirmations: item.Confirmations,
+			Coinbase:      item.Coinbase,
+			Mature:        item.Mature,
 		})
 	}
 	return out, nil
@@ -2148,6 +2459,132 @@ func printWalletAddressDetails(addr wallet.Address) {
 	}
 }
 
+type walletSubmitResult struct {
+	TxID string `json:"txid"`
+	Fee  uint64 `json:"fee"`
+}
+
+type walletFanoutResult struct {
+	Plan wallet.SendPlan
+	TxID string
+}
+
+func submitWalletSendPlan(store *wallet.Store, client *cliRPCClient, walletName string, plan wallet.SendPlan) (walletSubmitResult, error) {
+	var result walletSubmitResult
+	if err := client.Call("submittx", map[string]string{"hex": plan.TransactionHex}, &result); err != nil {
+		return walletSubmitResult{}, err
+	}
+	reportedTxID, err := decodeHex32(result.TxID)
+	if err != nil {
+		return walletSubmitResult{}, err
+	}
+	if reportedTxID != plan.TransactionID {
+		return walletSubmitResult{}, fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
+	}
+	if err := store.MarkSubmitted(walletName, reportedTxID, plan.Transaction, plan.Inputs); err != nil {
+		return walletSubmitResult{}, err
+	}
+	return result, nil
+}
+
+func completeWalletSendInputs(store *wallet.Store, from *string, to *string, amountRaw *string, amountAtoms *uint64, yes bool) error {
+	if strings.TrimSpace(*from) == "" {
+		name, err := defaultWalletName(store, stdinLooksInteractive() && !yes)
+		if err != nil {
+			return err
+		}
+		*from = name
+	}
+	if strings.TrimSpace(*to) == "" || (strings.TrimSpace(*amountRaw) == "" && *amountAtoms == 0) {
+		if yes || !stdinLooksInteractive() {
+			return errors.New("usage: bpu-cli wallet send [ADDRESS AMOUNT] [--from NAME] [--amount BPU | --amount-atoms ATOMS]")
+		}
+		reader := bufio.NewReader(os.Stdin)
+		if strings.TrimSpace(*to) == "" {
+			line, err := promptLine(reader, "to: ")
+			if err != nil {
+				return err
+			}
+			*to = line
+		}
+		if strings.TrimSpace(*amountRaw) == "" && *amountAtoms == 0 {
+			line, err := promptLine(reader, "amount (BPU, or append atoms): ")
+			if err != nil {
+				return err
+			}
+			*amountRaw = line
+		}
+	}
+	if strings.TrimSpace(*to) == "" {
+		return errors.New("destination address is required")
+	}
+	return nil
+}
+
+func defaultWalletName(store *wallet.Store, allowPrompt bool) (string, error) {
+	wallets := store.List()
+	switch len(wallets) {
+	case 0:
+		return "", errors.New("no wallets")
+	case 1:
+		return wallets[0].Name, nil
+	}
+	if !allowPrompt {
+		return "", errors.New("multiple wallets found; pass --from NAME")
+	}
+	fmt.Println("wallet")
+	for i, entry := range wallets {
+		fmt.Printf("  %d) %s\n", i+1, entry.Name)
+	}
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, err := promptLine(reader, "choose wallet: ")
+		if err != nil {
+			return "", err
+		}
+		choice, err := strconv.Atoi(strings.TrimSpace(line))
+		if err == nil && choice >= 1 && choice <= len(wallets) {
+			return wallets[choice-1].Name, nil
+		}
+		for _, entry := range wallets {
+			if strings.EqualFold(entry.Name, strings.TrimSpace(line)) {
+				return entry.Name, nil
+			}
+		}
+		fmt.Println("enter a wallet number or name")
+	}
+}
+
+func promptLine(reader *bufio.Reader, prompt string) (string, error) {
+	fmt.Print(prompt)
+	raw, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	line := strings.TrimSpace(raw)
+	if line == "" {
+		return "", errors.New("input cancelled")
+	}
+	return line, nil
+}
+
+func resolveWalletAmount(raw string, atoms uint64) (uint64, error) {
+	if strings.TrimSpace(raw) != "" && atoms != 0 {
+		return 0, errors.New("--amount and --amount-atoms cannot be combined")
+	}
+	if atoms != 0 {
+		return atoms, nil
+	}
+	return wallet.ParseAmount(raw)
+}
+
+func formatSignedWalletAmount(value int64) string {
+	if value < 0 {
+		return "-" + wallet.FormatAmount(uint64(-value))
+	}
+	return wallet.FormatAmount(uint64(value))
+}
+
 type walletActionRow struct {
 	label string
 	value string
@@ -2180,16 +2617,16 @@ func renderSendPreview(plan wallet.SendPlan, feeQuote *walletFeeQuote) walletAct
 	rows := []walletActionRow{
 		{label: "wallet", value: plan.WalletName},
 		{label: "to", value: plan.ToAddress},
-		{label: "amount", value: fmt.Sprintf("%d atoms", plan.Amount)},
+		{label: "amount", value: formatWalletAmountWithAtoms(plan.Amount)},
 	}
 	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
 	rows = append(rows,
 		walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
-		walletActionRow{label: "inputs", value: fmt.Sprintf("%d (%d atoms)", len(plan.Inputs), plan.InputTotal)},
+		walletActionRow{label: "inputs", value: fmt.Sprintf("%d (%s)", len(plan.Inputs), formatWalletAmountWithAtoms(plan.InputTotal))},
 		walletActionRow{label: "txid", value: fmt.Sprintf("%x", plan.TransactionID)},
 	)
 	if plan.Change > 0 && plan.ChangeAddress != nil {
-		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%d atoms -> %s", plan.Change, plan.ChangeAddress.Address)})
+		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%s -> %s", formatWalletAmountWithAtoms(plan.Change), plan.ChangeAddress.Address)})
 	}
 	return walletActionView{title: "send", rows: rows}
 }
@@ -2198,14 +2635,14 @@ func renderSendResult(plan wallet.SendPlan, txid string, feeQuote *walletFeeQuot
 	rows := []walletActionRow{
 		{label: "wallet", value: plan.WalletName},
 		{label: "txid", value: txid},
-		{label: "amount", value: fmt.Sprintf("%d atoms", plan.Amount)},
+		{label: "amount", value: formatWalletAmountWithAtoms(plan.Amount)},
 	}
 	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
 	rows = append(rows,
 		walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)},
 	)
 	if plan.Change > 0 && plan.ChangeAddress != nil {
-		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%d atoms -> %s", plan.Change, plan.ChangeAddress.Address)})
+		rows = append(rows, walletActionRow{label: "change", value: fmt.Sprintf("%s -> %s", formatWalletAmountWithAtoms(plan.Change), plan.ChangeAddress.Address)})
 	}
 	return walletActionView{title: "submitted", rows: rows}
 }
@@ -2214,8 +2651,8 @@ func renderCPFPPreview(plan wallet.CPFPPlan, feeQuote *walletFeeQuote) walletAct
 	rows := []walletActionRow{
 		{label: "wallet", value: plan.WalletName},
 		{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
-		{label: "source", value: fmt.Sprintf("%x:%d (%d atoms)", plan.Input.OutPoint.TxID, plan.Input.OutPoint.Vout, plan.Input.Value)},
-		{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
+		{label: "source", value: fmt.Sprintf("%x:%d (%s)", plan.Input.OutPoint.TxID, plan.Input.OutPoint.Vout, formatWalletAmountWithAtoms(plan.Input.Value))},
+		{label: "child", value: fmt.Sprintf("%s -> %s", formatWalletAmountWithAtoms(plan.Amount), plan.SweepAddress.Address)},
 	}
 	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
 	rows = append(rows,
@@ -2230,7 +2667,7 @@ func renderCPFPResult(plan wallet.CPFPPlan, txid string, feeQuote *walletFeeQuot
 		{label: "wallet", value: plan.WalletName},
 		{label: "parent", value: hex.EncodeToString(plan.ParentTxID[:])},
 		{label: "txid", value: txid},
-		{label: "child", value: fmt.Sprintf("%d atoms -> %s", plan.Amount, plan.SweepAddress.Address)},
+		{label: "child", value: fmt.Sprintf("%s -> %s", formatWalletAmountWithAtoms(plan.Amount), plan.SweepAddress.Address)},
 	}
 	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
 	rows = append(rows, walletActionRow{label: "fee", value: formatWalletFee(plan.Fee, plan.FeeRate, plan.EstimatedBytes)})
@@ -2239,9 +2676,83 @@ func renderCPFPResult(plan wallet.CPFPPlan, txid string, feeQuote *walletFeeQuot
 
 func formatWalletFee(fee uint64, feeRate uint64, estimatedBytes int) string {
 	if feeRate == 0 || estimatedBytes == 0 {
-		return fmt.Sprintf("%d atoms", fee)
+		return formatWalletAmountWithAtoms(fee)
 	}
-	return fmt.Sprintf("%d atoms (%d atoms/B, %d B)", fee, feeRate, estimatedBytes)
+	return fmt.Sprintf("%s (%d atoms/B, %d B)", formatWalletAmountWithAtoms(fee), feeRate, estimatedBytes)
+}
+
+func formatWalletAmountWithAtoms(atoms uint64) string {
+	return fmt.Sprintf("%s / %d atoms", wallet.FormatAmount(atoms), atoms)
+}
+
+func renderFanoutPreview(walletName string, destinations []string, amount uint64, count int, fee uint64, feeRate uint64, feeQuote *walletFeeQuote) walletActionView {
+	rows := []walletActionRow{
+		{label: "wallet", value: walletName},
+		{label: "txs", value: fmt.Sprintf("%d", count)},
+		{label: "to", value: formatWalletDestinationSummary(destinations)},
+		{label: "amount", value: formatWalletAmountWithAtoms(amount)},
+		{label: "total", value: formatWalletAmountWithAtoms(amount * uint64(count))},
+	}
+	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
+	switch {
+	case fee > 0:
+		rows = append(rows, walletActionRow{label: "fee", value: formatWalletAmountWithAtoms(fee) + " each"})
+	case feeRate > 0:
+		rows = append(rows, walletActionRow{label: "fee", value: fmt.Sprintf("%d atoms/B", feeRate)})
+	}
+	return walletActionView{title: "fanout", rows: rows}
+}
+
+func printWalletFanoutResult(walletName string, results []walletFanoutResult, feeQuote *walletFeeQuote) {
+	totalAmount := uint64(0)
+	totalFee := uint64(0)
+	for _, result := range results {
+		totalAmount += result.Plan.Amount
+		totalFee += result.Plan.Fee
+	}
+	rows := []walletActionRow{
+		{label: "wallet", value: walletName},
+		{label: "txs", value: fmt.Sprintf("%d", len(results))},
+		{label: "amount", value: formatWalletAmountWithAtoms(totalAmount)},
+		{label: "fee", value: formatWalletAmountWithAtoms(totalFee)},
+	}
+	rows = append(rows, walletFeeQuoteRows(feeQuote)...)
+	printWalletAction(walletActionView{title: "fanout submitted", rows: rows})
+	for i, result := range results {
+		fmt.Printf("  %03d  %s  %s\n", i+1, result.TxID, result.Plan.ToAddress)
+	}
+}
+
+func formatWalletDestinationSummary(destinations []string) string {
+	if len(destinations) == 0 {
+		return "-"
+	}
+	if len(destinations) == 1 {
+		return destinations[0]
+	}
+	return fmt.Sprintf("%d addresses, round-robin from %s", len(destinations), destinations[0])
+}
+
+func safeWalletFileStem(name string) string {
+	var b strings.Builder
+	for _, ch := range strings.TrimSpace(name) {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+			b.WriteRune(ch)
+		case ch >= 'A' && ch <= 'Z':
+			b.WriteRune(ch)
+		case ch >= '0' && ch <= '9':
+			b.WriteRune(ch)
+		case ch == '-' || ch == '_':
+			b.WriteRune(ch)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "wallet"
+	}
+	return b.String()
 }
 
 func resolveWalletFeeQuote(client *cliRPCClient, req walletFeeRequest) (walletFeeQuote, error) {

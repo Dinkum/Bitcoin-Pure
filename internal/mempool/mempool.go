@@ -1225,27 +1225,35 @@ func (p *Pool) RemoveConfirmed(block *types.Block) {
 	if block == nil {
 		return
 	}
-	roots := make(map[[32]byte]struct{})
+	confirmed := make(map[[32]byte]struct{})
+	conflicts := make(map[[32]byte]struct{})
 	confirmedSpends := make(map[types.OutPoint]struct{})
 	for i := 1; i < len(block.Txs); i++ {
 		tx := block.Txs[i]
 		txid := consensus.TxID(&tx)
 		if _, ok := p.entries[txid]; ok {
-			roots[txid] = struct{}{}
+			confirmed[txid] = struct{}{}
 		}
 		for _, input := range tx.Base.Inputs {
 			confirmedSpends[input.PrevOut] = struct{}{}
 		}
 	}
 	for txid, entry := range p.entries {
+		if _, ok := confirmed[txid]; ok {
+			continue
+		}
 		for _, input := range entry.Tx.Base.Inputs {
 			if _, ok := confirmedSpends[input.PrevOut]; ok {
-				roots[txid] = struct{}{}
+				conflicts[txid] = struct{}{}
 				break
 			}
 		}
 	}
-	p.removeRecursive(roots)
+	remove := p.collectRecursive(conflicts)
+	for txid := range confirmed {
+		remove[txid] = struct{}{}
+	}
+	p.removeEntriesLocked(remove)
 	p.bumpEpochLocked()
 }
 
@@ -1659,10 +1667,15 @@ func (p *Pool) updateOrphanMissing(txid [32]byte, missing map[types.OutPoint]str
 }
 
 func (p *Pool) removeRecursive(roots map[[32]byte]struct{}) {
-	if len(roots) == 0 {
-		return
-	}
+	remove := p.collectRecursive(roots)
+	p.removeEntriesLocked(remove)
+}
+
+func (p *Pool) collectRecursive(roots map[[32]byte]struct{}) map[[32]byte]struct{} {
 	remove := make(map[[32]byte]struct{})
+	if len(roots) == 0 {
+		return remove
+	}
 	stack := make([][32]byte, 0, len(roots))
 	for txid := range roots {
 		if _, ok := p.entries[txid]; ok {
@@ -1683,6 +1696,13 @@ func (p *Pool) removeRecursive(roots map[[32]byte]struct{}) {
 		for child := range entry.Children {
 			stack = append(stack, child)
 		}
+	}
+	return remove
+}
+
+func (p *Pool) removeEntriesLocked(remove map[[32]byte]struct{}) {
+	if len(remove) == 0 {
+		return
 	}
 	for txid := range remove {
 		entry := p.entries[txid]
@@ -1721,6 +1741,7 @@ func (p *Pool) removeRecursive(roots map[[32]byte]struct{}) {
 		delete(p.entries, txid)
 	}
 	p.removeSelectionCandidatesLocked(remove)
+	p.reindex()
 }
 
 // ensureMempoolCapacityLocked keeps the admitted transaction set within the

@@ -103,6 +103,9 @@ func (m *minerManager) BuildBenchmarkBlockTemplate(maxTxs int) (types.Block, err
 
 func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, error) {
 	startedAt := time.Now()
+	if m.stopping() {
+		return types.Block{}, 0, ErrServiceStopping
+	}
 	if m.svc.cfg.MinerPubKey == ([32]byte{}) {
 		return types.Block{}, 0, errors.New("miner pubkey is required for block template assembly")
 	}
@@ -110,8 +113,14 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	if err != nil {
 		return types.Block{}, 0, err
 	}
+	if m.stopping() {
+		return types.Block{}, 0, ErrServiceStopping
+	}
 	mempoolEpoch := m.svc.pool.Epoch()
 	if cached, generation, ok := m.cachedBlockTemplate(ctx.tipHash, mempoolEpoch); ok {
+		if m.stopping() {
+			return types.Block{}, 0, ErrServiceStopping
+		}
 		m.templateStats.noteCacheHit(m.svc.pool.SelectionCandidateCount())
 		m.svc.perf.noteTemplateDuration(time.Since(startedAt))
 		m.svc.logger.Debug("template ready",
@@ -126,6 +135,9 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	if block, generation, ok, err := m.extendBlockTemplate(ctx, mempoolEpoch); err != nil {
 		return types.Block{}, 0, err
 	} else if ok {
+		if m.stopping() {
+			return types.Block{}, 0, ErrServiceStopping
+		}
 		m.templateStats.noteAppendExtend(m.svc.pool.SelectionCandidateCount())
 		m.svc.noteTemplateRebuild()
 		m.svc.perf.noteTemplateDuration(time.Since(startedAt))
@@ -142,9 +154,15 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	if err != nil {
 		return types.Block{}, 0, err
 	}
+	if m.stopping() {
+		return types.Block{}, 0, ErrServiceStopping
+	}
 	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot, 0)
 	if err != nil {
 		return types.Block{}, 0, err
+	}
+	if m.stopping() {
+		return types.Block{}, 0, ErrServiceStopping
 	}
 	generation := m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, snapshot.utxoAcc, selectionAcc)
 	m.templateStats.noteFullBuild(m.svc.pool.SelectionCandidateCount())
@@ -169,8 +187,15 @@ func (m *minerManager) minerLoop(workerID int) {
 		}
 		hash, err := m.mineOneBlock()
 		if err != nil {
+			if errors.Is(err, ErrServiceStopping) {
+				return
+			}
 			if errors.Is(err, ErrNoTip) {
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-m.svc.stopCh:
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
 				continue
 			}
 			m.svc.logger.Warn("continuous mining failed", slog.Int("worker", workerID), slog.Any("error", err))
@@ -187,13 +212,22 @@ func (m *minerManager) minerLoop(workerID int) {
 
 func (m *minerManager) mineOneBlock() ([32]byte, error) {
 	for {
+		if m.stopping() {
+			return [32]byte{}, ErrServiceStopping
+		}
 		block, generation, err := m.buildBlockTemplateWithGeneration()
 		if err != nil {
 			return [32]byte{}, err
 		}
+		if m.stopping() {
+			return [32]byte{}, ErrServiceStopping
+		}
 		block, fresh, err := m.svc.mineBlockTemplate(block, generation)
 		if err != nil {
 			return [32]byte{}, err
+		}
+		if m.stopping() {
+			return [32]byte{}, ErrServiceStopping
 		}
 		if !fresh {
 			m.templateStats.noteInterruption()
@@ -214,8 +248,20 @@ func (m *minerManager) mineOneBlock() ([32]byte, error) {
 	}
 }
 
+func (m *minerManager) stopping() bool {
+	select {
+	case <-m.svc.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxTxs int) (types.Block, []mempool.SnapshotEntry, []types.Transaction, [][32]byte, [][32]byte, uint64, int, consensus.UtxoLookup, *consensus.UtxoOverlay, *utreexo.Accumulator, error) {
 	startedAt := time.Now()
+	if m.stopping() {
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, ErrServiceStopping
+	}
 	baseLookup := snapshot.utxoLookup
 	maxTemplateBytes := int(consensus.NextBlockSizeLimit(snapshot.blockSizeState, consensus.ParamsForProfile(m.svc.cfg.Profile)))
 	if maxTemplateBytes > 1024 {
@@ -223,14 +269,23 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxT
 	}
 	selectStartedAt := time.Now()
 	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlayWithLookupLimit(baseLookup, consensus.DefaultConsensusRules(), maxTemplateBytes, maxTxs)
+	if m.stopping() {
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, ErrServiceStopping
+	}
 	m.svc.perf.noteTemplateSelectDuration(time.Since(selectStartedAt))
 	selectedTxs, selectedTxIDs, selectedAuthIDs, usedTxBytes := buildSelectedTemplateVectors(selectedEntries)
+	if m.stopping() {
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, ErrServiceStopping
+	}
 	selectedSpends, selectedLeaves := selectedEntryAccumulatorDeltas(selectedEntries)
 	accStartedAt := time.Now()
 	selectionAcc, err := snapshot.utxoAcc.Apply(selectedSpends, selectedLeaves)
 	m.svc.perf.noteTemplateAccumulateDuration(time.Since(accStartedAt))
 	if err != nil {
 		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, err
+	}
+	if m.stopping() {
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, ErrServiceStopping
 	}
 	assembleStartedAt := time.Now()
 	block, err := m.assembleBlockTemplate(chainTemplateContext{
@@ -242,6 +297,9 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxT
 	m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
 	if err != nil {
 		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, err
+	}
+	if m.stopping() {
+		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, ErrServiceStopping
 	}
 	m.svc.logger.Debug("building block candidate",
 		slog.Uint64("next_height", snapshot.height+1),
@@ -473,9 +531,7 @@ func (t *templateBuildTelemetry) noteCacheHit(frontierCandidates int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.cacheHits++
-	if frontierCandidates > t.frontierCandidates {
-		t.frontierCandidates = frontierCandidates
-	}
+	t.frontierCandidates = frontierCandidates
 }
 
 func (t *templateBuildTelemetry) noteFullBuild(frontierCandidates int) {
@@ -483,9 +539,7 @@ func (t *templateBuildTelemetry) noteFullBuild(frontierCandidates int) {
 	defer t.mu.Unlock()
 	t.rebuilds++
 	t.fullBuilds++
-	if frontierCandidates > t.frontierCandidates {
-		t.frontierCandidates = frontierCandidates
-	}
+	t.frontierCandidates = frontierCandidates
 }
 
 func (t *templateBuildTelemetry) noteAppendExtend(frontierCandidates int) {
@@ -493,18 +547,14 @@ func (t *templateBuildTelemetry) noteAppendExtend(frontierCandidates int) {
 	defer t.mu.Unlock()
 	t.rebuilds++
 	t.appendExtends++
-	if frontierCandidates > t.frontierCandidates {
-		t.frontierCandidates = frontierCandidates
-	}
+	t.frontierCandidates = frontierCandidates
 }
 
 func (t *templateBuildTelemetry) noteNoChangeRefresh(frontierCandidates int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.noChangeRefreshes++
-	if frontierCandidates > t.frontierCandidates {
-		t.frontierCandidates = frontierCandidates
-	}
+	t.frontierCandidates = frontierCandidates
 }
 
 func (t *templateBuildTelemetry) noteInvalidation(reason string) {

@@ -19,6 +19,7 @@ import (
 var (
 	ErrNoTip                 = errors.New("chain tip is not initialized")
 	ErrTipAlreadyInitialized = errors.New("tip already initialized")
+	ErrServiceStopping       = errors.New("node service is stopping")
 )
 
 type GenesisBootstrapSummary struct {

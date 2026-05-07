@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 
 const (
 	StoreFileName = "wallets.json"
+
+	AtomsPerBPU = 1_000_000_000
 
 	AddressFamilyXOnly = "xonly"
 	AddressFamilyPQ    = "pq"
@@ -84,11 +87,15 @@ type PendingOutPoint struct {
 }
 
 type SpendableUTXO struct {
-	OutPoint  types.OutPoint
-	Value     uint64
-	Type      uint64
-	Payload32 [32]byte
-	PubKey    [32]byte
+	OutPoint      types.OutPoint
+	Value         uint64
+	Type          uint64
+	Payload32     [32]byte
+	PubKey        [32]byte
+	Height        uint64
+	Confirmations uint64
+	Coinbase      bool
+	Mature        bool
 }
 
 type SelectedInput struct {
@@ -130,10 +137,19 @@ type CPFPPlan struct {
 
 type BalanceSummary struct {
 	Confirmed    uint64
+	Mature       uint64
+	Immature     uint64
 	Reserved     uint64
 	Available    uint64
 	PendingCount int
 	AddressCount int
+}
+
+type ExportFile struct {
+	Version    int                `json:"version"`
+	Profile    types.ChainProfile `json:"profile"`
+	ExportedAt time.Time          `json:"exported_at"`
+	Wallet     Wallet             `json:"wallet"`
 }
 
 func ParseAddressFamily(raw string) (uint64, error) {
@@ -199,6 +215,10 @@ func (u SpendableUTXO) WatchItem() WatchItem {
 	return WatchItem{Type: u.Type, Payload32: u.Payload32}
 }
 
+func (u SpendableUTXO) SpendMature() bool {
+	return !u.Coinbase || u.Mature
+}
+
 func Open(path string) (*Store, error) {
 	return OpenWithProfile(path, types.Mainnet)
 }
@@ -237,10 +257,201 @@ func StorePath(dir string) string {
 	return filepath.Join(filepath.Clean(dir), StoreFileName)
 }
 
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+func FormatAmount(atoms uint64) string {
+	whole := atoms / AtomsPerBPU
+	frac := atoms % AtomsPerBPU
+	if frac == 0 {
+		return fmt.Sprintf("%d BPU", whole)
+	}
+	fracText := fmt.Sprintf("%09d", frac)
+	fracText = strings.TrimRight(fracText, "0")
+	return fmt.Sprintf("%d.%s BPU", whole, fracText)
+}
+
+func ParseAmount(raw string) (uint64, error) {
+	text := strings.TrimSpace(strings.ToLower(raw))
+	if text == "" {
+		return 0, errors.New("amount is required")
+	}
+	switch {
+	case strings.HasSuffix(text, "atoms"):
+		return parseAtomsAmount(strings.TrimSpace(strings.TrimSuffix(text, "atoms")))
+	case strings.HasSuffix(text, "atom"):
+		return parseAtomsAmount(strings.TrimSpace(strings.TrimSuffix(text, "atom")))
+	case strings.HasSuffix(text, "sat"):
+		return parseAtomsAmount(strings.TrimSpace(strings.TrimSuffix(text, "sat")))
+	case strings.HasSuffix(text, "bpu"):
+		text = strings.TrimSpace(strings.TrimSuffix(text, "bpu"))
+	}
+	return parseBPUAmount(text)
+}
+
+func parseAtomsAmount(raw string) (uint64, error) {
+	atoms, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid atom amount %q", raw)
+	}
+	if atoms == 0 {
+		return 0, errors.New("amount must be positive")
+	}
+	return atoms, nil
+}
+
+func parseBPUAmount(raw string) (uint64, error) {
+	if strings.HasPrefix(raw, "+") || strings.HasPrefix(raw, "-") {
+		return 0, fmt.Errorf("invalid BPU amount %q", raw)
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) > 2 || parts[0] == "" {
+		return 0, fmt.Errorf("invalid BPU amount %q", raw)
+	}
+	whole, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid BPU amount %q", raw)
+	}
+	if whole > ^uint64(0)/AtomsPerBPU {
+		return 0, fmt.Errorf("BPU amount overflows atoms: %q", raw)
+	}
+	atoms := whole * AtomsPerBPU
+	if len(parts) == 2 {
+		fracText := parts[1]
+		if fracText == "" || len(fracText) > 9 {
+			return 0, fmt.Errorf("BPU amount supports at most 9 decimal places: %q", raw)
+		}
+		for _, ch := range fracText {
+			if ch < '0' || ch > '9' {
+				return 0, fmt.Errorf("invalid BPU amount %q", raw)
+			}
+		}
+		fracText += strings.Repeat("0", 9-len(fracText))
+		frac, err := strconv.ParseUint(fracText, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid BPU amount %q", raw)
+		}
+		atoms += frac
+	}
+	if atoms == 0 {
+		return 0, errors.New("amount must be positive")
+	}
+	return atoms, nil
+}
+
 func (s *Store) List() []Wallet {
 	out := make([]Wallet, len(s.wallets))
 	copy(out, s.wallets)
 	return out
+}
+
+func (s *Store) Backup(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("backup path is required")
+	}
+	buf, err := json.MarshalIndent(s.wallets, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Clean(path), append(buf, '\n'), 0o600)
+}
+
+func (s *Store) RestoreBackup(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("backup path is required")
+	}
+	buf, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	var wallets []Wallet
+	if err := json.Unmarshal(buf, &wallets); err != nil {
+		return err
+	}
+	for wi := range wallets {
+		wallets[wi].Name = normalizeWalletName(wallets[wi].Name)
+		if wallets[wi].Name == "" {
+			return errors.New("backup contains a wallet with an empty name")
+		}
+		for ai := range wallets[wi].Addresses {
+			normalizeStoredAddress(&wallets[wi].Addresses[ai])
+		}
+	}
+	seen := make(map[string]struct{}, len(wallets))
+	for _, entry := range wallets {
+		key := strings.ToLower(entry.Name)
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("backup contains duplicate wallet %q", entry.Name)
+		}
+		seen[key] = struct{}{}
+	}
+	s.wallets = wallets
+	return s.save()
+}
+
+func (s *Store) ExportWallet(name string) (ExportFile, error) {
+	entry, err := s.Wallet(name)
+	if err != nil {
+		return ExportFile{}, err
+	}
+	return ExportFile{
+		Version:    1,
+		Profile:    s.profile,
+		ExportedAt: time.Now().UTC(),
+		Wallet:     entry,
+	}, nil
+}
+
+func (s *Store) ImportWallet(export ExportFile, nameOverride string) (Wallet, error) {
+	entry := export.Wallet
+	if strings.TrimSpace(nameOverride) != "" {
+		entry.Name = strings.TrimSpace(nameOverride)
+	}
+	entry.Name = normalizeWalletName(entry.Name)
+	if entry.Name == "" {
+		return Wallet{}, errors.New("wallet name is required")
+	}
+	if _, _, ok := s.findWallet(entry.Name); ok {
+		return Wallet{}, ErrWalletExists
+	}
+	for i := range entry.Addresses {
+		normalizeStoredAddress(&entry.Addresses[i])
+	}
+	s.wallets = append(s.wallets, entry)
+	if err := s.save(); err != nil {
+		return Wallet{}, err
+	}
+	return entry, nil
+}
+
+func LoadExportFile(path string) (ExportFile, error) {
+	buf, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return ExportFile{}, err
+	}
+	var export ExportFile
+	if err := json.Unmarshal(buf, &export); err == nil && export.Wallet.Name != "" {
+		return export, nil
+	}
+	var legacy Wallet
+	if err := json.Unmarshal(buf, &legacy); err != nil {
+		return ExportFile{}, err
+	}
+	return ExportFile{Version: 1, Wallet: legacy}, nil
+}
+
+func SaveExportFile(path string, export ExportFile) error {
+	buf, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Clean(path), append(buf, '\n'), 0o600)
 }
 
 func (s *Store) CreateWallet(name string) (Wallet, Address, error) {
@@ -595,8 +806,12 @@ func (s *Store) Balance(name string, utxos []SpendableUTXO) (BalanceSummary, err
 		return BalanceSummary{}, ErrWalletNotFound
 	}
 	confirmed := uint64(0)
+	immature := uint64(0)
 	for _, utxo := range utxos {
 		confirmed += utxo.Value
+		if !utxo.SpendMature() {
+			immature += utxo.Value
+		}
 	}
 	availableCoins, err := spendableCoins(*wallet, utxos)
 	if err != nil {
@@ -607,11 +822,14 @@ func (s *Store) Balance(name string, utxos []SpendableUTXO) (BalanceSummary, err
 		available += coin.Value
 	}
 	reserved := uint64(0)
-	if confirmed > available {
-		reserved = confirmed - available
+	mature := confirmed - immature
+	if mature > available {
+		reserved = mature - available
 	}
 	return BalanceSummary{
 		Confirmed:    confirmed,
+		Mature:       mature,
+		Immature:     immature,
 		Reserved:     reserved,
 		Available:    available,
 		PendingCount: len(wallet.Pending),
@@ -744,6 +962,9 @@ func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, erro
 	}
 	out := make([]SelectedInput, 0, len(utxos))
 	for _, utxo := range utxos {
+		if !utxo.SpendMature() {
+			continue
+		}
 		addr, ok := addressesByWatchItem[utxo.WatchItem()]
 		if !ok {
 			continue
@@ -1100,11 +1321,21 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	buf = append(buf, '\n')
-	tmp := s.path + ".tmp"
-	// Replace the store atomically so wallet create/receive/send never leaves a truncated JSON file behind.
+	return writeFileAtomic(s.path, append(buf, '\n'), 0o600)
+}
+
+func writeFileAtomic(path string, buf []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	// Replace wallet material atomically so a crash never leaves truncated JSON
+	// in the live store, backup, or export path.
 	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Chmod(tmp, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
