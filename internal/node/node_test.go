@@ -13,6 +13,8 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"slices"
 	"sort"
@@ -1510,6 +1512,50 @@ func TestOpenServiceRejectsWildcardRPCBindWithoutAuth(t *testing.T) {
 	}, &genesis)
 	if err == nil || !strings.Contains(err.Error(), "rpc auth token is required") {
 		t.Fatalf("expected wildcard bind auth error, got %v", err)
+	}
+}
+
+func TestUnauthenticatedLoopbackRPCRequiresJSONContentType(t *testing.T) {
+	svc := &Service{logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18443/", strings.NewReader(`{"method":"unknown","params":{}}`))
+	req.Header.Set("Content-Type", "text/plain")
+	resp := httptest.NewRecorder()
+
+	svc.handleRPC(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUnauthenticatedLoopbackRPCRejectsCrossOriginBrowserPost(t *testing.T) {
+	svc := &Service{logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18443/", strings.NewReader(`{"method":"unknown","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://example.invalid")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	resp := httptest.NewRecorder()
+
+	svc.handleRPC(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUnauthenticatedLoopbackRPCAllowsNonBrowserJSONClient(t *testing.T) {
+	svc := &Service{logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18443/", strings.NewReader(`{"method":"unknown","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	svc.handleRPC(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if !strings.Contains(resp.Body.String(), "unknown rpc method") {
+		t.Fatalf("response body %q does not show authorized dispatch", resp.Body.String())
 	}
 }
 
@@ -3456,7 +3502,7 @@ func TestOpenServiceRestoresPersistedVettedPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
 	}
-	svc.recordKnownPeerSuccess("127.0.0.1:18444", time.Unix(1_700_000_000, 0))
+	svc.recordKnownPeerSuccess("8.8.8.8:18444", time.Unix(1_700_000_000, 0))
 	if err := svc.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -3471,14 +3517,14 @@ func TestOpenServiceRestoresPersistedVettedPeers(t *testing.T) {
 	defer reopened.Close()
 
 	addrs := reopened.knownPeerAddrs()
-	if len(addrs) != 1 || addrs[0] != "127.0.0.1:18444" {
-		t.Fatalf("known peers after reopen = %v, want [127.0.0.1:18444]", addrs)
+	if len(addrs) != 1 || addrs[0] != "8.8.8.8:18444" {
+		t.Fatalf("known peers after reopen = %v, want [8.8.8.8:18444]", addrs)
 	}
 	loaded, err := reopened.chainState.Store().LoadKnownPeers()
 	if err != nil {
 		t.Fatalf("LoadKnownPeers: %v", err)
 	}
-	record, ok := loaded["127.0.0.1:18444"]
+	record, ok := loaded["8.8.8.8:18444"]
 	if !ok {
 		t.Fatal("persisted vetted peer missing after reopen")
 	}
@@ -3487,7 +3533,7 @@ func TestOpenServiceRestoresPersistedVettedPeers(t *testing.T) {
 	}
 }
 
-func TestRefillOutboundPeersDialsLearnedCandidates(t *testing.T) {
+func TestRememberKnownPeersRejectsUnroutableAutoDiscoveryAddrs(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
 		Profile:          types.Regtest,
@@ -3499,41 +3545,52 @@ func TestRefillOutboundPeersDialsLearnedCandidates(t *testing.T) {
 	}
 	defer svc.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	svc.rememberKnownPeers([]string{
+		" 8.8.8.8:18444 ",
+		"[2001:4860:4860::8888]:18444",
+		"127.0.0.1:18444",
+		"10.0.0.2:18444",
+		"100.64.0.1:18444",
+		"localhost:18444",
+		"203.0.113.1:18444",
+		strings.Repeat("1", maxLearnedPeerAddrBytes+1) + ":18444",
+	})
+
+	addrs := svc.knownPeerAddrs()
+	want := []string{"8.8.8.8:18444", "[2001:4860:4860::8888]:18444"}
+	if !slices.Equal(addrs, want) {
+		t.Fatalf("known peer addrs = %v, want %v", addrs, want)
 	}
-	defer ln.Close()
 
-	accepted := make(chan struct{}, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		wire := p2p.NewConn(conn, p2p.MagicForProfile(types.Regtest), 8<<20)
-		if _, err := p2p.Handshake(wire, p2p.VersionMessage{
-			Protocol:  1,
-			Height:    0,
-			Nonce:     1,
-			UserAgent: "learned-peer-test",
-		}, 2*time.Second); err == nil {
-			accepted <- struct{}{}
-			time.Sleep(250 * time.Millisecond)
-		}
-	}()
-
-	svc.rememberKnownPeers([]string{ln.Addr().String()})
-	svc.refillOutboundPeers()
-
-	select {
-	case <-accepted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for learned peer dial")
+	if candidates := svc.outboundRefillCandidates(4); !slices.Equal(candidates, want) {
+		t.Fatalf("outbound refill candidates = %v, want %v", candidates, want)
 	}
-	if got := svc.outboundPeerCount(); got != 1 {
-		t.Fatalf("outbound peer count = %d, want 1", got)
+}
+
+func TestLoadPersistedKnownPeersFiltersAutoButPreservesManual(t *testing.T) {
+	svc := &Service{
+		cfg: ServiceConfig{P2PAddr: "0.0.0.0:18444"},
+		knownPeers: map[string]storage.KnownPeerRecord{
+			"1.1.1.1:18444": {Manual: true},
+		},
+	}
+	manager := &peerManager{svc: svc}
+
+	manager.loadPersistedKnownPeers(map[string]storage.KnownPeerRecord{
+		"1.1.1.1:18444":   {},
+		"8.8.4.4:18444":   {},
+		"10.0.0.2:18444":  {},
+		"localhost:18444": {},
+		"10.0.0.3:18444":  {Manual: true},
+	})
+
+	addrs := manager.knownPeerAddrs()
+	want := []string{"1.1.1.1:18444", "10.0.0.3:18444", "8.8.4.4:18444"}
+	if !slices.Equal(addrs, want) {
+		t.Fatalf("loaded known peers = %v, want %v", addrs, want)
+	}
+	if !svc.knownPeers["1.1.1.1:18444"].Manual {
+		t.Fatal("persisted automatic record should not downgrade configured peer")
 	}
 }
 
@@ -3541,19 +3598,19 @@ func TestOutboundRefillCandidatesPreferDistinctNetgroupsAndHealthyPeers(t *testi
 	svc := &Service{
 		cfg: ServiceConfig{P2PAddr: "127.0.0.1:18444"},
 		knownPeers: map[string]storage.KnownPeerRecord{
-			"10.1.1.1:18444": {
+			"8.8.8.8:18444": {
 				LastSeen:    time.Unix(1_700_000_000, 0).UTC(),
 				LastSuccess: time.Unix(1_700_000_000, 0).UTC(),
 			},
-			"10.1.9.9:18444": {
+			"8.8.4.4:18444": {
 				LastSeen:    time.Unix(1_700_000_100, 0).UTC(),
 				LastSuccess: time.Unix(1_700_000_100, 0).UTC(),
 			},
-			"10.2.1.1:18444": {
+			"1.1.1.1:18444": {
 				LastSeen:    time.Unix(1_700_000_050, 0).UTC(),
 				LastSuccess: time.Unix(1_700_000_050, 0).UTC(),
 			},
-			"10.3.1.1:18444": {
+			"9.9.9.9:18444": {
 				LastSeen:     time.Unix(1_700_000_200, 0).UTC(),
 				LastSuccess:  time.Unix(1_700_000_200, 0).UTC(),
 				LastAttempt:  time.Now().UTC(),
@@ -3574,7 +3631,7 @@ func TestOutboundRefillCandidatesPreferDistinctNetgroupsAndHealthyPeers(t *testi
 		t.Fatalf("candidate netgroups should differ, got %v", addrs)
 	}
 	for _, addr := range addrs {
-		if addr == "10.3.1.1:18444" {
+		if addr == "9.9.9.9:18444" {
 			t.Fatalf("unhealthy peer should be deprioritized, got %v", addrs)
 		}
 	}
@@ -3588,7 +3645,7 @@ func TestKnownPeerAddrsSkipsSelfEquivalentAddresses(t *testing.T) {
 		},
 		knownPeers: map[string]storage.KnownPeerRecord{
 			"localhost:18444": {},
-			"10.9.0.3:18444":  {},
+			"8.8.8.8:18444":   {},
 		},
 	}
 	manager := &peerManager{svc: svc}
@@ -3612,7 +3669,7 @@ func TestOutboundRefillCandidatesSkipSelfEquivalentAddresses(t *testing.T) {
 				LastSeen:    time.Unix(1_700_000_000, 0).UTC(),
 				LastSuccess: time.Unix(1_700_000_000, 0).UTC(),
 			},
-			"10.9.0.2:18444": {
+			"8.8.8.8:18444": {
 				LastSeen:    time.Unix(1_700_000_010, 0).UTC(),
 				LastSuccess: time.Unix(1_700_000_010, 0).UTC(),
 			},
@@ -3624,8 +3681,8 @@ func TestOutboundRefillCandidatesSkipSelfEquivalentAddresses(t *testing.T) {
 	manager := &peerManager{svc: svc}
 
 	addrs := manager.outboundRefillCandidates(2)
-	if len(addrs) != 1 || addrs[0] != "10.9.0.2:18444" {
-		t.Fatalf("outbound refill candidates = %v, want [10.9.0.2:18444]", addrs)
+	if len(addrs) != 1 || addrs[0] != "8.8.8.8:18444" {
+		t.Fatalf("outbound refill candidates = %v, want [8.8.8.8:18444]", addrs)
 	}
 }
 
@@ -8470,7 +8527,7 @@ func TestReserveOutboundTargetReplacesLowValuePeerAndLogs(t *testing.T) {
 	}
 }
 
-func TestRefillOutboundPeersRebalancesLowValueLearnedPeer(t *testing.T) {
+func TestOutboundRefillCandidatesRebalanceLowValueLearnedPeer(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
 		Profile:          types.Regtest,
@@ -8503,20 +8560,33 @@ func TestRefillOutboundPeersRebalancesLowValueLearnedPeer(t *testing.T) {
 		low.addr:    {},
 	}
 	svc.knownPeers = map[string]storage.KnownPeerRecord{
-		manual.addr:       {Manual: true, LastSeen: now, LastSuccess: now},
-		low.addr:          {LastSeen: now.Add(-6 * time.Hour), FailureCount: 2},
-		"127.0.0.1:18446": {LastSeen: now, LastSuccess: now},
+		manual.addr:     {Manual: true, LastSeen: now, LastSuccess: now},
+		low.addr:        {LastSeen: now.Add(-6 * time.Hour), FailureCount: 2},
+		"8.8.8.8:18446": {LastSeen: now, LastSuccess: now},
 	}
 	svc.peerMu.Unlock()
 
-	svc.peerManager().refillOutboundPeers()
+	candidates := svc.peerManager().outboundRefillCandidates(1)
+	if len(candidates) != 1 || candidates[0] != "8.8.8.8:18446" {
+		t.Fatalf("outbound refill candidates = %v, want [8.8.8.8:18446]", candidates)
+	}
+	reservation, reserved, err := svc.peerManager().reserveOutboundTarget(candidates[0], false)
+	if err != nil {
+		t.Fatalf("reserve outbound target: %v", err)
+	}
+	if !reserved {
+		t.Fatal("expected learned candidate to reserve a replacement slot")
+	}
+	if reservation.evictedAddr != low.addr {
+		t.Fatalf("evicted addr = %s, want %s", reservation.evictedAddr, low.addr)
+	}
 
 	svc.peerMu.RLock()
 	defer svc.peerMu.RUnlock()
 	if _, ok := svc.outboundPeers[low.addr]; ok {
 		t.Fatalf("expected rebalance to remove low-value outbound target %s", low.addr)
 	}
-	if _, ok := svc.outboundPeers["127.0.0.1:18446"]; !ok {
+	if _, ok := svc.outboundPeers["8.8.8.8:18446"]; !ok {
 		t.Fatal("expected rebalance to install the better learned outbound target")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +32,36 @@ const (
 	sendQueueBurstLimit      = 1
 	inboundProtectionWindow  = 45 * time.Second
 	outboundReplacementGap   = 250.0
+	maxLearnedPeerAddrBytes  = 128
 )
+
+var blockedLearnedPeerPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
 
 type outboundAddrCandidate struct {
 	addr     string
@@ -666,20 +696,20 @@ func (m *peerManager) outboundRefillCandidates(limit int) []string {
 	now := time.Now().UTC()
 	candidates := make([]outboundAddrCandidate, 0, len(m.svc.knownPeers))
 	for addr, record := range m.svc.knownPeers {
-		addr = normalizePeerAddr(addr)
-		if addr == "" || m.isSelfPeerAddr(addr) || m.isBannedAddrLocked(addr, now) {
+		normalized, ok := normalizeStoredKnownPeerAddr(addr, record.Manual)
+		if !ok || m.isSelfPeerAddr(normalized) || m.isBannedAddrLocked(normalized, now) {
 			continue
 		}
-		if _, ok := m.svc.outboundPeers[addr]; ok {
+		if _, ok := m.svc.outboundPeers[normalized]; ok {
 			continue
 		}
-		if peer, ok := m.svc.peers[addr]; ok && peer.outbound {
+		if peer, ok := m.svc.peers[normalized]; ok && peer.outbound {
 			continue
 		}
 		candidates = append(candidates, outboundAddrCandidate{
-			addr:     addr,
+			addr:     normalized,
 			record:   record,
-			netgroup: peerNetgroup(addr),
+			netgroup: peerNetgroup(normalized),
 			score:    scoreKnownPeer(record, now),
 		})
 	}
@@ -1054,9 +1084,10 @@ func (m *peerManager) knownPeerAddrs() []string {
 			set[addr] = struct{}{}
 		}
 	}
-	for addr := range m.svc.knownPeers {
-		if addr != "" && !m.isSelfPeerAddr(addr) && !m.isBannedAddrLocked(addr, now) {
-			set[addr] = struct{}{}
+	for addr, record := range m.svc.knownPeers {
+		normalized, ok := normalizeStoredKnownPeerAddr(addr, record.Manual)
+		if ok && !m.isSelfPeerAddr(normalized) && !m.isBannedAddrLocked(normalized, now) {
+			set[normalized] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(set))
@@ -1090,16 +1121,22 @@ func (m *peerManager) loadPersistedKnownPeers(peers map[string]storage.KnownPeer
 	if m.svc.bannedPeers == nil {
 		m.svc.bannedPeers = make(map[string]time.Time)
 	}
+	if m.svc.knownPeers == nil {
+		m.svc.knownPeers = make(map[string]storage.KnownPeerRecord)
+	}
 	now := time.Now().UTC()
 	for addr, record := range peers {
-		addr = normalizePeerAddr(addr)
-		if addr == "" || m.isSelfPeerAddr(addr) {
+		record = normalizeKnownPeerRecord(record)
+		normalized, ok := normalizeStoredKnownPeerAddr(addr, record.Manual)
+		if !ok || m.isSelfPeerAddr(normalized) {
 			continue
 		}
-		record = normalizeKnownPeerRecord(record)
-		m.svc.knownPeers[addr] = record
+		if existing := m.svc.knownPeers[normalized]; existing.Manual {
+			record.Manual = true
+		}
+		m.svc.knownPeers[normalized] = record
 		if record.BannedUntil.After(now) {
-			m.svc.bannedPeers[peerBanKey(addr)] = record.BannedUntil
+			m.svc.bannedPeers[peerBanKey(normalized)] = record.BannedUntil
 		}
 	}
 }
@@ -1153,8 +1190,8 @@ func (m *peerManager) rememberKnownPeers(addrs []string) {
 	}
 	now := time.Now().UTC()
 	for _, addr := range addrs {
-		addr = normalizePeerAddr(addr)
-		if addr == "" || m.isSelfPeerAddr(addr) {
+		addr, ok := normalizeLearnedPeerAddr(addr)
+		if !ok || m.isSelfPeerAddr(addr) {
 			continue
 		}
 		record := m.svc.knownPeers[addr]
@@ -1166,6 +1203,33 @@ func (m *peerManager) rememberKnownPeers(addrs []string) {
 	m.svc.peerMu.Unlock()
 	if err := m.svc.chainState.Store().WriteKnownPeers(snapshot); err != nil {
 		m.svc.logger.Warn("failed to persist peer address book", slog.Any("error", err))
+	}
+}
+
+func (m *peerManager) rememberConfiguredPeers(addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+	m.svc.peerMu.Lock()
+	if m.svc.knownPeers == nil {
+		m.svc.knownPeers = make(map[string]storage.KnownPeerRecord)
+	}
+	now := time.Now().UTC()
+	for _, addr := range addrs {
+		addr = normalizePeerAddr(addr)
+		if addr == "" || m.isSelfPeerAddr(addr) {
+			continue
+		}
+		record := m.svc.knownPeers[addr]
+		record.LastSeen = now
+		record.Manual = true
+		m.svc.knownPeers[addr] = normalizeKnownPeerRecord(record)
+	}
+	trimKnownPeerMapLocked(m.svc.knownPeers)
+	snapshot := cloneKnownPeerMap(m.svc.knownPeers)
+	m.svc.peerMu.Unlock()
+	if err := m.svc.chainState.Store().WriteKnownPeers(snapshot); err != nil {
+		m.svc.logger.Warn("failed to persist configured peer address book", slog.Any("error", err))
 	}
 }
 
@@ -1523,6 +1587,54 @@ func isWildcardOrLoopbackHost(host string) bool {
 func normalizePeerHost(host string) string {
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
 	return strings.ToLower(host)
+}
+
+func normalizeStoredKnownPeerAddr(addr string, manual bool) (string, bool) {
+	if manual {
+		addr = normalizePeerAddr(addr)
+		return addr, addr != ""
+	}
+	return normalizeLearnedPeerAddr(addr)
+}
+
+func normalizeLearnedPeerAddr(addr string) (string, bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" || len(addr) > maxLearnedPeerAddrBytes {
+		return "", false
+	}
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || portText == "" {
+		return "", false
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return "", false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return "", false
+	}
+	ip = ip.Unmap()
+	if !isRoutableLearnedPeerIP(ip) {
+		return "", false
+	}
+	normalized := net.JoinHostPort(ip.String(), strconv.FormatUint(port, 10))
+	if len(normalized) > maxLearnedPeerAddrBytes {
+		return "", false
+	}
+	return normalized, true
+}
+
+func isRoutableLearnedPeerIP(ip netip.Addr) bool {
+	if !ip.IsValid() || !ip.IsGlobalUnicast() {
+		return false
+	}
+	for _, prefix := range blockedLearnedPeerPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 func peerBanKey(addr string) string {

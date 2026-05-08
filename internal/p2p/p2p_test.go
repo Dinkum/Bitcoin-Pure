@@ -342,7 +342,7 @@ func TestConnReadMessageRejectsBadChecksum(t *testing.T) {
 	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
 	errCh := make(chan error, 1)
 	go func() {
-		payload := []byte{1, 2, 3, 4}
+		payload := make([]byte, 8)
 		writeRawMessageForTest(t, right, MagicForProfile(types.Regtest), CmdPing, payload, []byte{0, 0, 0, 0})
 		right.Close()
 		errCh <- nil
@@ -351,6 +351,90 @@ func TestConnReadMessageRejectsBadChecksum(t *testing.T) {
 	_, err := conn.ReadMessage()
 	if !errors.Is(err, ErrBadChecksum) {
 		t.Fatalf("read message error = %v, want ErrBadChecksum", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnReadMessageRejectsCommandPayloadOverLimitBeforeBodyRead(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
+	errCh := make(chan error, 1)
+	go func() {
+		header := make([]byte, headerSize)
+		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
+		header[4] = byte(CmdGetAddr)
+		binary.LittleEndian.PutUint32(header[8:12], 1)
+		if _, err := right.Write(header); err != nil {
+			t.Fatalf("write raw header: %v", err)
+		}
+		right.Close()
+		errCh <- nil
+	}()
+
+	_, err := conn.ReadMessage()
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("read message error = %v, want ErrPayloadTooLarge", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnReadMessageRejectsAddrPayloadOverLimitBeforeBodyRead(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
+	errCh := make(chan error, 1)
+	go func() {
+		header := make([]byte, headerSize)
+		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
+		header[4] = byte(CmdAddr)
+		binary.LittleEndian.PutUint32(header[8:12], uint32(maxAddrPayloadBytes+1))
+		if _, err := right.Write(header); err != nil {
+			t.Fatalf("write raw header: %v", err)
+		}
+		right.Close()
+		errCh <- nil
+	}()
+
+	_, err := conn.ReadMessage()
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("read message error = %v, want ErrPayloadTooLarge", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnReadMessageRejectsUnknownCommandBeforeBodyRead(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
+	errCh := make(chan error, 1)
+	go func() {
+		header := make([]byte, headerSize)
+		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
+		header[4] = 0xff
+		binary.LittleEndian.PutUint32(header[8:12], 1<<20)
+		if _, err := right.Write(header); err != nil {
+			t.Fatalf("write raw header: %v", err)
+		}
+		right.Close()
+		errCh <- nil
+	}()
+
+	_, err := conn.ReadMessage()
+	if !errors.Is(err, ErrBadCommand) {
+		t.Fatalf("read message error = %v, want ErrBadCommand", err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
@@ -395,12 +479,37 @@ func TestDecodeMessageRejectsUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestDecodeMessageRejectsTrailingPayload(t *testing.T) {
+	payload := make([]byte, 12)
+	_, err := decodeMessage(CmdPing, payload, types.DefaultCodecLimits())
+	if !errors.Is(err, ErrTrailingPayload) {
+		t.Fatalf("decodeMessage error = %v, want ErrTrailingPayload", err)
+	}
+}
+
 func TestDecodeMessageRejectsOversizedTxReconPayload(t *testing.T) {
 	payload := make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, maxInvPerMessage+1)
 	_, err := decodeMessage(CmdTxRecon, payload, types.DefaultCodecLimits())
 	if !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("decodeMessage error = %v, want ErrPayloadTooLarge", err)
+	}
+}
+
+func TestDecodeMessageRejectsOversizedAddrString(t *testing.T) {
+	payload := make([]byte, 8)
+	binary.LittleEndian.PutUint32(payload[:4], 1)
+	binary.LittleEndian.PutUint32(payload[4:], maxAddrStringBytes+1)
+	_, err := decodeMessage(CmdAddr, payload, types.DefaultCodecLimits())
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("decodeMessage error = %v, want ErrPayloadTooLarge", err)
+	}
+}
+
+func TestEncodeMessageRejectsOversizedAddrString(t *testing.T) {
+	_, err := encodeMessage(AddrMessage{Addrs: []string{string(make([]byte, maxAddrStringBytes+1))}})
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("encodeMessage error = %v, want ErrPayloadTooLarge", err)
 	}
 }
 

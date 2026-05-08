@@ -13,6 +13,7 @@ BIN_LINK="/usr/local/bin/bpu-cli"
 SERVICE_NAME="bitcoin-pure"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 LOCK_PATH="/var/lock/${SERVICE_NAME}-install.lock"
+MOTD_PATH="/etc/update-motd.d/95-bitcoin-pure"
 
 MODE="install"
 SOURCE_ROOT=""
@@ -219,6 +220,7 @@ release_is_unchanged() {
 	files_match "${artifacts_dir}/config.yaml" "${CONFIG_PATH}" || return 1
 	files_match "${artifacts_dir}/config.json" "${LEGACY_CONFIG_PATH}" || return 1
 	files_match "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" || return 1
+	files_match "${artifacts_dir}/${SERVICE_NAME}.motd" "${MOTD_PATH}" || return 1
 	files_match "${STAGE_DIR}/bin/bpu-cli" "${CURRENT_LINK}/bin/bpu-cli" || return 1
 	return 0
 }
@@ -242,6 +244,9 @@ backup_live_state() {
 	fi
 	if [[ -f "${UNIT_PATH}" ]]; then
 		cp -a "${UNIT_PATH}" "${BACKUP_DIR}/unit.service"
+	fi
+	if [[ -f "${MOTD_PATH}" ]]; then
+		cp -a "${MOTD_PATH}" "${BACKUP_DIR}/motd"
 	fi
 	if [[ -e "${BIN_LINK}" ]]; then
 		cp -a "${BIN_LINK}" "${BACKUP_DIR}/bpu-cli"
@@ -282,6 +287,7 @@ apply_release() {
 	[[ -f "${artifacts_dir}/config.yaml" ]] || fail "staged release config is missing"
 	[[ -f "${artifacts_dir}/config.json" ]] || fail "staged release legacy config sidecar is missing"
 	[[ -f "${artifacts_dir}/${SERVICE_NAME}.service" ]] || fail "staged release unit file is missing"
+	[[ -f "${artifacts_dir}/${SERVICE_NAME}.motd" ]] || fail "staged release motd helper is missing"
 
 	if release_is_unchanged; then
 		log "staged release matches the live install; leaving binaries and config in place"
@@ -299,6 +305,8 @@ apply_release() {
 	install_candidate_file "${artifacts_dir}/config.json" "${LEGACY_CONFIG_PATH}" 600
 	log "installing staged service unit"
 	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" 644
+	log "installing ssh monitor banner"
+	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.motd" "${MOTD_PATH}" 755
 	log "switching current release"
 	switch_current_link
 	log "switching command symlink"
@@ -419,8 +427,16 @@ discover_public_ip() {
 	printf '%s' "${ip}"
 }
 
+ssh_tunnel_user() {
+	if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+		printf '%s' "${SUDO_USER}"
+		return
+	fi
+	id -un 2>/dev/null || printf 'root'
+}
+
 print_install_summary() {
-	local version rpc_addr p2p_addr profile miner_enabled miner_workers service_state monitor_local monitor_public public_ip current_path rpc_host
+	local version rpc_addr p2p_addr profile miner_enabled miner_workers service_state monitor_local monitor_public public_ip current_path rpc_host rpc_port tunnel_user tunnel_target
 	local -a config_lines
 	version="$(metadata_value "${CURRENT_LINK}/.bpu-release.env" "version")"
 	mapfile -t config_lines < <(python3 - "${LEGACY_CONFIG_PATH}" <<'PY'
@@ -445,9 +461,12 @@ PY
 	public_ip="$(discover_public_ip)"
 	monitor_public=""
 	rpc_host="${rpc_addr%:*}"
+	rpc_port="${rpc_addr##*:}"
 	if [[ -n "${public_ip}" && "${rpc_host}" != "127.0.0.1" && "${rpc_host}" != "[::1]" && "${rpc_host}" != "::1" && "${rpc_host}" != "localhost" ]]; then
-		monitor_public="http://${public_ip}:${rpc_addr##*:}/"
+		monitor_public="http://${public_ip}:${rpc_port}/"
 	fi
+	tunnel_user="$(ssh_tunnel_user)"
+	tunnel_target="${tunnel_user}@${public_ip:-$(hostname -f 2>/dev/null || hostname)}"
 	current_path="$(readlink -f "${CURRENT_LINK}" || true)"
 
 	cat <<EOF
@@ -476,6 +495,7 @@ EOF
 | Next                                                                |
 |   systemctl status ${SERVICE_NAME} --no-pager
 |   journalctl -u ${SERVICE_NAME} -f
+|   ssh -L ${rpc_port}:127.0.0.1:${rpc_port} ${tunnel_target}
 |   curl ${monitor_local}
 |   TOKEN=\$(python3 -c 'import json; print(json.load(open("${LEGACY_CONFIG_PATH}"))["rpc_auth_token"])')
 |   curl -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
@@ -517,6 +537,7 @@ rollback_release() {
 	restore_or_remove "${BACKUP_DIR}/config.yaml" "${CONFIG_PATH}" 600
 	restore_or_remove "${BACKUP_DIR}/config.json" "${LEGACY_CONFIG_PATH}" 600
 	restore_or_remove "${BACKUP_DIR}/unit.service" "${UNIT_PATH}" 644
+	restore_or_remove "${BACKUP_DIR}/motd" "${MOTD_PATH}" 755
 	systemctl daemon-reload
 	if [[ "${SERVICE_WAS_ACTIVE}" -eq 1 ]]; then
 		systemctl restart "${SERVICE_NAME}.service" || true

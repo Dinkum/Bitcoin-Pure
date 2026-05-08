@@ -18,6 +18,8 @@ const (
 	maxHeadersPerMessage  = 2000
 	maxInvPerMessage      = 2000
 	maxAddrPerMessage     = 1000
+	maxAddrStringBytes    = 128
+	maxAddrPayloadBytes   = 4 + maxAddrPerMessage*(4+maxAddrStringBytes)
 	maxTxBatchPerMessage  = 256
 	maxThinBlockTxs       = 200_000
 	maxAvalanchePollItems = 256
@@ -29,6 +31,7 @@ var (
 	ErrBadChecksum     = errors.New("invalid payload checksum")
 	ErrBadCommand      = errors.New("invalid command")
 	ErrBadHandshake    = errors.New("invalid handshake sequence")
+	ErrTrailingPayload = errors.New("trailing payload bytes")
 )
 
 const (
@@ -345,7 +348,11 @@ func (c *Conn) ReadMessage() (Message, error) {
 	}
 	cmd := Command(header[4])
 	payloadLen := int(binary.LittleEndian.Uint32(header[8:12]))
-	if payloadLen < 0 || payloadLen > c.maxPayload {
+	maxPayload, ok := maxPayloadForCommand(cmd, c.maxPayload)
+	if !ok {
+		return nil, ErrBadCommand
+	}
+	if payloadLen < 0 || payloadLen > maxPayload {
 		return nil, ErrPayloadTooLarge
 	}
 	payload := make([]byte, payloadLen)
@@ -357,6 +364,48 @@ func (c *Conn) ReadMessage() (Message, error) {
 		return nil, ErrBadChecksum
 	}
 	return decodeMessage(cmd, payload, c.limits)
+}
+
+func maxPayloadForCommand(cmd Command, globalMax int) (int, bool) {
+	if globalMax <= 0 {
+		globalMax = 64_000_000
+	}
+	max := globalMax
+	switch cmd {
+	case CmdVersion:
+		max = minInt(max, 16<<10)
+	case CmdVerAck, CmdGetAddr:
+		max = minInt(max, 0)
+	case CmdPing, CmdPong:
+		max = minInt(max, 8)
+	case CmdInv, CmdGetData, CmdNotFound:
+		max = minInt(max, 4+maxInvPerMessage*(1+32))
+	case CmdAddr:
+		max = minInt(max, maxAddrPayloadBytes)
+	case CmdGetHeaders, CmdGetBlocks:
+		max = minInt(max, 4+maxHeadersPerMessage*32+32)
+	case CmdHeaders:
+		max = minInt(max, 4+maxHeadersPerMessage*types.BlockHeaderEncodedLen)
+	case CmdTxRecon, CmdTxReq:
+		max = minInt(max, 4+maxInvPerMessage*32)
+	case CmdGetBlockTx, CmdGetXBlockTx:
+		max = minInt(max, 32+4+maxThinBlockTxs*4)
+	case CmdAvaPoll:
+		max = minInt(max, 8+4+maxAvalanchePollItems*(32+4))
+	case CmdAvaVote:
+		max = minInt(max, 8+4+maxAvalanchePollItems*(1+32))
+	case CmdBlock, CmdTx, CmdTxBatch, CmdCompactBlock, CmdBlockTx, CmdXThinBlock, CmdXBlockTx:
+	default:
+		return 0, false
+	}
+	return max, true
+}
+
+func minInt(left int, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func (c *Conn) WriteMessage(msg Message) error {
@@ -506,16 +555,27 @@ func encodePayload(msg Message) ([]byte, error) {
 
 func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Message, error) {
 	r := newReader(payload)
+	msg, err := decodeMessageFromReader(cmd, r, limits)
+	if err != nil {
+		return nil, err
+	}
+	if r.pos != len(payload) {
+		return nil, ErrTrailingPayload
+	}
+	return msg, nil
+}
+
+func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (Message, error) {
 	switch cmd {
 	case CmdVersion:
-		if len(payload) < 28 {
+		if len(r.buf) < 28 {
 			return nil, io.ErrUnexpectedEOF
 		}
 		msg := VersionMessage{
-			Protocol: binary.LittleEndian.Uint32(payload[:4]),
-			Services: binary.LittleEndian.Uint64(payload[4:12]),
-			Height:   binary.LittleEndian.Uint64(payload[12:20]),
-			Nonce:    binary.LittleEndian.Uint64(payload[20:28]),
+			Protocol: binary.LittleEndian.Uint32(r.buf[:4]),
+			Services: binary.LittleEndian.Uint64(r.buf[4:12]),
+			Height:   binary.LittleEndian.Uint64(r.buf[12:20]),
+			Nonce:    binary.LittleEndian.Uint64(r.buf[20:28]),
 		}
 		userAgent, err := r.skip(28).readString()
 		if err != nil {
@@ -540,7 +600,7 @@ func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Messa
 	case CmdGetAddr:
 		return GetAddrMessage{}, nil
 	case CmdAddr:
-		addrs, err := r.readStrings(maxAddrPerMessage)
+		addrs, err := r.readStrings(maxAddrPerMessage, maxAddrStringBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -842,6 +902,9 @@ func encodeStrings(items []string, limit int) ([]byte, error) {
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, uint32(len(items)))
 	for _, item := range items {
+		if len(item) > maxAddrStringBytes {
+			return nil, ErrPayloadTooLarge
+		}
 		buf = appendString(buf, item)
 	}
 	return buf, nil
@@ -958,9 +1021,16 @@ func (r *reader) readU64() (uint64, error) {
 }
 
 func (r *reader) readBytes() ([]byte, error) {
+	return r.readBytesWithLimit(-1)
+}
+
+func (r *reader) readBytesWithLimit(limit int) ([]byte, error) {
 	n, err := r.readU32()
 	if err != nil {
 		return nil, err
+	}
+	if limit >= 0 && int(n) > limit {
+		return nil, ErrPayloadTooLarge
 	}
 	return r.take(int(n))
 }
@@ -973,7 +1043,15 @@ func (r *reader) readString() (string, error) {
 	return string(buf), nil
 }
 
-func (r *reader) readStrings(limit int) ([]string, error) {
+func (r *reader) readStringWithLimit(limit int) (string, error) {
+	buf, err := r.readBytesWithLimit(limit)
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func (r *reader) readStrings(limit int, itemLimit int) ([]string, error) {
 	count, err := r.readU32()
 	if err != nil {
 		return nil, err
@@ -983,7 +1061,7 @@ func (r *reader) readStrings(limit int) ([]string, error) {
 	}
 	out := make([]string, 0, count)
 	for i := uint32(0); i < count; i++ {
-		item, err := r.readString()
+		item, err := r.readStringWithLimit(itemLimit)
 		if err != nil {
 			return nil, err
 		}

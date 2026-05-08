@@ -61,8 +61,22 @@ current_go_version() {
 	go version | awk '{print $3}' | sed 's/^go//'
 }
 
+go_tarball_sha256() {
+	case "$1" in
+	go1.26.0.linux-amd64.tar.gz)
+		echo "aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235"
+		;;
+	go1.26.0.linux-arm64.tar.gz)
+		echo "bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd"
+		;;
+	*)
+		fail "missing pinned Go checksum for $1"
+		;;
+	esac
+}
+
 install_go() {
-	local want have arch tarball url tmp
+	local want have arch tarball url expected tmp extract_dir actual extracted
 	want="$(required_go_version)"
 	have="$(current_go_version || true)"
 	if [[ "${have}" == "${want}" ]]; then
@@ -72,18 +86,43 @@ install_go() {
 	arch="$(detect_go_arch)"
 	tarball="go${want}.linux-${arch}.tar.gz"
 	url="https://go.dev/dl/${tarball}"
-	tmp="/tmp/${tarball}"
+	expected="$(go_tarball_sha256 "${tarball}")"
+	tmp="$(mktemp "/tmp/${tarball}.XXXXXX")"
+	extract_dir="$(mktemp -d "/tmp/${tarball%.tar.gz}.XXXXXX")"
 	log "installing Go ${want} (${arch})"
 	curl -fsSL "${url}" -o "${tmp}"
+	actual="$(sha256sum "${tmp}" | awk '{print $1}')"
+	if [[ "${actual}" != "${expected}" ]]; then
+		rm -f "${tmp}"
+		rm -rf "${extract_dir}"
+		fail "checksum mismatch for ${tarball}: got ${actual}, want ${expected}"
+	fi
+	if ! tar -C "${extract_dir}" -xzf "${tmp}"; then
+		rm -f "${tmp}"
+		rm -rf "${extract_dir}"
+		fail "failed to extract verified Go toolchain"
+	fi
+	if [[ ! -x "${extract_dir}/go/bin/go" ]]; then
+		rm -f "${tmp}"
+		rm -rf "${extract_dir}"
+		fail "verified Go archive did not contain go/bin/go"
+	fi
+	extracted="$("${extract_dir}/go/bin/go" version | awk '{print $3}' | sed 's/^go//')"
+	if [[ "${extracted}" != "${want}" ]]; then
+		rm -f "${tmp}"
+		rm -rf "${extract_dir}"
+		fail "verified Go archive version ${extracted} does not match required ${want}"
+	fi
 	rm -rf /usr/local/go
-	tar -C /usr/local -xzf "${tmp}"
+	mv "${extract_dir}/go" /usr/local/go
 	rm -f "${tmp}"
+	rm -rf "${extract_dir}"
 	export PATH="/usr/local/go/bin:${PATH}"
 }
 
 ensure_packages() {
 	local pkg
-	local -a required=(build-essential ca-certificates curl git python3 tar)
+	local -a required=(build-essential ca-certificates coreutils curl git python3 tar)
 	local -a missing=()
 	for pkg in "${required[@]}"; do
 		if ! package_installed "${pkg}"; then
@@ -186,7 +225,7 @@ cfg = {
     "db_path": keep("db_path", os.path.join(data_dir, "chain")),
     "log_path": keep("log_path", os.path.join(log_dir, "node.log")),
     "log_level": keep("log_level", "info"),
-    "rpc_addr": keep("rpc_addr", "0.0.0.0:18443"),
+    "rpc_addr": keep("rpc_addr", "127.0.0.1:18443"),
     "rpc_auth_token": rpc_token,
     "rpc_read_timeout_ms": keep("rpc_read_timeout_ms", 5000),
     "rpc_write_timeout_ms": keep("rpc_write_timeout_ms", 5000),
@@ -247,6 +286,54 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+render_motd() {
+	local artifacts_dir
+	artifacts_dir="${STAGE_DIR}/.artifacts"
+	cat >"${artifacts_dir}/${SERVICE_NAME}.motd" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_PATH="${LEGACY_CONFIG_PATH}"
+
+rpc_addr="\$(python3 - "\${CONFIG_PATH}" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        print(json.load(fh).get("rpc_addr", ""))
+except OSError:
+    pass
+PY
+)"
+[[ -n "\${rpc_addr}" ]] || exit 0
+
+if [[ "\${rpc_addr}" =~ ^\\[(.*)\\]:(.+)$ ]]; then
+	port="\${BASH_REMATCH[2]}"
+else
+	port="\${rpc_addr##*:}"
+fi
+[[ -n "\${port}" && "\${port}" != "\${rpc_addr}" ]] || exit 0
+
+public_ip="\$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i = 1; i <= NF; i++) if (\$i == "src") {print \$(i + 1); exit}}')"
+if [[ -z "\${public_ip}" ]]; then
+	public_ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+fi
+[[ -n "\${public_ip}" ]] || exit 0
+
+ssh_user="\${USER:-}"
+if [[ -z "\${ssh_user}" ]]; then
+	ssh_user="\$(id -un 2>/dev/null || true)"
+fi
+[[ -n "\${ssh_user}" ]] || exit 0
+
+cat <<MOTD
+Bitcoin Pure monitor:
+  ssh -L \${port}:127.0.0.1:\${port} \${ssh_user}@\${public_ip}
+  http://127.0.0.1:\${port}/
+MOTD
+EOF
+	chmod 755 "${artifacts_dir}/${SERVICE_NAME}.motd"
 }
 
 build_binary() {
@@ -400,6 +487,7 @@ main() {
 	install_go
 	render_config
 	render_unit
+	render_motd
 	build_binary
 	normalize_config
 	ensure_mining_wallet

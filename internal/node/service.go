@@ -16,6 +16,7 @@ import (
 	"math"
 	"math/big"
 	mrand "math/rand"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -1161,7 +1162,7 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	svc.minerMgr = &minerManager{svc: svc}
 	svc.avaMgr = newAvalancheManager(svc)
 	if !cfg.StaticPeerTopology {
-		svc.rememberKnownPeers(cfg.Peers)
+		svc.peerManager().rememberConfiguredPeers(cfg.Peers)
 		if persistedPeers, err := chainState.Store().LoadKnownPeers(); err != nil {
 			chainState.Close()
 			return nil, err
@@ -8801,7 +8802,7 @@ func (s *Service) findLocatorHeightLocked(locator [][32]byte) (uint64, error) {
 
 func (s *Service) authorizeRPC(r *http.Request) bool {
 	if s.cfg.RPCAuthToken == "" {
-		return true
+		return allowUnauthenticatedLoopbackRPC(r)
 	}
 	const prefix = "Bearer "
 	header := r.Header.Get("Authorization")
@@ -8809,6 +8810,43 @@ func (s *Service) authorizeRPC(r *http.Request) bool {
 		return true
 	}
 	return r.Header.Get("X-BPU-Auth") == s.cfg.RPCAuthToken
+}
+
+func allowUnauthenticatedLoopbackRPC(r *http.Request) bool {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		return false
+	}
+	if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" && site != "same-origin" && site != "none" {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	return originMatchesRequestHost(origin, r)
+}
+
+func isJSONContentType(raw string) bool {
+	mediaType, _, err := mime.ParseMediaType(raw)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "application/json")
+}
+
+func originMatchesRequestHost(origin string, r *http.Request) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return parsed.Scheme == scheme && strings.EqualFold(parsed.Host, r.Host)
 }
 
 func (s *Service) blockIndexByHashHex(raw string) (*storage.BlockIndexEntry, error) {
