@@ -26,6 +26,10 @@
 /Works
 /REFERENCE_NODES
 /CI/
+
+# This project does not use GitHub Actions CI.
+/.github/workflows/
+
 /bpu-cli
 /.*-tmp/
 /benchmarks/reports/
