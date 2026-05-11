@@ -8,6 +8,7 @@ Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to pre
 
 - One output type, one spend rule, no scripting
 - x-only Schnorr signatures for transactions
+- Optional post-quantum transaction authorization with ML-DSA-65 signatures
 - Block headers commit not just to transactions, but to the live UTXO state itself
 - Transactions separate base contents from authorization data via `txid` / `authid` and `tx_root` / `auth_root`
 - Canonical transaction and block encoding
@@ -22,7 +23,7 @@ See:
 - [Google: Quantum frontiers may be closer than they appear](https://blog.google/innovation-and-ai/technology/safety-security/cryptography-migration-timeline/)
 - [Cloudflare: Post-quantum roadmap](https://blog.cloudflare.com/post-quantum-roadmap/)
 
-BPU’s direction is to move from a pubkey-native coin model toward a typed lock model. The goal is to preserve the current x-only secp256k1 lane for now, add an optional compact post-quantum lane, and make any later hard cutover a clean simplification rather than a second architectural redesign.
+BPU’s direction is to move from a pubkey-native coin model toward a typed lock model. The goal is to preserve the current x-only secp256k1 lane for now, add an optional compact post-quantum lane (ML-DSA-65), and make any later hard cutover a clean simplification rather than a second architectural redesign.
 
 No cutoff heights, cutoff dates, or forced migration rules are implemented today. Any future hard cutover would be introduced explicitly and separately.
 
