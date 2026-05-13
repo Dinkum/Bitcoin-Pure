@@ -100,7 +100,8 @@ func (a accumulator) digest() [32]byte {
 }
 
 func leafElement(outPoint types.OutPoint, entry consensus.UtxoEntry) *big.Int {
-	payload := encodeLeaf(outPoint, entry)
+	var scratch [32 + 4 + 9 + 8 + 32]byte
+	payload := encodeLeaf(scratch[:0], outPoint, entry)
 	hash := crypto.TaggedHash(leafTag, payload)
 	value := new(big.Int).SetBytes(hash[:])
 	value.Mod(value, modulusM1)
@@ -108,8 +109,7 @@ func leafElement(outPoint types.OutPoint, entry consensus.UtxoEntry) *big.Int {
 	return value
 }
 
-func encodeLeaf(outPoint types.OutPoint, entry consensus.UtxoEntry) []byte {
-	buf := make([]byte, 0, 32+4+9+8+32)
+func encodeLeaf(buf []byte, outPoint types.OutPoint, entry consensus.UtxoEntry) []byte {
 	buf = append(buf, outPoint.TxID[:]...)
 	var vout [4]byte
 	binary.LittleEndian.PutUint32(vout[:], outPoint.Vout)

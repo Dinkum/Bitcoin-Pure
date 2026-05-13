@@ -416,6 +416,9 @@ func TestAcceptTxEvictsOldestOrphan(t *testing.T) {
 	if _, ok := pool.orphans[consensus.TxID(&first)]; ok {
 		t.Fatalf("expected oldest orphan to be evicted")
 	}
+	if waiting := pool.orphanDeps[firstPrev]; len(waiting) != 0 {
+		t.Fatalf("evicted orphan dependency retained %d stale waiters", len(waiting))
+	}
 	if _, ok := pool.orphans[consensus.TxID(&second)]; !ok {
 		t.Fatalf("expected newest orphan to remain")
 	}

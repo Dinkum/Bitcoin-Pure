@@ -118,6 +118,30 @@ func TestBlockRoundtrip(t *testing.T) {
 	}
 }
 
+func TestDecodeBlockRejectsOversizeBeforeDecode(t *testing.T) {
+	block := Block{
+		Header: BlockHeader{Version: 1},
+		Txs: []Transaction{{
+			Base: TxBase{
+				Version:            1,
+				CoinbaseHeight:     testCoinbaseHeight(0),
+				CoinbaseExtraNonce: testCoinbaseExtraNonce(1),
+				Outputs: []TxOutput{{
+					ValueAtoms: 50,
+					PubKey:     [32]byte{5},
+				}},
+			},
+		}},
+	}
+	raw := block.Encode()
+	limits := DefaultCodecLimits()
+	limits.MaxBlockBytes = len(raw) - 1
+	var limitErr LimitExceededError
+	if _, err := DecodeBlockWithLimits(raw, limits); !errors.As(err, &limitErr) {
+		t.Fatalf("decode oversize block error = %v, want LimitExceededError", err)
+	}
+}
+
 func TestCoinbaseTransactionRoundtripPreservesHeight(t *testing.T) {
 	tx := Transaction{
 		Base: TxBase{

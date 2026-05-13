@@ -543,8 +543,8 @@ func AuthID(tx *types.Transaction) [32]byte {
 }
 
 func HeaderHash(header *types.BlockHeader) [32]byte {
-	encoded := header.Encode()
-	return crypto.Sha256d(encoded)
+	encoded := encodeHeaderFixed(*header)
+	return crypto.Sha256d(encoded[:])
 }
 
 func encodeHeaderFixed(header types.BlockHeader) [types.BlockHeaderEncodedLen]byte {
@@ -875,6 +875,24 @@ func SighashWithParams(tx *types.Transaction, inputIndex int, spentCoins []UtxoE
 		return [32]byte{}, err
 	}
 	return ctx.hash(inputIndex, len(tx.Base.Inputs))
+}
+
+// SighashesWithParams computes every input sighash while sharing the tx-wide
+// prevout/output/spent-coin commitments.
+func SighashesWithParams(tx *types.Transaction, spentCoins []UtxoEntry, params ChainParams) ([][32]byte, error) {
+	ctx, err := newSighashContextWithParams(tx, spentCoins, params)
+	if err != nil {
+		return nil, err
+	}
+	hashes := make([][32]byte, len(tx.Base.Inputs))
+	for i := range tx.Base.Inputs {
+		hash, err := ctx.hash(i, len(tx.Base.Inputs))
+		if err != nil {
+			return nil, err
+		}
+		hashes[i] = hash
+	}
+	return hashes, nil
 }
 
 // Sighash preserves the legacy mainnet-default helper for callers that have

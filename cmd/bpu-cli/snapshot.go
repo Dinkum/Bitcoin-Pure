@@ -105,36 +105,34 @@ func runSnapshotExport(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
-	stored, err := store.LoadChainState()
+	stored, err := store.LoadChainStateMeta()
 	if err != nil {
+		_ = store.Close()
 		return err
 	}
 	if stored == nil {
+		_ = store.Close()
 		return fmt.Errorf("no persisted chain state found at %s", *dbPath)
 	}
-	view := node.CommittedChainView{
-		Height:         stored.Height,
-		TipHeader:      stored.TipHeader,
-		TipHash:        consensus.HeaderHash(&stored.TipHeader),
-		BlockSizeState: stored.BlockSizeState,
-		UTXOCount:      len(stored.UTXOs),
-		UTXORoot:       consensus.ComputedUTXORoot(stored.UTXOs),
-		UTXOChecksum:   stored.UTXOChecksum,
+	profile := stored.Profile
+	if err := store.Close(); err != nil {
+		return err
 	}
-	if err := node.ExportUTXOSnapshotFile(*outPath, view, func(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
-		for outPoint, entry := range stored.UTXOs {
-			if err := fn(outPoint, entry); err != nil {
-				return err
-			}
-		}
-		return nil
-	}, stored.Profile, *genesisFixture, *chainFixture); err != nil {
+	persistent, err := node.OpenPersistentChainStateFromMeta(*dbPath, profile)
+	if err != nil {
+		return err
+	}
+	defer persistent.Close()
+	view, ok := persistent.CommittedView()
+	if !ok {
+		return fmt.Errorf("no persisted chain state found at %s", *dbPath)
+	}
+	if err := node.ExportUTXOSnapshotFile(*outPath, view, persistent.Store().ForEachUTXO, profile, *genesisFixture, *chainFixture); err != nil {
 		return err
 	}
 	fmt.Printf("db: %s\n", *dbPath)
 	fmt.Printf("file: %s\n", *outPath)
-	fmt.Printf("profile: %s\n", stored.Profile)
+	fmt.Printf("profile: %s\n", profile)
 	fmt.Printf("height: %d\n", view.Height)
 	fmt.Printf("header_hash: %x\n", view.TipHash)
 	fmt.Printf("utxo_root: %x\n", view.UTXORoot)

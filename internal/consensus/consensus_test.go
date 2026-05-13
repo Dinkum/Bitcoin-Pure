@@ -575,10 +575,17 @@ func TestSighashMatchesSpecForMultiInputSpend(t *testing.T) {
 		{ValueAtoms: 30, PubKey: consensusTestPubKey(2)},
 	}
 
+	batched, err := SighashesWithParams(&tx, spentCoins, MainnetParams())
+	if err != nil {
+		t.Fatalf("batched sighashes: %v", err)
+	}
 	for i := range tx.Base.Inputs {
 		got, err := SighashWithParams(&tx, i, spentCoins, MainnetParams())
 		if err != nil {
 			t.Fatalf("sighash input %d: %v", i, err)
+		}
+		if batched[i] != got {
+			t.Fatalf("batched sighash input %d = %x, want %x", i, batched[i], got)
 		}
 		want, err := specSighashForTest(&tx, i, spentCoins, MainnetParams())
 		if err != nil {

@@ -249,13 +249,6 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 	if fastSyncState == nil {
 		return SnapshotHistoricalVerificationSummary{}, nil
 	}
-	snapshotUTXOs, err := store.LoadFastSyncSnapshotUTXOs()
-	if err != nil {
-		return SnapshotHistoricalVerificationSummary{}, err
-	}
-	if snapshotUTXOs == nil {
-		return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("missing retained fast-sync snapshot utxos")
-	}
 	state := NewChainState(profile).WithLogger(logger)
 	if _, err := state.InitializeFromGenesisBlock(genesis); err != nil {
 		return SnapshotHistoricalVerificationSummary{}, err
@@ -272,7 +265,7 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 		if err != nil {
 			return SnapshotHistoricalVerificationSummary{}, err
 		}
-		if _, err := state.ApplyBlock(block); err != nil {
+		if _, err := state.applyBlockDetailedWithSpent(block, spentCommittedUTXOsFromUndo(undo)); err != nil {
 			fastSyncState.LastError = err.Error()
 			_ = store.UpdateFastSyncState(fastSyncState)
 			return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("historical snapshot replay failed at height %d: %w", height, err)
@@ -302,7 +295,8 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 	if state.UTXOChecksum() != fastSyncState.SnapshotChecksum {
 		return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("historical snapshot checksum mismatch: expected %x, got %x", fastSyncState.SnapshotChecksum, state.UTXOChecksum())
 	}
-	if err := compareSnapshotUTXOsIter(state.UTXOCount(), state.ForEachUTXO, snapshotUTXOs); err != nil {
+	snapshotCount, err := compareFastSyncSnapshotUTXOs(state.UTXOCount(), state.utxoLookup, fastSyncState.SnapshotUTXOCount, store.ForEachFastSyncSnapshotUTXO)
+	if err != nil {
 		return SnapshotHistoricalVerificationSummary{}, err
 	}
 	if err := store.ClearFastSyncState(); err != nil {
@@ -313,7 +307,7 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 		HeaderHash: fastSyncState.SnapshotHeaderHash,
 		UTXORoot:   fastSyncState.SnapshotUTXORoot,
 		Checksum:   fastSyncState.SnapshotChecksum,
-		UTXOCount:  len(snapshotUTXOs),
+		UTXOCount:  snapshotCount,
 	}
 	logger.Info("completed historical snapshot verification",
 		slog.Uint64("height", summary.Height),
@@ -322,6 +316,42 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 		slog.Int("utxo_count", summary.UTXOCount),
 	)
 	return summary, nil
+}
+
+func compareFastSyncSnapshotUTXOs(liveCount int, liveLookup consensus.UtxoLookupWithErr, expectedSnapshotCount int, iterateSnapshot func(func(types.OutPoint, consensus.UtxoEntry) error) error) (int, error) {
+	if liveLookup == nil {
+		return 0, fmt.Errorf("live utxo lookup unavailable")
+	}
+	if iterateSnapshot == nil {
+		return 0, fmt.Errorf("snapshot utxo iteration unavailable")
+	}
+	if liveCount != expectedSnapshotCount {
+		return 0, fmt.Errorf("snapshot utxo set size mismatch: expected %d, got %d", expectedSnapshotCount, liveCount)
+	}
+	seen := 0
+	if err := iterateSnapshot(func(outPoint types.OutPoint, expected consensus.UtxoEntry) error {
+		got, ok, err := liveLookup(outPoint)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("live utxo set missing retained snapshot outpoint %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		if got != expected {
+			return fmt.Errorf("snapshot entry mismatch for %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		seen++
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	if seen == 0 {
+		return 0, fmt.Errorf("missing retained fast-sync snapshot utxos")
+	}
+	if seen != expectedSnapshotCount {
+		return 0, fmt.Errorf("snapshot utxo iteration count mismatch: expected %d, got %d", expectedSnapshotCount, seen)
+	}
+	return seen, nil
 }
 
 func encodeSnapshotFixtureEntries(utxos consensus.UtxoSet) []UTXOSnapshotFixtureEntry {
@@ -346,14 +376,30 @@ func encodeSnapshotFixtureEntries(utxos consensus.UtxoSet) []UTXOSnapshotFixture
 }
 
 func encodeSnapshotFixtureEntriesFromIterator(utxoCount int, iterate func(func(types.OutPoint, consensus.UtxoEntry) error) error) ([]UTXOSnapshotFixtureEntry, error) {
-	utxos := make(consensus.UtxoSet, utxoCount)
+	type keyedEntry struct {
+		outPoint types.OutPoint
+		entry    consensus.UtxoEntry
+	}
+	entries := make([]keyedEntry, 0, utxoCount)
 	if err := iterate(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
-		utxos[outPoint] = entry
+		entries = append(entries, keyedEntry{outPoint: outPoint, entry: entry})
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return encodeSnapshotFixtureEntries(utxos), nil
+	sort.Slice(entries, func(i, j int) bool {
+		return compareSnapshotOutPoints(entries[i].outPoint, entries[j].outPoint) < 0
+	})
+	fixtureEntries := make([]UTXOSnapshotFixtureEntry, 0, len(entries))
+	for _, item := range entries {
+		fixtureEntries = append(fixtureEntries, UTXOSnapshotFixtureEntry{
+			TxIDHex:    hex.EncodeToString(item.outPoint.TxID[:]),
+			Vout:       item.outPoint.Vout,
+			ValueAtoms: item.entry.ValueAtoms,
+			PubKeyHex:  hex.EncodeToString(item.entry.PubKey[:]),
+		})
+	}
+	return fixtureEntries, nil
 }
 
 func ensureSnapshotImportTargetEmpty(store *storage.ChainStore) error {

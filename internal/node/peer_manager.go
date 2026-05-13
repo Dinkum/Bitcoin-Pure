@@ -354,7 +354,6 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 		conn, err := dialer.Dial("tcp", addr)
 		if err != nil {
 			consecutiveFailures++
-			m.recordKnownPeerAttempt(addr, time.Now())
 			m.recordKnownPeerFailure(addr, time.Now())
 			m.svc.logger.Warn("peer dial failed", slog.String("addr", addr), slog.Any("error", err), slog.Duration("retry_in", backoff))
 			if consecutiveFailures >= autoPeerFailureCeiling && m.evictUnhealthyAutoPeer(addr) {
@@ -399,9 +398,6 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 	}
 	traffic := &peerTrafficMeter{}
 	wire := p2p.NewConn(&meteredNetConn{Conn: conn, meter: traffic}, p2p.MagicForProfile(m.svc.cfg.Profile), m.svc.cfg.MaxMessageBytes)
-	if outbound {
-		m.recordKnownPeerAttempt(addr, time.Now())
-	}
 	remoteVersion, err := p2p.Handshake(wire, m.svc.localVersion(), m.svc.cfg.HandshakeTimeout)
 	if err != nil {
 		if outbound {
@@ -1368,13 +1364,6 @@ func peerNetgroup(addr string) string {
 	}
 	raw := ip.As16()
 	return fmt.Sprintf("v6:%x:%x:%x:%x", raw[0], raw[1], raw[2], raw[3])
-}
-
-func (m *peerManager) recordKnownPeerAttempt(addr string, at time.Time) {
-	m.updateKnownPeerRecord(addr, func(record *storage.KnownPeerRecord) {
-		record.LastSeen = at.UTC()
-		record.LastAttempt = at.UTC()
-	})
 }
 
 func (m *peerManager) recordKnownPeerFailure(addr string, at time.Time) {

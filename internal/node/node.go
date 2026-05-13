@@ -177,18 +177,32 @@ func chainStateFromStoredMeta(stored *storage.StoredChainStateMeta, utxos consen
 }
 
 func buildAccumulatorFromStore(store *storage.ChainStore) (*utreexo.Accumulator, int, error) {
-	leaves := make([]utreexo.UtxoLeaf, 0)
+	const rebuildBatchSize = 8192
+	acc := utreexo.NewAccumulator()
+	leaves := make([]utreexo.UtxoLeaf, 0, rebuildBatchSize)
 	utxoCount := 0
 	if err := store.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
 		leaves = append(leaves, utxoLeafForEntry(outPoint, entry))
 		utxoCount++
+		if len(leaves) < rebuildBatchSize {
+			return nil
+		}
+		next, err := acc.Apply(nil, leaves)
+		if err != nil {
+			return err
+		}
+		acc = next
+		leaves = leaves[:0]
 		return nil
 	}); err != nil {
 		return nil, 0, err
 	}
-	acc, err := utreexo.NewAccumulatorFromLeaves(leaves)
-	if err != nil {
-		return nil, 0, err
+	if len(leaves) != 0 {
+		next, err := acc.Apply(nil, leaves)
+		if err != nil {
+			return nil, 0, err
+		}
+		acc = next
 	}
 	return acc, utxoCount, nil
 }
@@ -304,6 +318,10 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 }
 
 func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail, error) {
+	return c.applyBlockDetailedWithSpent(block, nil)
+}
+
+func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO map[types.OutPoint]consensus.UtxoEntry) (appliedBlockDetail, error) {
 	if c.height == nil || c.tipHeader == nil {
 		return appliedBlockDetail{}, ErrNoTip
 	}
@@ -324,9 +342,12 @@ func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail,
 		return appliedBlockDetail{}, err
 	}
 	createdUTXO := overlay.CreatedEntriesClone()
-	spentUTXO, err := blockSpentCommittedUTXOs(c.utxoLookup, block)
-	if err != nil {
-		return appliedBlockDetail{}, err
+	if spentUTXO == nil {
+		var err error
+		spentUTXO, err = blockSpentCommittedUTXOs(c.utxoLookup, block)
+		if err != nil {
+			return appliedBlockDetail{}, err
+		}
 	}
 	height := summary.Height
 	c.height = &height
@@ -522,6 +543,17 @@ func blockSpentCommittedUTXOs(lookup consensus.UtxoLookupWithErr, block *types.B
 		}
 	}
 	return spent, nil
+}
+
+func spentCommittedUTXOsFromUndo(undo []storage.BlockUndoEntry) map[types.OutPoint]consensus.UtxoEntry {
+	if len(undo) == 0 {
+		return map[types.OutPoint]consensus.UtxoEntry{}
+	}
+	spent := make(map[types.OutPoint]consensus.UtxoEntry, len(undo))
+	for _, entry := range undo {
+		spent[entry.OutPoint] = entry.Entry
+	}
+	return spent
 }
 
 func OpenPersistentChainState(path string, profile types.ChainProfile) (*PersistentChainState, error) {

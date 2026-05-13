@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -360,7 +361,7 @@ func (c *Conn) ReadMessage() (Message, error) {
 		return nil, err
 	}
 	checksum := crypto.Sha256d(payload)
-	if string(checksum[:4]) != string(header[12:16]) {
+	if !bytes.Equal(checksum[:4], header[12:16]) {
 		return nil, ErrBadChecksum
 	}
 	return decodeMessage(cmd, payload, c.limits)
@@ -493,11 +494,13 @@ func encodePayload(msg Message) ([]byte, error) {
 	case GetBlocksMessage:
 		return encodeLocatorPayload(m.Locator, m.StopHash)
 	case BlockMessage:
-		blockBytes := m.Block.Encode()
-		return appendBytes(nil, blockBytes), nil
+		buf := make([]byte, 0, 4+m.Block.EncodedLen())
+		buf = appendLengthPrefix(buf, m.Block.EncodedLen())
+		return m.Block.AppendEncode(buf), nil
 	case TxMessage:
-		txBytes := m.Tx.Encode()
-		return appendBytes(nil, txBytes), nil
+		buf := make([]byte, 0, 4+m.Tx.EncodedLen())
+		buf = appendLengthPrefix(buf, m.Tx.EncodedLen())
+		return m.Tx.AppendEncode(buf), nil
 	case TxBatchMessage:
 		return encodeTxs(m.Txs)
 	case TxReconMessage:
@@ -505,10 +508,9 @@ func encodePayload(msg Message) ([]byte, error) {
 	case TxRequestMessage:
 		return encodeHashes(m.TxIDs, maxInvPerMessage)
 	case CompactBlockMessage:
-		buf := append([]byte(nil), m.Header.Encode()...)
-		nonce := make([]byte, 8)
-		binary.LittleEndian.PutUint64(nonce, m.Nonce)
-		buf = append(buf, nonce...)
+		buf := make([]byte, 0, types.BlockHeaderEncodedLen+8+prefilledTxsEncodedLen(m.Prefilled)+4+len(m.ShortIDs)*8)
+		buf = m.Header.AppendEncode(buf)
+		buf = appendU64(buf, m.Nonce)
 		buf, err := encodePrefilledTxs(buf, m.Prefilled, maxThinBlockTxs)
 		if err != nil {
 			return nil, err
@@ -525,11 +527,11 @@ func encodePayload(msg Message) ([]byte, error) {
 		}
 		return encodeTxsWithLimit(buf, m.Txs, maxThinBlockTxs)
 	case XThinBlockMessage:
-		buf := append([]byte(nil), m.Header.Encode()...)
-		nonce := make([]byte, 8)
-		binary.LittleEndian.PutUint64(nonce, m.Nonce)
-		buf = append(buf, nonce...)
-		buf = appendBytes(buf, m.Coinbase.Encode())
+		buf := make([]byte, 0, types.BlockHeaderEncodedLen+8+4+m.Coinbase.EncodedLen()+4+len(m.ShortIDs)*8)
+		buf = m.Header.AppendEncode(buf)
+		buf = appendU64(buf, m.Nonce)
+		buf = appendLengthPrefix(buf, m.Coinbase.EncodedLen())
+		buf = m.Coinbase.AppendEncode(buf)
 		return encodeU64s(buf, m.ShortIDs, maxThinBlockTxs)
 	case GetXBlockTxMessage:
 		buf := append([]byte(nil), m.BlockHash[:]...)
@@ -846,16 +848,22 @@ func encodePrefilledTxs(buf []byte, items []PrefilledTx, limit int) ([]byte, err
 	if len(items) > limit {
 		return nil, fmt.Errorf("too many prefilled txs: %d", len(items))
 	}
-	count := make([]byte, 4)
-	binary.LittleEndian.PutUint32(count, uint32(len(items)))
-	buf = append(buf, count...)
+	buf = growBytes(buf, prefilledTxsEncodedLen(items))
+	buf = appendLengthPrefix(buf, len(items))
 	for _, item := range items {
-		index := make([]byte, 4)
-		binary.LittleEndian.PutUint32(index, item.Index)
-		buf = append(buf, index...)
-		buf = appendBytes(buf, item.Tx.Encode())
+		buf = appendU32(buf, item.Index)
+		buf = appendLengthPrefix(buf, item.Tx.EncodedLen())
+		buf = item.Tx.AppendEncode(buf)
 	}
 	return buf, nil
+}
+
+func prefilledTxsEncodedLen(items []PrefilledTx) int {
+	size := 4
+	for _, item := range items {
+		size += 4 + 4 + item.Tx.EncodedLen()
+	}
+	return size
 }
 
 func encodeInvs(items []InvVector) ([]byte, error) {
@@ -888,10 +896,10 @@ func encodeHeaders(headers []types.BlockHeader) ([]byte, error) {
 	if len(headers) > maxHeadersPerMessage {
 		return nil, fmt.Errorf("too many headers: %d", len(headers))
 	}
-	buf := make([]byte, 4)
+	buf := make([]byte, 4, 4+len(headers)*types.BlockHeaderEncodedLen)
 	binary.LittleEndian.PutUint32(buf, uint32(len(headers)))
 	for _, header := range headers {
-		buf = append(buf, header.Encode()...)
+		buf = header.AppendEncode(buf)
 	}
 	return buf, nil
 }
@@ -919,14 +927,20 @@ func encodeTxsWithLimit(buf []byte, txs []types.Transaction, limit int) ([]byte,
 	if len(txs) > limit {
 		return nil, fmt.Errorf("too many txs: %d", len(txs))
 	}
-	if buf == nil {
-		buf = make([]byte, 4)
-	} else {
-		buf = append(buf, make([]byte, 4)...)
+	payloadBytes := 4
+	for _, tx := range txs {
+		payloadBytes += 4 + tx.EncodedLen()
 	}
+	if buf == nil {
+		buf = make([]byte, 0, payloadBytes)
+	} else {
+		buf = growBytes(buf, payloadBytes)
+	}
+	buf = append(buf, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(txs)))
 	for _, tx := range txs {
-		buf = appendBytes(buf, tx.Encode())
+		buf = appendLengthPrefix(buf, tx.EncodedLen())
+		buf = tx.AppendEncode(buf)
 	}
 	return buf, nil
 }
@@ -935,12 +949,11 @@ func encodeU64s(buf []byte, items []uint64, limit int) ([]byte, error) {
 	if len(items) > limit {
 		return nil, fmt.Errorf("too many items: %d", len(items))
 	}
-	buf = append(buf, make([]byte, 4)...)
+	buf = growBytes(buf, 4+len(items)*8)
+	buf = append(buf, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(items)))
 	for _, item := range items {
-		raw := make([]byte, 8)
-		binary.LittleEndian.PutUint64(raw, item)
-		buf = append(buf, raw...)
+		buf = appendU64(buf, item)
 	}
 	return buf, nil
 }
@@ -961,12 +974,11 @@ func encodeU32s(buf []byte, items []uint32, limit int) ([]byte, error) {
 	if len(items) > limit {
 		return nil, fmt.Errorf("too many items: %d", len(items))
 	}
-	buf = append(buf, make([]byte, 4)...)
+	buf = growBytes(buf, 4+len(items)*4)
+	buf = append(buf, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(items)))
 	for _, item := range items {
-		raw := make([]byte, 4)
-		binary.LittleEndian.PutUint32(raw, item)
-		buf = append(buf, raw...)
+		buf = appendU32(buf, item)
 	}
 	return buf, nil
 }
@@ -976,10 +988,34 @@ func appendString(buf []byte, value string) []byte {
 }
 
 func appendBytes(buf []byte, value []byte) []byte {
-	size := make([]byte, 4)
-	binary.LittleEndian.PutUint32(size, uint32(len(value)))
-	buf = append(buf, size...)
+	buf = growBytes(buf, 4+len(value))
+	buf = appendLengthPrefix(buf, len(value))
 	return append(buf, value...)
+}
+
+func appendLengthPrefix(buf []byte, n int) []byte {
+	return appendU32(buf, uint32(n))
+}
+
+func appendU32(buf []byte, v uint32) []byte {
+	buf = append(buf, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(buf[len(buf)-4:], v)
+	return buf
+}
+
+func appendU64(buf []byte, v uint64) []byte {
+	buf = append(buf, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint64(buf[len(buf)-8:], v)
+	return buf
+}
+
+func growBytes(buf []byte, extra int) []byte {
+	if extra <= cap(buf)-len(buf) {
+		return buf
+	}
+	next := make([]byte, len(buf), len(buf)+extra)
+	copy(next, buf)
+	return next
 }
 
 type reader struct {

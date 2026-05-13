@@ -84,7 +84,8 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 		c.recentTimes = append([]uint64(nil), c.recentTimes[:len(c.recentTimes)-1]...)
 	}
 	c.blockSizeState = parent.BlockSizeState
-	c.replaceMaterializedUTXOs(workingUtxos.Materialize())
+	workingUtxos.ApplyToSet(baseUtxos)
+	c.replaceMaterializedUTXOs(baseUtxos)
 	c.utxoAcc = nextAcc
 	// Disconnects are reorg-only and off the hot path, so recompute directly to
 	// guarantee checksum/state parity after undo application.
@@ -154,7 +155,7 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	if err != nil {
 		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
-	detail, err := snapshot.applyBlockDetailed(block)
+	detail, err := snapshot.applyBlockDetailedWithSpent(block, spentCommittedUTXOsFromUndo(undo))
 	if err != nil {
 		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
@@ -392,9 +393,16 @@ func (p *PersistentChainState) currentEntryForBlock(parentEntry *storage.BlockIn
 
 func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uint64) (*ChainState, *consensus.UtxoOverlay, []storage.BlockIndexEntry, map[[32]byte][]storage.BlockUndoEntry, map[[32]byte]map[types.OutPoint]consensus.UtxoEntry, committedBranchTransition, consensus.BlockValidationSummary, error) {
 	tempState := p.state.Clone()
-	reorgOverlay, disconnectedBlocks, err := p.disconnectToHeight(tempState, forkHeight)
-	if err != nil {
-		return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
+	var reorgOverlay *consensus.UtxoOverlay
+	var disconnectedBlocks []types.Block
+	if tipHeight := tempState.TipHeight(); tipHeight != nil && *tipHeight == forkHeight {
+		reorgOverlay = consensus.NewUtxoOverlayWithLookup(tempState.utxoLookup)
+	} else {
+		var err error
+		reorgOverlay, disconnectedBlocks, err = p.disconnectToHeight(tempState, forkHeight)
+		if err != nil {
+			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
+		}
 	}
 
 	entries := make([]storage.BlockIndexEntry, 0, len(steps))
@@ -407,7 +415,7 @@ func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uin
 		if err != nil {
 			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
 		}
-		detail, err := tempState.applyBlockDetailed(&step.block)
+		detail, err := tempState.applyBlockDetailedWithSpent(&step.block, spentCommittedUTXOsFromUndo(undo))
 		if err != nil {
 			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
 		}
@@ -487,7 +495,8 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 		state.tipHeader = &parentHeader
 		state.blockSizeState = parentEntry.BlockSizeState
 	}
-	state.replaceMaterializedUTXOs(workingUtxos.Materialize())
+	workingUtxos.ApplyToSet(baseUtxos)
+	state.replaceMaterializedUTXOs(baseUtxos)
 	state.utxoAcc = workingAcc
 	if state.tipHeader != nil {
 		recentTimes, err := loadIndexedAncestorTimestamps(p.store, consensus.HeaderHash(state.tipHeader), 11)

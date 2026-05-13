@@ -1279,7 +1279,7 @@ func (p *Pool) PromoteReadyOrphansForBlockWithLookupAndParams(block *types.Block
 func (p *Pool) PromoteReadyOrphansDetailedForBlockWithLookupAndParams(block *types.Block, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) ([]AcceptedTx, []RejectedTx) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if block == nil {
+	if block == nil || len(p.orphans) == 0 {
 		return nil, nil
 	}
 	outputs := make([]types.OutPoint, 0)
@@ -1651,6 +1651,10 @@ func (p *Pool) trimOrphans() int {
 }
 
 func (p *Pool) deleteOrphan(txid [32]byte) {
+	orphan := p.orphans[txid]
+	if orphan != nil {
+		p.removeOrphanDeps(txid, orphan.Missing)
+	}
 	delete(p.orphans, txid)
 }
 
@@ -1659,10 +1663,30 @@ func (p *Pool) updateOrphanMissing(txid [32]byte, missing map[types.OutPoint]str
 	if orphan == nil {
 		return
 	}
+	p.removeOrphanDeps(txid, orphan.Missing)
 	orphan.Missing = copyOutPointSet(missing)
 	orphan.MissingCount = len(missing)
 	for out := range orphan.Missing {
 		p.orphanDeps[out] = append(p.orphanDeps[out], txid)
+	}
+}
+
+func (p *Pool) removeOrphanDeps(txid [32]byte, missing map[types.OutPoint]struct{}) {
+	for out := range missing {
+		waiting := p.orphanDeps[out]
+		for i, waitingTxID := range waiting {
+			if waitingTxID != txid {
+				continue
+			}
+			// Preserve waiter order so orphan promotion remains deterministic.
+			waiting = append(waiting[:i], waiting[i+1:]...)
+			break
+		}
+		if len(waiting) == 0 {
+			delete(p.orphanDeps, out)
+			continue
+		}
+		p.orphanDeps[out] = waiting
 	}
 }
 

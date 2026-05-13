@@ -469,32 +469,46 @@ func (s *ChainStore) LoadFastSyncState() (*FastSyncState, error) {
 
 func (s *ChainStore) LoadFastSyncSnapshotUTXOs() (consensus.UtxoSet, error) {
 	utxos := make(consensus.UtxoSet)
+	count := 0
+	if err := s.ForEachFastSyncSnapshotUTXO(func(outpoint types.OutPoint, entry consensus.UtxoEntry) error {
+		utxos[outpoint] = entry
+		count++
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	return utxos, nil
+}
+
+func (s *ChainStore) ForEachFastSyncSnapshotUTXO(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+	if fn == nil {
+		return nil
+	}
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: snapshotUTXOPrefix,
 		UpperBound: snapshotUTXOPrefixEnd,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
 		outpoint, err := decodeOutPoint(iter.Key()[len(snapshotUTXOPrefix):])
 		if err != nil {
-			return nil, err
+			return err
 		}
 		entry, err := decodeUTXOEntry(iter.Value())
 		if err != nil {
-			return nil, err
+			return err
 		}
-		utxos[outpoint] = entry
+		if err := fn(outpoint, entry); err != nil {
+			return err
+		}
 	}
-	if err := iter.Error(); err != nil {
-		return nil, err
-	}
-	if len(utxos) == 0 {
-		return nil, nil
-	}
-	return utxos, nil
+	return iter.Error()
 }
 
 func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO, error) {
@@ -508,41 +522,73 @@ func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO,
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		if limit > 0 && len(items) >= limit {
-			break
-		}
 		seq, err := decodeLocalitySeqFromKey(iter.Key())
 		if err != nil {
 			return nil, err
 		}
-		outPoint, err := decodeOutPoint(iter.Value())
+		outPoint, entry, ok, err := decodeLocalitySeqValue(iter.Value())
 		if err != nil {
 			return nil, err
 		}
-		entryBuf, err := s.get(utxoKey(outPoint))
-		if err != nil {
-			return nil, err
+		if !ok {
+			outPoint, err = decodeOutPoint(iter.Value())
+			if err != nil {
+				return nil, err
+			}
+			entryBuf, err := s.get(utxoKey(outPoint))
+			if err != nil {
+				return nil, err
+			}
+			if entryBuf == nil {
+				// The locality index is non-consensus metadata. If a stale row slips
+				// through during recovery, skip it instead of poisoning canonical UTXO
+				// reads.
+				continue
+			}
+			entry, err = decodeUTXOEntry(entryBuf)
+			if err != nil {
+				return nil, err
+			}
 		}
-		if entryBuf == nil {
-			// The locality index is non-consensus metadata. If a stale row slips
-			// through during recovery, skip it instead of poisoning canonical UTXO
-			// reads.
-			continue
-		}
-		entry, err := decodeUTXOEntry(entryBuf)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, LocalityIndexedUTXO{
+		item := LocalityIndexedUTXO{
 			Sequence: seq,
 			OutPoint: outPoint,
 			Entry:    entry,
-		})
+		}
+		items = keepLocalityItem(items, item, limit)
 	}
 	if err := iter.Error(); err != nil {
 		return nil, err
 	}
+	slices.SortFunc(items, compareLocalityItems)
 	return items, nil
+}
+
+func keepLocalityItem(items []LocalityIndexedUTXO, item LocalityIndexedUTXO, limit int) []LocalityIndexedUTXO {
+	if limit <= 0 || len(items) < limit {
+		return append(items, item)
+	}
+	worst := 0
+	for i := 1; i < len(items); i++ {
+		if compareLocalityItems(items[worst], items[i]) < 0 {
+			worst = i
+		}
+	}
+	if compareLocalityItems(item, items[worst]) < 0 {
+		items[worst] = item
+	}
+	return items
+}
+
+func compareLocalityItems(a, b LocalityIndexedUTXO) int {
+	switch {
+	case a.Sequence < b.Sequence:
+		return -1
+	case a.Sequence > b.Sequence:
+		return 1
+	default:
+		return compareOutPoints(a.OutPoint, b.OutPoint)
+	}
 }
 
 func (s *ChainStore) LocalitySequence(outPoint types.OutPoint) (uint64, bool, error) {
@@ -871,6 +917,7 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
+	existing := make(map[string][]byte)
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: knownPeerPrefix,
 		UpperBound: knownPeerPrefixEnd,
@@ -880,9 +927,17 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
+		addr := string(iter.Key()[len(knownPeerPrefix):])
+		if addr == "" {
+			continue
 		}
+		if _, keep := peers[addr]; !keep {
+			if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+				return err
+			}
+			continue
+		}
+		existing[addr] = cloneBytes(iter.Value())
 	}
 	if err := iter.Error(); err != nil {
 		return err
@@ -891,7 +946,11 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 		if addr == "" {
 			continue
 		}
-		if err := batch.Set(knownPeerKey(addr), encodeKnownPeerRecord(record), nil); err != nil {
+		encoded := encodeKnownPeerRecord(record)
+		if bytes.Equal(existing[addr], encoded) {
+			continue
+		}
+		if err := batch.Set(knownPeerKey(addr), encoded, nil); err != nil {
 			return err
 		}
 	}
@@ -946,6 +1005,9 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 func (s *ChainStore) WriteFastSyncState(state *FastSyncState, snapshot consensus.UtxoSet) error {
 	if state == nil {
 		return errors.New("fast sync state is required")
+	}
+	if state.SnapshotUTXOCount != len(snapshot) {
+		return fmt.Errorf("fast sync snapshot count mismatch: state=%d snapshot=%d", state.SnapshotUTXOCount, len(snapshot))
 	}
 	encoded, err := json.Marshal(state)
 	if err != nil {
@@ -1611,11 +1673,24 @@ func (s *ChainStore) appendJournalEntriesBatch(batch *pebble.Batch, entries ...c
 	if err != nil {
 		return err
 	}
+	startSeq := nextSeq
+	derivedSeq, err := s.derivedJournalSeq()
+	if err != nil {
+		return err
+	}
 	for _, entry := range entries {
 		if err := batch.Set(journalKey(nextSeq), encodeChainJournalEntry(entry), nil); err != nil {
 			return err
 		}
+		if err := applyJournalEntryBatch(batch, entry); err != nil {
+			return err
+		}
 		nextSeq++
+	}
+	if derivedSeq >= startSeq {
+		if err := batch.Set(metaDerivedJournalSeqKey, encodeU64(nextSeq), nil); err != nil {
+			return err
+		}
 	}
 	return batch.Set(metaJournalNextSeqKey, encodeU64(nextSeq), nil)
 }
@@ -1793,7 +1868,7 @@ func (s *ChainStore) rebuildLocalityIndexBatch(batch *pebble.Batch, utxos consen
 	}
 	sortOutPointsCanonical(ordered)
 	for seq, outPoint := range ordered {
-		if err := batch.Set(localitySeqKey(uint64(seq)), encodeOutPoint(outPoint), nil); err != nil {
+		if err := batch.Set(localitySeqKey(uint64(seq)), encodeLocalitySeqValue(outPoint, utxos[outPoint]), nil); err != nil {
 			return err
 		}
 		if err := batch.Set(localityMetaKey(outPoint), encodeU64(uint64(seq)), nil); err != nil {
@@ -1829,7 +1904,7 @@ func (s *ChainStore) applyLocalityDeltaBatch(batch *pebble.Batch, spent []types.
 	}
 	sortOutPointsCanonical(orderedCreated)
 	for _, outPoint := range orderedCreated {
-		if err := batch.Set(localitySeqKey(nextSeq), encodeOutPoint(outPoint), nil); err != nil {
+		if err := batch.Set(localitySeqKey(nextSeq), encodeLocalitySeqValue(outPoint, created[outPoint]), nil); err != nil {
 			return err
 		}
 		if err := batch.Set(localityMetaKey(outPoint), encodeU64(nextSeq), nil); err != nil {
@@ -1884,19 +1959,23 @@ func (s *ChainStore) localitySeqForOutPoint(outPoint types.OutPoint) (uint64, bo
 
 func sortOutPointsCanonical(outPoints []types.OutPoint) {
 	slices.SortFunc(outPoints, func(a, b types.OutPoint) int {
-		switch cmp := bytes.Compare(a.TxID[:], b.TxID[:]); {
-		case cmp < 0:
-			return -1
-		case cmp > 0:
-			return 1
-		case a.Vout < b.Vout:
-			return -1
-		case a.Vout > b.Vout:
-			return 1
-		default:
-			return 0
-		}
+		return compareOutPoints(a, b)
 	})
+}
+
+func compareOutPoints(a, b types.OutPoint) int {
+	switch cmp := bytes.Compare(a.TxID[:], b.TxID[:]); {
+	case cmp < 0:
+		return -1
+	case cmp > 0:
+		return 1
+	case a.Vout < b.Vout:
+		return -1
+	case a.Vout > b.Vout:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
@@ -2074,6 +2153,30 @@ func encodeOutPoint(outPoint types.OutPoint) []byte {
 	buf := make([]byte, 0, 36)
 	outPoint.Encode(&buf)
 	return buf
+}
+
+func encodeLocalitySeqValue(outPoint types.OutPoint, entry consensus.UtxoEntry) []byte {
+	buf := make([]byte, 0, 36+49)
+	outPoint.Encode(&buf)
+	return append(buf, encodeUTXOEntry(entry)...)
+}
+
+func decodeLocalitySeqValue(buf []byte) (types.OutPoint, consensus.UtxoEntry, bool, error) {
+	if len(buf) == 36 {
+		return types.OutPoint{}, consensus.UtxoEntry{}, false, nil
+	}
+	if len(buf) < 37 {
+		return types.OutPoint{}, consensus.UtxoEntry{}, false, errors.New("invalid locality sequence value")
+	}
+	outPoint, err := decodeOutPoint(buf[:36])
+	if err != nil {
+		return types.OutPoint{}, consensus.UtxoEntry{}, false, err
+	}
+	entry, err := decodeUTXOEntry(buf[36:])
+	if err != nil {
+		return types.OutPoint{}, consensus.UtxoEntry{}, false, err
+	}
+	return outPoint, entry, true, nil
 }
 
 func decodeLocalitySeqFromKey(key []byte) (uint64, error) {

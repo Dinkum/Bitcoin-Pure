@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -1027,7 +1028,7 @@ func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, erro
 			}
 			return 1
 		}
-		if cmp := strings.Compare(hex.EncodeToString(a.OutPoint.TxID[:]), hex.EncodeToString(b.OutPoint.TxID[:])); cmp != 0 {
+		if cmp := bytes.Compare(a.OutPoint.TxID[:], b.OutPoint.TxID[:]); cmp != 0 {
 			return cmp
 		}
 		switch {
@@ -1076,14 +1077,18 @@ func checkedMul(left, right uint64) (uint64, error) {
 func selectCoinsForAutoFee(coins []SelectedInput, destItem WatchItem, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
 	selected := make([]SelectedInput, 0, len(coins))
 	var total uint64
+	inputBytes := 0
+	authBytes := 0
 	for _, coin := range coins {
 		selected = append(selected, coin)
+		inputBytes += 36
+		authBytes += estimatedAuthEntryBytes(coin.Address)
 		nextTotal, err := checkedAdd(total, coin.Value)
 		if err != nil {
 			return nil, 0, 0, 0, 0, ErrInsufficientFunds
 		}
 		total = nextTotal
-		noChangeBytes := estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type})
+		noChangeBytes := estimateSignedTxBytesFromParts(len(selected), inputBytes, authBytes, []uint64{destItem.Type})
 		feeNoChange, err := checkedMul(feeRate, uint64(noChangeBytes))
 		if err != nil {
 			return nil, 0, 0, 0, 0, ErrInsufficientFunds
@@ -1092,7 +1097,7 @@ func selectCoinsForAutoFee(coins []SelectedInput, destItem WatchItem, amount uin
 		if err != nil || total < requiredNoChange {
 			continue
 		}
-		changeBytes := estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type, selected[0].Address.OutputType()})
+		changeBytes := estimateSignedTxBytesFromParts(len(selected), inputBytes, authBytes, []uint64{destItem.Type, selected[0].Address.OutputType()})
 		feeWithChange, err := checkedMul(feeRate, uint64(changeBytes))
 		if err != nil {
 			return nil, 0, 0, 0, 0, ErrInsufficientFunds
@@ -1126,17 +1131,23 @@ func estimateSignedTxBytes(inputCount int, outputCount int) int {
 }
 
 func estimateSignedTxBytesForFamilies(inputs []SelectedInput, outputTypes []uint64) int {
+	authBytes := 0
+	for _, input := range inputs {
+		authBytes += estimatedAuthEntryBytes(input.Address)
+	}
+	return estimateSignedTxBytesFromParts(len(inputs), len(inputs)*36, authBytes, outputTypes)
+}
+
+func estimateSignedTxBytesFromParts(inputCount int, inputBytes int, authBytes int, outputTypes []uint64) int {
 	size := 4 // version
-	size += varIntLenU64(uint64(len(inputs)))
-	size += len(inputs) * 36
+	size += varIntLenU64(uint64(inputCount))
+	size += inputBytes
 	size += varIntLenU64(uint64(len(outputTypes)))
 	for _, outputType := range outputTypes {
 		size += estimatedOutputBytes(outputType)
 	}
-	size += varIntLenU64(uint64(len(inputs)))
-	for _, input := range inputs {
-		size += estimatedAuthEntryBytes(input.Address)
-	}
+	size += varIntLenU64(uint64(inputCount))
+	size += authBytes
 	return size
 }
 
@@ -1212,11 +1223,12 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 		}
 		inputTotal += coin.Value
 	}
+	msgs, err := consensus.SighashesWithParams(&tx, spentCoins, s.chainParams())
+	if err != nil {
+		return SendPlan{}, err
+	}
 	for i, coin := range inputs {
-		msg, err := consensus.SighashWithParams(&tx, i, spentCoins, s.chainParams())
-		if err != nil {
-			return SendPlan{}, err
-		}
+		msg := msgs[i]
 		authEntry, err := signAddressAuthEntry(coin.Address, &msg)
 		if err != nil {
 			return SendPlan{}, err

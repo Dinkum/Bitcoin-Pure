@@ -5932,8 +5932,7 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		entries := s.pool.Snapshot()
 		out := make([]string, 0, len(entries))
 		for _, entry := range entries {
-			txid := consensus.TxID(&entry.Tx)
-			out = append(out, hex.EncodeToString(txid[:]))
+			out = append(out, hex.EncodeToString(entry.TxID[:]))
 		}
 		return out, nil
 	case "getutxosbypubkeys":

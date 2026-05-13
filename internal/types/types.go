@@ -599,6 +599,10 @@ func (t Transaction) EncodeAuth() []byte {
 
 func (t Transaction) Encode() []byte {
 	out := make([]byte, 0, t.EncodedLen())
+	return t.AppendEncode(out)
+}
+
+func (t Transaction) AppendEncode(out []byte) []byte {
 	t.Base.Encode(&out)
 	t.Auth.Encode(&out)
 	return out
@@ -663,14 +667,11 @@ func DecodeTransactionHex(raw string, limits CodecLimits) (Transaction, error) {
 
 func (h BlockHeader) Encode() []byte {
 	out := make([]byte, 0, BlockHeaderEncodedLen)
-	writeU32LE(&out, h.Version)
-	out = append(out, h.PrevBlockHash[:]...)
-	out = append(out, h.MerkleTxIDRoot[:]...)
-	out = append(out, h.MerkleAuthRoot[:]...)
-	out = append(out, h.UTXORoot[:]...)
-	writeU64LE(&out, h.Timestamp)
-	writeU32LE(&out, h.NBits)
-	writeU64LE(&out, h.Nonce)
+	return h.AppendEncode(out)
+}
+
+func (h BlockHeader) AppendEncode(out []byte) []byte {
+	encodeBlockHeader(&out, h)
 	return out
 }
 
@@ -731,12 +732,27 @@ func DecodeBlockHeader(buf []byte) (BlockHeader, error) {
 	return header, nil
 }
 
+func encodeBlockHeader(out *[]byte, h BlockHeader) {
+	writeU32LE(out, h.Version)
+	*out = append(*out, h.PrevBlockHash[:]...)
+	*out = append(*out, h.MerkleTxIDRoot[:]...)
+	*out = append(*out, h.MerkleAuthRoot[:]...)
+	*out = append(*out, h.UTXORoot[:]...)
+	writeU64LE(out, h.Timestamp)
+	writeU32LE(out, h.NBits)
+	writeU64LE(out, h.Nonce)
+}
+
 func (b Block) Encode() []byte {
-	out := b.Header.Encode()
+	out := make([]byte, 0, b.EncodedLen())
+	return b.AppendEncode(out)
+}
+
+func (b Block) AppendEncode(out []byte) []byte {
+	encodeBlockHeader(&out, b.Header)
 	writeVarInt(&out, uint64(len(b.Txs)))
 	for _, tx := range b.Txs {
-		bb := tx.EncodeBase()
-		out = append(out, bb...)
+		tx.Base.Encode(&out)
 		tx.Auth.Encode(&out)
 	}
 	return out
@@ -751,6 +767,9 @@ func (b Block) EncodedLen() int {
 }
 
 func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
+	if len(buf) > limits.MaxBlockBytes {
+		return Block{}, LimitExceededError{Field: "block.bytes"}
+	}
 	r := newReader(buf)
 	header, err := decodeBlockHeader(r)
 	if err != nil {
@@ -770,9 +789,6 @@ func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
 	}
 	if r.pos != len(buf) {
 		return Block{}, ErrTrailingBytes
-	}
-	if len(buf) > limits.MaxBlockBytes {
-		return Block{}, LimitExceededError{Field: "block.bytes"}
 	}
 	return Block{Header: header, Txs: txs}, nil
 }

@@ -338,6 +338,20 @@ func TestFastSyncStateRoundtripAndClear(t *testing.T) {
 	}
 }
 
+func TestWriteFastSyncStateRejectsCountMismatch(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	_, utxos := sampleBlockAndUTXOs()
+	state := &FastSyncState{SnapshotUTXOCount: len(utxos) + 1}
+	if err := store.WriteFastSyncState(state, utxos); err == nil {
+		t.Fatal("expected fast-sync count mismatch")
+	}
+}
+
 func TestMempoolStateRoundtripAndClear(t *testing.T) {
 	path := t.TempDir()
 	store, err := Open(path)
@@ -580,6 +594,47 @@ func TestLocalityIndexTracksAppendAndRewrite(t *testing.T) {
 	}
 	if ordered[0].OutPoint != secondOutPoint {
 		t.Fatalf("expected surviving output to keep earliest locality rank, got %+v", ordered)
+	}
+}
+
+func TestLoadLocalityOrderedUTXOsUsesNumericSequenceOrder(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	utxos := make(consensus.UtxoSet, 300)
+	for i := 0; i < 300; i++ {
+		var txid [32]byte
+		binary.LittleEndian.PutUint64(txid[:8], uint64(i+1))
+		utxos[types.OutPoint{TxID: txid, Vout: 0}] = consensus.UtxoEntry{
+			ValueAtoms: uint64(i + 1),
+			PubKey:     [32]byte{byte(i + 1)},
+		}
+	}
+	block, _ := sampleBlockAndUTXOs()
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ordered, err := store.LoadLocalityOrderedUTXOs(260)
+	if err != nil {
+		t.Fatalf("LoadLocalityOrderedUTXOs: %v", err)
+	}
+	if len(ordered) != 260 {
+		t.Fatalf("ordered count = %d, want 260", len(ordered))
+	}
+	for i, item := range ordered {
+		if item.Sequence != uint64(i) {
+			t.Fatalf("sequence at %d = %d, want %d", i, item.Sequence, i)
+		}
 	}
 }
 

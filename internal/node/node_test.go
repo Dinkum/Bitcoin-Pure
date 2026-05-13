@@ -543,6 +543,55 @@ func TestPersistentRoundtrip(t *testing.T) {
 	}
 }
 
+func TestBuildAccumulatorFromStoreMatchesBulkRoot(t *testing.T) {
+	store, err := storage.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	utxos := make(consensus.UtxoSet, 96)
+	for i := 0; i < 96; i++ {
+		var txid [32]byte
+		binary.LittleEndian.PutUint64(txid[:8], uint64(i+1))
+		outPoint := types.OutPoint{TxID: txid, Vout: uint32(i % 3)}
+		utxos[outPoint] = consensus.UtxoEntry{
+			ValueAtoms: uint64(1000 + i),
+			Type:       types.OutputXOnlyP2PK,
+			PubKey:     nodeSignerPubKey(byte(i + 1)),
+		}
+	}
+	genesis := genesisBlock()
+	if err := store.WriteFullState(&storage.StoredChainState{
+		Profile:   types.Regtest,
+		Height:    0,
+		TipHeader: genesis.Header,
+		BlockSizeState: consensus.BlockSizeState{
+			BlockSize: types.BlockHeaderEncodedLen,
+			Epsilon:   16_000_000,
+			Beta:      16_000_000,
+		},
+		UTXOs: utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, count, err := buildAccumulatorFromStore(store)
+	if err != nil {
+		t.Fatalf("build accumulator from store: %v", err)
+	}
+	want, err := consensus.UtxoAccumulator(utxos)
+	if err != nil {
+		t.Fatalf("bulk accumulator: %v", err)
+	}
+	if count != len(utxos) {
+		t.Fatalf("count = %d, want %d", count, len(utxos))
+	}
+	if got.Root() != want.Root() {
+		t.Fatalf("root = %x, want %x", got.Root(), want.Root())
+	}
+}
+
 func TestPersistentRoundtripFromMeta(t *testing.T) {
 	path := t.TempDir()
 	persistent, err := OpenPersistentChainState(path, types.Regtest)
