@@ -350,21 +350,40 @@ func renderOperationRecords(records []logRecord) string {
 		message := recordString(record, "message")
 		name := recordString(record, "name")
 		fields := renderLogFields(record)
+		text := message
+		if fields != "" {
+			text += " | " + fields
+		}
 		if depth <= 0 {
-			fmt.Fprintf(&b, "%s %s", symbol, message)
+			appendRenderedLogLine(&b, symbol+" ", text)
 		} else {
 			label := strings.Repeat(">> ", depth) + name
-			fmt.Fprintf(&b, "%-26s | %s %s", label, symbol, message)
+			appendRenderedLogLine(&b, fmt.Sprintf("%-26s | %s ", label, symbol), text)
 		}
-		if fields != "" {
-			fmt.Fprintf(&b, " | %s", fields)
-		}
-		b.WriteByte('\n')
 	}
 	if totalMS != nil {
 		fmt.Fprintf(&b, "|= %.1fms total\n", *totalMS)
 	}
 	return b.String()
+}
+
+func appendRenderedLogLine(b *strings.Builder, prefix string, text string) {
+	const renderWidth = 100
+	width := renderWidth - len(prefix)
+	if width < 24 {
+		width = 24
+	}
+	lines := wrapTerminalText(text, width)
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	for i, line := range lines {
+		if i == 0 {
+			fmt.Fprintf(b, "%s%s\n", prefix, line)
+			continue
+		}
+		fmt.Fprintf(b, "%s%s\n", strings.Repeat(" ", len(prefix)), line)
+	}
 }
 
 func renderLogFields(record logRecord) string {

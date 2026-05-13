@@ -106,6 +106,15 @@ miner_wallet_marker_value() {
 	metadata_value "${CURRENT_LINK}/.artifacts/miner-wallet-provisioned" "${key}"
 }
 
+resolve_source_repo_url() {
+	if [[ -n "${REPO_URL}" ]]; then
+		return
+	fi
+	if [[ -n "${SOURCE_ROOT}" ]] && git -C "${SOURCE_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1; then
+		REPO_URL="$(git -C "${SOURCE_ROOT}" remote get-url origin 2>/dev/null || true)"
+	fi
+}
+
 resolve_repo_url() {
 	if [[ -n "${REPO_URL}" ]]; then
 		return
@@ -130,33 +139,34 @@ stage_checkout() {
 	if [[ "${MODE}" == "install" ]]; then
 		[[ -n "${SOURCE_ROOT}" ]] || fail "install mode requires --source"
 		[[ -f "${SOURCE_ROOT}/go.mod" ]] || fail "source checkout is missing go.mod"
+		resolve_source_repo_url
 		log "copying local checkout from ${SOURCE_ROOT}"
-        if [[ -d "${SOURCE_ROOT}/.git" ]] && git -C "${SOURCE_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1; then
-            log "copying repository files from ${SOURCE_ROOT}"
-            (
-                cd "${SOURCE_ROOT}"
-                git ls-files --cached --others --exclude-standard -z | tar --null -T - -cf -
-            ) | (
-                cd "${STAGE_DIR}"
-                tar -xf -
-            )
-        else
-            log "copying source tree from ${SOURCE_ROOT}"
-            (
-                cd "${SOURCE_ROOT}"
-                tar \
-                    --exclude='.git' \
-                    --exclude='.gocache' \
-                    --exclude='.gopath' \
-                    --exclude='.DS_Store' \
-                    --exclude='REFERENCE_NODES' \
-                    --exclude='Works' \
-                    -cf - .
-            ) | (
-                cd "${STAGE_DIR}"
-                tar -xf -
-            )
-        fi
+		if git -C "${SOURCE_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1; then
+			log "copying repository files from ${SOURCE_ROOT}"
+			(
+				cd "${SOURCE_ROOT}"
+				git ls-files --cached --others --exclude-standard -z | tar --null -T - -cf -
+			) | (
+				cd "${STAGE_DIR}"
+				tar -xf -
+			)
+		else
+			log "copying source tree from ${SOURCE_ROOT}"
+			(
+				cd "${SOURCE_ROOT}"
+				tar \
+					--exclude='.git' \
+					--exclude='.gocache' \
+					--exclude='.gopath' \
+					--exclude='.DS_Store' \
+					--exclude='REFERENCE_NODES' \
+					--exclude='Works' \
+					-cf - .
+			) | (
+				cd "${STAGE_DIR}"
+				tar -xf -
+			)
+		fi
 	else
 		resolve_repo_url
 		log "cloning ${REPO_URL}"
@@ -247,6 +257,16 @@ release_is_unchanged() {
 	return 0
 }
 
+refresh_live_metadata() {
+	[[ -f "${STAGE_DIR}/.bpu-release.env" ]] || return 0
+	[[ -d "${CURRENT_LINK}" ]] || return 0
+	if files_match "${STAGE_DIR}/.bpu-release.env" "${CURRENT_LINK}/.bpu-release.env"; then
+		return 0
+	fi
+	log "refreshing live release metadata"
+	install_candidate_file "${STAGE_DIR}/.bpu-release.env" "${CURRENT_LINK}/.bpu-release.env" 644 root root
+}
+
 backup_live_state() {
 	BACKUP_DIR="/var/tmp/${SERVICE_NAME}-rollback-$(date -u '+%Y%m%d%H%M%S')-$$"
 	mkdir -p "${BACKUP_DIR}"
@@ -332,6 +352,7 @@ apply_release() {
 
 	if release_is_unchanged; then
 		log "staged release matches the live install; leaving binaries and config in place"
+		refresh_live_metadata
 		ensure_live_service
 		DEPLOY_RESULT="unchanged"
 		return
@@ -543,6 +564,13 @@ EOF
 |   curl -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
 |     --data '{"method":"getinfo","params":{}}' ${monitor_local}
 EOF
+	if [[ "${miner_enabled}" != "on" ]]; then
+		cat <<EOF
+|                                                                      |
+| To enable mining with automatic wallet setup later:                  |
+|   sudo ${CURRENT_LINK}/install --update --mining on
+EOF
+	fi
 	if [[ -n "${miner_wallet_dir}" ]]; then
 		cat <<EOF
 |                                                                      |

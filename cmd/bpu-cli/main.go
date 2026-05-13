@@ -652,39 +652,44 @@ func runWallet(args []string) error {
 	if len(args) == 0 {
 		return errors.New(walletUsage())
 	}
+	var err error
 	switch args[0] {
 	case "create":
-		return runWalletCreate(args[1:])
+		err = runWalletCreate(args[1:])
 	case "list":
-		return runWalletList(args[1:])
+		err = runWalletList(args[1:])
 	case "balance":
-		return runWalletBalance(args[1:])
+		err = runWalletBalance(args[1:])
 	case "history":
-		return runWalletHistory(args[1:])
+		err = runWalletHistory(args[1:])
 	case "fee":
-		return runWalletFee(args[1:])
+		err = runWalletFee(args[1:])
 	case "receive":
-		return runWalletReceive(args[1:])
+		err = runWalletReceive(args[1:])
 	case "send":
-		return runWalletSend(args[1:])
+		err = runWalletSend(args[1:])
 	case "fanout":
-		return runWalletFanout(args[1:])
+		err = runWalletFanout(args[1:])
 	case "backup":
-		return runWalletBackup(args[1:])
+		err = runWalletBackup(args[1:])
 	case "restore":
-		return runWalletRestore(args[1:])
+		err = runWalletRestore(args[1:])
 	case "export":
-		return runWalletExport(args[1:])
+		err = runWalletExport(args[1:])
 	case "import":
-		return runWalletImport(args[1:])
+		err = runWalletImport(args[1:])
 	case "cpfp":
-		return runWalletCPFP(args[1:])
-	case "help":
+		err = runWalletCPFP(args[1:])
+	case "help", "--help", "-h":
 		fmt.Print(walletUsage())
 		return nil
 	default:
 		return fmt.Errorf("unknown wallet subcommand %q\n\n%s", args[0], walletUsage())
 	}
+	if errors.Is(err, errFlagHelpHandled) {
+		return nil
+	}
+	return err
 }
 
 func walletUsage() string {
@@ -702,13 +707,79 @@ Advanced:
 `) + "\n"
 }
 
+func setWalletFlagUsage(fs *flag.FlagSet, usage string) {
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: %s\n\nOptions:\n", usage)
+		fs.PrintDefaults()
+	}
+}
+
+var errFlagHelpHandled = errors.New("flag help handled")
+
+func parseWalletFlags(fs *flag.FlagSet, args []string) error {
+	reordered, err := reorderFlagsBeforePositionals(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := fs.Parse(reordered); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return errFlagHelpHandled
+		}
+		return err
+	}
+	return nil
+}
+
+type boolFlagValue interface {
+	IsBoolFlag() bool
+}
+
+func reorderFlagsBeforePositionals(fs *flag.FlagSet, args []string) ([]string, error) {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			positionals = append(positionals, arg)
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		if idx := strings.IndexByte(name, '='); idx >= 0 {
+			name = name[:idx]
+		}
+		defined := fs.Lookup(name)
+		if defined == nil {
+			flags = append(flags, arg)
+			continue
+		}
+		flags = append(flags, arg)
+		if strings.Contains(arg, "=") {
+			continue
+		}
+		if boolValue, ok := defined.Value.(boolFlagValue); ok && boolValue.IsBoolFlag() {
+			continue
+		}
+		if i+1 >= len(args) {
+			return nil, fmt.Errorf("flag needs an argument: -%s", name)
+		}
+		i++
+		flags = append(flags, args[i])
+	}
+	return append(flags, positionals...), nil
+}
+
 func runWalletCreate(args []string) error {
 	fs := flag.NewFlagSet("wallet create", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	setWalletFlagUsage(fs, "bpu-cli wallet create [--family xonly|pq] [--config PATH] [--wallet-dir DIR] [name]")
 	configPath := fs.String("config", "", "config file path")
 	walletDir := fs.String("wallet-dir", "", "wallet store directory")
 	family := fs.String("family", wallet.AddressFamilyXOnly, "receive address family: xonly or pq")
-	if err := fs.Parse(args); err != nil {
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 1 {
@@ -744,16 +815,33 @@ func runWalletCreate(args []string) error {
 	printWalletAddressDetails(addr)
 	fmt.Println("share only receive_address")
 	fmt.Printf("next: after funds arrive, run bpu-cli wallet balance %s\n", entry.Name)
-	fmt.Printf("backup: bpu-cli wallet backup%s --wallet-dir %s\n", formatConfigFlag(resolvedConfigPath), filepath.Dir(walletPath))
+	fmt.Printf("backup: %s\n", walletBackupCommand(resolvedConfigPath, walletPath))
 	return nil
+}
+
+func walletBackupCommand(configPath string, walletPath string) string {
+	prefix := ""
+	if isInstalledWalletContext(configPath, walletPath) {
+		prefix = "sudo "
+	}
+	return fmt.Sprintf("%sbpu-cli wallet backup%s --wallet-dir %s", prefix, formatConfigFlag(configPath), filepath.Dir(walletPath))
+}
+
+func isInstalledWalletContext(configPath string, walletPath string) bool {
+	configPath = filepath.Clean(strings.TrimSpace(configPath))
+	walletPath = filepath.Clean(strings.TrimSpace(walletPath))
+	return strings.HasPrefix(configPath, "/etc/bitcoin-pure/") ||
+		configPath == "/etc/bitcoin-pure/config.yaml" ||
+		strings.HasPrefix(walletPath, "/var/lib/bitcoin-pure/")
 }
 
 func runWalletList(args []string) error {
 	fs := flag.NewFlagSet("wallet list", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	setWalletFlagUsage(fs, "bpu-cli wallet list [--config PATH] [--wallet-dir DIR]")
 	configPath := fs.String("config", "", "config file path")
 	walletDir := fs.String("wallet-dir", "", "wallet store directory")
-	if err := fs.Parse(args); err != nil {
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -794,11 +882,12 @@ func runWalletList(args []string) error {
 func runWalletBalance(args []string) error {
 	fs := flag.NewFlagSet("wallet balance", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	setWalletFlagUsage(fs, "bpu-cli wallet balance [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] [wallet]")
 	configPath := fs.String("config", "", "config file path")
 	walletDir := fs.String("wallet-dir", "", "wallet store directory")
 	rpcAddr := fs.String("rpc", "", "node RPC address")
 	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
-	if err := fs.Parse(args); err != nil {
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 1 {
@@ -867,12 +956,13 @@ func runWalletBalance(args []string) error {
 func runWalletHistory(args []string) error {
 	fs := flag.NewFlagSet("wallet history", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	setWalletFlagUsage(fs, "bpu-cli wallet history [--limit N] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] [wallet]")
 	configPath := fs.String("config", "", "config file path")
 	walletDir := fs.String("wallet-dir", "", "wallet store directory")
 	rpcAddr := fs.String("rpc", "", "node RPC address")
 	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
 	limit := fs.Int("limit", 20, "maximum activity rows to show")
-	if err := fs.Parse(args); err != nil {
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 1 {
@@ -960,12 +1050,13 @@ func runWalletHistory(args []string) error {
 func runWalletFee(args []string) error {
 	fs := flag.NewFlagSet("wallet fee", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	rpcAddr := fs.String("rpc", "", "")
-	rpcAuthToken := fs.String("rpc-auth-token", "", "")
-	targetBlocks := fs.Int("target-blocks", 1, "")
-	txBytes := fs.Int("tx-bytes", 250, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet fee [--target-blocks N] [--tx-bytes N] [--config PATH] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	configPath := fs.String("config", "", "config file path")
+	rpcAddr := fs.String("rpc", "", "node RPC address")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
+	targetBlocks := fs.Int("target-blocks", 1, "confirmation target in blocks")
+	txBytes := fs.Int("tx-bytes", 250, "estimated transaction size in bytes")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -997,10 +1088,11 @@ func runWalletFee(args []string) error {
 func runWalletReceive(args []string) error {
 	fs := flag.NewFlagSet("wallet receive", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	setWalletFlagUsage(fs, "bpu-cli wallet receive [--family xonly|pq] [--config PATH] [--wallet-dir DIR] [wallet]")
 	configPath := fs.String("config", "", "config file path")
 	walletDir := fs.String("wallet-dir", "", "wallet store directory")
 	family := fs.String("family", wallet.AddressFamilyXOnly, "receive address family: xonly or pq")
-	if err := fs.Parse(args); err != nil {
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 1 {
@@ -1043,11 +1135,12 @@ func runWalletReceive(args []string) error {
 func runWalletBackup(args []string) error {
 	fs := flag.NewFlagSet("wallet backup", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	out := fs.String("out", "", "")
-	overwrite := fs.Bool("overwrite", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet backup [--out PATH] [--overwrite] [--config PATH] [--wallet-dir DIR]")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	out := fs.String("out", "", "backup output path")
+	overwrite := fs.Bool("overwrite", false, "allow replacing an existing backup file")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -1084,12 +1177,13 @@ func runWalletBackup(args []string) error {
 func runWalletRestore(args []string) error {
 	fs := flag.NewFlagSet("wallet restore", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	from := fs.String("from", "", "")
-	yes := fs.Bool("yes", false, "")
-	forceProfileMismatch := fs.Bool("force-profile-mismatch", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet restore --from PATH [--yes] [--force-profile-mismatch] [--config PATH] [--wallet-dir DIR]")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	from := fs.String("from", "", "backup file to restore")
+	yes := fs.Bool("yes", false, "restore without interactive confirmation")
+	forceProfileMismatch := fs.Bool("force-profile-mismatch", false, "restore a backup from another chain profile")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() == 1 && *from == "" {
@@ -1153,11 +1247,12 @@ func runWalletRestore(args []string) error {
 func runWalletExport(args []string) error {
 	fs := flag.NewFlagSet("wallet export", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	out := fs.String("out", "", "")
-	overwrite := fs.Bool("overwrite", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet export [--out PATH] [--overwrite] [--config PATH] [--wallet-dir DIR] [wallet]")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	out := fs.String("out", "", "export output path")
+	overwrite := fs.Bool("overwrite", false, "allow replacing an existing export file")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 1 {
@@ -1203,11 +1298,12 @@ func runWalletExport(args []string) error {
 func runWalletImport(args []string) error {
 	fs := flag.NewFlagSet("wallet import", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	name := fs.String("name", "", "")
-	force := fs.Bool("force", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet import [--name NAME] [--force] [--config PATH] [--wallet-dir DIR] <export-file>")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	name := fs.String("name", "", "imported wallet name")
+	force := fs.Bool("force", false, "import a wallet from another chain profile")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -1238,20 +1334,21 @@ func runWalletImport(args []string) error {
 func runWalletSend(args []string) error {
 	fs := flag.NewFlagSet("wallet send", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	rpcAddr := fs.String("rpc", "", "")
-	rpcAuthToken := fs.String("rpc-auth-token", "", "")
-	from := fs.String("from", "", "")
-	to := fs.String("to", "", "")
-	amountRaw := fs.String("amount", "", "")
-	amountAtoms := fs.Uint64("amount-atoms", 0, "")
-	fee := fs.Uint64("fee", 0, "")
-	targetBlocks := fs.Int("target-blocks", 1, "")
-	targetMinutes := fs.Int("target-minutes", 0, "")
-	priority := fs.String("priority", "", "")
-	yes := fs.Bool("yes", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet send [ADDRESS AMOUNT] [--from NAME] [--amount BPU | --amount-atoms ATOMS] [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	rpcAddr := fs.String("rpc", "", "node RPC address")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
+	from := fs.String("from", "", "wallet to spend from")
+	to := fs.String("to", "", "destination receive address")
+	amountRaw := fs.String("amount", "", "amount in BPU")
+	amountAtoms := fs.Uint64("amount-atoms", 0, "amount in atoms")
+	fee := fs.Uint64("fee", 0, "exact fee in atoms")
+	targetBlocks := fs.Int("target-blocks", 1, "confirmation target in blocks")
+	targetMinutes := fs.Int("target-minutes", 0, "rough confirmation target in minutes")
+	priority := fs.String("priority", "", "fee target: now, soon, relaxed, or cheap")
+	yes := fs.Bool("yes", false, "broadcast without interactive confirmation")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	switch fs.NArg() {
@@ -1347,21 +1444,22 @@ func runWalletSend(args []string) error {
 func runWalletFanout(args []string) error {
 	fs := flag.NewFlagSet("wallet fanout", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	rpcAddr := fs.String("rpc", "", "")
-	rpcAuthToken := fs.String("rpc-auth-token", "", "")
-	from := fs.String("from", "", "")
-	toRaw := fs.String("to", "", "")
-	amountRaw := fs.String("amount", "", "")
-	amountAtoms := fs.Uint64("amount-atoms", 0, "")
-	count := fs.Int("count", 0, "")
-	fee := fs.Uint64("fee", 0, "")
-	targetBlocks := fs.Int("target-blocks", 1, "")
-	targetMinutes := fs.Int("target-minutes", 0, "")
-	priority := fs.String("priority", "", "")
-	yes := fs.Bool("yes", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet fanout --to ADDRESS[,ADDRESS...] --amount BPU --count N [--from NAME] [--amount-atoms ATOMS] [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	rpcAddr := fs.String("rpc", "", "node RPC address")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
+	from := fs.String("from", "", "wallet to spend from")
+	toRaw := fs.String("to", "", "comma-separated destination addresses")
+	amountRaw := fs.String("amount", "", "amount per transaction in BPU")
+	amountAtoms := fs.Uint64("amount-atoms", 0, "amount per transaction in atoms")
+	count := fs.Int("count", 0, "number of transactions to create")
+	fee := fs.Uint64("fee", 0, "exact fee per transaction in atoms")
+	targetBlocks := fs.Int("target-blocks", 1, "confirmation target in blocks")
+	targetMinutes := fs.Int("target-minutes", 0, "rough confirmation target in minutes")
+	priority := fs.String("priority", "", "fee target: now, soon, relaxed, or cheap")
+	yes := fs.Bool("yes", false, "broadcast without interactive confirmation")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -1480,18 +1578,19 @@ func runWalletFanout(args []string) error {
 func runWalletCPFP(args []string) error {
 	fs := flag.NewFlagSet("wallet cpfp", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	configPath := fs.String("config", "", "")
-	walletDir := fs.String("wallet-dir", "", "")
-	rpcAddr := fs.String("rpc", "", "")
-	rpcAuthToken := fs.String("rpc-auth-token", "", "")
-	from := fs.String("from", "", "")
-	parent := fs.String("txid", "", "")
-	fee := fs.Uint64("fee", 0, "")
-	targetBlocks := fs.Int("target-blocks", 1, "")
-	targetMinutes := fs.Int("target-minutes", 0, "")
-	priority := fs.String("priority", "", "")
-	yes := fs.Bool("yes", false, "")
-	if err := fs.Parse(args); err != nil {
+	setWalletFlagUsage(fs, "bpu-cli wallet cpfp [PARENT_TXID] [--from NAME] [--txid PARENT_TXID] [--fee ATOMS | --priority now|soon|relaxed|cheap | --target-blocks N | --target-minutes N] [--yes] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+	configPath := fs.String("config", "", "config file path")
+	walletDir := fs.String("wallet-dir", "", "wallet store directory")
+	rpcAddr := fs.String("rpc", "", "node RPC address")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
+	from := fs.String("from", "", "wallet to spend from")
+	parent := fs.String("txid", "", "parent transaction id to accelerate")
+	fee := fs.Uint64("fee", 0, "exact child fee in atoms")
+	targetBlocks := fs.Int("target-blocks", 1, "confirmation target in blocks")
+	targetMinutes := fs.Int("target-minutes", 0, "rough confirmation target in minutes")
+	priority := fs.String("priority", "", "fee target: now, soon, relaxed, or cheap")
+	yes := fs.Bool("yes", false, "broadcast without interactive confirmation")
+	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() == 1 && *parent == "" {
@@ -2327,7 +2426,7 @@ func walletRPCError(err error, cfg config.Config, override string) error {
 	if strings.TrimSpace(addr) == "" {
 		addr = "(not configured)"
 	}
-	return fmt.Errorf("%w\nwallet needs node RPC at %s; start bpu-cli serve or pass --rpc ADDR", err, addr)
+	return fmt.Errorf("wallet cannot reach node RPC at %s\nnext: start bpu-cli serve or pass --rpc ADDR\ndetail: %w", addr, err)
 }
 
 func walletCommandError(walletName string, err error) error {
@@ -2588,7 +2687,9 @@ func renderNodeStatus(status cliNodeStatus, cfg config.Config) string {
 		peerWord = "peer"
 	}
 	syncState := "synced"
-	if status.Info.HeaderHeight > status.Info.TipHeight {
+	if len(status.Peers) == 0 {
+		syncState = "waiting for peers"
+	} else if status.Info.HeaderHeight > status.Info.TipHeight {
 		syncState = fmt.Sprintf("syncing (%d headers ahead)", status.Info.HeaderHeight-status.Info.TipHeight)
 	}
 	mining := "off"
@@ -2606,24 +2707,21 @@ func renderNodeStatus(status cliNodeStatus, cfg config.Config) string {
 	if dashboard != "" && !strings.Contains(dashboard, "://") {
 		dashboard = "http://" + dashboard + "/"
 	}
-	var b strings.Builder
-	b.WriteString("+------------------------------------------------------------+\n")
-	b.WriteString("| Bitcoin Pure status                                        |\n")
-	b.WriteString("+------------------------------------------------------------+\n")
-	fmt.Fprintf(&b, "| health   %s\n", syncState)
-	fmt.Fprintf(&b, "| profile  %s\n", status.Info.Profile)
-	fmt.Fprintf(&b, "| height   blocks=%d headers=%d\n", status.Info.TipHeight, status.Info.HeaderHeight)
-	fmt.Fprintf(&b, "| tip      %s\n", shortenHex(status.Info.TipHeaderHash, 16))
-	fmt.Fprintf(&b, "| peers    %d %s\n", len(status.Peers), peerWord)
-	fmt.Fprintf(&b, "| mempool  %d tx / %d bytes / %d orphans\n", status.Mempool.Count, status.Mempool.Bytes, status.Mempool.Orphans)
-	fmt.Fprintf(&b, "| fees     min=%d median=%d high=%d atoms/B\n", status.Mempool.MinRelayFeePerByte, status.Mempool.MedianFee, status.Mempool.HighFee)
-	fmt.Fprintf(&b, "| mining   %s\n", mining)
-	if dashboard != "" {
-		fmt.Fprintf(&b, "| monitor  %s\n", dashboard)
+	rows := []walletActionRow{
+		{label: "health", value: syncState},
+		{label: "profile", value: status.Info.Profile},
+		{label: "height", value: fmt.Sprintf("blocks=%d headers=%d", status.Info.TipHeight, status.Info.HeaderHeight)},
+		{label: "tip", value: shortenHex(status.Info.TipHeaderHash, 16)},
+		{label: "peers", value: fmt.Sprintf("%d %s", len(status.Peers), peerWord)},
+		{label: "mempool", value: fmt.Sprintf("%d tx / %d bytes / %d orphans", status.Mempool.Count, status.Mempool.Bytes, status.Mempool.Orphans)},
+		{label: "fees", value: fmt.Sprintf("min=%d median=%d high=%d atoms/B", status.Mempool.MinRelayFeePerByte, status.Mempool.MedianFee, status.Mempool.HighFee)},
+		{label: "mining", value: mining},
 	}
-	fmt.Fprintf(&b, "| logs     %s\n", resolveLogPath(cfg))
-	b.WriteString("+------------------------------------------------------------+\n")
-	return b.String()
+	if dashboard != "" {
+		rows = append(rows, walletActionRow{label: "monitor", value: dashboard})
+	}
+	rows = append(rows, walletActionRow{label: "logs", value: shortenDisplayPath(resolveLogPath(cfg), 56)})
+	return renderTerminalBox("Bitcoin Pure status", rows)
 }
 
 func shortenHex(raw string, keep int) string {
@@ -2632,6 +2730,23 @@ func shortenHex(raw string, keep int) string {
 		return raw
 	}
 	return raw[:keep] + "..."
+}
+
+func shortenDisplayPath(path string, keep int) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if keep <= 0 || len(path) <= keep {
+		return path
+	}
+	base := filepath.Base(path)
+	parent := filepath.Base(filepath.Dir(path))
+	suffix := filepath.Join(parent, base)
+	if len(suffix)+4 <= keep {
+		return ".../" + suffix
+	}
+	if len(base)+4 <= keep {
+		return ".../" + base
+	}
+	return "..." + base[len(base)-(keep-3):]
 }
 
 func printWalletAddressDetails(addr wallet.Address) {
@@ -2949,7 +3064,7 @@ func renderFanoutPlansPreview(walletName string, destinations []string, plans []
 		{label: "wallet", value: walletName},
 		{label: "txs", value: fmt.Sprintf("%d", len(plans))},
 		{label: "to", value: formatWalletDestinationSummary(destinations)},
-		{label: "send total", value: formatWalletAmountWithAtoms(totalAmount)},
+		{label: "total", value: formatWalletAmountWithAtoms(totalAmount)},
 		{label: "fee", value: formatWalletAmountWithAtoms(totalFee)},
 		{label: "inputs", value: fmt.Sprintf("%d total", totalInputs)},
 	}
@@ -3316,11 +3431,97 @@ func printWalletAction(view walletActionView) {
 	if title == "" {
 		title = "wallet"
 	}
-	fmt.Printf("+-- %s --+\n", title)
-	for _, row := range view.rows {
-		fmt.Printf("  %-8s %s\n", row.label, row.value)
+	fmt.Print(renderTerminalBox(title, view.rows))
+}
+
+const (
+	terminalBoxWidth      = 72
+	terminalBoxLabelWidth = 9
+)
+
+func renderTerminalBox(title string, rows []walletActionRow) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "status"
 	}
-	fmt.Println("+------------+")
+	innerWidth := terminalBoxWidth - 2
+	contentWidth := innerWidth - 2
+	var b strings.Builder
+	border := "+" + strings.Repeat("-", innerWidth) + "+\n"
+	b.WriteString(border)
+	b.WriteString(formatTerminalBoxLine(title))
+	b.WriteString(border)
+	valueWidth := contentWidth - terminalBoxLabelWidth - 2
+	if valueWidth < 16 {
+		valueWidth = 16
+	}
+	for _, row := range rows {
+		label := strings.TrimSpace(row.label)
+		if len(label) > terminalBoxLabelWidth {
+			label = label[:terminalBoxLabelWidth]
+		}
+		lines := wrapTerminalText(strings.TrimSpace(row.value), valueWidth)
+		if len(lines) == 0 {
+			lines = []string{""}
+		}
+		for i, line := range lines {
+			rowLabel := label
+			if i > 0 {
+				rowLabel = ""
+			}
+			b.WriteString(formatTerminalBoxLine(fmt.Sprintf("%-*s  %s", terminalBoxLabelWidth, rowLabel, line)))
+		}
+	}
+	b.WriteString(border)
+	return b.String()
+}
+
+func formatTerminalBoxLine(text string) string {
+	contentWidth := terminalBoxWidth - 4
+	if len(text) > contentWidth {
+		text = text[:contentWidth]
+	}
+	return fmt.Sprintf("| %-*s |\n", contentWidth, text)
+}
+
+func wrapTerminalText(text string, width int) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	lines := []string{}
+	current := ""
+	flushCurrent := func() {
+		if current != "" {
+			lines = append(lines, current)
+			current = ""
+		}
+	}
+	for _, word := range words {
+		for len(word) > width {
+			if current != "" {
+				flushCurrent()
+			}
+			lines = append(lines, word[:width])
+			word = word[width:]
+		}
+		if current == "" {
+			current = word
+			continue
+		}
+		if len(current)+1+len(word) <= width {
+			current += " " + word
+			continue
+		}
+		flushCurrent()
+		current = word
+	}
+	flushCurrent()
+	return lines
 }
 
 func maybeConfirmWalletAction(view walletActionView, yes bool) error {

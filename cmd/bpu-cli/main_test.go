@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -250,6 +251,27 @@ func TestLogsHelpersUseStandardJSONLPathAndOperationRender(t *testing.T) {
 	}
 }
 
+func TestRenderOperationRecordsWrapsLongFields(t *testing.T) {
+	records := []logRecord{{
+		"ts":             "2026-05-13T12:00:00Z",
+		"level":          "INFO",
+		"category":       "service",
+		"name":           "node.status",
+		"message":        "node status",
+		"seq":            json.Number("1"),
+		"depth":          json.Number("0"),
+		"op_id":          strings.Repeat("a", 48),
+		"last_block_ago": strings.Repeat("9", 64),
+		"detail":         "status " + strings.Repeat("x", 160),
+	}}
+	out := renderOperationRecords(records)
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if len(line) > 100 {
+			t.Fatalf("rendered log line length = %d, want <= 100:\n%s", len(line), out)
+		}
+	}
+}
+
 func TestWalletCreateDefaultsToMainWallet(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
@@ -268,6 +290,25 @@ func TestWalletCreateDefaultsToMainWallet(t *testing.T) {
 	}
 	if _, err := store.Wallet("main"); err != nil {
 		t.Fatalf("default wallet not created: %v", err)
+	}
+}
+
+func TestWalletFlagsMayFollowPositionals(t *testing.T) {
+	walletDir := filepath.Join(t.TempDir(), "wallets")
+	if err := runWalletCreate([]string{"main", "--wallet-dir", walletDir}); err != nil {
+		t.Fatalf("runWalletCreate with trailing flag: %v", err)
+	}
+	if err := runWalletReceive([]string{"main", "--wallet-dir", walletDir}); err != nil {
+		t.Fatalf("runWalletReceive with trailing flag: %v", err)
+	}
+}
+
+func TestWalletSubcommandHelpIsHandled(t *testing.T) {
+	if err := runWallet([]string{"--help"}); err != nil {
+		t.Fatalf("wallet --help err = %v", err)
+	}
+	if err := runWallet([]string{"send", "--help"}); err != nil {
+		t.Fatalf("wallet send --help err = %v", err)
 	}
 }
 
@@ -458,6 +499,42 @@ func TestRenderNodeStatusShowsOperatorSummary(t *testing.T) {
 	for _, want := range []string{"Bitcoin Pure status", "syncing", "blocks=7 headers=9", "1 peer", "2 tx / 500 bytes", "on (4 workers)", "events.jsonl"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("status output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderNodeStatusDoesNotCallIsolatedNodeSynced(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "chain")
+	status := cliNodeStatus{
+		Info: node.ServiceInfo{
+			Profile:       "regtest",
+			TipHeight:     7,
+			HeaderHeight:  9,
+			TipHeaderHash: strings.Repeat("a", 64),
+			RPCAddr:       "127.0.0.1:18443",
+		},
+	}
+	out := renderNodeStatus(status, cfg)
+	if !strings.Contains(out, "waiting for peers") {
+		t.Fatalf("status output did not flag isolated node:\n%s", out)
+	}
+	if strings.Contains(out, "health     synced") {
+		t.Fatalf("status output called isolated node synced:\n%s", out)
+	}
+	if strings.Contains(out, "syncing") {
+		t.Fatalf("status output masked zero peers with syncing:\n%s", out)
+	}
+}
+
+func TestTerminalBoxWrapsToFixedWidth(t *testing.T) {
+	out := renderTerminalBox("cpfp", []walletActionRow{
+		{label: "parent", value: strings.Repeat("a", 64)},
+		{label: "child", value: "3.9999995 BPU / 3999999500 atoms -> bpu:" + strings.Repeat("q", 80)},
+	})
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if len(line) != terminalBoxWidth {
+			t.Fatalf("line length = %d, want %d:\n%s", len(line), terminalBoxWidth, out)
 		}
 	}
 }

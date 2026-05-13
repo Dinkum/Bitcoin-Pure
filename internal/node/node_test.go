@@ -5122,6 +5122,18 @@ func TestRenderTPSChartUsesBlockThroughputLayout(t *testing.T) {
 	}
 }
 
+func TestDashboardHealthPrioritizesZeroPeers(t *testing.T) {
+	svc := &Service{}
+	got := svc.dashboardHealth(ServiceInfo{
+		P2PAddr:      "127.0.0.1:18444",
+		TipHeight:    7,
+		HeaderHeight: 9,
+	}, nil)
+	if got != "LONELY-BUT-RUNNING" {
+		t.Fatalf("dashboard health = %q, want LONELY-BUT-RUNNING", got)
+	}
+}
+
 func TestDashboardFeeSummaryUsesRecent24Blocks(t *testing.T) {
 	var svc Service
 	blocks := make([]dashboardBlockPage, 0, 30)
@@ -5211,8 +5223,8 @@ func TestRenderFeeSectionUsesFeeMarketLayout(t *testing.T) {
 		"8 / 24",
 		"Full fee chart",
 		"/fees",
-		"▁",
-		"█",
+		".",
+		"#",
 	} {
 		if !strings.Contains(section, want) {
 			t.Fatalf("expected %q in fee market section:\n%s", want, section)

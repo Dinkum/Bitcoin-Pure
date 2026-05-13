@@ -5906,10 +5906,10 @@ func (s *Service) dashboardTPSChartFromBlocks(blocks []dashboardBlockPage, pow d
 
 func (s *Service) dashboardHealth(info ServiceInfo, peers []PeerInfo) string {
 	switch {
-	case info.HeaderHeight > info.TipHeight:
-		return fmt.Sprintf("CATCHING-UP (%d headers ahead)", info.HeaderHeight-info.TipHeight)
 	case info.P2PAddr != "" && len(peers) == 0:
 		return "LONELY-BUT-RUNNING"
+	case info.HeaderHeight > info.TipHeight:
+		return fmt.Sprintf("CATCHING-UP (%d headers ahead)", info.HeaderHeight-info.TipHeight)
 	default:
 		return "HEALTHY"
 	}
@@ -9539,7 +9539,7 @@ func renderTPSChart(chart dashboardTPSChart) string {
 		if block.Candidate {
 			marker = "*"
 		}
-		out.WriteString(fmt.Sprintf(" %3d tx%s |%s\n", block.TxCount, marker, strings.Repeat("█", block.BarWidth)))
+		out.WriteString(fmt.Sprintf(" %3d tx%s |%s\n", block.TxCount, marker, strings.Repeat("#", block.BarWidth)))
 	}
 	out.WriteString("\n")
 	out.WriteString(fmt.Sprintf(" %d tx total over last %d blocks (%.2f avg TPS)\n", chart.TotalTx, len(chart.Blocks), chart.AvgTPS))
@@ -9564,7 +9564,7 @@ func renderFeeSection(summary dashboardFeeSummary) string {
 		dashboardKeyValueRow{Key: "paid blocks", Value: fmt.Sprintf("%d / %d", summary.PaidBlocks, summary.TotalBlocks)},
 	))
 	out.WriteString("\n")
-	out.WriteString(" <a href=\"/fees\">Full fee chart →</a>\n")
+	out.WriteString(" <a href=\"/fees\">Full fee chart -></a>\n")
 	return out.String()
 }
 
@@ -10487,7 +10487,7 @@ func renderFeeSparkline(lines []dashboardBlockFeeLine) string {
 	if len(lines) == 0 {
 		return "n/a"
 	}
-	levels := []rune("▁▂▃▄▅▆▇█")
+	levels := []byte("._:-=+*#")
 	maxMedian := uint64(0)
 	for _, line := range lines {
 		if line.MedianFee > maxMedian {
@@ -10498,7 +10498,7 @@ func renderFeeSparkline(lines []dashboardBlockFeeLine) string {
 		return strings.Repeat(string(levels[0]), len(lines))
 	}
 	var out strings.Builder
-	out.Grow(len(lines) * 3)
+	out.Grow(len(lines))
 	// Compress recent fee medians into a fixed eight-level sparkline so the
 	// home page keeps directional fee pressure without dumping a full table.
 	for _, line := range lines {
@@ -10509,7 +10509,7 @@ func renderFeeSparkline(lines []dashboardBlockFeeLine) string {
 		if level >= len(levels) {
 			level = len(levels) - 1
 		}
-		out.WriteRune(levels[level])
+		out.WriteByte(levels[level])
 	}
 	return out.String()
 }
@@ -10542,7 +10542,7 @@ func buildFeeHistogramColumns(lines []dashboardBlockFeeLine, level uint64) strin
 	for _, line := range lines {
 		cell := " "
 		if level == 0 || line.MedianFee >= level {
-			cell = "█"
+			cell = "#"
 		}
 		cols = append(cols, cell)
 	}
