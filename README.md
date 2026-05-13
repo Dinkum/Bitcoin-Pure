@@ -17,24 +17,34 @@ Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to pre
 
 ## Post-Quantum Direction
 
-Bitcoin Pure no longer treats post-quantum resistance as a distant problem. Recent public moves by Google and Cloudflare, including 2029 migration targets and an explicit focus on authentication and signatures, reinforce that long-lived signature systems need a transition plan now, not later.
+Bitcoin Pure does not treat post-quantum resistance as a distant problem. Recent public moves by Google and Cloudflare, including 2029 migration targets and an explicit focus on authentication and signatures, reinforce that long-lived signature systems need a transition plan now, not later.
 
 See:
 - [Google: Quantum frontiers may be closer than they appear](https://blog.google/innovation-and-ai/technology/safety-security/cryptography-migration-timeline/)
 - [Cloudflare: Post-quantum roadmap](https://blog.cloudflare.com/post-quantum-roadmap/)
 
-BPU’s direction is to move from a pubkey-native coin model toward a typed lock model. The goal is to preserve the current x-only secp256k1 lane for now, add an optional compact post-quantum lane (ML-DSA-65), and make any later hard cutover a clean simplification rather than a second architectural redesign.
+BPU’s direction is to move from a coin model based on public keys toward a typed lock model. The goal is to preserve the current x-only secp256k1 lane for now, add an optional compact post-quantum lane (ML-DSA-65), and make any later hard cutover a clean simplification rather than a second architectural redesign.
 
 No cutoff heights, cutoff dates, or forced migration rules are implemented today. Any future hard cutover would be introduced explicitly and separately.
 
 ## Node Reference Implementation Highlights
 
-- Full node runtime with persisted chainstate, restart-safe replay, and best-chain tracking.
+- Full node runtime with persisted chainstate, restart-safe replay, and best chain tracking.
 - Integrated miner and package-aware mempool management with orphan handling.
 - Local wallet management for receive addresses, balance/history, fee estimation, and signed transaction send flow.
 - Binary peer-to-peer transport with header-first sync, transaction reconciliation, batched relay, and short-ID block propagation with full-block fallback.
 - Authenticated HTTP JSON-RPC for node control and automation.
 - Public ASCII status page served directly from the node so you can watch tip, peers, mempool, mining, and host health from the server IP.
+
+## Screenshots
+
+![Bitcoin Pure node monitor](assets/screenshots/node-viewer-overview.png)
+
+![Bitcoin Pure installer](assets/screenshots/installer-demo.png)
+
+## Prerequisites
+
+Bitcoin Pure has only been tested on Ubuntu 24.04.
 
 ## Install
 
@@ -74,6 +84,54 @@ What `./install` does:
 - installs and enables a `systemd` service
 - brings up the node with the public monitor page and RPC surface
 - uses staged deploys and rollback checks for `--update`
+
+## Common Commands (`bpu-cli`)
+
+```bash
+# Show node status from the configured RPC endpoint.
+bpu-cli status
+
+# Add a peer to a running node.
+bpu-cli peer add 203.0.113.10:18444
+
+# Create a local wallet named "main".
+bpu-cli wallet create main
+
+# Generate a fresh receive address.
+bpu-cli wallet receive main
+
+# Show spendable, pending, and immature wallet funds.
+bpu-cli wallet balance main
+
+# Show recent wallet activity.
+bpu-cli wallet history main
+
+# Estimate a fee for a wallet transaction.
+bpu-cli wallet fee --target-blocks 6
+
+# Send BPU with guided fee selection.
+bpu-cli wallet send ADDRESS AMOUNT --from main
+
+# Follow node logs.
+bpu-cli logs tail --lines 100
+
+# Filter structured logs by level, event name, or text.
+bpu-cli logs filter --level error --limit 50
+```
+
+## Common Configuration Options (`config.yaml`)
+
+Installed nodes read `/etc/bitcoin-pure/config.yaml` by default.
+
+```yaml
+# Pin outbound peers when you want explicit static connections.
+peers:
+  - 203.0.113.10:18444
+
+# Enable mining and set a destination public key.
+miner_enabled: true
+miner_pubkey_hex: "<x-only-pubkey-hex>"
+```
 
 ## Structure
 

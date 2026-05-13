@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -161,6 +162,59 @@ func TestConfigNormalizeWritesCanonicalYAMLAndLegacyJSONSidecar(t *testing.T) {
 	}
 	if loadedJSON.MaxMempoolBytes != cfg.MaxMempoolBytes {
 		t.Fatalf("json max mempool bytes = %d, want %d", loadedJSON.MaxMempoolBytes, cfg.MaxMempoolBytes)
+	}
+}
+
+func TestPeerAddCallsAddPeerRPC(t *testing.T) {
+	var gotAuth string
+	var gotMethod string
+	var gotAddr string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		var req struct {
+			Method string `json:"method"`
+			Params struct {
+				Addr string `json:"addr"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		gotMethod = req.Method
+		gotAddr = req.Params.Addr
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"addr":"198.51.100.25:18444"}}`))
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	cfg.RPCAddr = server.URL
+	cfg.RPCAuthToken = "secret-token"
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	if err := runPeer([]string{"add", "--config", configPath, "198.51.100.25:18444"}); err != nil {
+		t.Fatalf("runPeer add: %v", err)
+	}
+	if gotAuth != "Bearer secret-token" {
+		t.Fatalf("Authorization = %q, want bearer token", gotAuth)
+	}
+	if gotMethod != "addpeer" {
+		t.Fatalf("method = %q, want addpeer", gotMethod)
+	}
+	if gotAddr != "198.51.100.25:18444" {
+		t.Fatalf("addr = %q, want peer address", gotAddr)
+	}
+}
+
+func TestPeerAddRequiresAddress(t *testing.T) {
+	err := runPeer([]string{"add"})
+	if err == nil || !strings.Contains(err.Error(), "usage: bpu-cli peer add") {
+		t.Fatalf("runPeer add err = %v, want usage error", err)
 	}
 }
 

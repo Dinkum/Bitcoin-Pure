@@ -75,6 +75,8 @@ func run(args []string) error {
 		return runServe(args[1:])
 	case "wallet":
 		return runWallet(args[1:])
+	case "peer":
+		return runPeer(args[1:])
 	case "validate-tx":
 		return runValidateTx(args[1:])
 	case "validate-block":
@@ -116,6 +118,52 @@ func runStatus(args []string) error {
 		return err
 	}
 	fmt.Print(renderNodeStatus(status, cfg))
+	return nil
+}
+
+func runPeer(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing peer subcommand")
+	}
+	switch args[0] {
+	case "add":
+		return runPeerAdd(args[1:])
+	default:
+		return errors.New("unknown peer subcommand")
+	}
+}
+
+func runPeerAdd(args []string) error {
+	fs := flag.NewFlagSet("peer add", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	rpcAddr := fs.String("rpc", "", "")
+	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli peer add [--config PATH] [--rpc ADDR] [--rpc-auth-token TOKEN] HOST:PORT")
+	}
+	addr := strings.TrimSpace(fs.Arg(0))
+	if addr == "" {
+		return errors.New("peer address is required")
+	}
+	cfg, _, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken), rpcClientTimeout(cfg))
+	var result struct {
+		Addr string `json:"addr"`
+	}
+	if err := client.Call("addpeer", map[string]string{"addr": addr}, &result); err != nil {
+		return err
+	}
+	if result.Addr == "" {
+		result.Addr = addr
+	}
+	fmt.Printf("peer add requested: %s\n", result.Addr)
 	return nil
 }
 
@@ -3579,7 +3627,7 @@ func fileExists(path string) bool {
 }
 
 func usageError() error {
-	return errors.New("usage: bpu-cli <serve|status|wallet|validate-tx|validate-block|chain|snapshot|config|logs>")
+	return errors.New("usage: bpu-cli <serve|status|peer|wallet|validate-tx|validate-block|chain|snapshot|config|logs>")
 }
 
 func defaultGenesisFixture(profile types.ChainProfile) string {
