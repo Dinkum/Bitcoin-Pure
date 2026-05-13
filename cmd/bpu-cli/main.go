@@ -24,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"bitcoin-pure/benchmarks"
 	"bitcoin-pure/internal/config"
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
@@ -72,8 +71,6 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return runServe(args[1:])
-	case "bench":
-		return runBench(args[1:])
 	case "wallet":
 		return runWallet(args[1:])
 	case "validate-tx":
@@ -124,342 +121,6 @@ func runConfigNormalize(args []string) error {
 		cfg = loaded
 	}
 	return config.Save(strings.TrimSpace(*outPath), cfg)
-}
-
-func runBench(args []string) error {
-	if len(args) == 0 {
-		return errors.New("missing bench subcommand")
-	}
-	switch args[0] {
-	case "e2e":
-		return runBenchE2E(args[1:])
-	case "micro":
-		return runBenchMicro(args[1:])
-	case "gate":
-		return runBenchGate(args[1:])
-	case "sim":
-		return runBenchSim(args[1:])
-	default:
-		return errors.New("unknown bench subcommand (supported: e2e, micro, gate, sim; use `go test ./benchmarks -run '^$' -bench ...` for the raw in-process throughput loop)")
-	}
-}
-
-func runBenchE2E(args []string) error {
-	defaults := benchmarks.DefaultE2EOptions()
-	fs := flag.NewFlagSet("bench e2e", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	profileRaw := fs.String("profile", string(defaults.Profile), "")
-	nodes := fs.Int("nodes", defaults.NodeCount, "")
-	topologyRaw := fs.String("topology", string(defaults.Topology), "")
-	batchSize := fs.Int("batch-size", defaults.BatchSize, "")
-	txsPerBlock := fs.Int("txs-per-block", defaults.TxsPerBlock, "")
-	blocks := fs.Int("blocks", defaults.BlockCount, "")
-	blockInterval := fs.Duration("block-interval", defaults.BlockInterval, "")
-	miningRaw := fs.String("mining", string(defaults.MiningMode), "")
-	txOrigin := fs.String("tx-origin", string(defaults.TxOriginSpread), "")
-	steadyStateBacklog := fs.Bool("steady-state-backlog", defaults.SteadyStateBacklog, "")
-	timeout := fs.Duration("timeout", defaults.Timeout, "")
-	reportPath := fs.String("report", "", "")
-	markdownPath := fs.String("markdown", "", "")
-	dbRoot := fs.String("db-root", "", "")
-	profileDir := fs.String("profile-dir", "", "")
-	suppressLogs := fs.Bool("suppress-logs", true, "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	profile, err := types.ParseChainProfile(*profileRaw)
-	if err != nil {
-		return err
-	}
-	opts := benchmarks.RunOptions{
-		Profile:            profile,
-		NodeCount:          *nodes,
-		Topology:           benchmarks.Topology(*topologyRaw),
-		BatchSize:          *batchSize,
-		TxsPerBlock:        *txsPerBlock,
-		BlockCount:         *blocks,
-		BlockInterval:      *blockInterval,
-		MiningMode:         benchmarks.MiningMode(*miningRaw),
-		TxOriginSpread:     benchmarks.TxOriginSpread(*txOrigin),
-		SteadyStateBacklog: *steadyStateBacklog,
-		Timeout:            *timeout,
-		DBRoot:             *dbRoot,
-		ProfileDir:         *profileDir,
-		SuppressLogs:       *suppressLogs,
-		ProgressWriter:     os.Stderr,
-	}
-
-	report, err := benchmarks.RunE2E(context.Background(), opts)
-	if err != nil {
-		return err
-	}
-	if *reportPath == "" || *markdownPath == "" {
-		base := filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-e2e-"+*miningRaw)
-		if *reportPath == "" {
-			*reportPath = base + ".json"
-		}
-		if *markdownPath == "" {
-			*markdownPath = base + ".md"
-		}
-	}
-	if err := benchmarks.WriteReportFiles(report, *reportPath, *markdownPath); err != nil {
-		return err
-	}
-
-	printBenchmarkReport(report, *reportPath, *markdownPath)
-	return nil
-}
-
-func runBenchMicro(args []string) error {
-	defaults := benchmarks.DefaultMicroBenchOptions()
-	fs := flag.NewFlagSet("bench micro", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	benchRE := fs.String("bench", defaults.Bench, "")
-	count := fs.Int("count", defaults.Count, "")
-	benchtime := fs.String("benchtime", "", "")
-	reportPath := fs.String("report", "", "")
-	markdownPath := fs.String("markdown", "", "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	report, err := benchmarks.RunMicroBenchmarks(context.Background(), benchmarks.MicroBenchOptions{
-		Package:   defaults.Package,
-		Bench:     *benchRE,
-		Count:     *count,
-		Benchtime: *benchtime,
-	})
-	if err != nil {
-		return err
-	}
-	if *reportPath == "" || *markdownPath == "" {
-		defaultJSON, defaultMarkdown := benchmarks.DefaultMicroReportPaths(time.Now().UTC())
-		if *reportPath == "" {
-			*reportPath = defaultJSON
-		}
-		if *markdownPath == "" {
-			*markdownPath = defaultMarkdown
-		}
-	}
-	if err := benchmarks.WriteMicroReportFiles(report, *reportPath, *markdownPath); err != nil {
-		return err
-	}
-	printMicroBenchReport(report, *reportPath, *markdownPath)
-	return nil
-}
-
-func runBenchGate(args []string) error {
-	if len(args) == 0 {
-		return errors.New("missing bench gate subcommand")
-	}
-	switch args[0] {
-	case "run":
-		return runBenchGateRun(args[1:])
-	case "compare":
-		return runBenchGateCompare(args[1:])
-	default:
-		return errors.New("unknown bench gate subcommand (supported: run, compare)")
-	}
-}
-
-func runBenchGateRun(args []string) error {
-	fs := flag.NewFlagSet("bench gate run", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	budgetPath := fs.String("budget", benchmarks.DefaultPerfGateBudgetPath, "")
-	outDir := fs.String("out-dir", filepath.Join("benchmarks", "reports", "gate", time.Now().UTC().Format("20060102-150405")), "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	budget, err := benchmarks.LoadPerfGateBudget(*budgetPath)
-	if err != nil {
-		return err
-	}
-	reports, err := budget.Run(context.Background(), *outDir)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stdout, "perf_gate_budget: %s\n", filepath.Clean(*budgetPath))
-	fmt.Fprintf(os.Stdout, "micro_report_json: %s\n", reports.MicroJSON)
-	fmt.Fprintf(os.Stdout, "micro_report_markdown: %s\n", reports.MicroMD)
-	fmt.Fprintf(os.Stdout, "e2e_report_json: %s\n", reports.E2EJSON)
-	fmt.Fprintf(os.Stdout, "e2e_report_markdown: %s\n", reports.E2EMD)
-	return nil
-}
-
-func runBenchGateCompare(args []string) error {
-	fs := flag.NewFlagSet("bench gate compare", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	budgetPath := fs.String("budget", benchmarks.DefaultPerfGateBudgetPath, "")
-	baselineDir := fs.String("baseline-dir", "", "")
-	candidateDir := fs.String("candidate-dir", "", "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if strings.TrimSpace(*baselineDir) == "" || strings.TrimSpace(*candidateDir) == "" {
-		return errors.New("usage: bpu-cli bench gate compare --baseline-dir PATH --candidate-dir PATH [--budget PATH]")
-	}
-
-	budget, err := benchmarks.LoadPerfGateBudget(*budgetPath)
-	if err != nil {
-		return err
-	}
-	comparison, err := benchmarks.ComparePerfGateReports(budget, *baselineDir, *candidateDir)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(os.Stdout, benchmarks.RenderPerfGateComparison(comparison))
-	return comparison.Error()
-}
-
-func runBenchSim(args []string) error {
-	defaults := benchmarks.DefaultSimulationOptions()
-	fs := flag.NewFlagSet("bench sim", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	nodes := fs.Int("nodes", defaults.NodeCount, "")
-	topology := fs.String("topology", string(defaults.Topology), "")
-	seed := fs.Int64("seed", defaults.Seed, "")
-	txs := fs.Int("txs", defaults.TxCount, "")
-	blocks := fs.Int("blocks", defaults.BlockCount, "")
-	baseLatency := fs.Duration("base-latency", defaults.BaseLatency, "")
-	latencyJitter := fs.Duration("latency-jitter", defaults.LatencyJitter, "")
-	txProcessingDelay := fs.Duration("tx-processing-delay", defaults.TxProcessingDelay, "")
-	blockProcessingDelay := fs.Duration("block-processing-delay", defaults.BlockProcessingDelay, "")
-	txSpacing := fs.Duration("tx-spacing", defaults.TxSpacing, "")
-	blockSpacing := fs.Duration("block-spacing", defaults.BlockSpacing, "")
-	churnEvents := fs.Int("churn-events", defaults.ChurnEvents, "")
-	churnDuration := fs.Duration("churn-duration", defaults.ChurnDuration, "")
-	smallWorldDegree := fs.Int("small-world-degree", defaults.SmallWorldDegree, "")
-	reportPath := fs.String("report", "", "")
-	markdownPath := fs.String("markdown", "", "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	report, err := benchmarks.RunSimulation(context.Background(), benchmarks.SimulationOptions{
-		NodeCount:            *nodes,
-		Topology:             benchmarks.SimulationTopology(*topology),
-		Seed:                 *seed,
-		TxCount:              *txs,
-		BlockCount:           *blocks,
-		BaseLatency:          *baseLatency,
-		LatencyJitter:        *latencyJitter,
-		TxProcessingDelay:    *txProcessingDelay,
-		BlockProcessingDelay: *blockProcessingDelay,
-		TxSpacing:            *txSpacing,
-		BlockSpacing:         *blockSpacing,
-		ChurnEvents:          *churnEvents,
-		ChurnDuration:        *churnDuration,
-		SmallWorldDegree:     *smallWorldDegree,
-	})
-	if err != nil {
-		return err
-	}
-	if *reportPath == "" || *markdownPath == "" {
-		base := filepath.Join("benchmarks", "reports", time.Now().UTC().Format("20060102-150405")+"-sim")
-		if *reportPath == "" {
-			*reportPath = base + ".json"
-		}
-		if *markdownPath == "" {
-			*markdownPath = base + ".md"
-		}
-	}
-	if err := benchmarks.WriteSimulationReportFiles(report, *reportPath, *markdownPath); err != nil {
-		return err
-	}
-	printSimulationReport(report, *reportPath, *markdownPath)
-	return nil
-}
-
-func printBenchmarkReport(report *benchmarks.Report, reportPath, markdownPath string) {
-	fmt.Printf("benchmark: %s\n", report.Benchmark)
-	if report.Mode != "" {
-		fmt.Printf("mode: %s\n", report.Mode)
-	}
-	if report.Mining != "" {
-		fmt.Printf("mining: %s\n", report.Mining)
-	}
-	fmt.Printf("profile: %s\n", report.Profile)
-	fmt.Printf("nodes: %d\n", report.NodeCount)
-	if report.Topology != "" {
-		fmt.Printf("topology: %s\n", report.Topology)
-	}
-	fmt.Printf("tx_count: %d\n", report.TxCount)
-	if report.BatchSize > 0 {
-		fmt.Printf("batch_size: %d\n", report.BatchSize)
-	}
-	if report.TxsPerBlock > 0 {
-		fmt.Printf("txs_per_block: %d\n", report.TxsPerBlock)
-	}
-	if report.Benchmark == string(benchmarks.BenchmarkE2E) && report.TargetBlocks > 0 {
-		fmt.Printf("blocks: %d\n", report.TargetBlocks)
-	}
-	if report.Benchmark == string(benchmarks.BenchmarkE2E) && report.BlockIntervalMS > 0 {
-		fmt.Printf("block_interval_ms: %.2f\n", report.BlockIntervalMS)
-	}
-	if report.Benchmark == string(benchmarks.BenchmarkThroughput) && report.RequestedDurationMS > 0 {
-		fmt.Printf("requested_duration_ms: %.2f\n", report.RequestedDurationMS)
-	}
-	fmt.Printf("admission_tps: %.2f\n", report.AdmissionTPS)
-	fmt.Printf("completion_tps: %.2f\n", report.CompletionTPS)
-	if report.ConfirmedProcessingTPS > 0 {
-		fmt.Printf("confirmed_processing_tps: %.2f\n", report.ConfirmedProcessingTPS)
-	}
-	if report.ConfirmedWallTPS > 0 {
-		fmt.Printf("confirmed_wall_tps: %.2f\n", report.ConfirmedWallTPS)
-	}
-	if report.SyntheticIntervalTPS > 0 {
-		fmt.Printf("synthetic_interval_tps: %.2f\n", report.SyntheticIntervalTPS)
-	}
-	fmt.Printf("admission_duration_ms: %.2f\n", report.AdmissionDurationMS)
-	fmt.Printf("completion_duration_ms: %.2f\n", report.CompletionDurationMS)
-	if len(report.Profiling.Artifacts) != 0 {
-		fmt.Printf("profile_dir: %s\n", filepath.Dir(report.Profiling.Artifacts[0].Path))
-	}
-	fmt.Printf("report_json: %s\n", reportPath)
-	fmt.Printf("report_markdown: %s\n", markdownPath)
-	fmt.Println()
-	fmt.Println(benchmarks.RenderASCIISummary(report))
-}
-
-func printMicroBenchReport(report *benchmarks.MicroBenchReport, reportPath, markdownPath string) {
-	fmt.Printf("benchmark: micro\n")
-	fmt.Printf("package: %s\n", report.Package)
-	fmt.Printf("bench_regex: %s\n", report.Bench)
-	if report.Count > 0 {
-		fmt.Printf("count: %d\n", report.Count)
-	}
-	if report.Benchtime != "" {
-		fmt.Printf("benchtime: %s\n", report.Benchtime)
-	}
-	fmt.Printf("duration_ms: %.2f\n", report.DurationMS)
-	fmt.Printf("report_json: %s\n", reportPath)
-	fmt.Printf("report_markdown: %s\n", markdownPath)
-	fmt.Println()
-	fmt.Println("microbenchmarks:")
-	for _, bench := range report.Benchmarks {
-		name := bench.Name
-		if bench.Procs > 0 {
-			name = fmt.Sprintf("%s (P=%d)", name, bench.Procs)
-		}
-		fmt.Printf("  - %s: %.0f ns/op, %.0f B/op, %.0f allocs/op\n", name, bench.NsPerOp, bench.BytesPerOp, bench.AllocsPerOp)
-	}
-}
-
-func printSimulationReport(report *benchmarks.SimulationReport, reportPath, markdownPath string) {
-	fmt.Printf("benchmark: sim\n")
-	fmt.Printf("nodes: %d\n", report.Config.NodeCount)
-	fmt.Printf("topology: %s\n", report.Config.Topology)
-	fmt.Printf("seed: %d\n", report.Config.Seed)
-	fmt.Printf("tx_count: %d\n", report.Config.TxCount)
-	fmt.Printf("block_count: %d\n", report.Config.BlockCount)
-	fmt.Printf("base_latency_ms: %.2f\n", report.Config.BaseLatencyMS)
-	fmt.Printf("latency_jitter_ms: %.2f\n", report.Config.LatencyJitterMS)
-	fmt.Printf("report_json: %s\n", reportPath)
-	fmt.Printf("report_markdown: %s\n", markdownPath)
-	fmt.Println()
-	fmt.Println(benchmarks.RenderSimulationASCIISummary(report))
 }
 
 func runServe(args []string) error {
@@ -649,7 +310,7 @@ func runServe(args []string) error {
 		return err
 	}
 	if profile == types.BenchNet {
-		return errors.New("benchnet is benchmark-only; use `bpu-cli bench ...` instead of `serve`")
+		return errors.New("benchnet is not an operator profile")
 	}
 	if cfg.GenesisFixture == "" {
 		cfg.GenesisFixture = defaultGenesisFixture(profile)
@@ -2037,7 +1698,7 @@ func loadGenesisFixture(profile types.ChainProfile) (*loadedGenesisFixture, erro
 	case types.RegtestHard:
 		return loadGenesisFixtureFromPath("fixtures/genesis/regtest_hard.json")
 	case types.BenchNet:
-		return nil, errors.New("benchnet genesis is generated by the benchmark harness")
+		return nil, errors.New("benchnet genesis is not available in public CLI fixtures")
 	default:
 		return nil, fmt.Errorf("unsupported profile: %s", profile)
 	}
@@ -3068,7 +2729,7 @@ func fileExists(path string) bool {
 }
 
 func usageError() error {
-	return errors.New("usage: bpu-cli <serve|bench|wallet|validate-tx|validate-block|chain|snapshot|config>")
+	return errors.New("usage: bpu-cli <serve|wallet|validate-tx|validate-block|chain|snapshot|config>")
 }
 
 func defaultGenesisFixture(profile types.ChainProfile) string {

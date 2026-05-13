@@ -1,6 +1,8 @@
 package compactfilter
 
 import (
+	"encoding/binary"
+	"strings"
 	"testing"
 
 	"bitcoin-pure/internal/consensus"
@@ -45,5 +47,39 @@ func TestHeaderChainsDeterministically(t *testing.T) {
 	second := Header(secondHash, first)
 	if second == first {
 		t.Fatal("expected distinct chained filter headers")
+	}
+}
+
+func TestDecodeFingerprintsRejectsImpossibleCount(t *testing.T) {
+	if _, err := decodeFingerprints([]byte{2, 0}); err == nil || !strings.Contains(err.Error(), "count") {
+		t.Fatalf("decodeFingerprints err = %v, want count error", err)
+	}
+}
+
+func TestDecodeFingerprintsRejectsMissingCount(t *testing.T) {
+	if _, err := decodeFingerprints(nil); err == nil || !strings.Contains(err.Error(), "missing compact filter count") {
+		t.Fatalf("decodeFingerprints err = %v, want missing count error", err)
+	}
+}
+
+func TestDecodeFingerprintsRejectsOverlongCount(t *testing.T) {
+	if _, err := decodeFingerprints([]byte{0x80, 0x00}); err == nil || !strings.Contains(err.Error(), "count") {
+		t.Fatalf("decodeFingerprints err = %v, want count error", err)
+	}
+}
+
+func TestDecodeFingerprintsRejectsOverlongDelta(t *testing.T) {
+	if _, err := decodeFingerprints([]byte{1, 0x80, 0x00}); err == nil || !strings.Contains(err.Error(), "delta") {
+		t.Fatalf("decodeFingerprints err = %v, want delta error", err)
+	}
+}
+
+func TestDecodeFingerprintsRejectsDeltaOverflow(t *testing.T) {
+	var encoded []byte
+	encoded = binary.AppendUvarint(encoded, 2)
+	encoded = binary.AppendUvarint(encoded, ^uint64(0))
+	encoded = binary.AppendUvarint(encoded, 1)
+	if _, err := decodeFingerprints(encoded); err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Fatalf("decodeFingerprints err = %v, want overflow error", err)
 	}
 }

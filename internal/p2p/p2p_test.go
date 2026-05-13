@@ -24,22 +24,22 @@ func testCoinbaseTx(height uint64, value uint64) types.Transaction {
 	}
 }
 
-func writeRawMessageForTest(t *testing.T, conn net.Conn, magic uint32, cmd Command, payload []byte, checksum []byte) {
-	t.Helper()
+func writeRawMessageForTest(conn net.Conn, magic uint32, cmd Command, payload []byte, checksum []byte) error {
 	header := make([]byte, headerSize)
 	binary.LittleEndian.PutUint32(header[:4], magic)
 	header[4] = byte(cmd)
 	binary.LittleEndian.PutUint32(header[8:12], uint32(len(payload)))
 	copy(header[12:16], checksum)
 	if _, err := conn.Write(header); err != nil {
-		t.Fatalf("write raw header: %v", err)
+		return err
 	}
 	if len(payload) == 0 {
-		return
+		return nil
 	}
 	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("write raw payload: %v", err)
+		return err
 	}
+	return nil
 }
 
 func TestConnMessageRoundTrip(t *testing.T) {
@@ -342,10 +342,9 @@ func TestConnReadMessageRejectsBadChecksum(t *testing.T) {
 	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
 	errCh := make(chan error, 1)
 	go func() {
+		defer right.Close()
 		payload := make([]byte, 8)
-		writeRawMessageForTest(t, right, MagicForProfile(types.Regtest), CmdPing, payload, []byte{0, 0, 0, 0})
-		right.Close()
-		errCh <- nil
+		errCh <- writeRawMessageForTest(right, MagicForProfile(types.Regtest), CmdPing, payload, []byte{0, 0, 0, 0})
 	}()
 
 	_, err := conn.ReadMessage()
@@ -365,14 +364,15 @@ func TestConnReadMessageRejectsCommandPayloadOverLimitBeforeBodyRead(t *testing.
 	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
 	errCh := make(chan error, 1)
 	go func() {
+		defer right.Close()
 		header := make([]byte, headerSize)
 		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
 		header[4] = byte(CmdGetAddr)
 		binary.LittleEndian.PutUint32(header[8:12], 1)
 		if _, err := right.Write(header); err != nil {
-			t.Fatalf("write raw header: %v", err)
+			errCh <- err
+			return
 		}
-		right.Close()
 		errCh <- nil
 	}()
 
@@ -393,14 +393,15 @@ func TestConnReadMessageRejectsAddrPayloadOverLimitBeforeBodyRead(t *testing.T) 
 	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
 	errCh := make(chan error, 1)
 	go func() {
+		defer right.Close()
 		header := make([]byte, headerSize)
 		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
 		header[4] = byte(CmdAddr)
 		binary.LittleEndian.PutUint32(header[8:12], uint32(maxAddrPayloadBytes+1))
 		if _, err := right.Write(header); err != nil {
-			t.Fatalf("write raw header: %v", err)
+			errCh <- err
+			return
 		}
-		right.Close()
 		errCh <- nil
 	}()
 
@@ -421,14 +422,15 @@ func TestConnReadMessageRejectsUnknownCommandBeforeBodyRead(t *testing.T) {
 	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
 	errCh := make(chan error, 1)
 	go func() {
+		defer right.Close()
 		header := make([]byte, headerSize)
 		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
 		header[4] = 0xff
 		binary.LittleEndian.PutUint32(header[8:12], 1<<20)
 		if _, err := right.Write(header); err != nil {
-			t.Fatalf("write raw header: %v", err)
+			errCh <- err
+			return
 		}
-		right.Close()
 		errCh <- nil
 	}()
 
@@ -449,6 +451,7 @@ func TestConnReadMessageRejectsPayloadOverLimit(t *testing.T) {
 	conn := NewConn(left, MagicForProfile(types.Regtest), 3)
 	errCh := make(chan error, 1)
 	go func() {
+		defer right.Close()
 		payload := []byte{1, 2, 3, 4}
 		header := make([]byte, headerSize)
 		binary.LittleEndian.PutUint32(header[:4], MagicForProfile(types.Regtest))
@@ -457,9 +460,9 @@ func TestConnReadMessageRejectsPayloadOverLimit(t *testing.T) {
 		checksum := crypto.Sha256d(payload)
 		copy(header[12:16], checksum[:4])
 		if _, err := right.Write(header); err != nil {
-			t.Fatalf("write raw header: %v", err)
+			errCh <- err
+			return
 		}
-		right.Close()
 		errCh <- nil
 	}()
 
@@ -510,6 +513,20 @@ func TestEncodeMessageRejectsOversizedAddrString(t *testing.T) {
 	_, err := encodeMessage(AddrMessage{Addrs: []string{string(make([]byte, maxAddrStringBytes+1))}})
 	if !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("encodeMessage error = %v, want ErrPayloadTooLarge", err)
+	}
+}
+
+func TestConnWriteMessageRejectsCommandPayloadOverLimit(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	conn := NewConn(left, MagicForProfile(types.Regtest), 1<<20)
+	err := conn.WriteMessage(VersionMessage{
+		Protocol:  defaultProtocolNumber,
+		UserAgent: string(make([]byte, 17<<10)),
+	})
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("WriteMessage error = %v, want ErrPayloadTooLarge", err)
 	}
 }
 

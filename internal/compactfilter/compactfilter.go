@@ -125,11 +125,14 @@ func encodeFingerprints(values []uint64) []byte {
 
 func decodeFingerprints(encoded []byte) ([]uint64, error) {
 	if len(encoded) == 0 {
-		return nil, nil
+		return nil, errors.New("missing compact filter count")
 	}
-	count, n := binary.Uvarint(encoded)
-	if n <= 0 {
+	count, n, ok := readCanonicalUvarint(encoded)
+	if !ok {
 		return nil, errors.New("invalid compact filter count")
+	}
+	if count > uint64(len(encoded)-n) {
+		return nil, errors.New("compact filter count exceeds encoded deltas")
 	}
 	values := make([]uint64, 0, int(count))
 	offset := n
@@ -138,9 +141,12 @@ func decodeFingerprints(encoded []byte) ([]uint64, error) {
 		if offset >= len(encoded) {
 			return nil, errors.New("truncated compact filter")
 		}
-		delta, read := binary.Uvarint(encoded[offset:])
-		if read <= 0 {
+		delta, read, ok := readCanonicalUvarint(encoded[offset:])
+		if !ok {
 			return nil, errors.New("invalid compact filter delta")
+		}
+		if delta > ^uint64(0)-prev {
+			return nil, errors.New("compact filter delta overflows fingerprint")
 		}
 		value := prev + delta
 		values = append(values, value)
@@ -153,24 +159,20 @@ func decodeFingerprints(encoded []byte) ([]uint64, error) {
 	return values, nil
 }
 
-func appendCanonicalVarInt(dst []byte, v uint64) []byte {
-	switch {
-	case v <= 0xfc:
-		return append(dst, byte(v))
-	case v <= 0xffff:
-		return append(dst, 0xfd, byte(v), byte(v>>8))
-	case v <= 0xffff_ffff:
-		return append(dst, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-	default:
-		return append(dst, 0xff,
-			byte(v),
-			byte(v>>8),
-			byte(v>>16),
-			byte(v>>24),
-			byte(v>>32),
-			byte(v>>40),
-			byte(v>>48),
-			byte(v>>56),
-		)
+func readCanonicalUvarint(buf []byte) (uint64, int, bool) {
+	value, n := binary.Uvarint(buf)
+	if n <= 0 {
+		return 0, 0, false
 	}
+	var scratch [binary.MaxVarintLen64]byte
+	if canonicalLen := binary.PutUvarint(scratch[:], value); canonicalLen != n {
+		return 0, 0, false
+	} else if !bytes.Equal(buf[:n], scratch[:canonicalLen]) {
+		return 0, 0, false
+	}
+	return value, n, true
+}
+
+func appendCanonicalVarInt(dst []byte, v uint64) []byte {
+	return types.AppendCanonicalVarInt(dst, v)
 }

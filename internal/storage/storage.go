@@ -191,6 +191,8 @@ type ChainStore struct {
 	deriveNotify chan struct{}
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 type chainJournalKind uint8
@@ -275,12 +277,15 @@ func (s *ChainStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	s.logger.Info("closing pebble chain store")
-	if s.stopCh != nil {
-		close(s.stopCh)
-	}
-	s.wg.Wait()
-	return s.db.Close()
+	s.closeOnce.Do(func() {
+		s.logger.Info("closing pebble chain store")
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+		s.wg.Wait()
+		s.closeErr = s.db.Close()
+	})
+	return s.closeErr
 }
 
 func (s *ChainStore) LoadChainState() (*StoredChainState, error) {

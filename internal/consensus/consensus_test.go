@@ -2,16 +2,49 @@ package consensus
 
 import (
 	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"math/big"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"testing"
 
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 )
+
+type bootstrapVectorProfile struct {
+	GenesisAuthIDHex        string `json:"genesis_authid_hex"`
+	GenesisHeaderHashHex    string `json:"genesis_header_hash_hex"`
+	GenesisTxIDHex          string `json:"genesis_txid_hex"`
+	UTXORootAfterGenesisHex string `json:"utxo_root_after_genesis_hex"`
+}
+
+type bootstrapVectors struct {
+	VectorsVersion   int                    `json:"vectors_version"`
+	SighashTags      map[string]string      `json:"sighash_tags"`
+	UTXORootTag      string                 `json:"utxo_root_tag"`
+	UTXOLeafTag      string                 `json:"utxo_leaf_tag"`
+	UTXOBranchTag    string                 `json:"utxo_branch_tag"`
+	EmptyUTXORootHex string                 `json:"empty_utxo_root_hex"`
+	Mainnet          bootstrapVectorProfile `json:"mainnet"`
+	Regtest          bootstrapVectorProfile `json:"regtest"`
+}
+
+type genesisFixtureForVectorTest struct {
+	Profile                      string `json:"profile"`
+	ExpectedHeaderHashHex        string `json:"expected_header_hash_hex"`
+	ExpectedTxIDHex              string `json:"expected_txid_hex"`
+	ExpectedAuthIDHex            string `json:"expected_authid_hex"`
+	ExpectedUTXORootAfterGenesis string `json:"expected_utxo_root_after_genesis_hex"`
+	BlockHex                     string `json:"block_hex"`
+}
 
 func consensusTestPubKey(seed byte) [32]byte {
 	return crypto.XOnlyPubKeyFromSecret([32]byte{seed})
@@ -26,6 +59,92 @@ func coinbaseTxForConsensusTest(height uint64, outputs []types.TxOutput) types.T
 			CoinbaseExtraNonce: &extraNonce,
 			Outputs:            outputs,
 		},
+	}
+}
+
+func TestConsensusBootstrapVectorsMatchGenesisFixtures(t *testing.T) {
+	var vectors bootstrapVectors
+	readJSONForConsensusTest(t, filepath.Join("..", "..", "fixtures", "vectors", "consensus_bootstrap_vectors.json"), &vectors)
+	if vectors.VectorsVersion != 1 {
+		t.Fatalf("vectors version = %d, want 1", vectors.VectorsVersion)
+	}
+	if got := MainnetParams().SighashTag(); got != vectors.SighashTags[types.Mainnet.String()] {
+		t.Fatalf("mainnet sighash tag = %q, want %q", got, vectors.SighashTags[types.Mainnet.String()])
+	}
+	if got := RegtestParams().SighashTag(); got != vectors.SighashTags[types.Regtest.String()] {
+		t.Fatalf("regtest sighash tag = %q, want %q", got, vectors.SighashTags[types.Regtest.String()])
+	}
+	if vectors.UTXORootTag != utreexo.UTXORootTag {
+		t.Fatalf("utxo root tag = %q, want %q", vectors.UTXORootTag, utreexo.UTXORootTag)
+	}
+	if vectors.UTXOLeafTag != utreexo.UTXOLeafTag {
+		t.Fatalf("utxo leaf tag = %q, want %q", vectors.UTXOLeafTag, utreexo.UTXOLeafTag)
+	}
+	if vectors.UTXOBranchTag != utreexo.UTXOBranchTag {
+		t.Fatalf("utxo branch tag = %q, want %q", vectors.UTXOBranchTag, utreexo.UTXOBranchTag)
+	}
+	emptyRoot := ComputedUTXORoot(UtxoSet{})
+	if got := hex.EncodeToString(emptyRoot[:]); got != vectors.EmptyUTXORootHex {
+		t.Fatalf("empty utxo root = %s, want %s", got, vectors.EmptyUTXORootHex)
+	}
+	assertGenesisVector(t, filepath.Join("..", "..", "fixtures", "genesis", "mainnet.json"), vectors.Mainnet)
+	assertGenesisVector(t, filepath.Join("..", "..", "fixtures", "genesis", "regtest.json"), vectors.Regtest)
+}
+
+func assertGenesisVector(t *testing.T, path string, vector bootstrapVectorProfile) {
+	t.Helper()
+	var fixture genesisFixtureForVectorTest
+	readJSONForConsensusTest(t, path, &fixture)
+	if fixture.ExpectedTxIDHex != vector.GenesisTxIDHex {
+		t.Fatalf("%s fixture txid vector = %s, want %s", path, fixture.ExpectedTxIDHex, vector.GenesisTxIDHex)
+	}
+	if fixture.ExpectedAuthIDHex != vector.GenesisAuthIDHex {
+		t.Fatalf("%s fixture authid vector = %s, want %s", path, fixture.ExpectedAuthIDHex, vector.GenesisAuthIDHex)
+	}
+	if fixture.ExpectedHeaderHashHex != vector.GenesisHeaderHashHex {
+		t.Fatalf("%s fixture header vector = %s, want %s", path, fixture.ExpectedHeaderHashHex, vector.GenesisHeaderHashHex)
+	}
+	if fixture.ExpectedUTXORootAfterGenesis != vector.UTXORootAfterGenesisHex {
+		t.Fatalf("%s fixture utxo root vector = %s, want %s", path, fixture.ExpectedUTXORootAfterGenesis, vector.UTXORootAfterGenesisHex)
+	}
+	block, err := types.DecodeBlockHex(fixture.BlockHex, types.DefaultCodecLimits())
+	if err != nil {
+		t.Fatalf("DecodeBlockHex(%s): %v", path, err)
+	}
+	if len(block.Txs) != 1 {
+		t.Fatalf("%s tx count = %d, want 1", path, len(block.Txs))
+	}
+	txid := TxID(&block.Txs[0])
+	authid := AuthID(&block.Txs[0])
+	headerHash := HeaderHash(&block.Header)
+	if got := hex.EncodeToString(txid[:]); got != vector.GenesisTxIDHex {
+		t.Fatalf("%s txid = %s, want %s", path, got, vector.GenesisTxIDHex)
+	}
+	if got := hex.EncodeToString(authid[:]); got != vector.GenesisAuthIDHex {
+		t.Fatalf("%s authid = %s, want %s", path, got, vector.GenesisAuthIDHex)
+	}
+	if got := hex.EncodeToString(headerHash[:]); got != vector.GenesisHeaderHashHex {
+		t.Fatalf("%s header hash = %s, want %s", path, got, vector.GenesisHeaderHashHex)
+	}
+	if got := hex.EncodeToString(block.Header.UTXORoot[:]); got != vector.UTXORootAfterGenesisHex {
+		t.Fatalf("%s utxo root = %s, want %s", path, got, vector.UTXORootAfterGenesisHex)
+	}
+}
+
+func readJSONForConsensusTest(t *testing.T, path string, out any) {
+	t.Helper()
+	buf, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(buf))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		t.Fatalf("Unmarshal(%s): %v", path, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		t.Fatalf("Unmarshal(%s) trailing data err = %v, want EOF", path, err)
 	}
 }
 

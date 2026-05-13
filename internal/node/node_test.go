@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -1500,6 +1501,43 @@ func TestOpenServiceDefaultsRPCHardening(t *testing.T) {
 	}
 	if svc.cfg.MaxMessageBytes < int(consensus.MainnetParams().BlockSizeFloor) {
 		t.Fatalf("max message bytes = %d, want at least %d", svc.cfg.MaxMessageBytes, consensus.MainnetParams().BlockSizeFloor)
+	}
+}
+
+func TestStartCleansUpRPCWhenP2PListenFails(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen occupied addr: %v", err)
+	}
+	defer occupied.Close()
+
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:      types.Regtest,
+		DBPath:       t.TempDir(),
+		RPCAddr:      "127.0.0.1:0",
+		RPCAuthToken: "test-token",
+		P2PAddr:      occupied.Addr().String(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	if err := svc.Start(context.Background()); err == nil {
+		t.Fatal("expected Start to fail on occupied p2p address")
+	}
+	rpcAddr := svc.rpcSrv.Addr
+	select {
+	case <-svc.stopCh:
+	default:
+		t.Fatal("service stop channel is still open after failed Start")
+	}
+	rebound, err := net.Listen("tcp", rpcAddr)
+	if err != nil {
+		t.Fatalf("RPC addr was not cleaned up after failed Start: %v", err)
+	}
+	rebound.Close()
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close after failed Start: %v", err)
 	}
 }
 

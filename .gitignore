@@ -26,14 +26,21 @@
 /Works
 /REFERENCE_NODES
 /CI/
+/UI_Screenshots/
+/architecture/
+/AGENTS.md
+/agents.md
+/ROADMAP.md
 
 # This project does not use GitHub Actions CI.
 /.github/workflows/
 
 /bpu-cli
 /.*-tmp/
+/benchmarks/
 /benchmarks/reports/
 /benchmarks/reports/micro/
+/benchmarks.test
 /node.test
 /*.test
 
@@ -50,6 +57,9 @@ target/
 
 # Root-level markdown notes are local unless explicitly published.
 /beta-pq-ideas.md
+/release_notes.md
+/release-notes.md
+/release-notes-*.md
 /*.md
 !/README.md
 !/SPEC.md

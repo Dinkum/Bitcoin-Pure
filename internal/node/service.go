@@ -1483,11 +1483,21 @@ func (s *Service) reloadPersistedMempool() error {
 
 func (s *Service) Start(ctx context.Context) error {
 	s.logger.Info("starting node service")
+	started := false
+	defer func() {
+		if !started {
+			_ = s.Close()
+		}
+	}()
 	if s.cfg.RPCAddr != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", s.handleHTTP)
+		rpcListener, err := net.Listen("tcp", s.cfg.RPCAddr)
+		if err != nil {
+			return err
+		}
 		s.rpcSrv = &http.Server{
-			Addr:              s.cfg.RPCAddr,
+			Addr:              rpcListener.Addr().String(),
 			Handler:           mux,
 			ReadTimeout:       s.cfg.RPCReadTimeout,
 			ReadHeaderTimeout: s.cfg.RPCHeaderTimeout,
@@ -1495,13 +1505,13 @@ func (s *Service) Start(ctx context.Context) error {
 			IdleTimeout:       s.cfg.RPCIdleTimeout,
 			MaxHeaderBytes:    s.cfg.RPCMaxHeaderBytes,
 		}
-		s.logger.Info("rpc server enabled", slog.String("addr", s.cfg.RPCAddr))
+		s.logger.Info("rpc server enabled", slog.String("addr", s.rpcSrv.Addr))
 		if s.publicPage {
-			s.logger.Info("public ascii dashboard enabled", slog.String("addr", s.cfg.RPCAddr), slog.Duration("cache_ttl", time.Minute))
+			s.logger.Info("public ascii dashboard enabled", slog.String("addr", s.rpcSrv.Addr), slog.Duration("cache_ttl", time.Minute))
 		}
 		s.safeGo("rpc-server", func() {
-			if err := s.rpcSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				s.logger.Error("rpc server failed", slog.String("addr", s.cfg.RPCAddr), slog.Any("error", err))
+			if err := s.rpcSrv.Serve(rpcListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.logger.Error("rpc server failed", slog.String("addr", s.rpcSrv.Addr), slog.Any("error", err))
 			}
 		})
 	}
@@ -1544,6 +1554,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.safeGo("node-status-loop", func() {
 		s.nodeStatusLoop()
 	})
+	started = true
 	if s.cfg.P2PAddr != "" || len(s.cfg.Peers) > 0 {
 		s.safeGo("sync-watchdog-loop", func() {
 			s.syncWatchdogLoop()

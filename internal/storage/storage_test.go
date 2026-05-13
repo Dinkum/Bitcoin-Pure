@@ -64,6 +64,19 @@ func TestStorageWritePoliciesMatchDurabilityIntent(t *testing.T) {
 	}
 }
 
+func TestChainStoreCloseIsIdempotent(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
 func encodeLegacyBlockSizeState(limit, ewma uint64, recent []uint64) []byte {
 	buf := make([]byte, 24, 24+len(recent)*8)
 	binary.LittleEndian.PutUint64(buf[:8], limit)

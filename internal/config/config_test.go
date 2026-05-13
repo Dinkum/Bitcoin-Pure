@@ -2,6 +2,9 @@ package config
 
 import (
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 
 	"bitcoin-pure/internal/consensus"
@@ -59,6 +62,26 @@ func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(filepath.Dir(path), "config.json")); err != nil {
 		t.Fatalf("Load sidecar json: %v", err)
+	}
+}
+
+func TestCommentedYAMLCoversEveryConfigField(t *testing.T) {
+	buf, err := renderCommentedYAML(Default())
+	if err != nil {
+		t.Fatalf("renderCommentedYAML: %v", err)
+	}
+	rendered := string(buf)
+	cfgType := reflect.TypeOf(Config{})
+	for i := 0; i < cfgType.NumField(); i++ {
+		field := cfgType.Field(i)
+		key := strings.Split(field.Tag.Get("yaml"), ",")[0]
+		if key == "" || key == "-" {
+			continue
+		}
+		matches := regexp.MustCompile(`(?m)^`+regexp.QuoteMeta(key)+`:`).FindAllStringIndex(rendered, -1)
+		if len(matches) != 1 {
+			t.Fatalf("yaml key %q appears %d times, want exactly once", key, len(matches))
+		}
 	}
 }
 

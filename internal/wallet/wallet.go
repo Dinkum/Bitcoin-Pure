@@ -335,7 +335,10 @@ func parseBPUAmount(raw string) (uint64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("invalid BPU amount %q", raw)
 		}
-		atoms += frac
+		atoms, err = checkedAdd(atoms, frac)
+		if err != nil {
+			return 0, fmt.Errorf("BPU amount overflows atoms: %q", raw)
+		}
 	}
 	if atoms == 0 {
 		return 0, errors.New("amount must be positive")
@@ -345,7 +348,9 @@ func parseBPUAmount(raw string) (uint64, error) {
 
 func (s *Store) List() []Wallet {
 	out := make([]Wallet, len(s.wallets))
-	copy(out, s.wallets)
+	for i := range s.wallets {
+		out[i] = cloneWallet(s.wallets[i])
+	}
 	return out
 }
 
@@ -409,7 +414,7 @@ func (s *Store) ExportWallet(name string) (ExportFile, error) {
 }
 
 func (s *Store) ImportWallet(export ExportFile, nameOverride string) (Wallet, error) {
-	entry := export.Wallet
+	entry := cloneWallet(export.Wallet)
 	if strings.TrimSpace(nameOverride) != "" {
 		entry.Name = strings.TrimSpace(nameOverride)
 	}
@@ -423,11 +428,11 @@ func (s *Store) ImportWallet(export ExportFile, nameOverride string) (Wallet, er
 	for i := range entry.Addresses {
 		normalizeStoredAddress(&entry.Addresses[i])
 	}
-	s.wallets = append(s.wallets, entry)
+	s.wallets = append(s.wallets, cloneWallet(entry))
 	if err := s.save(); err != nil {
 		return Wallet{}, err
 	}
-	return entry, nil
+	return cloneWallet(entry), nil
 }
 
 func LoadExportFile(path string) (ExportFile, error) {
@@ -476,11 +481,11 @@ func (s *Store) CreateWalletWithType(name string, outputType uint64) (Wallet, Ad
 		return Wallet{}, Address{}, err
 	}
 	entry.Addresses = append(entry.Addresses, addr)
-	s.wallets = append(s.wallets, entry)
+	s.wallets = append(s.wallets, cloneWallet(entry))
 	if err := s.save(); err != nil {
 		return Wallet{}, Address{}, err
 	}
-	return entry, addr, nil
+	return cloneWallet(entry), addr, nil
 }
 
 func (s *Store) Wallet(name string) (Wallet, error) {
@@ -488,7 +493,7 @@ func (s *Store) Wallet(name string) (Wallet, error) {
 	if !ok {
 		return Wallet{}, ErrWalletNotFound
 	}
-	return *wallet, nil
+	return cloneWallet(*wallet), nil
 }
 
 func (s *Store) NewReceiveAddress(name string) (Address, error) {
@@ -553,7 +558,10 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 	if err != nil {
 		return SendPlan{}, err
 	}
-	required := amount + fee
+	required, err := checkedAdd(amount, fee)
+	if err != nil {
+		return SendPlan{}, ErrInsufficientFunds
+	}
 	selected, total, err := selectCoins(available, required)
 	if err != nil {
 		return SendPlan{}, err
@@ -584,6 +592,9 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if err != nil {
 		return SendPlan{}, err
 	}
+	if amount == 0 {
+		return SendPlan{}, errors.New("amount must be positive")
+	}
 	selected, total, fee, change, estimatedBytes, err := selectCoinsForAutoFee(available, destItem, amount, feeRate)
 	if err != nil {
 		return SendPlan{}, err
@@ -607,7 +618,10 @@ func (s *Store) BuildCPFP(name string, parentTxID [32]byte, feeRate uint64) (CPF
 		return CPFPPlan{}, err
 	}
 	estimatedBytes := estimateSignedTxBytesForFamilies([]SelectedInput{{Address: input.Address}}, []uint64{input.Address.OutputType()})
-	fee := feeRate * uint64(estimatedBytes)
+	fee, err := checkedMul(feeRate, uint64(estimatedBytes))
+	if err != nil {
+		return CPFPPlan{}, ErrInsufficientFunds
+	}
 	if fee == 0 {
 		return CPFPPlan{}, ErrInsufficientFunds
 	}
@@ -808,9 +822,17 @@ func (s *Store) Balance(name string, utxos []SpendableUTXO) (BalanceSummary, err
 	confirmed := uint64(0)
 	immature := uint64(0)
 	for _, utxo := range utxos {
-		confirmed += utxo.Value
+		nextConfirmed, err := checkedAdd(confirmed, utxo.Value)
+		if err != nil {
+			return BalanceSummary{}, errors.New("wallet balance overflow")
+		}
+		confirmed = nextConfirmed
 		if !utxo.SpendMature() {
-			immature += utxo.Value
+			nextImmature, err := checkedAdd(immature, utxo.Value)
+			if err != nil {
+				return BalanceSummary{}, errors.New("wallet balance overflow")
+			}
+			immature = nextImmature
 		}
 	}
 	availableCoins, err := spendableCoins(*wallet, utxos)
@@ -819,7 +841,11 @@ func (s *Store) Balance(name string, utxos []SpendableUTXO) (BalanceSummary, err
 	}
 	available := uint64(0)
 	for _, coin := range availableCoins {
-		available += coin.Value
+		nextAvailable, err := checkedAdd(available, coin.Value)
+		if err != nil {
+			return BalanceSummary{}, errors.New("wallet balance overflow")
+		}
+		available = nextAvailable
 	}
 	reserved := uint64(0)
 	mature := confirmed - immature
@@ -849,6 +875,22 @@ func (w Wallet) LatestReceiveAddress() *Address {
 
 func normalizeWalletName(name string) string {
 	return strings.TrimSpace(name)
+}
+
+func cloneWallet(wallet Wallet) Wallet {
+	wallet.Addresses = append([]Address(nil), wallet.Addresses...)
+	wallet.Pending = clonePendingTxs(wallet.Pending)
+	return wallet
+}
+
+func clonePendingTxs(pending []PendingTx) []PendingTx {
+	out := make([]PendingTx, len(pending))
+	for i := range pending {
+		out[i] = pending[i]
+		out[i].Spent = append([]PendingOutPoint(nil), pending[i].Spent...)
+		out[i].Outputs = append([]PendingOutput(nil), pending[i].Outputs...)
+	}
+	return out
 }
 
 func nextAddressIndex(wallet Wallet) int {
@@ -1005,7 +1047,11 @@ func selectCoins(coins []SelectedInput, required uint64) ([]SelectedInput, uint6
 	var total uint64
 	for _, coin := range coins {
 		selected = append(selected, coin)
-		total += coin.Value
+		next, err := checkedAdd(total, coin.Value)
+		if err != nil {
+			return nil, 0, ErrInsufficientFunds
+		}
+		total = next
 		if total >= required {
 			return selected, total, nil
 		}
@@ -1013,24 +1059,52 @@ func selectCoins(coins []SelectedInput, required uint64) ([]SelectedInput, uint6
 	return nil, 0, ErrInsufficientFunds
 }
 
+func checkedAdd(left, right uint64) (uint64, error) {
+	if right > ^uint64(0)-left {
+		return 0, errors.New("uint64 addition overflow")
+	}
+	return left + right, nil
+}
+
+func checkedMul(left, right uint64) (uint64, error) {
+	if left != 0 && right > ^uint64(0)/left {
+		return 0, errors.New("uint64 multiplication overflow")
+	}
+	return left * right, nil
+}
+
 func selectCoinsForAutoFee(coins []SelectedInput, destItem WatchItem, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
 	selected := make([]SelectedInput, 0, len(coins))
 	var total uint64
 	for _, coin := range coins {
 		selected = append(selected, coin)
-		total += coin.Value
-		feeNoChange := feeRate * uint64(estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type}))
-		if total < amount+feeNoChange {
+		nextTotal, err := checkedAdd(total, coin.Value)
+		if err != nil {
+			return nil, 0, 0, 0, 0, ErrInsufficientFunds
+		}
+		total = nextTotal
+		noChangeBytes := estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type})
+		feeNoChange, err := checkedMul(feeRate, uint64(noChangeBytes))
+		if err != nil {
+			return nil, 0, 0, 0, 0, ErrInsufficientFunds
+		}
+		requiredNoChange, err := checkedAdd(amount, feeNoChange)
+		if err != nil || total < requiredNoChange {
 			continue
 		}
-		feeWithChange := feeRate * uint64(estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type, selected[0].Address.OutputType()}))
-		if total >= amount+feeWithChange {
-			return selected, total, feeWithChange, total - amount - feeWithChange, estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type, selected[0].Address.OutputType()}), nil
+		changeBytes := estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type, selected[0].Address.OutputType()})
+		feeWithChange, err := checkedMul(feeRate, uint64(changeBytes))
+		if err != nil {
+			return nil, 0, 0, 0, 0, ErrInsufficientFunds
+		}
+		requiredWithChange, err := checkedAdd(amount, feeWithChange)
+		if err == nil && total >= requiredWithChange {
+			return selected, total, feeWithChange, total - requiredWithChange, changeBytes, nil
 		}
 		// If we can fund the payment at the requested fee rate but not a second
 		// wallet-owned change output, collapse the remainder into fee instead of
 		// manufacturing dust-like change that would immediately need another spend.
-		return selected, total, total - amount, 0, estimateSignedTxBytesForFamilies(selected, []uint64{destItem.Type}), nil
+		return selected, total, total - amount, 0, noChangeBytes, nil
 	}
 	return nil, 0, 0, 0, 0, ErrInsufficientFunds
 }

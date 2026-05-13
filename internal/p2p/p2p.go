@@ -413,7 +413,8 @@ func (c *Conn) WriteMessage(msg Message) error {
 	if err != nil {
 		return err
 	}
-	if len(payload) > c.maxPayload {
+	maxPayload, ok := maxPayloadForCommand(msg.Command(), c.maxPayload)
+	if !ok || len(payload) > maxPayload {
 		return ErrPayloadTooLarge
 	}
 	header := make([]byte, headerSize)
@@ -1139,8 +1140,14 @@ func (r *reader) readAvaVotes(limit int) ([]AvaVote, error) {
 		if err != nil {
 			return nil, err
 		}
-		vote := AvaVote{HasOpinion: flag[0] != 0}
+		if flag[0] != 0 && flag[0] != 1 {
+			return nil, fmt.Errorf("invalid avalanche vote flag %d", flag[0])
+		}
+		vote := AvaVote{HasOpinion: flag[0] == 1}
 		copy(vote.TxID[:], hash)
+		if !vote.HasOpinion && vote.TxID != ([32]byte{}) {
+			return nil, errors.New("avalanche no-opinion vote must carry a zero txid")
+		}
 		out = append(out, vote)
 	}
 	return out, nil

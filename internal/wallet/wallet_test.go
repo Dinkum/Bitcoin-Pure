@@ -69,6 +69,41 @@ func TestCreateWalletAndReceiveAddress(t *testing.T) {
 	}
 }
 
+func TestCreateAndImportWalletReturnClonedWallets(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	created, _, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	created.Addresses[0].Address = "mutated"
+	loaded, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatalf("Wallet: %v", err)
+	}
+	if loaded.Addresses[0].Address == "mutated" {
+		t.Fatal("CreateWallet returned mutable store internals")
+	}
+
+	export := ExportFile{Wallet: loaded}
+	imported, err := store.ImportWallet(export, "bob")
+	if err != nil {
+		t.Fatalf("ImportWallet: %v", err)
+	}
+	imported.Addresses[0].Address = "also-mutated"
+	export.Wallet.Addresses[0].Address = "export-mutated"
+	export.Wallet.Addresses[0].PayloadHex = "export-payload-mutated"
+	reloaded, err := store.Wallet("bob")
+	if err != nil {
+		t.Fatalf("Wallet bob: %v", err)
+	}
+	if reloaded.Addresses[0].Address == "also-mutated" || reloaded.Addresses[0].Address == "export-mutated" || reloaded.Addresses[0].PayloadHex == "export-payload-mutated" {
+		t.Fatal("ImportWallet shared wallet slice backing arrays")
+	}
+}
+
 func TestBuildPQAuthPayloadUsesSpecFixedLayout(t *testing.T) {
 	verificationKey := make([]byte, bpcrypto.MLDSA65VerificationKeySize)
 	signature := make([]byte, bpcrypto.MLDSA65SignatureSize)
@@ -195,6 +230,29 @@ func TestBuildSendCreatesSignedTransactionAndChange(t *testing.T) {
 	}
 	if !loaded.Addresses[2].Change {
 		t.Fatal("expected generated change address to be marked as change")
+	}
+}
+
+func TestBuildSendRejectsAmountFeeOverflow(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	_, err = store.BuildSend("alice", first.Address, ^uint64(0), 1, []SpendableUTXO{{
+		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+		Value:    ^uint64(0),
+		PubKey:   keyHash,
+	}})
+	if !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("BuildSend err = %v, want ErrInsufficientFunds", err)
 	}
 }
 
@@ -356,6 +414,28 @@ func TestBalanceSeparatesImmatureCoinbase(t *testing.T) {
 	}
 }
 
+func TestBalanceRejectsOverflowingTotals(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	_, err = store.Balance("alice", []SpendableUTXO{
+		{OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0}, Value: ^uint64(0), PubKey: keyHash},
+		{OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 0}, Value: 1, PubKey: keyHash},
+	})
+	if err == nil || !strings.Contains(err.Error(), "overflow") {
+		t.Fatalf("Balance err = %v, want overflow", err)
+	}
+}
+
 func TestParseAndFormatBPUAmounts(t *testing.T) {
 	tests := []struct {
 		raw  string
@@ -380,6 +460,51 @@ func TestParseAndFormatBPUAmounts(t *testing.T) {
 	}
 	if _, err := ParseAmount("0.0000000001"); err == nil {
 		t.Fatal("expected too many BPU decimals to fail")
+	}
+	if _, err := ParseAmount("18446744073.709551616"); err == nil {
+		t.Fatal("expected overflowing BPU decimal to fail")
+	}
+}
+
+func TestWalletReadAPIsReturnDeepCopies(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	store.wallets[0].Pending = append(store.wallets[0].Pending, PendingTx{
+		TxID:  strings.Repeat("01", 32),
+		Spent: []PendingOutPoint{{Vout: 1}},
+		Outputs: []PendingOutput{{
+			Vout:      0,
+			Value:     1,
+			Address:   first.Address,
+			PubKeyHex: first.PubKeyHex,
+		}},
+	})
+
+	listed := store.List()
+	listed[0].Addresses[0].Address = "mutated"
+	listed[0].Pending[0].Spent[0].Vout = 99
+	listed[0].Pending[0].Outputs[0].Value = 99
+	loaded, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatalf("Wallet: %v", err)
+	}
+	if loaded.Addresses[0].Address == "mutated" || loaded.Pending[0].Spent[0].Vout == 99 || loaded.Pending[0].Outputs[0].Value == 99 {
+		t.Fatalf("List returned mutable store internals: %+v", loaded)
+	}
+
+	loaded.Addresses[0].Address = "also-mutated"
+	reloaded, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatalf("Wallet reload: %v", err)
+	}
+	if reloaded.Addresses[0].Address == "also-mutated" {
+		t.Fatal("Wallet returned mutable store internals")
 	}
 }
 
@@ -481,6 +606,29 @@ func TestBuildSendAutoChoosesFeeFromEstimatedSize(t *testing.T) {
 	}
 }
 
+func TestBuildSendAutoRejectsFeeOverflow(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	_, err = store.BuildSendAuto("alice", first.Address, 1, ^uint64(0), []SpendableUTXO{{
+		OutPoint: types.OutPoint{TxID: [32]byte{1}, Vout: 0},
+		Value:    ^uint64(0),
+		PubKey:   keyHash,
+	}})
+	if !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("BuildSendAuto err = %v, want ErrInsufficientFunds", err)
+	}
+}
+
 func TestMarkSubmittedTracksWalletOwnedOutputsForCPFP(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
 	if err != nil {
@@ -558,5 +706,33 @@ func TestBuildCPFPUsesPendingWalletOutput(t *testing.T) {
 	}
 	if child.Fee == 0 || child.Amount == 0 {
 		t.Fatalf("child fee/amount = %d/%d, want positive values", child.Fee, child.Amount)
+	}
+}
+
+func TestBuildCPFPRejectsFeeOverflow(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	parentTxID := [32]byte{9}
+	store.wallets[0].Pending = append(store.wallets[0].Pending, PendingTx{
+		TxID: hex.EncodeToString(parentTxID[:]),
+		Outputs: []PendingOutput{{
+			Vout:       0,
+			Value:      ^uint64(0),
+			Address:    first.Address,
+			Type:       first.OutputType(),
+			PayloadHex: first.PayloadHex,
+			PubKeyHex:  first.PubKeyHex,
+			Change:     true,
+		}},
+	})
+	_, err = store.BuildCPFP("alice", parentTxID, ^uint64(0))
+	if !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("BuildCPFP err = %v, want ErrInsufficientFunds", err)
 	}
 }
