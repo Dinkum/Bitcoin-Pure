@@ -114,7 +114,7 @@ func encodeLeaf(buf []byte, outPoint types.OutPoint, entry consensus.UtxoEntry) 
 	var vout [4]byte
 	binary.LittleEndian.PutUint32(vout[:], outPoint.Vout)
 	buf = append(buf, vout[:]...)
-	buf = appendCanonicalVarInt(buf, entry.Type)
+	buf = types.AppendCanonicalVarInt(buf, entry.Type)
 	var value [8]byte
 	binary.LittleEndian.PutUint64(value[:], entry.ValueAtoms)
 	buf = append(buf, value[:]...)
@@ -132,26 +132,4 @@ func mustParseBigInt(hex string) *big.Int {
 		panic("invalid big integer constant")
 	}
 	return v
-}
-
-func appendCanonicalVarInt(dst []byte, v uint64) []byte {
-	switch {
-	case v <= 0xfc:
-		return append(dst, byte(v))
-	case v <= 0xffff:
-		return append(dst, 0xfd, byte(v), byte(v>>8))
-	case v <= 0xffff_ffff:
-		return append(dst, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-	default:
-		return append(dst, 0xff,
-			byte(v),
-			byte(v>>8),
-			byte(v>>16),
-			byte(v>>24),
-			byte(v>>32),
-			byte(v>>40),
-			byte(v>>48),
-			byte(v>>56),
-		)
-	}
 }

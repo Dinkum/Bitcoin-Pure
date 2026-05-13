@@ -79,7 +79,7 @@ func (s *Service) CompactFilterByHash(blockHash [32]byte) (CompactFilterInfo, er
 	if entry == nil {
 		return CompactFilterInfo{}, fmt.Errorf("block index %x not found", blockHash)
 	}
-	filter := compactfilter.Build(blockHash, block, undo)
+	filter := compactfilter.Build(blockHash, block, compactFilterItemsForUndo(undo))
 	return CompactFilterInfo{
 		FilterType: compactfilter.Type(),
 		Height:     entry.Height,
@@ -222,7 +222,7 @@ func (s *Service) compactFilterForHash(blockHash [32]byte) (compactfilter.Filter
 	if err != nil {
 		return compactfilter.Filter{}, err
 	}
-	return compactfilter.Build(blockHash, block, undo), nil
+	return compactfilter.Build(blockHash, block, compactFilterItemsForUndo(undo)), nil
 }
 
 func decodeCompactFilterHash(raw string) ([32]byte, error) {

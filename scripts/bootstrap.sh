@@ -11,6 +11,8 @@ DATA_DIR="/var/lib/bitcoin-pure"
 LOG_DIR="/var/log/bitcoin-pure"
 BIN_LINK="/usr/local/bin/bpu-cli"
 SERVICE_NAME="bitcoin-pure"
+SERVICE_USER="bitcoin-pure"
+SERVICE_GROUP="bitcoin-pure"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 LOCK_PATH="/var/lock/${SERVICE_NAME}-install.lock"
 MOTD_PATH="/etc/update-motd.d/95-bitcoin-pure"
@@ -73,6 +75,15 @@ require_command() {
 	command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+ensure_service_account() {
+	if ! getent group "${SERVICE_GROUP}" >/dev/null; then
+		groupadd --system "${SERVICE_GROUP}"
+	fi
+	if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+		useradd --system --gid "${SERVICE_GROUP}" --home-dir "${DATA_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
+	fi
+}
+
 acquire_lock() {
 	mkdir -p "$(dirname "${LOCK_PATH}")"
 	exec 9>"${LOCK_PATH}"
@@ -87,6 +98,12 @@ metadata_value() {
 	key="$2"
 	[[ -f "${file}" ]] || return 0
 	sed -n "s/^${key}=//p" "${file}" | head -n 1
+}
+
+miner_wallet_marker_value() {
+	local key
+	key="$1"
+	metadata_value "${CURRENT_LINK}/.artifacts/miner-wallet-provisioned" "${key}"
 }
 
 resolve_repo_url() {
@@ -196,12 +213,17 @@ prepare_stage() {
 }
 
 install_candidate_file() {
-	local src dst mode tmp
+	local src dst mode owner group tmp
 	src="$1"
 	dst="$2"
 	mode="$3"
+	owner="${4:-}"
+	group="${5:-}"
 	tmp="${dst}.new"
 	install -D -m "${mode}" "${src}" "${tmp}"
+	if [[ -n "${owner}" || -n "${group}" ]]; then
+		chown "${owner:-root}:${group:-root}" "${tmp}"
+	fi
 	mv -f "${tmp}" "${dst}"
 }
 
@@ -280,6 +302,21 @@ ensure_live_service() {
 	fi
 }
 
+chown_wallet_paths() {
+	local wallet_path wallet_file
+	[[ -f "$1" ]] || return 0
+	while IFS= read -r wallet_path; do
+		[[ -n "${wallet_path}" ]] || continue
+		[[ "${wallet_path}" = /* ]] || fail "staged wallet path must be absolute: ${wallet_path}"
+		mkdir -p "${wallet_path}"
+		chown "${SERVICE_USER}:${SERVICE_GROUP}" "${wallet_path}"
+		wallet_file="${wallet_path}/wallets.json"
+		if [[ -e "${wallet_file}" ]]; then
+			chown "${SERVICE_USER}:${SERVICE_GROUP}" "${wallet_file}"
+		fi
+	done <"$1"
+}
+
 apply_release() {
 	local artifacts_dir
 	artifacts_dir="${STAGE_DIR}/.artifacts"
@@ -288,6 +325,10 @@ apply_release() {
 	[[ -f "${artifacts_dir}/config.json" ]] || fail "staged release legacy config sidecar is missing"
 	[[ -f "${artifacts_dir}/${SERVICE_NAME}.service" ]] || fail "staged release unit file is missing"
 	[[ -f "${artifacts_dir}/${SERVICE_NAME}.motd" ]] || fail "staged release motd helper is missing"
+
+	mkdir -p "${APP_ROOT}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
+	chown "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}" "${LOG_DIR}"
+	chown_wallet_paths "${artifacts_dir}/wallet-paths"
 
 	if release_is_unchanged; then
 		log "staged release matches the live install; leaving binaries and config in place"
@@ -298,15 +339,14 @@ apply_release() {
 
 	backup_live_state
 	ROLLBACK_NEEDED=1
-	mkdir -p "${APP_ROOT}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
 
 	log "installing staged config"
-	install_candidate_file "${artifacts_dir}/config.yaml" "${CONFIG_PATH}" 600
-	install_candidate_file "${artifacts_dir}/config.json" "${LEGACY_CONFIG_PATH}" 600
+	install_candidate_file "${artifacts_dir}/config.yaml" "${CONFIG_PATH}" 640 root "${SERVICE_GROUP}"
+	install_candidate_file "${artifacts_dir}/config.json" "${LEGACY_CONFIG_PATH}" 640 root "${SERVICE_GROUP}"
 	log "installing staged service unit"
-	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" 644
+	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" 644 root root
 	log "installing ssh monitor banner"
-	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.motd" "${MOTD_PATH}" 755
+	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.motd" "${MOTD_PATH}" 755 root root
 	log "switching current release"
 	switch_current_link
 	log "switching command symlink"
@@ -436,7 +476,7 @@ ssh_tunnel_user() {
 }
 
 print_install_summary() {
-	local version rpc_addr p2p_addr profile miner_enabled miner_workers service_state monitor_local monitor_public public_ip current_path rpc_host rpc_port tunnel_user tunnel_target
+	local version rpc_addr p2p_addr profile miner_enabled miner_workers service_state monitor_local monitor_public public_ip current_path rpc_host rpc_port tunnel_user tunnel_target miner_wallet_dir miner_receive_address
 	local -a config_lines
 	version="$(metadata_value "${CURRENT_LINK}/.bpu-release.env" "version")"
 	mapfile -t config_lines < <(python3 - "${LEGACY_CONFIG_PATH}" <<'PY'
@@ -468,6 +508,8 @@ PY
 	tunnel_user="$(ssh_tunnel_user)"
 	tunnel_target="${tunnel_user}@${public_ip:-$(hostname -f 2>/dev/null || hostname)}"
 	current_path="$(readlink -f "${CURRENT_LINK}" || true)"
+	miner_wallet_dir="$(miner_wallet_marker_value "wallet_dir")"
+	miner_receive_address="$(miner_wallet_marker_value "receive_address")"
 
 	cat <<EOF
 
@@ -500,18 +542,33 @@ EOF
 |   TOKEN=\$(python3 -c 'import json; print(json.load(open("${LEGACY_CONFIG_PATH}"))["rpc_auth_token"])')
 |   curl -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
 |     --data '{"method":"getinfo","params":{}}' ${monitor_local}
+EOF
+	if [[ -n "${miner_wallet_dir}" ]]; then
+		cat <<EOF
+|                                                                      |
+| Miner wallet was provisioned. Back it up now:                        |
+|   sudo bpu-cli wallet backup --config ${CONFIG_PATH} --out /root/bitcoin-pure-wallets.backup.json
+| Keep the backup private; it can spend mined rewards.                  |
+EOF
+		if [[ -n "${miner_receive_address}" ]]; then
+			printf '| Miner receive address: %s\n' "${miner_receive_address}"
+		fi
+	fi
+	cat <<EOF
 +======================================================================+
 
 EOF
 }
 
 restore_or_remove() {
-	local backup live mode
+	local backup live mode owner group
 	backup="$1"
 	live="$2"
 	mode="$3"
+	owner="${4:-}"
+	group="${5:-}"
 	if [[ -e "${backup}" || -L "${backup}" ]]; then
-		install_candidate_file "${backup}" "${live}" "${mode}"
+		install_candidate_file "${backup}" "${live}" "${mode}" "${owner}" "${group}"
 	else
 		rm -f "${live}"
 	fi
@@ -534,10 +591,10 @@ rollback_release() {
 	else
 		rm -f "${BIN_LINK}"
 	fi
-	restore_or_remove "${BACKUP_DIR}/config.yaml" "${CONFIG_PATH}" 600
-	restore_or_remove "${BACKUP_DIR}/config.json" "${LEGACY_CONFIG_PATH}" 600
-	restore_or_remove "${BACKUP_DIR}/unit.service" "${UNIT_PATH}" 644
-	restore_or_remove "${BACKUP_DIR}/motd" "${MOTD_PATH}" 755
+	restore_or_remove "${BACKUP_DIR}/config.yaml" "${CONFIG_PATH}" 640 root "${SERVICE_GROUP}"
+	restore_or_remove "${BACKUP_DIR}/config.json" "${LEGACY_CONFIG_PATH}" 640 root "${SERVICE_GROUP}"
+	restore_or_remove "${BACKUP_DIR}/unit.service" "${UNIT_PATH}" 644 root root
+	restore_or_remove "${BACKUP_DIR}/motd" "${MOTD_PATH}" 755 root root
 	systemctl daemon-reload
 	if [[ "${SERVICE_WAS_ACTIVE}" -eq 1 ]]; then
 		systemctl restart "${SERVICE_NAME}.service" || true
@@ -657,6 +714,7 @@ main() {
 	require_command systemctl
 	require_command curl
 	acquire_lock
+	ensure_service_account
 	stage_checkout
 	prepare_stage
 	apply_release

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,10 +11,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/storage"
+	"bitcoin-pure/internal/types"
 )
 
 // peerManager owns peer lifecycle: accept, connect, reconnect, bookkeeping,
@@ -150,14 +153,18 @@ func (m *peerManager) acceptLoop() {
 			continue
 		}
 		backoff = acceptLoopInitialBackoff
-		if !m.ensureInboundCapacity(conn.RemoteAddr().String()) {
+		if !m.reserveInboundHandshake(conn.RemoteAddr().String()) {
 			_ = conn.Close()
 			continue
 		}
+		releaseInbound := sync.OnceFunc(func() {
+			m.releaseInboundHandshake()
+		})
 		m.svc.safeGoWithCleanup("peer-handle-inbound", func() {
+			releaseInbound()
 			_ = conn.Close()
 		}, func() {
-			m.handlePeer(conn, false, "")
+			m.handlePeer(conn, false, "", releaseInbound)
 		})
 	}
 }
@@ -178,10 +185,11 @@ func waitForAcceptRetry(stopCh <-chan struct{}, backoff time.Duration) bool {
 	}
 }
 
-func (m *peerManager) ensureInboundCapacity(candidateAddr string) bool {
+func (m *peerManager) reserveInboundHandshake(candidateAddr string) bool {
 	m.svc.peerMu.Lock()
+	defer m.svc.peerMu.Unlock()
 	if m.svc.cfg.MaxInboundPeers <= 0 {
-		m.svc.peerMu.Unlock()
+		m.svc.pendingInboundPeers++
 		return true
 	}
 	inbound := 0
@@ -190,28 +198,25 @@ func (m *peerManager) ensureInboundCapacity(candidateAddr string) bool {
 			inbound++
 		}
 	}
-	if inbound < m.svc.cfg.MaxInboundPeers {
-		m.svc.peerMu.Unlock()
+	if inbound+m.svc.pendingInboundPeers < m.svc.cfg.MaxInboundPeers {
+		m.svc.pendingInboundPeers++
 		return true
 	}
-	now := time.Now()
-	localHeaderHeight := m.svc.headerHeight()
-	preferred := m.svc.syncManager().preferredDownloadPeerAddrsLocked(now, localHeaderHeight)
-	victim, victimState := m.selectInboundEvictionTargetLocked(now, localHeaderHeight, preferred)
-	if victim == nil {
-		m.svc.peerMu.Unlock()
-		m.svc.logger.Warn("rejecting inbound peer: all inbound slots currently protected",
-			slog.String("candidate_addr", candidateAddr),
-			slog.Int("max_inbound", m.svc.cfg.MaxInboundPeers),
-			slog.Int("inbound_peers", inbound),
-		)
-		return false
+	m.svc.logger.Warn("rejecting inbound peer: inbound slots or handshakes are saturated",
+		slog.String("candidate_addr", candidateAddr),
+		slog.Int("max_inbound", m.svc.cfg.MaxInboundPeers),
+		slog.Int("inbound_peers", inbound),
+		slog.Int("pending_inbound_peers", m.svc.pendingInboundPeers),
+	)
+	return false
+}
+
+func (m *peerManager) releaseInboundHandshake() {
+	m.svc.peerMu.Lock()
+	defer m.svc.peerMu.Unlock()
+	if m.svc.pendingInboundPeers > 0 {
+		m.svc.pendingInboundPeers--
 	}
-	delete(m.svc.peers, victim.addr)
-	m.svc.peerMu.Unlock()
-	m.logPeerEvictionDecision("evicting low-value inbound peer to admit candidate", candidateAddr, victim.addr, false, victimState, peerRetentionState{})
-	m.disconnectPeer(victim)
-	return true
 }
 
 func (m *peerManager) canAcceptInboundPeer() bool {
@@ -226,7 +231,7 @@ func (m *peerManager) canAcceptInboundPeer() bool {
 			inbound++
 		}
 	}
-	return inbound < m.svc.cfg.MaxInboundPeers
+	return inbound+m.svc.pendingInboundPeers < m.svc.cfg.MaxInboundPeers
 }
 
 func (m *peerManager) ConnectPeer(addr string) error {
@@ -351,7 +356,16 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 		}
 
 		m.svc.logger.Debug("connecting peer", slog.String("addr", addr))
-		conn, err := dialer.Dial("tcp", addr)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-m.svc.stopCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		cancel()
 		if err != nil {
 			consecutiveFailures++
 			m.recordKnownPeerFailure(addr, time.Now())
@@ -368,7 +382,16 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 			}
 			continue
 		}
-		if !m.handlePeer(conn, true, addr) {
+		handshakeDone := make(chan struct{})
+		go func() {
+			select {
+			case <-m.svc.stopCh:
+				_ = conn.Close()
+			case <-handshakeDone:
+			}
+		}()
+		if !m.handlePeer(conn, true, addr, nil) {
+			close(handshakeDone)
 			consecutiveFailures++
 			if consecutiveFailures >= autoPeerFailureCeiling && m.evictUnhealthyAutoPeer(addr) {
 				return
@@ -382,6 +405,7 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 			}
 			continue
 		}
+		close(handshakeDone)
 		consecutiveFailures = 0
 		backoff = time.Second
 		if !m.svc.sleepUntilStop(time.Second) {
@@ -390,14 +414,18 @@ func (m *peerManager) maintainOutboundPeer(addr string) {
 	}
 }
 
-func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string) (established bool) {
+func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string, releaseInboundHandshake func()) (established bool) {
 	remoteAddr := conn.RemoteAddr().String()
 	addr := remoteAddr
 	if outbound && targetAddr != "" {
 		addr = targetAddr
 	}
 	traffic := &peerTrafficMeter{}
-	wire := p2p.NewConn(&meteredNetConn{Conn: conn, meter: traffic}, p2p.MagicForProfile(m.svc.cfg.Profile), m.svc.cfg.MaxMessageBytes)
+	limits := types.DefaultCodecLimits()
+	if m.svc.cfg.MaxMessageBytes > 0 {
+		limits.MaxBlockBytes = m.svc.cfg.MaxMessageBytes
+	}
+	wire := p2p.NewConnWithLimits(&meteredNetConn{Conn: conn, meter: traffic}, p2p.MagicForProfile(m.svc.cfg.Profile), m.svc.cfg.MaxMessageBytes, limits)
 	remoteVersion, err := p2p.Handshake(wire, m.svc.localVersion(), m.svc.cfg.HandshakeTimeout)
 	if err != nil {
 		if outbound {
@@ -440,7 +468,29 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 	if outbound {
 		m.recordKnownPeerSuccess(addr, time.Now())
 	}
+	if !outbound && releaseInboundHandshake != nil {
+		releaseInboundHandshake()
+	}
 	m.svc.peerMu.Lock()
+	if !outbound {
+		inbound := 0
+		for _, existing := range m.svc.peers {
+			if !existing.outbound {
+				inbound++
+			}
+		}
+		if m.svc.cfg.MaxInboundPeers > 0 && inbound >= m.svc.cfg.MaxInboundPeers {
+			m.svc.peerMu.Unlock()
+			m.svc.logger.Warn("rejecting established inbound peer: inbound slots saturated",
+				slog.String("addr", addr),
+				slog.String("remote_addr", remoteAddr),
+				slog.Int("max_inbound", m.svc.cfg.MaxInboundPeers),
+				slog.Int("inbound_peers", inbound),
+			)
+			_ = conn.Close()
+			return false
+		}
+	}
 	m.svc.peers[addr] = peer
 	m.svc.peerMu.Unlock()
 	m.svc.logger.Debug("peer connected",
@@ -484,7 +534,9 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		m.peerWriteLoop(peer)
 	})
 
-	m.svc.requestSync(peer)
+	if err := m.svc.requestSync(peer); err != nil {
+		m.svc.logger.Warn("initial peer sync request failed", slog.String("addr", addr), slog.Any("error", err))
+	}
 	m.svc.safeGoWithCleanup("peer-ping-loop", peer.close, func() {
 		m.peerPingLoop(peer)
 	})

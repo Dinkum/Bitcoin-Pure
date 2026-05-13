@@ -196,7 +196,7 @@ func (p *peerConn) canServeDownloads(now time.Time) bool {
 	return stats.CooldownUntil.IsZero() || !stats.CooldownUntil.After(now)
 }
 
-func (m *syncManager) requestSync(peer *peerConn) {
+func (m *syncManager) requestSync(peer *peerConn) error {
 	m.svc.logger.Debug("nudging peer sync",
 		slog.String("addr", peer.addr),
 		slog.Uint64("tip_height", m.svc.blockHeight()),
@@ -204,9 +204,14 @@ func (m *syncManager) requestSync(peer *peerConn) {
 		slog.Uint64("peer_best_height", peer.snapshotHeight()),
 	)
 	if !m.svc.cfg.StaticPeerTopology {
-		_ = peer.send(p2p.GetAddrMessage{})
+		if err := peer.send(p2p.GetAddrMessage{}); err != nil {
+			m.svc.logger.Debug("getaddr enqueue failed during sync nudge",
+				slog.String("addr", peer.addr),
+				slog.Any("error", err),
+			)
+		}
 	}
-	_ = m.requestHeaders(peer, [32]byte{})
+	return m.requestHeaders(peer, [32]byte{})
 }
 
 func (m *syncManager) shouldPollIdleHeaders(now time.Time) bool {
@@ -618,7 +623,9 @@ func (m *syncManager) runSyncWatchdogStep() {
 			slog.Int("peers", len(peers)),
 		)
 		for _, peer := range peers {
-			m.requestSync(peer)
+			if err := m.requestSync(peer); err != nil {
+				m.svc.logger.Warn("sync watchdog header poll failed", slog.String("addr", peer.addr), slog.Any("error", err))
+			}
 		}
 		return
 	}
@@ -719,7 +726,9 @@ func (m *syncManager) runSyncWatchdogStep() {
 		slog.String("inflight_blocks", m.svc.inflightBlockDebugSummary(6)),
 	)
 	for _, peer := range peers {
-		m.requestSync(peer)
+		if err := m.requestSync(peer); err != nil {
+			m.svc.logger.Warn("sync watchdog header request failed", slog.String("addr", peer.addr), slog.Any("error", err))
+		}
 		if err := m.requestBlocks(peer); err != nil {
 			m.svc.logger.Warn("sync watchdog block request failed", slog.String("addr", peer.addr), slog.Any("error", err))
 		}

@@ -70,7 +70,7 @@ func LeafHash(leaf UtxoLeaf) [32]byte {
 	buf := scratch[:0]
 	key := leafKey(leaf.OutPoint)
 	buf = append(buf, key[:]...)
-	buf = appendCanonicalVarInt(buf, leaf.Type)
+	buf = types.AppendCanonicalVarInt(buf, leaf.Type)
 	buf = append(buf,
 		byte(leaf.ValueAtoms),
 		byte(leaf.ValueAtoms>>8),
@@ -423,28 +423,6 @@ func parallelBuildBudget() int {
 		return 0
 	}
 	return workers - 1
-}
-
-func appendCanonicalVarInt(dst []byte, v uint64) []byte {
-	switch {
-	case v <= 0xfc:
-		return append(dst, byte(v))
-	case v <= 0xffff:
-		return append(dst, 0xfd, byte(v), byte(v>>8))
-	case v <= 0xffff_ffff:
-		return append(dst, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-	default:
-		return append(dst, 0xff,
-			byte(v),
-			byte(v>>8),
-			byte(v>>16),
-			byte(v>>24),
-			byte(v>>32),
-			byte(v>>40),
-			byte(v>>48),
-			byte(v>>56),
-		)
-	}
 }
 
 func splitParallelBudget(budget int) (int, int) {

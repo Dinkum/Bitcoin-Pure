@@ -48,6 +48,7 @@ const (
 	maxServedBlocksPerGetData      = 16
 	erlayReconcileInterval         = 5 * time.Second
 	erlayReconcileBatchLimit       = 256
+	maxWalletActivityLimit         = 10_000
 	txRequestCoalesceDelay         = 2 * time.Millisecond
 	// Give distributed-origin submissions a slightly larger window to
 	// coalesce Erlay announcements before they fan out into tiny
@@ -280,6 +281,7 @@ type Service struct {
 	stateMu             sync.RWMutex
 	stressMu            sync.Mutex
 	peerMu              sync.RWMutex
+	pendingInboundPeers int
 	downloadMu          sync.Mutex
 	recentMu            sync.RWMutex
 	rebroadcastMu       sync.Mutex
@@ -325,6 +327,7 @@ type Service struct {
 	stopOnce            sync.Once
 	closeOnce           sync.Once
 	closeErr            error
+	rpcRequestSeq       atomic.Uint64
 	wg                  sync.WaitGroup
 }
 
@@ -1038,6 +1041,15 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 	if cfg.RPCMaxHeaderBytes <= 0 {
 		cfg.RPCMaxHeaderBytes = 8 << 10
 	}
+	if cfg.RPCReadTimeout <= 0 {
+		cfg.RPCReadTimeout = 5 * time.Second
+	}
+	if cfg.RPCWriteTimeout <= 0 {
+		cfg.RPCWriteTimeout = 15 * time.Minute
+	}
+	if cfg.RPCHeaderTimeout <= 0 {
+		cfg.RPCHeaderTimeout = 2 * time.Second
+	}
 	if cfg.RPCIdleTimeout <= 0 {
 		cfg.RPCIdleTimeout = 30 * time.Second
 	}
@@ -1424,7 +1436,10 @@ func (s *Service) reloadPersistedMempool() error {
 			_ = s.chainState.Store().ClearMempoolState()
 			return nil
 		}
+		txid := consensus.TxID(&tx)
 		accepted = append(accepted, mempool.PersistedEntry{
+			TxID:    txid,
+			AuthID:  consensus.AuthID(&tx),
 			Tx:      tx,
 			Summary: entry.Summary,
 			AddedAt: entry.AddedAt,
@@ -1441,12 +1456,18 @@ func (s *Service) reloadPersistedMempool() error {
 			_ = s.chainState.Store().ClearMempoolState()
 			return nil
 		}
+		txid := consensus.TxID(&tx)
 		orphans = append(orphans, mempool.PersistedOrphan{
+			TxID:    txid,
+			AuthID:  consensus.AuthID(&tx),
 			Tx:      tx,
 			AddedAt: entry.AddedAt,
 			Missing: append([]types.OutPoint(nil), entry.Missing...),
 		})
 	}
+	s.mempoolPersistMu.Lock()
+	s.mempoolPersistState = persistedStateFromStoredMempool(stored, accepted, orphans)
+	s.mempoolPersistMu.Unlock()
 	tip, ok := s.chainState.tipSnapshot()
 	if !ok {
 		return nil
@@ -1481,7 +1502,49 @@ func (s *Service) reloadPersistedMempool() error {
 	return s.flushMempoolPersistence()
 }
 
+func persistedStateFromStoredMempool(stored *storage.StoredMempoolState, entries []mempool.PersistedEntry, orphans []mempool.PersistedOrphan) persistedMempoolState {
+	if stored == nil {
+		return persistedMempoolState{}
+	}
+	state := persistedMempoolState{
+		Valid: true,
+		Meta: storage.StoredMempoolStateMeta{
+			Version:   stored.Version,
+			Profile:   stored.Profile,
+			TipHeight: stored.TipHeight,
+			TipHash:   stored.TipHash,
+		},
+		Entries: make(map[[32]byte]persistedMempoolEntryFingerprint, len(entries)),
+		Orphans: make(map[[32]byte]persistedMempoolOrphanFingerprint, len(orphans)),
+	}
+	if state.Meta.Version < 2 {
+		state.Meta.Version = 2
+		// Legacy checkpoints stored every tx inside meta/mempool_state. Treat
+		// the v2 per-tx keyspace as empty until the next flush rewrites all
+		// still-live entries or clears the legacy blob entirely.
+		return state
+	}
+	for _, entry := range entries {
+		state.Entries[entry.TxID] = persistedMempoolEntryFingerprint{
+			AuthID:  entry.AuthID,
+			Summary: entry.Summary,
+			AddedAt: entry.AddedAt,
+		}
+	}
+	for _, orphan := range orphans {
+		state.Orphans[orphan.TxID] = persistedMempoolOrphanFingerprint{
+			AuthID:  orphan.AuthID,
+			AddedAt: orphan.AddedAt,
+			Missing: append([]types.OutPoint(nil), orphan.Missing...),
+		}
+	}
+	return state
+}
+
 func (s *Service) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.logger.Info("starting node service")
 	started := false
 	defer func() {
@@ -1492,7 +1555,8 @@ func (s *Service) Start(ctx context.Context) error {
 	if s.cfg.RPCAddr != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", s.handleHTTP)
-		rpcListener, err := net.Listen("tcp", s.cfg.RPCAddr)
+		var listenConfig net.ListenConfig
+		rpcListener, err := listenConfig.Listen(ctx, "tcp", s.cfg.RPCAddr)
 		if err != nil {
 			return err
 		}
@@ -1515,8 +1579,12 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 		})
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.cfg.P2PAddr != "" {
-		ln, err := net.Listen("tcp", s.cfg.P2PAddr)
+		var listenConfig net.ListenConfig
+		ln, err := listenConfig.Listen(ctx, "tcp", s.cfg.P2PAddr)
 		if err != nil {
 			return err
 		}
@@ -1526,13 +1594,22 @@ func (s *Service) Start(ctx context.Context) error {
 			s.acceptLoop()
 		})
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, addr := range s.cfg.Peers {
 		if addr == "" {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := s.ConnectPeer(addr); err != nil {
 			s.logger.Warn("peer dial failed", slog.String("addr", addr), slog.Any("error", err))
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if s.publicPage {
 		if err := s.recordDashboardSystemSample(); err != nil {
@@ -1657,7 +1734,7 @@ func (s *Service) ConnectPeer(addr string) error    { return s.peerManager().Con
 func (s *Service) outboundPeerCount() int           { return s.peerManager().outboundPeerCount() }
 func (s *Service) maintainOutboundPeer(addr string) { s.peerManager().maintainOutboundPeer(addr) }
 func (s *Service) handlePeer(conn net.Conn, outbound bool, targetAddr string) {
-	s.peerManager().handlePeer(conn, outbound, targetAddr)
+	s.peerManager().handlePeer(conn, outbound, targetAddr, nil)
 }
 func (s *Service) peerPingLoop(peer *peerConn)  { s.peerManager().peerPingLoop(peer) }
 func (s *Service) peerWriteLoop(peer *peerConn) { s.peerManager().peerWriteLoop(peer) }
@@ -2105,17 +2182,32 @@ func (p *peerConn) clearRelayState() {
 
 func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bool {
 	if s.cfg.StallTimeout > 0 {
-		_ = peer.wire.SetWriteDeadline(time.Now().Add(s.cfg.StallTimeout))
+		if err := peer.wire.SetWriteDeadline(time.Now().Add(s.cfg.StallTimeout)); err != nil {
+			s.logPeerWriteFailure(peer, envelope, err, "peer write deadline setup failed")
+			peer.releaseQueuedInv(envelope.invItems)
+			peer.releaseRelayBatch(envelope.msg)
+			peer.close()
+			_ = peer.wire.Close()
+			return false
+		}
+		defer func() {
+			if err := peer.wire.SetWriteDeadline(time.Time{}); err != nil && s.logger != nil {
+				s.logger.Debug("peer write deadline clear failed",
+					slog.String("addr", peer.addr),
+					slog.String("target_addr", peer.targetAddr),
+					slog.Bool("outbound", peer.outbound),
+					slog.Any("error", err),
+				)
+			}
+		}()
 	}
 	if err := peer.wire.WriteMessage(envelope.msg); err != nil {
+		s.logPeerWriteFailure(peer, envelope, err, "peer write failed")
 		peer.releaseQueuedInv(envelope.invItems)
 		peer.releaseRelayBatch(envelope.msg)
 		peer.close()
 		_ = peer.wire.Close()
 		return false
-	}
-	if s.cfg.StallTimeout > 0 {
-		_ = peer.wire.SetWriteDeadline(time.Time{})
 	}
 	peer.noteKnownTxs(envelope.msg)
 	peer.releaseQueuedInv(envelope.invItems)
@@ -2128,6 +2220,40 @@ func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bo
 	}
 	s.noteRelaySent(envelope.class)
 	return true
+}
+
+func (s *Service) logPeerWriteFailure(peer *peerConn, envelope outboundMessage, err error, message string) {
+	if s == nil || s.logger == nil || peer == nil {
+		return
+	}
+	level := slog.LevelDebug
+	if isTimeoutError(err) {
+		level = slog.LevelWarn
+	}
+	depths := peer.queueDepths()
+	attrs := []slog.Attr{
+		slog.String("addr", peer.addr),
+		slog.String("target_addr", peer.targetAddr),
+		slog.Bool("outbound", peer.outbound),
+		slog.String("type", fmt.Sprintf("%T", envelope.msg)),
+		slog.String("lane", envelope.lane.String()),
+		slog.Int("queue_depth", depths.total),
+		slog.Int("control_queue_depth", depths.control),
+		slog.Int("priority_queue_depth", depths.priority),
+		slog.Int("send_queue_depth", depths.send),
+		slog.Duration("stall_timeout", s.cfg.StallTimeout),
+		slog.Any("error", err),
+	}
+	if !envelope.enqueuedAt.IsZero() {
+		attrs = append(attrs, slog.Duration("enqueue_age", time.Since(envelope.enqueuedAt)))
+	}
+	attrs = append(attrs, envelope.class.logAttrs()...)
+	s.logger.LogAttrs(context.Background(), level, message, attrs...)
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
@@ -2487,31 +2613,33 @@ func (s *Service) UTXOsByWatchItems(items []compactfilter.WatchItem) []PubKeyUTX
 	if len(items) == 0 {
 		return nil
 	}
-	wanted := make(map[compactfilter.WatchItem]struct{}, len(items))
-	for _, item := range items {
-		wanted[item] = struct{}{}
+	indexed, err := s.chainState.Store().WalletUTXOsByWatchItems(storageWatchItems(items))
+	if err != nil {
+		s.logger.Warn("load wallet utxos by watch item failed", slog.Any("error", err))
+		return nil
 	}
-	out := make([]PubKeyUTXO, 0)
-	if err := s.chainState.Store().ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
-		item := compactFilterItemForUTXO(entry)
-		if _, ok := wanted[item]; !ok {
-			return nil
-		}
+	s.stateMu.RLock()
+	view, ok := s.chainState.sharedCommittedView()
+	s.stateMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	params := consensus.ParamsForProfile(s.cfg.Profile)
+	out := make([]PubKeyUTXO, 0, len(indexed))
+	for _, indexedUTXO := range indexed {
+		item := compactFilterItemForUTXO(indexedUTXO.Entry)
+		confirmations := view.Height - indexedUTXO.Height + 1
 		out = append(out, PubKeyUTXO{
-			OutPoint:  outPoint,
-			Value:     entry.ValueAtoms,
-			Type:      item.Type,
-			Payload32: item.Payload32,
-			PubKey:    entry.PubKey,
+			OutPoint:      indexedUTXO.OutPoint,
+			Value:         indexedUTXO.Entry.ValueAtoms,
+			Type:          item.Type,
+			Payload32:     item.Payload32,
+			PubKey:        indexedUTXO.Entry.PubKey,
+			Height:        indexedUTXO.Height,
+			Confirmations: confirmations,
+			Coinbase:      indexedUTXO.Coinbase,
+			Mature:        !indexedUTXO.Coinbase || confirmations >= params.CoinbaseMaturity,
 		})
-		return nil
-	}); err != nil {
-		s.logger.Warn("scan utxos by watch item failed", slog.Any("error", err))
-		return nil
-	}
-	if err := s.annotateWalletUTXOOrigins(out); err != nil {
-		s.logger.Warn("annotate wallet utxos failed", slog.Any("error", err))
-		return nil
 	}
 	slices.SortFunc(out, func(a, b PubKeyUTXO) int {
 		switch {
@@ -2655,45 +2783,23 @@ func (s *Service) WalletActivityByWatchItems(items []compactfilter.WatchItem, li
 	if len(items) == 0 {
 		return nil, nil
 	}
-	s.stateMu.RLock()
-	view, ok := s.chainState.sharedCommittedView()
-	s.stateMu.RUnlock()
-	if !ok {
-		return nil, ErrNoTip
+	records, err := s.chainState.Store().WalletActivityByWatchItems(storageWatchItems(items), limit)
+	if err != nil {
+		return nil, err
 	}
-	wanted := make(map[compactfilter.WatchItem]struct{}, len(items))
-	for _, item := range items {
-		wanted[item] = struct{}{}
-	}
-	out := make([]WalletActivity, 0)
-	for height := view.Height + 1; height > 0; height-- {
-		blockHeight := height - 1
-		hash, err := s.chainState.Store().GetBlockHashByHeight(blockHeight)
-		if err != nil {
-			return nil, err
-		}
-		if hash == nil {
-			continue
-		}
-		block, err := s.chainState.Store().GetBlock(hash)
-		if err != nil {
-			return nil, err
-		}
-		if block == nil {
-			continue
-		}
-		undo, err := s.chainState.Store().GetUndo(hash)
-		if err != nil {
-			return nil, err
-		}
-		items, err := walletActivityFromBlock(blockHeight, *hash, block, undo, wanted)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, items...)
-		if limit > 0 && len(out) >= limit {
-			return out[:limit], nil
-		}
+	out := make([]WalletActivity, 0, len(records))
+	for _, record := range records {
+		out = append(out, WalletActivity{
+			TxID:      record.TxID,
+			BlockHash: record.BlockHash,
+			Height:    record.Height,
+			Timestamp: time.Unix(int64(record.Timestamp), 0).UTC(),
+			Coinbase:  record.Coinbase,
+			Received:  record.Received,
+			Sent:      record.Sent,
+			Fee:       record.Fee,
+			Net:       int64(record.Received) - int64(record.Sent),
+		})
 	}
 	return out, nil
 }
@@ -2704,6 +2810,17 @@ func (s *Service) WalletActivityByPubKeys(pubKeys [][32]byte, limit int) ([]Wall
 		items = append(items, compactfilter.WatchItem{Type: types.OutputXOnlyP2PK, Payload32: pubKey})
 	}
 	return s.WalletActivityByWatchItems(items, limit)
+}
+
+func validateWalletActivityLimit(limit int) error {
+	switch {
+	case limit <= 0:
+		return errors.New("wallet activity limit must be positive")
+	case limit > maxWalletActivityLimit:
+		return fmt.Errorf("wallet activity limit must be <= %d", maxWalletActivityLimit)
+	default:
+		return nil
+	}
 }
 
 func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, undo []storage.BlockUndoEntry, wanted map[compactfilter.WatchItem]struct{}) ([]WalletActivity, error) {
@@ -2762,11 +2879,7 @@ func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, u
 }
 
 func compactFilterItemForOutput(output types.TxOutput) compactfilter.WatchItem {
-	item := compactfilter.WatchItem{Type: output.Type, Payload32: output.Payload32}
-	if item.Type == types.OutputXOnlyP2PK && item.Payload32 == ([32]byte{}) {
-		item.Payload32 = output.PubKey
-	}
-	return item
+	return compactfilter.WatchItemForOutput(output)
 }
 
 func compactFilterItemForUTXO(entry consensus.UtxoEntry) compactfilter.WatchItem {
@@ -2775,6 +2888,25 @@ func compactFilterItemForUTXO(entry consensus.UtxoEntry) compactfilter.WatchItem
 		item.Payload32 = entry.PubKey
 	}
 	return item
+}
+
+func compactFilterItemsForUndo(undo []storage.BlockUndoEntry) []compactfilter.WatchItem {
+	if len(undo) == 0 {
+		return nil
+	}
+	items := make([]compactfilter.WatchItem, 0, len(undo))
+	for _, spent := range undo {
+		items = append(items, compactFilterItemForUTXO(spent.Entry))
+	}
+	return items
+}
+
+func storageWatchItems(items []compactfilter.WatchItem) []storage.WalletWatchItem {
+	out := make([]storage.WalletWatchItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, storage.WalletWatchItem{Type: item.Type, Payload32: item.Payload32})
+	}
+	return out
 }
 
 // The node-side accumulator/template paths must build the exact same typed leaf
@@ -5784,12 +5916,27 @@ func (s *Service) dashboardHealth(info ServiceInfo, peers []PeerInfo) string {
 }
 
 func (s *Service) handleRPC(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	requestID := s.nextRPCRequestID()
 	if r.Method != http.MethodPost {
+		s.logger.Warn("rpc request rejected",
+			slog.String("request_id", requestID),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.String("http_method", r.Method),
+			slog.Int("status_code", http.StatusMethodNotAllowed),
+			slog.Duration("duration", time.Since(started)),
+		)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	defer r.Body.Close()
 	if !s.authorizeRPC(r) {
+		s.logger.Warn("rpc request rejected",
+			slog.String("request_id", requestID),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.Int("status_code", http.StatusUnauthorized),
+			slog.Duration("duration", time.Since(started)),
+		)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -5798,26 +5945,93 @@ func (s *Service) handleRPC(w http.ResponseWriter, r *http.Request) {
 		body = http.MaxBytesReader(w, r.Body, int64(s.cfg.RPCMaxBodyBytes))
 	}
 	var req rpcRequest
-	if err := json.NewDecoder(body).Decode(&req); err != nil {
-		s.logger.Warn("rpc decode failed", slog.String("remote_addr", r.RemoteAddr), slog.Any("error", err))
-		_ = json.NewEncoder(w).Encode(rpcResponse{Error: err.Error()})
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(&req); err != nil {
+		s.logger.Warn("rpc decode failed",
+			slog.String("request_id", requestID),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.Int("status_code", http.StatusOK),
+			slog.Duration("duration", time.Since(started)),
+			slog.Any("error", err),
+		)
+		s.writeRPCResponse(w, requestID, r.RemoteAddr, "", started, rpcResponse{Error: err.Error()})
 		return
 	}
-	s.logger.Debug("rpc request", slog.String("remote_addr", r.RemoteAddr), slog.String("method", req.Method))
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("trailing data after RPC request")
+		}
+		s.logger.Warn("rpc decode failed",
+			slog.String("request_id", requestID),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.String("method", req.Method),
+			slog.Int("status_code", http.StatusOK),
+			slog.Duration("duration", time.Since(started)),
+			slog.Any("error", err),
+		)
+		s.writeRPCResponse(w, requestID, r.RemoteAddr, req.Method, started, rpcResponse{Error: err.Error()})
+		return
+	}
+	s.logger.Debug("rpc request",
+		slog.String("request_id", requestID),
+		slog.String("remote_addr", r.RemoteAddr),
+		slog.String("method", req.Method),
+	)
 	result, err := s.dispatchRPC(req)
 	resp := rpcResponse{Result: result}
 	if err != nil {
 		if shouldDebugRPCFailure(req.Method, err) {
-			s.logger.Debug("rpc request failed", slog.String("method", req.Method), slog.Any("error", err))
+			s.logger.Debug("rpc request failed",
+				slog.String("request_id", requestID),
+				slog.String("remote_addr", r.RemoteAddr),
+				slog.String("method", req.Method),
+				slog.Int("status_code", http.StatusOK),
+				slog.Duration("duration", time.Since(started)),
+				slog.Any("error", err),
+			)
 		} else {
-			s.logger.Warn("rpc request failed", slog.String("method", req.Method), slog.Any("error", err))
+			s.logger.Warn("rpc request failed",
+				slog.String("request_id", requestID),
+				slog.String("remote_addr", r.RemoteAddr),
+				slog.String("method", req.Method),
+				slog.Int("status_code", http.StatusOK),
+				slog.Duration("duration", time.Since(started)),
+				slog.Any("error", err),
+			)
 		}
 		resp.Error = err.Error()
 		resp.Result = nil
 	} else {
-		s.logger.Debug("rpc request completed", slog.String("method", req.Method))
+		s.logger.Debug("rpc request completed",
+			slog.String("request_id", requestID),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.String("method", req.Method),
+			slog.Int("status_code", http.StatusOK),
+			slog.Duration("duration", time.Since(started)),
+		)
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	s.writeRPCResponse(w, requestID, r.RemoteAddr, req.Method, started, resp)
+}
+
+func (s *Service) writeRPCResponse(w http.ResponseWriter, requestID string, remoteAddr string, method string, started time.Time, resp rpcResponse) {
+	if err := json.NewEncoder(w).Encode(resp); err != nil && s.logger != nil {
+		s.logger.Warn("rpc response write failed",
+			slog.String("request_id", requestID),
+			slog.String("remote_addr", remoteAddr),
+			slog.String("method", method),
+			slog.Int("status_code", http.StatusOK),
+			slog.Duration("duration", time.Since(started)),
+			slog.Any("error", err),
+		)
+	}
+}
+
+func (s *Service) nextRPCRequestID() string {
+	if s == nil {
+		return "rpc_0"
+	}
+	return fmt.Sprintf("rpc_%d", s.rpcRequestSeq.Add(1))
 }
 
 func shouldDebugRPCFailure(method string, err error) bool {
@@ -5935,6 +6149,30 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			out = append(out, hex.EncodeToString(entry.TxID[:]))
 		}
 		return out, nil
+	case "gettxstatus":
+		var params struct {
+			TxID string `json:"txid"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, err
+		}
+		txid, err := decodeHashHex(params.TxID)
+		if err != nil {
+			return nil, err
+		}
+		blockHash, confirmed, err := s.findActiveTxBlockHash(txid)
+		if err != nil {
+			return nil, err
+		}
+		result := map[string]any{
+			"txid":      hex.EncodeToString(txid[:]),
+			"confirmed": confirmed,
+			"mempool":   s.pool.Contains(txid),
+		}
+		if confirmed {
+			result["block_hash"] = hex.EncodeToString(blockHash[:])
+		}
+		return result, nil
 	case "getutxosbypubkeys":
 		var params struct {
 			PubKeys []string `json:"pubkeys"`
@@ -6135,6 +6373,9 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, err
 		}
+		if err := validateWalletActivityLimit(params.Limit); err != nil {
+			return nil, err
+		}
 		pubKeys := make([][32]byte, 0, len(params.PubKeys))
 		for _, raw := range params.PubKeys {
 			pubKey, err := ParseMinerPubKey(raw)
@@ -6171,6 +6412,9 @@ func (s *Service) dispatchRPC(req rpcRequest) (any, error) {
 			Limit int `json:"limit"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, err
+		}
+		if err := validateWalletActivityLimit(params.Limit); err != nil {
 			return nil, err
 		}
 		items := make([]compactfilter.WatchItem, 0, len(params.WatchItems))
@@ -6520,7 +6764,7 @@ func (s *Service) cachedCandidateFeeLine() dashboardCandidateFeeLine {
 	return line
 }
 
-func (s *Service) requestSync(peer *peerConn) { s.syncManager().requestSync(peer) }
+func (s *Service) requestSync(peer *peerConn) error { return s.syncManager().requestSync(peer) }
 func (s *Service) requestHeaders(peer *peerConn, stopHash [32]byte) error {
 	return s.syncManager().requestHeaders(peer, stopHash)
 }

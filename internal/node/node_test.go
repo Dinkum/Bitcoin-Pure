@@ -2416,6 +2416,30 @@ func TestGetWalletActivityByPubKeysRPC(t *testing.T) {
 	}
 }
 
+func TestGetWalletActivityRPCRejectsUnboundedLimit(t *testing.T) {
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	svc, err := OpenService(ServiceConfig{
+		Profile: types.Regtest,
+		DBPath:  t.TempDir(),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	pubKey7 := nodeSignerPubKey(7)
+	params, err := json.Marshal(map[string]any{
+		"pubkeys": []string{hex.EncodeToString(pubKey7[:])},
+		"limit":   0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.dispatchRPC(rpcRequest{Method: "getwalletactivitybypubkeys", Params: params}); err == nil || !strings.Contains(err.Error(), "limit must be positive") {
+		t.Fatalf("dispatchRPC err = %v, want positive limit error", err)
+	}
+}
+
 func TestEstimateFeeRPC(t *testing.T) {
 	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	genesis.Txs[0].Base.Outputs[0].ValueAtoms = 5_000
@@ -8116,8 +8140,8 @@ func TestEmitThroughputSummaryLogsExpectedFields(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
 		t.Fatalf("unmarshal summary log: %v", err)
 	}
-	if got := entry["msg"]; got != "throughput summary" {
-		t.Fatalf("msg = %v, want throughput summary", got)
+	if got := entry["message"]; got != "throughput summary" {
+		t.Fatalf("message = %v, want throughput summary", got)
 	}
 	if got := int(entry["admitted_txs"].(float64)); got != 2 {
 		t.Fatalf("admitted_txs = %d, want 2", got)
@@ -8306,21 +8330,21 @@ func TestEmitNodeStatusLogsPhaseTransitionsAndHealthSnapshot(t *testing.T) {
 		entries = append(entries, entry)
 	}
 
-	if got := entries[0]["msg"]; got != "sync phase changed" {
-		t.Fatalf("first msg = %v, want sync phase changed", got)
+	if got := entries[0]["message"]; got != "sync phase changed" {
+		t.Fatalf("first message = %v, want sync phase changed", got)
 	}
 	if got := entries[0]["to"]; got != "catching_up_blocks" {
 		t.Fatalf("sync phase = %v, want catching_up_blocks", got)
 	}
-	if got := entries[1]["msg"]; got != "mempool pressure changed" {
-		t.Fatalf("second msg = %v, want mempool pressure changed", got)
+	if got := entries[1]["message"]; got != "mempool pressure changed" {
+		t.Fatalf("second message = %v, want mempool pressure changed", got)
 	}
 	if got := entries[1]["to"]; got != "normal" {
 		t.Fatalf("mempool pressure = %v, want normal", got)
 	}
 	status := entries[2]
-	if got := status["msg"]; got != "node status" {
-		t.Fatalf("status msg = %v, want node status", got)
+	if got := status["message"]; got != "node status" {
+		t.Fatalf("status message = %v, want node status", got)
 	}
 	if got := status["node"]; got != "NODE1234" {
 		t.Fatalf("node = %v, want NODE1234", got)
@@ -8469,7 +8493,7 @@ func TestRelayPeerStatsExposeLanePressureCounters(t *testing.T) {
 	}
 }
 
-func TestEnsureInboundCapacityEvictsLowValuePeerAndLogs(t *testing.T) {
+func TestReserveInboundHandshakeRejectsWhenEstablishedSlotsFull(t *testing.T) {
 	var buf bytes.Buffer
 	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "info"})
 	if err != nil {
@@ -8501,22 +8525,22 @@ func TestEnsureInboundCapacityEvictsLowValuePeerAndLogs(t *testing.T) {
 		stopCh: make(chan struct{}),
 	}
 
-	if ok := svc.peerManager().ensureInboundCapacity("127.0.0.1:19000"); !ok {
-		t.Fatal("expected inbound capacity manager to evict low-value peer")
+	if ok := svc.peerManager().reserveInboundHandshake("127.0.0.1:19000"); ok {
+		t.Fatal("expected inbound handshake reservation to reject when established slots are full")
 	}
-	if _, ok := svc.peers[low.addr]; ok {
-		t.Fatalf("expected low-value peer %s to be evicted", low.addr)
+	if _, ok := svc.peers[low.addr]; !ok {
+		t.Fatalf("expected established low-value peer %s to remain until a candidate completes handshake", low.addr)
 	}
 	logged := buf.String()
-	if !strings.Contains(logged, "evicting low-value inbound peer to admit candidate") {
-		t.Fatalf("expected inbound eviction log, got %s", logged)
+	if !strings.Contains(logged, "inbound slots or handshakes are saturated") {
+		t.Fatalf("expected inbound reservation rejection log, got %s", logged)
 	}
-	if !strings.Contains(logged, low.addr) || !strings.Contains(logged, "127.0.0.1:19000") {
-		t.Fatalf("expected candidate and victim in inbound eviction log, got %s", logged)
+	if !strings.Contains(logged, "127.0.0.1:19000") {
+		t.Fatalf("expected candidate in inbound reservation rejection log, got %s", logged)
 	}
 }
 
-func TestEnsureInboundCapacityRejectsWhenPeersProtected(t *testing.T) {
+func TestReserveInboundHandshakeCountsPendingHandshakes(t *testing.T) {
 	var buf bytes.Buffer
 	logger, err := logging.NewLogger(&buf, logging.Config{Format: "json", Level: "info"})
 	if err != nil {
@@ -8544,12 +8568,21 @@ func TestEnsureInboundCapacityRejectsWhenPeersProtected(t *testing.T) {
 		stopCh: make(chan struct{}),
 	}
 
-	if ok := svc.peerManager().ensureInboundCapacity("127.0.0.1:19001"); ok {
-		t.Fatal("expected inbound capacity manager to reject candidate when peers are protected")
+	if ok := svc.peerManager().reserveInboundHandshake("127.0.0.1:19001"); ok {
+		t.Fatal("expected inbound handshake reservation to reject candidate when slots are full")
 	}
-	if !strings.Contains(buf.String(), "all inbound slots currently protected") {
-		t.Fatalf("expected protected inbound rejection log, got %s", buf.String())
+	if !strings.Contains(buf.String(), "inbound slots or handshakes are saturated") {
+		t.Fatalf("expected inbound reservation rejection log, got %s", buf.String())
 	}
+
+	svc.cfg.MaxInboundPeers = 3
+	if ok := svc.peerManager().reserveInboundHandshake("127.0.0.1:19002"); !ok {
+		t.Fatal("expected one pending inbound handshake to fit")
+	}
+	if ok := svc.peerManager().reserveInboundHandshake("127.0.0.1:19003"); ok {
+		t.Fatal("expected pending inbound handshake to count against capacity")
+	}
+	svc.peerManager().releaseInboundHandshake()
 }
 
 func TestReserveOutboundTargetReplacesLowValuePeerAndLogs(t *testing.T) {

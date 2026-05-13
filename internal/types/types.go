@@ -385,10 +385,7 @@ func decodeTxInput(r *reader) (TxInput, error) {
 func (o TxOutput) Encode(out *[]byte) {
 	writeVarInt(out, o.Type)
 	writeU64LE(out, o.ValueAtoms)
-	payload32 := o.Payload32
-	if payload32 == ([32]byte{}) && o.Type == OutputXOnlyP2PK {
-		payload32 = o.PubKey
-	}
+	payload32 := o.CanonicalPayload32()
 	*out = append(*out, payload32[:]...)
 }
 
@@ -828,14 +825,21 @@ func (o TxOutput) XOnlyPubKey() ([32]byte, bool) {
 	if o.Type != OutputXOnlyP2PK {
 		return [32]byte{}, false
 	}
-	return o.Payload32, true
+	return o.CanonicalPayload32(), true
 }
 
 func (o TxOutput) PQLock() ([32]byte, bool) {
 	if o.Type != OutputPQLock32 {
 		return [32]byte{}, false
 	}
-	return o.Payload32, true
+	return o.CanonicalPayload32(), true
+}
+
+func (o TxOutput) CanonicalPayload32() [32]byte {
+	if o.Type == OutputXOnlyP2PK && o.Payload32 == ([32]byte{}) {
+		return o.PubKey
+	}
+	return o.Payload32
 }
 
 func (e TxAuthEntry) XOnlySignature() ([64]byte, bool) {

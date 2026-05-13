@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"container/heap"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ var (
 	metaLocalityNextSeqKey   = []byte("meta/locality_next_seq")
 	metaJournalNextSeqKey    = []byte("meta/journal_next_seq")
 	metaDerivedJournalSeqKey = []byte("meta/derived_journal_seq")
+	metaWalletIndexHeightKey = []byte("meta/wallet_index_height")
 	mempoolEntryPrefix       = []byte("mempool_entry/")
 	mempoolOrphanPrefix      = []byte("mempool_orphan/")
 	blockPrefix              = []byte("blocks/")
@@ -46,7 +48,13 @@ var (
 	snapshotUTXOPrefix       = []byte("snapshot_utxo/")
 	localitySeqPrefix        = []byte("locality_seq/")
 	localityMetaPrefix       = []byte("locality_meta/")
+	walletOriginPrefix       = []byte("wallet_origin/")
+	walletUTXOPrefix         = []byte("wallet_utxo/")
+	walletActivityItemPrefix = []byte("wallet_activity_item/")
+	walletActivityHtPrefix   = []byte("wallet_activity_height/")
 )
+
+const walletIndexChunkSize = 10_000
 
 var (
 	knownPeerPrefixEnd     = prefixUpperBound(knownPeerPrefix)
@@ -56,6 +64,10 @@ var (
 	snapshotUTXOPrefixEnd  = prefixUpperBound(snapshotUTXOPrefix)
 	localitySeqPrefixEnd   = prefixUpperBound(localitySeqPrefix)
 	localityMetaPrefixEnd  = prefixUpperBound(localityMetaPrefix)
+	walletOriginPrefixEnd  = prefixUpperBound(walletOriginPrefix)
+	walletUTXOPrefixEnd    = prefixUpperBound(walletUTXOPrefix)
+	walletActItemPrefixEnd = prefixUpperBound(walletActivityItemPrefix)
+	walletActHtPrefixEnd   = prefixUpperBound(walletActivityHtPrefix)
 )
 
 var (
@@ -178,6 +190,35 @@ type BlockUndoEntry struct {
 	Entry    consensus.UtxoEntry
 }
 
+type WalletWatchItem struct {
+	Type      uint64
+	Payload32 [32]byte
+}
+
+type WalletIndexedUTXO struct {
+	OutPoint types.OutPoint
+	Entry    consensus.UtxoEntry
+	Height   uint64
+	Coinbase bool
+}
+
+type WalletActivityRecord struct {
+	TxID      [32]byte
+	BlockHash [32]byte
+	Height    uint64
+	Timestamp uint64
+	Coinbase  bool
+	Received  uint64
+	Sent      uint64
+	Fee       uint64
+}
+
+type walletOriginRecord struct {
+	Entry    consensus.UtxoEntry
+	Height   uint64
+	Coinbase bool
+}
+
 type HeaderBatchEntry struct {
 	Height    uint64
 	Header    types.BlockHeader
@@ -188,11 +229,12 @@ type ChainStore struct {
 	db     *pebble.DB
 	logger *slog.Logger
 
-	deriveNotify chan struct{}
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
-	closeOnce    sync.Once
-	closeErr     error
+	walletIndexMu sync.Mutex
+	deriveNotify  chan struct{}
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 type chainJournalKind uint8
@@ -216,10 +258,23 @@ type chainJournalEntry struct {
 	Pairs        []chainJournalHeightHash
 }
 
-type noopLogger struct{}
+type pebbleLogger struct {
+	logger *slog.Logger
+}
 
-func (noopLogger) Infof(string, ...interface{})  {}
-func (noopLogger) Fatalf(string, ...interface{}) {}
+func (l pebbleLogger) Infof(format string, args ...interface{}) {
+	if l.logger != nil {
+		l.logger.Debug("pebble", slog.String("pebble_message", fmt.Sprintf(format, args...)))
+	}
+}
+
+func (l pebbleLogger) Fatalf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if l.logger != nil {
+		l.logger.Error("pebble fatal error", slog.String("pebble_message", msg))
+	}
+	panic(msg)
+}
 
 // OpenOptions holds optional Pebble tuning for point-read-heavy workloads.
 // Zero values preserve Pebble defaults so existing callers keep their current
@@ -242,7 +297,7 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		logger = logging.Component("storage")
 	}
 	logger.Info("opening pebble chain store", slog.String("path", path))
-	pebbleOpts := &pebble.Options{Logger: noopLogger{}}
+	pebbleOpts := &pebble.Options{Logger: pebbleLogger{logger: logger}}
 	if opts.PebbleCacheBytes > 0 {
 		cache := pebble.NewCache(opts.PebbleCacheBytes)
 		defer cache.Unref()
@@ -421,7 +476,14 @@ func (s *ChainStore) UTXOLookupWithErr() consensus.UtxoLookupWithErr {
 // misses. This is suitable for non-consensus read paths only.
 func (s *ChainStore) UTXOLookupFunc() consensus.UtxoLookup {
 	return func(out types.OutPoint) (consensus.UtxoEntry, bool) {
-		entry, ok, _ := s.GetUTXO(out)
+		entry, ok, err := s.GetUTXO(out)
+		if err != nil && s.logger != nil {
+			s.logger.Warn("utxo lookup failed",
+				slog.String("txid", fmt.Sprintf("%x", out.TxID)),
+				slog.Uint64("vout", uint64(out.Vout)),
+				slog.Any("error", err),
+			)
+		}
 		return entry, ok
 	}
 }
@@ -562,6 +624,224 @@ func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO,
 	}
 	slices.SortFunc(items, compareLocalityItems)
 	return items, nil
+}
+
+func (s *ChainStore) WalletUTXOsByWatchItems(items []WalletWatchItem) ([]WalletIndexedUTXO, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if err := s.requireWalletIndexReady(); err != nil {
+		return nil, err
+	}
+	out := make([]WalletIndexedUTXO, 0)
+	for _, item := range uniqueWalletWatchItems(items) {
+		prefix := walletUTXOItemPrefix(item)
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: prefixUpperBound(prefix),
+		})
+		if err != nil {
+			return nil, err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			outPoint, err := decodeOutPoint(iter.Key()[len(prefix):])
+			if err != nil {
+				iter.Close()
+				return nil, err
+			}
+			record, err := decodeWalletIndexedUTXO(iter.Value())
+			if err != nil {
+				iter.Close()
+				return nil, err
+			}
+			record.OutPoint = outPoint
+			out = append(out, record)
+		}
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return nil, err
+		}
+		iter.Close()
+	}
+	slices.SortFunc(out, compareWalletIndexedUTXOs)
+	return out, nil
+}
+
+func (s *ChainStore) WalletActivityByWatchItems(items []WalletWatchItem, limit int) ([]WalletActivityRecord, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if err := s.requireWalletIndexReady(); err != nil {
+		return nil, err
+	}
+	uniqueItems := uniqueWalletWatchItems(items)
+	cursors := make([]*walletActivityCursor, 0, len(uniqueItems))
+	for _, item := range uniqueItems {
+		prefix := walletActivityItemWatchPrefix(item)
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: prefixUpperBound(prefix),
+		})
+		if err != nil {
+			return nil, err
+		}
+		cursor := &walletActivityCursor{iter: iter}
+		if err := cursor.first(); err != nil {
+			iter.Close()
+			return nil, err
+		}
+		if cursor.valid {
+			cursors = append(cursors, cursor)
+		} else {
+			iter.Close()
+		}
+	}
+	defer func() {
+		for _, cursor := range cursors {
+			cursor.iter.Close()
+		}
+	}()
+
+	activityHeap := walletActivityHeap(cursors)
+	heap.Init(&activityHeap)
+	out := make([]WalletActivityRecord, 0)
+	for activityHeap.Len() > 0 && (limit <= 0 || len(out) < limit) {
+		cursor := heap.Pop(&activityHeap).(*walletActivityCursor)
+		record := cursor.record
+		if err := cursor.next(); err != nil {
+			return nil, err
+		}
+		if cursor.valid {
+			heap.Push(&activityHeap, cursor)
+		}
+		for activityHeap.Len() > 0 {
+			next := activityHeap[0]
+			if next.record.Height != record.Height || next.record.TxID != record.TxID {
+				break
+			}
+			next = heap.Pop(&activityHeap).(*walletActivityCursor)
+			record.Received += next.record.Received
+			record.Sent += next.record.Sent
+			if next.record.Fee > record.Fee {
+				record.Fee = next.record.Fee
+			}
+			if err := next.next(); err != nil {
+				return nil, err
+			}
+			if next.valid {
+				heap.Push(&activityHeap, next)
+			}
+		}
+		out = append(out, record)
+	}
+	return out, nil
+}
+
+func (s *ChainStore) WalletIndexHeight() (*uint64, error) {
+	buf, err := s.get(metaWalletIndexHeightKey)
+	if err != nil {
+		return nil, err
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	height, err := decodeU64(buf)
+	if err != nil {
+		return nil, err
+	}
+	return &height, nil
+}
+
+func (s *ChainStore) requireWalletIndexReady() error {
+	height, err := s.WalletIndexHeight()
+	if err != nil {
+		return err
+	}
+	if height == nil {
+		return errors.New("wallet index is not ready")
+	}
+	chainMeta, err := s.LoadChainStateMeta()
+	if err != nil {
+		return err
+	}
+	if chainMeta == nil {
+		return errors.New("chain state is not ready")
+	}
+	if *height != chainMeta.Height {
+		return fmt.Errorf("wallet index height %d does not match chain height %d", *height, chainMeta.Height)
+	}
+	return nil
+}
+
+func uniqueWalletWatchItems(items []WalletWatchItem) []WalletWatchItem {
+	if len(items) < 2 {
+		return items
+	}
+	seen := make(map[WalletWatchItem]struct{}, len(items))
+	out := make([]WalletWatchItem, 0, len(items))
+	for _, item := range items {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+type walletActivityCursor struct {
+	iter   *pebble.Iterator
+	record WalletActivityRecord
+	valid  bool
+}
+
+func (c *walletActivityCursor) first() error {
+	c.valid = c.iter.First()
+	if !c.valid {
+		return c.iter.Error()
+	}
+	return c.decode()
+}
+
+func (c *walletActivityCursor) next() error {
+	c.valid = c.iter.Next()
+	if !c.valid {
+		return c.iter.Error()
+	}
+	return c.decode()
+}
+
+func (c *walletActivityCursor) decode() error {
+	record, err := decodeWalletActivityRecord(c.iter.Value())
+	if err != nil {
+		return err
+	}
+	c.record = record
+	return nil
+}
+
+type walletActivityHeap []*walletActivityCursor
+
+func (h walletActivityHeap) Len() int { return len(h) }
+
+func (h walletActivityHeap) Less(i, j int) bool {
+	return compareWalletActivityRecords(h[i].record, h[j].record) < 0
+}
+
+func (h walletActivityHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *walletActivityHeap) Push(x any) {
+	*h = append(*h, x.(*walletActivityCursor))
+}
+
+func (h *walletActivityHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 func keepLocalityItem(items []LocalityIndexedUTXO, item LocalityIndexedUTXO, limit int) []LocalityIndexedUTXO {
@@ -962,10 +1242,42 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 }
 
 func (s *ChainStore) WriteFullState(state *StoredChainState) error {
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+	return s.writeFullStateLocked(state, nil, nil, nil)
+}
+
+func (s *ChainStore) WriteFullStateWithFastSyncStateMetadata(state *StoredChainState, fastSyncState *FastSyncState, headerState *StoredHeaderState, activeEntries []BlockIndexEntry) error {
+	if fastSyncState == nil {
+		return errors.New("fast sync state is required")
+	}
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+	return s.writeFullStateLocked(state, fastSyncState, headerState, activeEntries)
+}
+
+func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState *FastSyncState, headerState *StoredHeaderState, activeEntries []BlockIndexEntry) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeMeta(batch, state); err != nil {
 		return err
+	}
+	if headerState != nil {
+		if err := writeHeaderMeta(batch, headerState); err != nil {
+			return err
+		}
+	}
+	if fastSyncState != nil {
+		encoded, err := json.Marshal(fastSyncState)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set(metaFastSyncStateKey, encoded, nil); err != nil {
+			return err
+		}
+		if err := deletePrefixBatch(s.db, batch, snapshotUTXOPrefix, snapshotUTXOPrefixEnd); err != nil {
+			return err
+		}
 	}
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: utxoPrefix,
@@ -988,8 +1300,30 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 			return err
 		}
 	}
+	if err := invalidateWalletIndexesBatch(batch); err != nil {
+		return err
+	}
 	if err := s.rebuildLocalityIndexBatch(batch, state.UTXOs); err != nil {
 		return err
+	}
+	if len(activeEntries) > 0 {
+		pairs := journalPairsFromEntries(activeEntries)
+		if err := s.appendJournalEntriesBatch(batch,
+			chainJournalEntry{
+				Kind:         journalRewriteBlockHeights,
+				ForkHeight:   0,
+				OldTipHeight: 0,
+				Pairs:        pairs,
+			},
+			chainJournalEntry{
+				Kind:         journalRewriteHeaderHeights,
+				ForkHeight:   0,
+				OldTipHeight: 0,
+				Pairs:        pairs,
+			},
+		); err != nil {
+			return err
+		}
 	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
@@ -1045,6 +1379,45 @@ func (s *ChainStore) WriteFastSyncState(state *FastSyncState, snapshot consensus
 	s.logger.Info("wrote fast-sync snapshot state",
 		slog.Uint64("height", state.SnapshotHeight),
 		slog.Int("utxo_count", len(snapshot)),
+	)
+	return nil
+}
+
+func (s *ChainStore) WriteFastSyncStateMetadata(state *FastSyncState) error {
+	if state == nil {
+		return errors.New("fast sync state is required")
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(metaFastSyncStateKey, encoded, nil); err != nil {
+		return err
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: snapshotUTXOPrefix,
+		UpperBound: snapshotUTXOPrefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		return err
+	}
+	s.logger.Info("wrote fast-sync snapshot metadata",
+		slog.Uint64("height", state.SnapshotHeight),
+		slog.Int("utxo_count", state.SnapshotUTXOCount),
 	)
 	return nil
 }
@@ -1137,6 +1510,9 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if err := s.applyLocalityRewriteBatch(batch, previous.UTXOs, next.UTXOs); err != nil {
 		return err
 	}
+	if err := invalidateWalletIndexesBatch(batch); err != nil {
+		return err
+	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
@@ -1158,6 +1534,9 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 		return errors.New("reorg chain metadata is required")
 	}
 
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeMetaFromMeta(batch, meta); err != nil {
@@ -1174,6 +1553,18 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 		}
 	}
 	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
+		return err
+	}
+	walletReady, err := s.walletIndexReadyForReorg(oldTipHeight)
+	if err != nil {
+		return err
+	}
+	if walletReady {
+		err = s.applyWalletReorgBatch(batch, spent, created, forkHeight, oldTipHeight, activeEntries)
+	} else {
+		err = invalidateWalletIndexesBatch(batch)
+	}
+	if err != nil {
 		return err
 	}
 	pairs := journalPairsFromEntries(activeEntries)
@@ -1338,13 +1729,23 @@ func (s *ChainStore) AppendBlock(state *StoredChainState, block *types.Block, sp
 	if err != nil {
 		return err
 	}
-	return s.AppendValidatedBlock(state, block, &entry, nil, spent, created)
+	return s.AppendValidatedBlockMeta(storedChainStateMeta(state), block, &entry, nil, spent, created)
 }
 
 func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	return s.AppendValidatedBlockMeta(storedChainStateMeta(state), block, entry, undo, spent, created)
+}
+
+func (s *ChainStore) AppendValidatedBlockMeta(state *StoredChainStateMeta, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	if state == nil {
+		return errors.New("chain state metadata is required")
+	}
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := writeMeta(batch, state); err != nil {
+	if err := writeMetaFromMeta(batch, state); err != nil {
 		return err
 	}
 	if err := putBlockBatch(batch, block, *entry, false); err != nil {
@@ -1365,6 +1766,18 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 		}
 	}
 	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
+		return err
+	}
+	walletReady, err := s.walletIndexReadyForAppend(state.Height)
+	if err != nil {
+		return err
+	}
+	if walletReady {
+		err = s.applyWalletActiveBlockBatch(batch, state.Height, hash, block, undo, spent, created)
+	} else {
+		err = invalidateWalletIndexesBatch(batch)
+	}
+	if err != nil {
 		return err
 	}
 	if err := s.appendJournalEntriesBatch(batch,
@@ -1393,12 +1806,68 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 }
 
 func (s *ChainStore) PutValidatedBlock(block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry) error {
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := putBlockBatch(batch, block, *entry, false); err != nil {
 		return err
 	}
 	hash := consensus.HeaderHash(&block.Header)
+	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
+		return err
+	}
+	if err := putWalletOriginsForBlockBatch(batch, entry.Height, hash, block); err != nil {
+		return err
+	}
+	return batch.Commit(consensusCriticalWriteOptions)
+}
+
+func (s *ChainStore) PutValidatedBlockWithoutWalletIndex(block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry) error {
+	if block == nil || entry == nil {
+		return errors.New("block and index entry are required")
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := putBlockBatch(batch, block, *entry, false); err != nil {
+		return err
+	}
+	hash := consensus.HeaderHash(&block.Header)
+	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
+		return err
+	}
+	return batch.Commit(consensusCriticalWriteOptions)
+}
+
+func (s *ChainStore) PutValidatedBlocksWithoutWalletIndex(blocks []types.Block, entries []BlockIndexEntry) error {
+	if len(blocks) != len(entries) {
+		return fmt.Errorf("block batch length mismatch: blocks=%d entries=%d", len(blocks), len(entries))
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for i := range blocks {
+		if err := putBlockBatch(batch, &blocks[i], entries[i], false); err != nil {
+			return err
+		}
+		hash := consensus.HeaderHash(&blocks[i].Header)
+		if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(nil), nil); err != nil {
+			return err
+		}
+	}
+	return batch.Commit(consensusCriticalWriteOptions)
+}
+
+func (s *ChainStore) PutValidatedBlockUndo(entry *BlockIndexEntry, undo []BlockUndoEntry) error {
+	if entry == nil {
+		return errors.New("block index entry is required")
+	}
+	hash := consensus.HeaderHash(&entry.Header)
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(blockIndexKey(hash), encodeBlockIndexEntry(*entry), nil); err != nil {
+		return err
+	}
 	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
 		return err
 	}
@@ -1904,6 +2373,16 @@ func (s *ChainStore) applyLocalityDeltaBatch(batch *pebble.Batch, spent []types.
 	}
 	sortOutPointsCanonical(orderedCreated)
 	for _, outPoint := range orderedCreated {
+		if oldSeq, ok, err := s.localitySeqForOutPoint(outPoint); err != nil {
+			return err
+		} else if ok {
+			if err := batch.Delete(localitySeqKey(oldSeq), nil); err != nil {
+				return err
+			}
+			if err := batch.Delete(localityMetaKey(outPoint), nil); err != nil {
+				return err
+			}
+		}
 		if err := batch.Set(localitySeqKey(nextSeq), encodeLocalitySeqValue(outPoint, created[outPoint]), nil); err != nil {
 			return err
 		}
@@ -1913,6 +2392,474 @@ func (s *ChainStore) applyLocalityDeltaBatch(batch *pebble.Batch, spent []types.
 		nextSeq++
 	}
 	return batch.Set(metaLocalityNextSeqKey, encodeU64(nextSeq), nil)
+}
+
+func (s *ChainStore) RebuildWalletIndexes(tipHeight uint64) error {
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+	return s.rebuildWalletIndexesLocked(tipHeight)
+}
+
+func (s *ChainStore) RebuildWalletIndexesAtCurrentTip() (uint64, error) {
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+	meta, err := s.LoadChainStateMeta()
+	if err != nil {
+		return 0, err
+	}
+	if meta == nil {
+		return 0, errors.New("chain state is not ready")
+	}
+	return meta.Height, s.rebuildWalletIndexesLocked(meta.Height)
+}
+
+func (s *ChainStore) rebuildWalletIndexesLocked(tipHeight uint64) error {
+	batch := s.db.NewBatch()
+	if err := s.deleteWalletIndexesBatch(batch); err != nil {
+		batch.Close()
+		return err
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		batch.Close()
+		return err
+	}
+	batch.Close()
+
+	batch = s.db.NewBatch()
+	for height := uint64(0); height <= tipHeight; height++ {
+		hash, err := s.GetBlockHashByHeight(height)
+		if err != nil {
+			batch.Close()
+			return err
+		}
+		if hash == nil {
+			batch.Close()
+			return fmt.Errorf("missing active block hash at height %d during wallet index rebuild", height)
+		}
+		block, err := s.GetBlock(hash)
+		if err != nil {
+			batch.Close()
+			return err
+		}
+		if block == nil {
+			batch.Close()
+			return fmt.Errorf("missing active block %x at height %d during wallet index rebuild", *hash, height)
+		}
+		undo, err := s.GetUndo(hash)
+		if err != nil {
+			batch.Close()
+			return err
+		}
+		if err := putWalletOriginsForBlockBatchWithMap(batch, height, *hash, block, nil); err != nil {
+			batch.Close()
+			return err
+		}
+		if err := putWalletActivityForBlockBatch(batch, height, *hash, block, undo); err != nil {
+			batch.Close()
+			return err
+		}
+		if height%1000 == 999 {
+			if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+				batch.Close()
+				return err
+			}
+			batch.Close()
+			batch = s.db.NewBatch()
+		}
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		batch.Close()
+		return err
+	}
+	batch.Close()
+
+	batch = s.db.NewBatch()
+	writtenUTXOs := 0
+	if err := s.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		origin, ok, err := s.walletOrigin(outPoint)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := batch.Set(walletUTXOKey(walletWatchItemForEntry(entry), outPoint), encodeWalletIndexedUTXO(WalletIndexedUTXO{
+			Entry:    entry,
+			Height:   origin.Height,
+			Coinbase: origin.Coinbase,
+		}), nil); err != nil {
+			return err
+		}
+		writtenUTXOs++
+		if writtenUTXOs%10_000 != 0 {
+			return nil
+		}
+		if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+			return err
+		}
+		batch.Close()
+		batch = s.db.NewBatch()
+		return nil
+	}); err != nil {
+		batch.Close()
+		return err
+	}
+	if err := batch.Set(metaWalletIndexHeightKey, encodeU64(tipHeight), nil); err != nil {
+		batch.Close()
+		return err
+	}
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		batch.Close()
+		return err
+	}
+	batch.Close()
+	s.logger.Info("rebuilt wallet indexes", slog.Uint64("height", tipHeight))
+	return nil
+}
+
+func (s *ChainStore) walletIndexReadyForAppend(height uint64) (bool, error) {
+	indexHeight, err := s.WalletIndexHeight()
+	if err != nil {
+		return false, err
+	}
+	if indexHeight == nil {
+		return height == 0, nil
+	}
+	if height == 0 {
+		return *indexHeight == 0, nil
+	}
+	return *indexHeight == height-1, nil
+}
+
+func (s *ChainStore) walletIndexReadyForReorg(oldTipHeight uint64) (bool, error) {
+	indexHeight, err := s.WalletIndexHeight()
+	if err != nil {
+		return false, err
+	}
+	return indexHeight != nil && *indexHeight == oldTipHeight, nil
+}
+
+func (s *ChainStore) applyWalletActiveBlockBatch(batch *pebble.Batch, height uint64, hash [32]byte, block *types.Block, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	origins := make(map[types.OutPoint]walletOriginRecord)
+	if err := putWalletOriginsForBlockBatchWithMap(batch, height, hash, block, origins); err != nil {
+		return err
+	}
+	if err := putWalletActivityForBlockBatch(batch, height, hash, block, undo); err != nil {
+		return err
+	}
+	if err := s.applyWalletUTXODeltaBatch(batch, spent, created, origins); err != nil {
+		return err
+	}
+	return batch.Set(metaWalletIndexHeightKey, encodeU64(height), nil)
+}
+
+func (s *ChainStore) applyWalletReorgBatch(batch *pebble.Batch, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []BlockIndexEntry) error {
+	if err := s.deleteWalletActivityHeightRangeBatch(batch, forkHeight+1, oldTipHeight); err != nil {
+		return err
+	}
+	origins := make(map[types.OutPoint]walletOriginRecord)
+	for _, entry := range activeEntries {
+		hash := consensus.HeaderHash(&entry.Header)
+		block, err := s.GetBlock(&hash)
+		if err != nil {
+			return err
+		}
+		if block == nil {
+			return fmt.Errorf("missing active block for wallet reorg index %x", hash)
+		}
+		undo, err := s.GetUndo(&hash)
+		if err != nil {
+			return err
+		}
+		if err := putWalletOriginsForBlockBatchWithMap(batch, entry.Height, hash, block, origins); err != nil {
+			return err
+		}
+		if err := putWalletActivityForBlockBatch(batch, entry.Height, hash, block, undo); err != nil {
+			return err
+		}
+	}
+	if err := s.applyWalletUTXODeltaBatch(batch, spent, created, origins); err != nil {
+		return err
+	}
+	if len(activeEntries) == 0 {
+		return batch.Delete(metaWalletIndexHeightKey, nil)
+	}
+	return batch.Set(metaWalletIndexHeightKey, encodeU64(activeEntries[len(activeEntries)-1].Height), nil)
+}
+
+func (s *ChainStore) applyWalletUTXODeltaBatch(batch *pebble.Batch, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, origins map[types.OutPoint]walletOriginRecord) error {
+	for _, outPoint := range spent {
+		origin, ok, err := s.walletOrigin(outPoint)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := batch.Delete(walletUTXOKey(walletWatchItemForEntry(origin.Entry), outPoint), nil); err != nil {
+			return err
+		}
+	}
+	for outPoint, entry := range created {
+		origin, ok := origins[outPoint]
+		if !ok {
+			var err error
+			origin, ok, err = s.walletOrigin(outPoint)
+			if err != nil {
+				return err
+			}
+		}
+		if !ok {
+			continue
+		}
+		origin.Entry = entry
+		if err := batch.Set(walletUTXOKey(walletWatchItemForEntry(entry), outPoint), encodeWalletIndexedUTXO(WalletIndexedUTXO{
+			Entry:    entry,
+			Height:   origin.Height,
+			Coinbase: origin.Coinbase,
+		}), nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func putWalletOriginsForBlockBatch(batch *pebble.Batch, height uint64, hash [32]byte, block *types.Block) error {
+	return putWalletOriginsForBlockBatchWithMap(batch, height, hash, block, nil)
+}
+
+func putWalletOriginsForBlockBatchWithMap(batch *pebble.Batch, height uint64, _ [32]byte, block *types.Block, origins map[types.OutPoint]walletOriginRecord) error {
+	if block == nil {
+		return nil
+	}
+	for txIndex := range block.Txs {
+		txid := consensus.TxID(&block.Txs[txIndex])
+		for vout, output := range block.Txs[txIndex].Base.Outputs {
+			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+			entry := consensus.UtxoEntryFromOutput(output)
+			record := walletOriginRecord{Entry: entry, Height: height, Coinbase: txIndex == 0}
+			if origins != nil {
+				origins[outPoint] = record
+			}
+			if err := batch.Set(walletOriginKey(outPoint), encodeWalletOrigin(record), nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func putWalletActivityForBlockBatch(batch *pebble.Batch, height uint64, hash [32]byte, block *types.Block, undo []BlockUndoEntry) error {
+	if block == nil {
+		return nil
+	}
+	timestamp := block.Header.Timestamp
+	undoIndex := 0
+	createdInBlock := make(map[types.OutPoint]consensus.UtxoEntry)
+	for txIndex, tx := range block.Txs {
+		type itemDelta struct {
+			received uint64
+			sent     uint64
+		}
+		deltas := make(map[WalletWatchItem]itemDelta)
+		for _, output := range tx.Base.Outputs {
+			item := walletWatchItemForOutput(output)
+			delta := deltas[item]
+			delta.received += output.ValueAtoms
+			deltas[item] = delta
+		}
+		inputSum := uint64(0)
+		if txIndex > 0 {
+			for _, input := range tx.Base.Inputs {
+				if entry, ok := createdInBlock[input.PrevOut]; ok {
+					inputSum += entry.ValueAtoms
+					item := walletWatchItemForEntry(entry)
+					delta := deltas[item]
+					delta.sent += entry.ValueAtoms
+					deltas[item] = delta
+					continue
+				}
+				if undoIndex >= len(undo) {
+					return fmt.Errorf("missing wallet activity undo for height %d input %v", height, input.PrevOut)
+				}
+				undoEntry := undo[undoIndex]
+				if undoEntry.OutPoint != input.PrevOut {
+					return fmt.Errorf("wallet activity undo mismatch for height %d input %v: got %v", height, input.PrevOut, undoEntry.OutPoint)
+				}
+				entry := undoEntry.Entry
+				undoIndex++
+				inputSum += entry.ValueAtoms
+				item := walletWatchItemForEntry(entry)
+				delta := deltas[item]
+				delta.sent += entry.ValueAtoms
+				deltas[item] = delta
+			}
+		}
+		txid := consensus.TxID(&tx)
+		for vout, output := range tx.Base.Outputs {
+			createdInBlock[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
+		}
+		if len(deltas) == 0 {
+			continue
+		}
+		outputSum := uint64(0)
+		for _, output := range tx.Base.Outputs {
+			outputSum += output.ValueAtoms
+		}
+		fee := uint64(0)
+		if txIndex > 0 && inputSum >= outputSum {
+			fee = inputSum - outputSum
+		}
+		for item, delta := range deltas {
+			if delta.received == 0 && delta.sent == 0 {
+				continue
+			}
+			itemFee := uint64(0)
+			if delta.sent > 0 {
+				itemFee = fee
+			}
+			record := WalletActivityRecord{
+				TxID:      txid,
+				BlockHash: hash,
+				Height:    height,
+				Timestamp: timestamp,
+				Coinbase:  txIndex == 0,
+				Received:  delta.received,
+				Sent:      delta.sent,
+				Fee:       itemFee,
+			}
+			encoded := encodeWalletActivityRecord(record)
+			if err := batch.Set(walletActivityItemKey(item, height, txid), encoded, nil); err != nil {
+				return err
+			}
+			if err := batch.Set(walletActivityHeightKey(height, item, txid), nil, nil); err != nil {
+				return err
+			}
+		}
+	}
+	if undoIndex != len(undo) {
+		return fmt.Errorf("unused wallet activity undo entries at height %d: used=%d total=%d", height, undoIndex, len(undo))
+	}
+	return nil
+}
+
+func (s *ChainStore) deleteWalletActivityHeightBatch(batch *pebble.Batch, height uint64) error {
+	prefix := walletActivityHeightPrefixForHeight(height)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		item, txid, err := decodeWalletActivityHeightKey(iter.Key(), height)
+		if err != nil {
+			return err
+		}
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+		if err := batch.Delete(walletActivityItemKey(item, height, txid), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func (s *ChainStore) deleteWalletActivityHeightRangeBatch(batch *pebble.Batch, firstHeight uint64, lastHeight uint64) error {
+	if firstHeight > lastHeight {
+		return nil
+	}
+	lower := walletActivityHeightPrefixForHeight(firstHeight)
+	var upper []byte
+	if lastHeight == ^uint64(0) {
+		upper = walletActHtPrefixEnd
+	} else {
+		upper = walletActivityHeightPrefixForHeight(lastHeight + 1)
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if len(iter.Key()) < len(walletActivityHtPrefix)+8 {
+			return errors.New("invalid wallet activity height key")
+		}
+		height, err := decodeU64BE(iter.Key()[len(walletActivityHtPrefix) : len(walletActivityHtPrefix)+8])
+		if err != nil {
+			return err
+		}
+		item, txid, err := decodeWalletActivityHeightKey(iter.Key(), height)
+		if err != nil {
+			return err
+		}
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+		if err := batch.Delete(walletActivityItemKey(item, height, txid), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func (s *ChainStore) deleteWalletIndexesBatch(batch *pebble.Batch) error {
+	for _, bounds := range []struct {
+		lower []byte
+		upper []byte
+	}{
+		{walletOriginPrefix, walletOriginPrefixEnd},
+		{walletUTXOPrefix, walletUTXOPrefixEnd},
+		{walletActivityItemPrefix, walletActItemPrefixEnd},
+		{walletActivityHtPrefix, walletActHtPrefixEnd},
+	} {
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: bounds.lower,
+			UpperBound: bounds.upper,
+		})
+		if err != nil {
+			return err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+				iter.Close()
+				return err
+			}
+		}
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return err
+		}
+		iter.Close()
+	}
+	return batch.Delete(metaWalletIndexHeightKey, nil)
+}
+
+func invalidateWalletIndexesBatch(batch *pebble.Batch) error {
+	return batch.Delete(metaWalletIndexHeightKey, nil)
+}
+
+func deletePrefixBatch(db *pebble.DB, batch *pebble.Batch, lower, upper []byte) error {
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }
 
 func (s *ChainStore) applyLocalityRewriteBatch(batch *pebble.Batch, previous consensus.UtxoSet, next consensus.UtxoSet) error {
@@ -1979,17 +2926,24 @@ func compareOutPoints(a, b types.OutPoint) int {
 }
 
 func writeMeta(batch *pebble.Batch, state *StoredChainState) error {
+	return writeMetaFromMeta(batch, storedChainStateMeta(state))
+}
+
+func storedChainStateMeta(state *StoredChainState) *StoredChainStateMeta {
+	if state == nil {
+		return nil
+	}
 	checksum := state.UTXOChecksum
 	if checksum == ([32]byte{}) {
 		checksum = utxochecksum.Compute(state.UTXOs)
 	}
-	return writeMetaFromMeta(batch, &StoredChainStateMeta{
+	return &StoredChainStateMeta{
 		Profile:        state.Profile,
 		Height:         state.Height,
 		TipHeader:      state.TipHeader,
 		BlockSizeState: state.BlockSizeState,
 		UTXOChecksum:   checksum,
-	})
+	}
 }
 
 func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
@@ -2069,6 +3023,12 @@ func encodeU64(v uint64) []byte {
 	return out
 }
 
+func encodeU64BE(v uint64) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, v)
+	return out
+}
+
 func encodeI64(v int64) []byte {
 	out := make([]byte, 8)
 	binary.LittleEndian.PutUint64(out, uint64(v))
@@ -2080,6 +3040,13 @@ func decodeU64(buf []byte) (uint64, error) {
 		return 0, errors.New("invalid u64 encoding")
 	}
 	return binary.LittleEndian.Uint64(buf), nil
+}
+
+func decodeU64BE(buf []byte) (uint64, error) {
+	if len(buf) != 8 {
+		return 0, errors.New("invalid u64 encoding")
+	}
+	return binary.BigEndian.Uint64(buf), nil
 }
 
 func decodeI64(buf []byte) (int64, error) {
@@ -2139,6 +3106,48 @@ func snapshotUTXOKey(outPoint types.OutPoint) []byte {
 	return buf
 }
 
+func walletOriginKey(outPoint types.OutPoint) []byte {
+	buf := append([]byte(nil), walletOriginPrefix...)
+	outPoint.Encode(&buf)
+	return buf
+}
+
+func walletUTXOItemPrefix(item WalletWatchItem) []byte {
+	buf := append([]byte(nil), walletUTXOPrefix...)
+	encodeWalletWatchItem(&buf, item)
+	return buf
+}
+
+func walletUTXOKey(item WalletWatchItem, outPoint types.OutPoint) []byte {
+	buf := walletUTXOItemPrefix(item)
+	outPoint.Encode(&buf)
+	return buf
+}
+
+func walletActivityItemWatchPrefix(item WalletWatchItem) []byte {
+	buf := append([]byte(nil), walletActivityItemPrefix...)
+	encodeWalletWatchItem(&buf, item)
+	return buf
+}
+
+func walletActivityItemKey(item WalletWatchItem, height uint64, txid [32]byte) []byte {
+	buf := walletActivityItemWatchPrefix(item)
+	buf = append(buf, encodeU64BE(^height)...)
+	buf = append(buf, txid[:]...)
+	return buf
+}
+
+func walletActivityHeightPrefixForHeight(height uint64) []byte {
+	return append(append([]byte(nil), walletActivityHtPrefix...), encodeU64BE(height)...)
+}
+
+func walletActivityHeightKey(height uint64, item WalletWatchItem, txid [32]byte) []byte {
+	buf := walletActivityHeightPrefixForHeight(height)
+	encodeWalletWatchItem(&buf, item)
+	buf = append(buf, txid[:]...)
+	return buf
+}
+
 func decodeOutPoint(buf []byte) (types.OutPoint, error) {
 	if len(buf) != 36 {
 		return types.OutPoint{}, errors.New("invalid outpoint encoding")
@@ -2153,6 +3162,199 @@ func encodeOutPoint(outPoint types.OutPoint) []byte {
 	buf := make([]byte, 0, 36)
 	outPoint.Encode(&buf)
 	return buf
+}
+
+func encodeWalletWatchItem(buf *[]byte, item WalletWatchItem) {
+	*buf = append(*buf, encodeU64(item.Type)...)
+	*buf = append(*buf, item.Payload32[:]...)
+}
+
+func decodeWalletWatchItem(buf []byte) (WalletWatchItem, error) {
+	if len(buf) != 40 {
+		return WalletWatchItem{}, errors.New("invalid wallet watch item encoding")
+	}
+	itemType, err := decodeU64(buf[:8])
+	if err != nil {
+		return WalletWatchItem{}, err
+	}
+	var payload [32]byte
+	copy(payload[:], buf[8:40])
+	return WalletWatchItem{Type: itemType, Payload32: payload}, nil
+}
+
+func encodeWalletOrigin(record walletOriginRecord) []byte {
+	buf := make([]byte, 0, 8+1+49)
+	buf = append(buf, encodeU64(record.Height)...)
+	if record.Coinbase {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	return append(buf, encodeUTXOEntry(record.Entry)...)
+}
+
+func decodeWalletOrigin(buf []byte) (walletOriginRecord, error) {
+	if len(buf) < 10 {
+		return walletOriginRecord{}, errors.New("invalid wallet origin encoding")
+	}
+	height, err := decodeU64(buf[:8])
+	if err != nil {
+		return walletOriginRecord{}, err
+	}
+	coinbase, err := decodeBoolByte(buf[8])
+	if err != nil {
+		return walletOriginRecord{}, err
+	}
+	entry, err := decodeUTXOEntry(buf[9:])
+	if err != nil {
+		return walletOriginRecord{}, err
+	}
+	return walletOriginRecord{Height: height, Coinbase: coinbase, Entry: entry}, nil
+}
+
+func encodeWalletIndexedUTXO(record WalletIndexedUTXO) []byte {
+	return encodeWalletOrigin(walletOriginRecord{Entry: record.Entry, Height: record.Height, Coinbase: record.Coinbase})
+}
+
+func decodeWalletIndexedUTXO(buf []byte) (WalletIndexedUTXO, error) {
+	origin, err := decodeWalletOrigin(buf)
+	if err != nil {
+		return WalletIndexedUTXO{}, err
+	}
+	return WalletIndexedUTXO{Entry: origin.Entry, Height: origin.Height, Coinbase: origin.Coinbase}, nil
+}
+
+func encodeWalletActivityRecord(record WalletActivityRecord) []byte {
+	buf := make([]byte, 0, 105)
+	buf = append(buf, record.TxID[:]...)
+	buf = append(buf, record.BlockHash[:]...)
+	buf = append(buf, encodeU64(record.Height)...)
+	buf = append(buf, encodeU64(record.Timestamp)...)
+	if record.Coinbase {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	buf = append(buf, encodeU64(record.Received)...)
+	buf = append(buf, encodeU64(record.Sent)...)
+	buf = append(buf, encodeU64(record.Fee)...)
+	return buf
+}
+
+func decodeWalletActivityRecord(buf []byte) (WalletActivityRecord, error) {
+	if len(buf) != 105 {
+		return WalletActivityRecord{}, errors.New("invalid wallet activity encoding")
+	}
+	var record WalletActivityRecord
+	copy(record.TxID[:], buf[:32])
+	copy(record.BlockHash[:], buf[32:64])
+	var err error
+	if record.Height, err = decodeU64(buf[64:72]); err != nil {
+		return WalletActivityRecord{}, err
+	}
+	if record.Timestamp, err = decodeU64(buf[72:80]); err != nil {
+		return WalletActivityRecord{}, err
+	}
+	if record.Coinbase, err = decodeBoolByte(buf[80]); err != nil {
+		return WalletActivityRecord{}, err
+	}
+	if record.Received, err = decodeU64(buf[81:89]); err != nil {
+		return WalletActivityRecord{}, err
+	}
+	if record.Sent, err = decodeU64(buf[89:97]); err != nil {
+		return WalletActivityRecord{}, err
+	}
+	if record.Fee, err = decodeU64(buf[97:105]); err != nil {
+		return WalletActivityRecord{}, err
+	}
+	return record, nil
+}
+
+func decodeBoolByte(raw byte) (bool, error) {
+	switch raw {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, errors.New("invalid bool encoding")
+	}
+}
+
+func decodeWalletActivityHeightKey(key []byte, height uint64) (WalletWatchItem, [32]byte, error) {
+	prefixLen := len(walletActivityHtPrefix) + 8
+	if len(key) != prefixLen+40+32 {
+		return WalletWatchItem{}, [32]byte{}, errors.New("invalid wallet activity height key")
+	}
+	gotHeight, err := decodeU64BE(key[len(walletActivityHtPrefix):prefixLen])
+	if err != nil {
+		return WalletWatchItem{}, [32]byte{}, err
+	}
+	if gotHeight != height {
+		return WalletWatchItem{}, [32]byte{}, errors.New("wallet activity height key mismatch")
+	}
+	item, err := decodeWalletWatchItem(key[prefixLen : prefixLen+40])
+	if err != nil {
+		return WalletWatchItem{}, [32]byte{}, err
+	}
+	var txid [32]byte
+	copy(txid[:], key[prefixLen+40:])
+	return item, txid, nil
+}
+
+func walletWatchItemForOutput(output types.TxOutput) WalletWatchItem {
+	return WalletWatchItem{Type: output.Type, Payload32: output.CanonicalPayload32()}
+}
+
+func walletWatchItemForEntry(entry consensus.UtxoEntry) WalletWatchItem {
+	item := WalletWatchItem{Type: entry.Type, Payload32: entry.Payload32}
+	if item.Type == types.OutputXOnlyP2PK && item.Payload32 == ([32]byte{}) {
+		item.Payload32 = entry.PubKey
+	}
+	return item
+}
+
+func (s *ChainStore) walletOrigin(outPoint types.OutPoint) (walletOriginRecord, bool, error) {
+	buf, err := s.get(walletOriginKey(outPoint))
+	if err != nil {
+		return walletOriginRecord{}, false, err
+	}
+	if buf == nil {
+		return walletOriginRecord{}, false, nil
+	}
+	record, err := decodeWalletOrigin(buf)
+	if err != nil {
+		return walletOriginRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func compareWalletIndexedUTXOs(a, b WalletIndexedUTXO) int {
+	if a.Entry.Type < b.Entry.Type {
+		return -1
+	}
+	if a.Entry.Type > b.Entry.Type {
+		return 1
+	}
+	aItem := walletWatchItemForEntry(a.Entry)
+	bItem := walletWatchItemForEntry(b.Entry)
+	if cmp := bytes.Compare(aItem.Payload32[:], bItem.Payload32[:]); cmp != 0 {
+		return cmp
+	}
+	return compareOutPoints(a.OutPoint, b.OutPoint)
+}
+
+func compareWalletActivityRecords(a, b WalletActivityRecord) int {
+	switch {
+	case a.Height > b.Height:
+		return -1
+	case a.Height < b.Height:
+		return 1
+	}
+	if cmp := bytes.Compare(a.TxID[:], b.TxID[:]); cmp != 0 {
+		return cmp
+	}
+	return bytes.Compare(a.BlockHash[:], b.BlockHash[:])
 }
 
 func encodeLocalitySeqValue(outPoint types.OutPoint, entry consensus.UtxoEntry) []byte {
@@ -2288,8 +3490,14 @@ func applyJournalEntryBatch(batch *pebble.Batch, entry chainJournalEntry) error 
 }
 
 func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {
-	entry, _, err := decodeUTXOEntryWithLen(buf)
-	return entry, err
+	entry, consumed, err := decodeUTXOEntryWithLen(buf)
+	if err != nil {
+		return consensus.UtxoEntry{}, err
+	}
+	if consumed != len(buf) {
+		return consensus.UtxoEntry{}, errors.New("unexpected trailing utxo entry data")
+	}
+	return entry, nil
 }
 
 func decodeUTXOEntryWithLen(buf []byte) (consensus.UtxoEntry, int, error) {
@@ -2422,7 +3630,11 @@ func decodeBlockUndo(buf []byte) ([]BlockUndoEntry, error) {
 	}
 	count := binary.LittleEndian.Uint64(buf[:8])
 	buf = buf[8:]
-	entries := make([]BlockUndoEntry, 0, count)
+	const minEncodedUndoEntryBytes = 36 + 1 + 8 + 32
+	if count > uint64(len(buf)/minEncodedUndoEntryBytes) {
+		return nil, errors.New("invalid block undo count")
+	}
+	entries := make([]BlockUndoEntry, 0, int(count))
 	for i := uint64(0); i < count; i++ {
 		if len(buf) < 36 {
 			return nil, errors.New("truncated block undo entry")

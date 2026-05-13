@@ -177,40 +177,29 @@ func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture
 	if err := ensureSnapshotImportTargetEmpty(store); err != nil {
 		return SnapshotImportSummary{}, err
 	}
-	if err := store.WriteFullState(&storage.StoredChainState{
-		Profile:        profile,
-		Height:         material.Height,
-		TipHeader:      material.TipHeader,
-		BlockSizeState: material.BlockSizeState,
-		UTXOChecksum:   loaded.ComputedChecksum,
-		UTXOs:          cloneUtxos(loaded.UTXOs),
-	}); err != nil {
-		return SnapshotImportSummary{}, err
-	}
-	if err := store.WriteHeaderState(&material.HeaderState); err != nil {
-		return SnapshotImportSummary{}, err
-	}
-	if err := store.PutValidatedBlock(genesis, &material.Entries[0], nil); err != nil {
-		return SnapshotImportSummary{}, err
-	}
-	for i := uint64(1); i <= material.Height; i++ {
-		if err := store.PutValidatedBlock(&blocks[i-1], &material.Entries[i], nil); err != nil {
-			return SnapshotImportSummary{}, err
-		}
-	}
-	if err := store.RewriteActiveHeights(0, 0, material.Entries); err != nil {
-		return SnapshotImportSummary{}, err
-	}
-	if err := store.RewriteActiveHeaderHeights(0, 0, material.Entries); err != nil {
-		return SnapshotImportSummary{}, err
-	}
-	if err := store.WriteFastSyncState(&storage.FastSyncState{
+	fastSyncState := &storage.FastSyncState{
 		SnapshotHeight:     material.Height,
 		SnapshotHeaderHash: material.TipHash,
 		SnapshotUTXORoot:   loaded.ComputedUTXORoot,
 		SnapshotChecksum:   loaded.ComputedChecksum,
 		SnapshotUTXOCount:  len(loaded.UTXOs),
-	}, cloneUtxos(loaded.UTXOs)); err != nil {
+	}
+	importBlocks := make([]types.Block, 0, len(material.Entries))
+	importBlocks = append(importBlocks, *genesis)
+	if material.Height > 0 {
+		importBlocks = append(importBlocks, blocks[:material.Height]...)
+	}
+	if err := store.PutValidatedBlocksWithoutWalletIndex(importBlocks, material.Entries); err != nil {
+		return SnapshotImportSummary{}, err
+	}
+	if err := store.WriteFullStateWithFastSyncStateMetadata(&storage.StoredChainState{
+		Profile:        profile,
+		Height:         material.Height,
+		TipHeader:      material.TipHeader,
+		BlockSizeState: material.BlockSizeState,
+		UTXOChecksum:   loaded.ComputedChecksum,
+		UTXOs:          loaded.UTXOs,
+	}, fastSyncState, &material.HeaderState, material.Entries); err != nil {
 		return SnapshotImportSummary{}, err
 	}
 	logger.Info("imported snapshot fast-sync state",
@@ -279,7 +268,7 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 		}
 		entry.Validated = true
 		entry.BlockSizeState = state.BlockSizeState()
-		if err := store.PutValidatedBlock(block, entry, undo); err != nil {
+		if err := store.PutValidatedBlockUndo(entry, undo); err != nil {
 			return SnapshotHistoricalVerificationSummary{}, err
 		}
 	}
@@ -295,8 +284,21 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 	if state.UTXOChecksum() != fastSyncState.SnapshotChecksum {
 		return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("historical snapshot checksum mismatch: expected %x, got %x", fastSyncState.SnapshotChecksum, state.UTXOChecksum())
 	}
-	snapshotCount, err := compareFastSyncSnapshotUTXOs(state.UTXOCount(), state.utxoLookup, fastSyncState.SnapshotUTXOCount, store.ForEachFastSyncSnapshotUTXO)
+	snapshotCount := state.UTXOCount()
+	if snapshotCount != fastSyncState.SnapshotUTXOCount {
+		return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("historical snapshot count mismatch: expected %d, got %d", fastSyncState.SnapshotUTXOCount, snapshotCount)
+	}
+	retainedCount, err := countFastSyncSnapshotUTXOs(store.ForEachFastSyncSnapshotUTXO)
 	if err != nil {
+		return SnapshotHistoricalVerificationSummary{}, err
+	}
+	if retainedCount > 0 {
+		snapshotCount, err = compareFastSyncSnapshotUTXOs(state.UTXOCount(), state.utxoLookup, fastSyncState.SnapshotUTXOCount, store.ForEachFastSyncSnapshotUTXO)
+		if err != nil {
+			return SnapshotHistoricalVerificationSummary{}, err
+		}
+	}
+	if _, err := store.RebuildWalletIndexesAtCurrentTip(); err != nil {
 		return SnapshotHistoricalVerificationSummary{}, err
 	}
 	if err := store.ClearFastSyncState(); err != nil {
@@ -352,6 +354,20 @@ func compareFastSyncSnapshotUTXOs(liveCount int, liveLookup consensus.UtxoLookup
 		return 0, fmt.Errorf("snapshot utxo iteration count mismatch: expected %d, got %d", expectedSnapshotCount, seen)
 	}
 	return seen, nil
+}
+
+func countFastSyncSnapshotUTXOs(iterateSnapshot func(func(types.OutPoint, consensus.UtxoEntry) error) error) (int, error) {
+	if iterateSnapshot == nil {
+		return 0, nil
+	}
+	count := 0
+	if err := iterateSnapshot(func(types.OutPoint, consensus.UtxoEntry) error {
+		count++
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func encodeSnapshotFixtureEntries(utxos consensus.UtxoSet) []UTXOSnapshotFixtureEntry {
@@ -417,6 +433,11 @@ func ensureSnapshotImportTargetEmpty(store *storage.ChainStore) error {
 		return err
 	} else if hash != nil {
 		return fmt.Errorf("snapshot import target already has indexed blocks")
+	}
+	if state, err := store.LoadFastSyncState(); err != nil {
+		return err
+	} else if state != nil {
+		return fmt.Errorf("snapshot import target already has pending fast-sync state at height %d", state.SnapshotHeight)
 	}
 	return nil
 }

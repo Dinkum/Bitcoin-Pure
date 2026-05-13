@@ -195,7 +195,7 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	if existing != nil && existing.Validated {
 		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, ErrBlockAlreadyKnown
 	}
-	if err := p.store.AppendValidatedBlock(nextStateMeta, block, &entry, undo, spent, created); err != nil {
+	if err := p.store.AppendValidatedBlockMeta(nextStateMeta, block, &entry, undo, spent, created); err != nil {
 		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, err
 	}
 	snapshot.bindCommittedUTXOBackend(p.store.UTXOLookupWithErr(), p.store.ForEachUTXO, snapshot.UTXOCount())
@@ -275,7 +275,7 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 	if isActiveTipExtension {
 		undo := undoByHash[blockHash]
 		spent, created := activeTipDelta(undo, createdByHash[blockHash])
-		if err := p.store.AppendValidatedBlock(nextStateMeta, block, &newTipEntry, undo, spent, created); err != nil {
+		if err := p.store.AppendValidatedBlockMeta(nextStateMeta, block, &newTipEntry, undo, spent, created); err != nil {
 			return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 		}
 	} else {
@@ -291,7 +291,7 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 			}
 		}
 		if err := p.store.CommitReorgDelta(
-			chainStateMeta(nextStateMeta),
+			nextStateMeta,
 			reorgOverlay.SpentOutPoints(),
 			reorgOverlay.CreatedEntriesClone(),
 			forkHeight,
@@ -438,17 +438,21 @@ func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uin
 }
 
 func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeight uint64) (*consensus.UtxoOverlay, []types.Block, error) {
-	baseUtxos, err := state.materializeUTXOs()
-	if err != nil {
-		return nil, nil, err
-	}
-	workingUtxos := consensus.NewUtxoOverlay(baseUtxos)
+	workingUtxos := consensus.NewUtxoOverlayWithLookup(state.utxoLookup)
 	workingAcc := state.utxoAcc
 	if state.utxoChecksum == ([32]byte{}) {
-		state.utxoChecksum = utxochecksum.Compute(baseUtxos)
+		utxos, err := state.materializeUTXOs()
+		if err != nil {
+			return nil, nil, err
+		}
+		state.utxoChecksum = utxochecksum.Compute(utxos)
 	}
 	if workingAcc == nil {
-		workingAcc, err = consensus.UtxoAccumulator(baseUtxos)
+		utxos, err := state.materializeUTXOs()
+		if err != nil {
+			return nil, nil, err
+		}
+		workingAcc, err = consensus.UtxoAccumulator(utxos)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -483,10 +487,17 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 			return nil, nil, fmt.Errorf("missing parent entry for active block %x", *hash)
 		}
 		checksumSpent := survivingBlockOutputs(workingUtxos.Lookup, block)
+		if err := workingUtxos.Err(); err != nil {
+			return nil, nil, err
+		}
 		checksumRestored := undoEntriesToUtxoMap(undo)
 		state.utxoChecksum = utxochecksum.ApplyDelta(state.utxoChecksum, checksumSpent, checksumRestored)
+		state.utxoCount += len(checksumRestored) - len(checksumSpent)
 		workingAcc, err = disconnectBlockOverlay(workingUtxos, workingAcc, block, undo)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := workingUtxos.Err(); err != nil {
 			return nil, nil, err
 		}
 		parentHeight := parentEntry.Height
@@ -495,8 +506,7 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 		state.tipHeader = &parentHeader
 		state.blockSizeState = parentEntry.BlockSizeState
 	}
-	workingUtxos.ApplyToSet(baseUtxos)
-	state.replaceMaterializedUTXOs(baseUtxos)
+	state.bindCommittedUTXOBackend(lookupWithErrFromOverlay(workingUtxos), nil, state.utxoCount)
 	state.utxoAcc = workingAcc
 	if state.tipHeader != nil {
 		recentTimes, err := loadIndexedAncestorTimestamps(p.store, consensus.HeaderHash(state.tipHeader), 11)
@@ -507,6 +517,16 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 	}
 	slices.Reverse(disconnected)
 	return workingUtxos, disconnected, nil
+}
+
+func lookupWithErrFromOverlay(overlay *consensus.UtxoOverlay) consensus.UtxoLookupWithErr {
+	return func(outPoint types.OutPoint) (consensus.UtxoEntry, bool, error) {
+		entry, ok := overlay.Lookup(outPoint)
+		if err := overlay.Err(); err != nil {
+			return consensus.UtxoEntry{}, false, err
+		}
+		return entry, ok, nil
+	}
 }
 
 func disconnectedBranchTransactions(blocks []types.Block) []types.Transaction {
@@ -620,12 +640,7 @@ func captureUndoEntries(block *types.Block, lookup consensus.UtxoLookupWithErr) 
 			delete(created, input.PrevOut)
 		}
 		for vout, output := range tx.Base.Outputs {
-			created[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
-				Type:       output.Type,
-				ValueAtoms: output.ValueAtoms,
-				Payload32:  output.Payload32,
-				PubKey:     output.PubKey,
-			}
+			created[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
 		}
 	}
 	return undo, nil
@@ -640,19 +655,6 @@ func activeTipDelta(undo []storage.BlockUndoEntry, created map[types.OutPoint]co
 		return spent, nil
 	}
 	return spent, created
-}
-
-func chainStateMeta(state *storage.StoredChainState) *storage.StoredChainStateMeta {
-	if state == nil {
-		return nil
-	}
-	return &storage.StoredChainStateMeta{
-		Profile:        state.Profile,
-		Height:         state.Height,
-		TipHeader:      state.TipHeader,
-		BlockSizeState: state.BlockSizeState,
-		UTXOChecksum:   state.UTXOChecksum,
-	}
 }
 
 func mergeOverlayDelta(target *consensus.UtxoOverlay, delta *consensus.UtxoOverlay) {

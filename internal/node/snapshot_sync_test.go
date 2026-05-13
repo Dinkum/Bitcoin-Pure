@@ -100,6 +100,20 @@ func TestImportUTXOSnapshotFastSyncStoresChainState(t *testing.T) {
 	if fastSyncState == nil || fastSyncState.SnapshotHeight != loaded.Fixture.Height {
 		t.Fatalf("fast sync state = %+v, want height %d", fastSyncState, loaded.Fixture.Height)
 	}
+	retained, err := store.LoadFastSyncSnapshotUTXOs()
+	if err != nil {
+		t.Fatalf("LoadFastSyncSnapshotUTXOs: %v", err)
+	}
+	if len(retained) != 0 {
+		t.Fatalf("retained fast-sync snapshot utxos = %d, want metadata-only state", len(retained))
+	}
+	walletIndexHeight, err := store.WalletIndexHeight()
+	if err != nil {
+		t.Fatalf("WalletIndexHeight after import: %v", err)
+	}
+	if walletIndexHeight != nil {
+		t.Fatalf("wallet index height after import = %v, want nil until verification", walletIndexHeight)
+	}
 }
 
 func TestVerifyFastSyncSnapshotFromStoreClearsTrustState(t *testing.T) {
@@ -137,6 +151,13 @@ func TestVerifyFastSyncSnapshotFromStoreClearsTrustState(t *testing.T) {
 	}
 	if fastSyncState != nil {
 		t.Fatalf("expected fast sync state to clear, got %+v", fastSyncState)
+	}
+	walletIndexHeight, err := store.WalletIndexHeight()
+	if err != nil {
+		t.Fatalf("WalletIndexHeight after verify: %v", err)
+	}
+	if walletIndexHeight == nil || *walletIndexHeight != loaded.Fixture.Height {
+		t.Fatalf("wallet index height after verify = %v, want %d", walletIndexHeight, loaded.Fixture.Height)
 	}
 	entry, err := store.GetBlockIndexByHeight(2)
 	if err != nil {

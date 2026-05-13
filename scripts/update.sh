@@ -4,6 +4,7 @@ set -euo pipefail
 MODE=""
 STAGE_DIR=""
 CURRENT_LINK=""
+APP_ROOT=""
 CONFIG_PATH=""
 LEGACY_CONFIG_PATH=""
 DATA_DIR=""
@@ -54,11 +55,10 @@ required_go_version() {
 }
 
 current_go_version() {
-	export PATH="/usr/local/go/bin:${PATH}"
-	if ! command -v go >/dev/null 2>&1; then
+	if [[ ! -x "${APP_ROOT}/toolchains/go/bin/go" ]]; then
 		return 1
 	fi
-	go version | awk '{print $3}' | sed 's/^go//'
+	"${APP_ROOT}/toolchains/go/bin/go" version | awk '{print $3}' | sed 's/^go//'
 }
 
 go_tarball_sha256() {
@@ -76,11 +76,11 @@ go_tarball_sha256() {
 }
 
 install_go() {
-	local want have arch tarball url expected tmp extract_dir actual extracted
+	local want have arch tarball url expected tmp extract_dir actual extracted toolchain_root
 	want="$(required_go_version)"
 	have="$(current_go_version || true)"
 	if [[ "${have}" == "${want}" ]]; then
-		export PATH="/usr/local/go/bin:${PATH}"
+		export PATH="${APP_ROOT}/toolchains/go/bin:${PATH}"
 		return
 	fi
 	arch="$(detect_go_arch)"
@@ -113,11 +113,15 @@ install_go() {
 		rm -rf "${extract_dir}"
 		fail "verified Go archive version ${extracted} does not match required ${want}"
 	fi
-	rm -rf /usr/local/go
-	mv "${extract_dir}/go" /usr/local/go
+	toolchain_root="${APP_ROOT}/toolchains/go-${want}"
+	rm -rf "${toolchain_root}"
+	mkdir -p "$(dirname "${toolchain_root}")"
+	mv "${extract_dir}/go" "${toolchain_root}"
+	rm -rf "${APP_ROOT}/toolchains/go"
+	ln -s "${toolchain_root}" "${APP_ROOT}/toolchains/go"
 	rm -f "${tmp}"
 	rm -rf "${extract_dir}"
-	export PATH="/usr/local/go/bin:${PATH}"
+	export PATH="${APP_ROOT}/toolchains/go/bin:${PATH}"
 }
 
 ensure_packages() {
@@ -156,13 +160,25 @@ PY
 }
 
 render_config() {
-	local artifacts_dir current_legacy_config_path peers_json mining_override profile_override
+	local artifacts_dir current_config_path current_legacy_config_path seed_config seed_existing peers_json mining_override profile_override
 	artifacts_dir="${STAGE_DIR}/.artifacts"
+	current_config_path="${CONFIG_PATH}"
 	current_legacy_config_path="${LEGACY_CONFIG_PATH}"
 	if [[ -z "${current_legacy_config_path}" ]]; then
 		current_legacy_config_path="$(dirname "${CONFIG_PATH}")/config.json"
 	fi
 	mkdir -p "${artifacts_dir}"
+	seed_config="${artifacts_dir}/current-config.json"
+	if [[ -f "${current_config_path}" ]]; then
+		"${STAGE_DIR}/bin/bpu-cli" config normalize --in "${current_config_path}" --out "${seed_config}"
+		seed_existing=1
+	elif [[ -f "${current_legacy_config_path}" ]]; then
+		"${STAGE_DIR}/bin/bpu-cli" config normalize --in "${current_legacy_config_path}" --out "${seed_config}"
+		seed_existing=1
+	else
+		"${STAGE_DIR}/bin/bpu-cli" config normalize --out "${seed_config}"
+		seed_existing=0
+	fi
 	if [[ "${#PEERS[@]}" -gt 0 ]]; then
 		peers_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${PEERS[@]}")"
 	else
@@ -171,22 +187,31 @@ render_config() {
 	mining_override="${MINING_MODE}"
 	profile_override="${PROFILE}"
 
-	python3 - "${current_legacy_config_path}" "${artifacts_dir}/config.json" "${DATA_DIR}" "${LOG_DIR}" "${STAGE_DIR}" "${profile_override}" "${mining_override}" "${peers_json}" <<'PY'
+	python3 - "${seed_config}" "${artifacts_dir}/config.json" "${DATA_DIR}" "${LOG_DIR}" "${STAGE_DIR}" "${profile_override}" "${mining_override}" "${peers_json}" "${seed_existing}" <<'PY'
 import json
 import os
 import secrets
 import sys
 
-config_path, out_path, data_dir, log_dir, stage_dir, profile_override, mining_override, peers_json = sys.argv[1:9]
-current = {}
-if os.path.exists(config_path):
-    with open(config_path, "r", encoding="utf-8") as fh:
-        current = json.load(fh)
+seed_path, out_path, data_dir, log_dir, stage_dir, profile_override, mining_override, peers_json, seed_existing = sys.argv[1:10]
+with open(seed_path, "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+existing_config = seed_existing == "1"
 
 def keep(key, default):
-    return current.get(key, default)
+    if existing_config:
+        return cfg.get(key, default)
+    return default
 
 profile = profile_override or keep("profile", "regtest")
+previous_profile = keep("profile", "regtest")
+if profile_override and profile_override != previous_profile:
+    previous_db_path = str(keep("db_path", "")).strip()
+    if previous_db_path and os.path.exists(previous_db_path):
+        raise SystemExit(
+            f"profile change from {previous_profile} to {profile_override} would reuse existing db_path {previous_db_path}; "
+            "move the old database or edit config.yaml to a fresh db_path first"
+        )
 
 def default_mempool_bytes():
     mem_total_bytes = 0
@@ -215,38 +240,35 @@ elif mining_override == "off":
 else:
     miner_enabled = bool(keep("miner_enabled", has_miner_pubkey))
 
+cfg["profile"] = profile
+cfg["db_path"] = keep("db_path", os.path.join(data_dir, "chain"))
+cfg["log_path"] = keep("log_path", os.path.join(log_dir, "events.jsonl"))
+cfg["log_level"] = keep("log_level", "info")
+cfg["log_format"] = keep("log_format", "jsonl")
+cfg["rpc_addr"] = keep("rpc_addr", "127.0.0.1:18443")
+cfg["rpc_auth_token"] = rpc_token
+cfg["rpc_read_timeout_ms"] = keep("rpc_read_timeout_ms", 5000)
+cfg["rpc_write_timeout_ms"] = keep("rpc_write_timeout_ms", 900000)
+cfg["rpc_header_timeout_ms"] = keep("rpc_header_timeout_ms", 2000)
+cfg["rpc_idle_timeout_ms"] = keep("rpc_idle_timeout_ms", 30000)
+cfg["rpc_max_header_bytes"] = keep("rpc_max_header_bytes", 8192)
+cfg["rpc_max_body_bytes"] = keep("rpc_max_body_bytes", 1048576)
+cfg["p2p_addr"] = keep("p2p_addr", "0.0.0.0:18444")
 if peers_json:
-    peers = json.loads(peers_json)
+    cfg["peers"] = json.loads(peers_json)
 else:
-    peers = keep("peers", [])
-
-cfg = {
-    "profile": profile,
-    "db_path": keep("db_path", os.path.join(data_dir, "chain")),
-    "log_path": keep("log_path", os.path.join(log_dir, "node.log")),
-    "log_level": keep("log_level", "info"),
-    "rpc_addr": keep("rpc_addr", "127.0.0.1:18443"),
-    "rpc_auth_token": rpc_token,
-    "rpc_read_timeout_ms": keep("rpc_read_timeout_ms", 5000),
-    "rpc_write_timeout_ms": keep("rpc_write_timeout_ms", 5000),
-    "rpc_header_timeout_ms": keep("rpc_header_timeout_ms", 2000),
-    "rpc_idle_timeout_ms": keep("rpc_idle_timeout_ms", 30000),
-    "rpc_max_header_bytes": keep("rpc_max_header_bytes", 8192),
-    "rpc_max_body_bytes": keep("rpc_max_body_bytes", 1048576),
-    "p2p_addr": keep("p2p_addr", "0.0.0.0:18444"),
-    "peers": peers,
-    "max_inbound_peers": keep("max_inbound_peers", 32),
-    "max_outbound_peers": keep("max_outbound_peers", 8),
-    "handshake_timeout_ms": keep("handshake_timeout_ms", 5000),
-    "stall_timeout_ms": keep("stall_timeout_ms", 15000),
-    "max_message_bytes": keep("max_message_bytes", 64000000),
-    "min_relay_fee_per_byte": keep("min_relay_fee_per_byte", 1),
-    "max_mempool_bytes": keep("max_mempool_bytes", default_mempool_bytes()),
-    "miner_enabled": miner_enabled,
-    "miner_workers": keep("miner_workers", 0),
-    "miner_pubkey_hex": miner_pubkey,
-    "genesis_fixture": os.path.join(stage_dir, "fixtures", "genesis", f"{profile}.json"),
-}
+    cfg["peers"] = keep("peers", [])
+cfg["max_inbound_peers"] = keep("max_inbound_peers", 32)
+cfg["max_outbound_peers"] = keep("max_outbound_peers", 8)
+cfg["handshake_timeout_ms"] = keep("handshake_timeout_ms", 5000)
+cfg["stall_timeout_ms"] = keep("stall_timeout_ms", 15000)
+cfg["max_message_bytes"] = keep("max_message_bytes", 64000000)
+cfg["min_relay_fee_per_byte"] = keep("min_relay_fee_per_byte", 1)
+cfg["max_mempool_bytes"] = keep("max_mempool_bytes", default_mempool_bytes())
+cfg["miner_enabled"] = miner_enabled
+cfg["miner_workers"] = keep("miner_workers", 0)
+cfg["miner_pubkey_hex"] = miner_pubkey
+cfg["genesis_fixture"] = os.path.join(stage_dir, "fixtures", "genesis", f"{profile}.json")
 
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, "w", encoding="utf-8") as fh:
@@ -267,8 +289,53 @@ normalize_config() {
 }
 
 render_unit() {
-	local artifacts_dir
+	local artifacts_dir read_write_paths
 	artifacts_dir="${STAGE_DIR}/.artifacts"
+	read_write_paths="$(python3 - "${artifacts_dir}/config.json" "${CONFIG_PATH}" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+paths = [
+    os.path.dirname(sys.argv[2]),
+    str(cfg.get("db_path", "")).strip(),
+]
+db_path = str(cfg.get("db_path", "")).strip()
+if db_path:
+    paths.append(os.path.join(os.path.dirname(db_path), "wallets"))
+log_path = str(cfg.get("log_path", "")).strip()
+if log_path:
+    paths.append(os.path.dirname(log_path))
+
+seen = set()
+out = []
+for path in paths:
+    if not path:
+        continue
+    clean = os.path.abspath(path)
+    if clean not in seen:
+        seen.add(clean)
+        out.append(clean)
+print(" ".join(out))
+PY
+)"
+	python3 - "${artifacts_dir}/config.json" >"${artifacts_dir}/wallet-paths" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+db_path = str(cfg.get("db_path", "")).strip()
+if db_path:
+    if not os.path.isabs(db_path):
+        raise SystemExit(f"configured db_path must be absolute for installed nodes: {db_path}")
+    print(os.path.join(os.path.dirname(db_path), "wallets"))
+PY
 	cat >"${artifacts_dir}/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Bitcoin Pure Node
@@ -277,11 +344,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=bitcoin-pure
+Group=bitcoin-pure
 WorkingDirectory=${CURRENT_LINK}
 ExecStart=${CURRENT_LINK}/bin/bpu-cli serve --config ${CONFIG_PATH}
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${read_write_paths}
 
 [Install]
 WantedBy=multi-user.target
@@ -347,12 +420,13 @@ build_binary() {
 }
 
 ensure_mining_wallet() {
-	local artifacts_dir staged_config staged_legacy_config miner_state miner_pubkey wallet_dir wallet_output pubkey receive_address
+	local artifacts_dir staged_config staged_legacy_config miner_state_raw miner_state miner_pubkey wallet_dir wallet_output pubkey receive_address
 	artifacts_dir="${STAGE_DIR}/.artifacts"
 	staged_config="${artifacts_dir}/config.yaml"
 	staged_legacy_config="${artifacts_dir}/config.json"
-	mapfile -t miner_state < <(python3 - "${staged_legacy_config}" <<'PY'
+	miner_state_raw="$(python3 - "${staged_legacy_config}" <<'PY'
 import json
+import os
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
@@ -360,8 +434,16 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
 
 print("on" if cfg.get("miner_enabled", False) else "off")
 print(str(cfg.get("miner_pubkey_hex", "")).strip())
+db_path = str(cfg.get("db_path", "")).strip()
+if db_path:
+    if not os.path.isabs(db_path):
+        raise SystemExit(f"configured db_path must be absolute for installed nodes: {db_path}")
+    print(os.path.join(os.path.dirname(db_path), "wallets"))
+else:
+    print("")
 PY
-)
+)" || fail "failed to resolve miner wallet path: ${miner_state_raw}"
+	mapfile -t miner_state <<<"${miner_state_raw}"
 	if [[ "${miner_state[0]:-off}" != "on" ]]; then
 		return
 	fi
@@ -370,7 +452,10 @@ PY
 		return
 	fi
 
-	wallet_dir="${DATA_DIR}/wallets"
+	wallet_dir="${miner_state[2]:-}"
+	if [[ -z "${wallet_dir}" ]]; then
+		wallet_dir="${DATA_DIR}/wallets"
+	fi
 	mkdir -p "${wallet_dir}"
 	log "provisioning miner wallet"
 	if ! wallet_output="$("${STAGE_DIR}/bin/bpu-cli" wallet create --config "${staged_config}" --wallet-dir "${wallet_dir}" miner 2>&1)"; then
@@ -399,6 +484,10 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
 PY
 	"${STAGE_DIR}/bin/bpu-cli" config normalize --in "${staged_legacy_config}" --out "${staged_config}"
 	chmod 600 "${staged_config}" "${staged_legacy_config}"
+	{
+		printf 'wallet_dir=%s\n' "${wallet_dir}"
+		printf 'receive_address=%s\n' "${receive_address:-}"
+	} >"${artifacts_dir}/miner-wallet-provisioned"
 	log "miner wallet ready at ${wallet_dir} (${receive_address:-address unavailable})"
 }
 
@@ -480,15 +569,16 @@ main() {
 	[[ -n "${MODE}" ]] || fail "--mode is required"
 	[[ -n "${STAGE_DIR}" ]] || fail "--stage-dir is required"
 	[[ -n "${CURRENT_LINK}" ]] || fail "--current-link is required"
+	APP_ROOT="$(dirname "${CURRENT_LINK}")"
 	[[ -n "${CONFIG_PATH}" ]] || fail "--config-path is required"
 	[[ -n "${SERVICE_NAME}" ]] || fail "--service-name is required"
 	verify_stage
 	ensure_packages
 	install_go
+	build_binary
 	render_config
 	render_unit
 	render_motd
-	build_binary
 	normalize_config
 	ensure_mining_wallet
 	render_metadata

@@ -29,7 +29,7 @@ db_path: data/chain
 # ==============================================================================
 # Operator-visible logs, summaries, and optional local profiling endpoints.
 
-# Writes daemon logs to a file when set; leave empty to log to stderr only.
+# Overrides the daemon log path; leave empty to derive events.jsonl beside the chain database.
 # Default: ""
 log_path: ""
 
@@ -37,9 +37,9 @@ log_path: ""
 # Default: info
 log_level: info
 
-# Chooses structured json logs or human-readable text logs.
-# Default: text
-log_format: text
+# Chooses canonical JSONL logs or human-readable text logs.
+# Default: jsonl
+log_format: jsonl
 
 # Emits periodic throughput summaries on this interval in milliseconds.
 # Default: 60000
@@ -124,7 +124,7 @@ max_message_bytes: 64000000
 # ==============================================================================
 # Admission policy for relayed transactions and dependency tracking limits.
 
-# Rejects transactions whose fee rate falls below this minimum satoshi-per-byte policy floor.
+# Rejects transactions whose fee rate falls below this minimum atoms-per-byte policy floor.
 # Default: 1
 min_relay_fee_per_byte: 1
 
@@ -195,6 +195,6 @@ miner_enabled: false
 # Default: 0
 miner_workers: 0
 
-# Pays coinbase rewards to this compressed public key; leave empty to let wallet auto-provisioning fill it in.
+# Pays coinbase rewards to a 32-byte x-only secp256k1 public key; installed nodes should use ./install --mining on or set this explicitly.
 # Default: ""
 miner_pubkey_hex: ""

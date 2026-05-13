@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -151,6 +152,13 @@ type ExportFile struct {
 	Profile    types.ChainProfile `json:"profile"`
 	ExportedAt time.Time          `json:"exported_at"`
 	Wallet     Wallet             `json:"wallet"`
+}
+
+type BackupFile struct {
+	Version   int                `json:"version"`
+	Profile   types.ChainProfile `json:"profile"`
+	CreatedAt time.Time          `json:"created_at"`
+	Wallets   []Wallet           `json:"wallets"`
 }
 
 func ParseAddressFamily(raw string) (uint64, error) {
@@ -356,29 +364,49 @@ func (s *Store) List() []Wallet {
 }
 
 func (s *Store) Backup(path string) error {
+	return s.BackupWithOptions(path, false)
+}
+
+func (s *Store) BackupWithOptions(path string, overwrite bool) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return errors.New("backup path is required")
 	}
-	buf, err := json.MarshalIndent(s.wallets, "", "  ")
+	if sameCleanPath(path, s.path) {
+		return errors.New("backup path cannot be the live wallet store")
+	}
+	backup := BackupFile{
+		Version:   1,
+		Profile:   s.profile,
+		CreatedAt: time.Now().UTC(),
+		Wallets:   cloneWallets(s.wallets),
+	}
+	buf, err := json.MarshalIndent(backup, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Clean(path), append(buf, '\n'), 0o600)
+	return writeFileAtomic(filepath.Clean(path), append(buf, '\n'), 0o600, overwrite)
 }
 
 func (s *Store) RestoreBackup(path string) error {
+	return s.RestoreBackupWithOptions(path, false)
+}
+
+func (s *Store) RestoreBackupWithOptions(path string, allowProfileMismatch bool) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return errors.New("backup path is required")
 	}
-	buf, err := os.ReadFile(filepath.Clean(path))
+	backup, err := LoadBackupFile(path)
 	if err != nil {
 		return err
 	}
-	var wallets []Wallet
-	if err := json.Unmarshal(buf, &wallets); err != nil {
-		return err
+	if backup.Profile != "" && backup.Profile != s.profile && !allowProfileMismatch {
+		return fmt.Errorf("wallet backup profile %q does not match current profile %q", backup.Profile, s.profile)
+	}
+	wallets := backup.Wallets
+	if len(wallets) == 0 {
+		return errors.New("wallet backup contains no wallets")
 	}
 	for wi := range wallets {
 		wallets[wi].Name = normalizeWalletName(wallets[wi].Name)
@@ -387,6 +415,9 @@ func (s *Store) RestoreBackup(path string) error {
 		}
 		for ai := range wallets[wi].Addresses {
 			normalizeStoredAddress(&wallets[wi].Addresses[ai])
+			if err := validateWalletAddress(wallets[wi].Addresses[ai]); err != nil {
+				return fmt.Errorf("backup wallet %q address %d: %w", wallets[wi].Name, ai, err)
+			}
 		}
 	}
 	seen := make(map[string]struct{}, len(wallets))
@@ -397,8 +428,49 @@ func (s *Store) RestoreBackup(path string) error {
 		}
 		seen[key] = struct{}{}
 	}
-	s.wallets = wallets
-	return s.save()
+	next := cloneWallets(wallets)
+	if err := s.saveWallets(next); err != nil {
+		return err
+	}
+	s.wallets = next
+	return nil
+}
+
+func LoadBackupFile(path string) (BackupFile, error) {
+	buf, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return BackupFile{}, err
+	}
+	var envelope struct {
+		Version   int                `json:"version"`
+		Profile   types.ChainProfile `json:"profile"`
+		CreatedAt time.Time          `json:"created_at"`
+		Wallets   *json.RawMessage   `json:"wallets"`
+	}
+	if err := json.Unmarshal(buf, &envelope); err == nil && (envelope.Version != 0 || envelope.Wallets != nil) {
+		if envelope.Version != 1 {
+			return BackupFile{}, fmt.Errorf("unsupported wallet backup version %d", envelope.Version)
+		}
+		if envelope.Wallets == nil {
+			return BackupFile{}, errors.New("wallet backup is missing wallets")
+		}
+		if string(bytes.TrimSpace(*envelope.Wallets)) == "null" {
+			return BackupFile{}, errors.New("wallet backup wallets must be an array")
+		}
+		var wallets []Wallet
+		if err := json.Unmarshal(*envelope.Wallets, &wallets); err != nil {
+			return BackupFile{}, err
+		}
+		return BackupFile{Version: envelope.Version, Profile: envelope.Profile, CreatedAt: envelope.CreatedAt, Wallets: wallets}, nil
+	}
+	var legacy []Wallet
+	if err := json.Unmarshal(buf, &legacy); err != nil {
+		return BackupFile{}, err
+	}
+	if legacy == nil && string(bytes.TrimSpace(buf)) == "null" {
+		return BackupFile{}, errors.New("legacy wallet backup must be an array")
+	}
+	return BackupFile{Version: 0, Wallets: legacy}, nil
 }
 
 func (s *Store) ExportWallet(name string) (ExportFile, error) {
@@ -415,6 +487,13 @@ func (s *Store) ExportWallet(name string) (ExportFile, error) {
 }
 
 func (s *Store) ImportWallet(export ExportFile, nameOverride string) (Wallet, error) {
+	return s.ImportWalletWithOptions(export, nameOverride, false)
+}
+
+func (s *Store) ImportWalletWithOptions(export ExportFile, nameOverride string, allowProfileMismatch bool) (Wallet, error) {
+	if export.Profile != "" && export.Profile != s.profile && !allowProfileMismatch {
+		return Wallet{}, fmt.Errorf("wallet export profile %q does not match current profile %q", export.Profile, s.profile)
+	}
 	entry := cloneWallet(export.Wallet)
 	if strings.TrimSpace(nameOverride) != "" {
 		entry.Name = strings.TrimSpace(nameOverride)
@@ -428,12 +507,66 @@ func (s *Store) ImportWallet(export ExportFile, nameOverride string) (Wallet, er
 	}
 	for i := range entry.Addresses {
 		normalizeStoredAddress(&entry.Addresses[i])
+		if err := validateWalletAddress(entry.Addresses[i]); err != nil {
+			return Wallet{}, fmt.Errorf("wallet %q address %d: %w", entry.Name, i, err)
+		}
 	}
-	s.wallets = append(s.wallets, cloneWallet(entry))
-	if err := s.save(); err != nil {
+	next := append(cloneWallets(s.wallets), cloneWallet(entry))
+	if err := s.saveWallets(next); err != nil {
 		return Wallet{}, err
 	}
+	s.wallets = next
 	return cloneWallet(entry), nil
+}
+
+func validateWalletAddress(addr Address) error {
+	payload, err := addr.payload32()
+	if err != nil {
+		return err
+	}
+	if payload == ([32]byte{}) {
+		return errors.New("address payload is empty")
+	}
+	secretHex := strings.TrimSpace(addr.signingSecretHex())
+	if secretHex == "" {
+		return errors.New("signing secret is missing")
+	}
+	secret, err := hex.DecodeString(secretHex)
+	if err != nil || len(secret) == 0 {
+		return errors.New("signing secret is invalid")
+	}
+	if addr.OutputType() == types.OutputPQLock32 {
+		verificationKey, err := hex.DecodeString(strings.TrimSpace(addr.VerificationKeyHex))
+		if err != nil || len(verificationKey) != bpcrypto.MLDSA65VerificationKeySize {
+			return errors.New("PQ verification key is invalid")
+		}
+		if len(secret) != bpcrypto.MLDSA65PrivateKeySize {
+			return errors.New("PQ signing secret is invalid")
+		}
+		wantLock := consensus.PQLock(verificationKey)
+		if wantLock != payload {
+			return errors.New("PQ verification key does not match receive address")
+		}
+		msg := []byte("BPU wallet backup validation")
+		sig, err := bpcrypto.SignMLDSA65(secret, msg)
+		if err != nil || !bpcrypto.VerifyMLDSA65(verificationKey, sig, msg) {
+			return errors.New("PQ signing secret does not match receive address")
+		}
+		return nil
+	}
+	if len(secret) != 32 {
+		return errors.New("xonly signing secret must be 32 bytes")
+	}
+	priv, _ := btcec.PrivKeyFromBytes(secret)
+	var derived [32]byte
+	copy(derived[:], schnorr.SerializePubKey(priv.PubKey()))
+	if derived != payload {
+		return errors.New("private key does not match receive address")
+	}
+	if addr.Address != "" && addr.Address != EncodeAddress(payload) {
+		return errors.New("receive address does not match private key")
+	}
+	return nil
 }
 
 func LoadExportFile(path string) (ExportFile, error) {
@@ -453,11 +586,15 @@ func LoadExportFile(path string) (ExportFile, error) {
 }
 
 func SaveExportFile(path string, export ExportFile) error {
+	return SaveExportFileWithOptions(path, export, false)
+}
+
+func SaveExportFileWithOptions(path string, export ExportFile, overwrite bool) error {
 	buf, err := json.MarshalIndent(export, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Clean(path), append(buf, '\n'), 0o600)
+	return writeFileAtomic(filepath.Clean(path), append(buf, '\n'), 0o600, overwrite)
 }
 
 func (s *Store) CreateWallet(name string) (Wallet, Address, error) {
@@ -482,10 +619,11 @@ func (s *Store) CreateWalletWithType(name string, outputType uint64) (Wallet, Ad
 		return Wallet{}, Address{}, err
 	}
 	entry.Addresses = append(entry.Addresses, addr)
-	s.wallets = append(s.wallets, cloneWallet(entry))
-	if err := s.save(); err != nil {
+	next := append(cloneWallets(s.wallets), cloneWallet(entry))
+	if err := s.saveWallets(next); err != nil {
 		return Wallet{}, Address{}, err
 	}
+	s.wallets = next
 	return cloneWallet(entry), addr, nil
 }
 
@@ -502,7 +640,7 @@ func (s *Store) NewReceiveAddress(name string) (Address, error) {
 }
 
 func (s *Store) NewReceiveAddressWithType(name string, outputType uint64) (Address, error) {
-	wallet, _, ok := s.findWallet(name)
+	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return Address{}, ErrWalletNotFound
 	}
@@ -510,17 +648,53 @@ func (s *Store) NewReceiveAddressWithType(name string, outputType uint64) (Addre
 	if err != nil {
 		return Address{}, err
 	}
-	wallet.Addresses = append(wallet.Addresses, addr)
-	if err := s.save(); err != nil {
+	next := cloneWallets(s.wallets)
+	next[index].Addresses = append(next[index].Addresses, addr)
+	if err := s.saveWallets(next); err != nil {
 		return Address{}, err
 	}
+	s.wallets = next
 	return addr, nil
 }
 
 func (s *Store) ReconcilePending(name string, mempool map[[32]byte]struct{}) (int, error) {
-	wallet, _, ok := s.findWallet(name)
+	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return 0, ErrWalletNotFound
+	}
+	_ = mempool
+	filtered := wallet.Pending[:0]
+	removed := 0
+	for _, pending := range wallet.Pending {
+		if _, err := decodeHex32(pending.TxID); err != nil {
+			removed++
+			continue
+		}
+		// Mempool absence is not a final wallet state: the tx may be confirmed,
+		// evicted, not relayed to this node, or hidden by a restart. Keep unknown
+		// spends reserved until a later explicit status signal can clear them.
+		filtered = append(filtered, pending)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	next := cloneWallets(s.wallets)
+	next[index].Pending = append([]PendingTx{}, filtered...)
+	if err := s.saveWallets(next); err != nil {
+		return 0, err
+	}
+	s.wallets = next
+	return removed, nil
+}
+
+func (s *Store) ReconcilePendingWithStatus(name string, mempool map[[32]byte]struct{}, utxos []SpendableUTXO, confirmed map[[32]byte]struct{}) (int, error) {
+	wallet, index, ok := s.findWallet(name)
+	if !ok {
+		return 0, ErrWalletNotFound
+	}
+	current := make(map[types.OutPoint]struct{}, len(utxos))
+	for _, utxo := range utxos {
+		current[utxo.OutPoint] = struct{}{}
 	}
 	filtered := wallet.Pending[:0]
 	removed := 0
@@ -534,16 +708,55 @@ func (s *Store) ReconcilePending(name string, mempool map[[32]byte]struct{}) (in
 			filtered = append(filtered, pending)
 			continue
 		}
-		removed++
+		if _, ok := confirmed[txid]; ok {
+			removed++
+			continue
+		}
+		if pendingResolvedAgainstUTXOs(txid, pending, current) {
+			removed++
+			continue
+		}
+		filtered = append(filtered, pending)
 	}
 	if removed == 0 {
 		return 0, nil
 	}
-	wallet.Pending = append([]PendingTx{}, filtered...)
-	return removed, s.save()
+	next := cloneWallets(s.wallets)
+	next[index].Pending = append([]PendingTx{}, filtered...)
+	if err := s.saveWallets(next); err != nil {
+		return 0, err
+	}
+	s.wallets = next
+	return removed, nil
+}
+
+func (s *Store) ReconcilePendingWithUTXOs(name string, mempool map[[32]byte]struct{}, utxos []SpendableUTXO) (int, error) {
+	return s.ReconcilePendingWithStatus(name, mempool, utxos, nil)
+}
+
+func pendingResolvedAgainstUTXOs(txid [32]byte, pending PendingTx, current map[types.OutPoint]struct{}) bool {
+	for _, spent := range pending.Spent {
+		spentTxID, err := decodeHex32(spent.TxID)
+		if err != nil {
+			continue
+		}
+		if _, ok := current[types.OutPoint{TxID: spentTxID, Vout: spent.Vout}]; ok {
+			return true
+		}
+	}
+	for _, output := range pending.Outputs {
+		if _, ok := current[types.OutPoint{TxID: txid, Vout: output.Vout}]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []SpendableUTXO) (SendPlan, error) {
+	return s.BuildSendWithKnownAddresses(name, to, amount, fee, utxos, nil)
+}
+
+func (s *Store) BuildSendWithKnownAddresses(name string, to string, amount, fee uint64, utxos []SpendableUTXO, knownAddresses []Address) (SendPlan, error) {
 	if amount == 0 {
 		return SendPlan{}, errors.New("amount must be positive")
 	}
@@ -555,7 +768,8 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 	if err != nil {
 		return SendPlan{}, err
 	}
-	available, err := spendableCoins(*wallet, utxos)
+	planningWallet := walletWithKnownAddresses(*wallet, knownAddresses)
+	available, err := spendableCoins(planningWallet, utxos)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -568,7 +782,7 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 		return SendPlan{}, err
 	}
 	change := total - required
-	plan, err := s.buildSignedPlan(wallet, selected, to, destItem, amount, fee, change)
+	plan, err := s.buildSignedPlan(&planningWallet, selected, to, destItem, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -578,6 +792,10 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 }
 
 func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, utxos []SpendableUTXO) (SendPlan, error) {
+	return s.BuildSendAutoWithKnownAddresses(name, to, amount, feeRate, utxos, nil)
+}
+
+func (s *Store) BuildSendAutoWithKnownAddresses(name string, to string, amount, feeRate uint64, utxos []SpendableUTXO, knownAddresses []Address) (SendPlan, error) {
 	if feeRate == 0 {
 		return SendPlan{}, errors.New("fee rate must be positive")
 	}
@@ -589,7 +807,8 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if err != nil {
 		return SendPlan{}, err
 	}
-	available, err := spendableCoins(*wallet, utxos)
+	planningWallet := walletWithKnownAddresses(*wallet, knownAddresses)
+	available, err := spendableCoins(planningWallet, utxos)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -600,7 +819,7 @@ func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, ut
 	if err != nil {
 		return SendPlan{}, err
 	}
-	plan, err := s.buildSignedPlan(wallet, selected, to, destItem, amount, fee, change)
+	plan, err := s.buildSignedPlan(&planningWallet, selected, to, destItem, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
@@ -674,10 +893,6 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	wallet.Addresses = append(wallet.Addresses, addr)
-	if err := s.save(); err != nil {
-		return CPFPPlan{}, err
-	}
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
@@ -721,10 +936,15 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 	}, nil
 }
 
-func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, inputs []SelectedInput) error {
-	wallet, _, ok := s.findWallet(name)
+func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, inputs []SelectedInput, changeAddress *Address) error {
+	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return ErrWalletNotFound
+	}
+	next := cloneWallets(s.wallets)
+	wallet = &next[index]
+	if changeAddress != nil && !walletHasAddress(*wallet, changeAddress.Address) {
+		wallet.Addresses = append(wallet.Addresses, *changeAddress)
 	}
 	entry := PendingTx{
 		TxID:      hex.EncodeToString(txid[:]),
@@ -745,7 +965,80 @@ func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, 
 		}
 	}
 	wallet.Pending = append(wallet.Pending, entry)
-	return s.save()
+	if err := s.saveWallets(next); err != nil {
+		return err
+	}
+	s.wallets = next
+	return nil
+}
+
+func (s *Store) RememberAddress(name string, addr Address) error {
+	_, index, ok := s.findWallet(name)
+	if !ok {
+		return ErrWalletNotFound
+	}
+	next := cloneWallets(s.wallets)
+	wallet := &next[index]
+	if walletHasAddress(*wallet, addr.Address) {
+		return nil
+	}
+	wallet.Addresses = append(wallet.Addresses, addr)
+	if err := s.saveWallets(next); err != nil {
+		return err
+	}
+	s.wallets = next
+	return nil
+}
+
+func (s *Store) ForgetPending(name string, txid [32]byte) error {
+	_, index, ok := s.findWallet(name)
+	if !ok {
+		return ErrWalletNotFound
+	}
+	txidText := hex.EncodeToString(txid[:])
+	next := cloneWallets(s.wallets)
+	wallet := &next[index]
+	filtered := wallet.Pending[:0]
+	removed := false
+	for _, pending := range wallet.Pending {
+		if pending.TxID == txidText {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, pending)
+	}
+	if !removed {
+		return nil
+	}
+	wallet.Pending = append([]PendingTx{}, filtered...)
+	if err := s.saveWallets(next); err != nil {
+		return err
+	}
+	s.wallets = next
+	return nil
+}
+
+func walletHasAddress(wallet Wallet, address string) bool {
+	for _, candidate := range wallet.Addresses {
+		if candidate.Address == address {
+			return true
+		}
+	}
+	return false
+}
+
+func walletWithKnownAddresses(wallet Wallet, knownAddresses []Address) Wallet {
+	if len(knownAddresses) == 0 {
+		return wallet
+	}
+	next := cloneWallet(wallet)
+	for _, addr := range knownAddresses {
+		if walletHasAddress(next, addr.Address) {
+			continue
+		}
+		next.Addresses = append(next.Addresses, addr)
+	}
+	return next
 }
 
 func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]SpendableUTXO, error) {
@@ -884,6 +1177,14 @@ func cloneWallet(wallet Wallet) Wallet {
 	return wallet
 }
 
+func cloneWallets(wallets []Wallet) []Wallet {
+	out := make([]Wallet, len(wallets))
+	for i := range wallets {
+		out[i] = cloneWallet(wallets[i])
+	}
+	return out
+}
+
 func clonePendingTxs(pending []PendingTx) []PendingTx {
 	out := make([]PendingTx, len(pending))
 	for i := range pending {
@@ -932,7 +1233,7 @@ func newAddress(index int, change bool, outputType uint64) (Address, error) {
 		if err != nil {
 			return Address{}, err
 		}
-		pqLock := bpcrypto.PQLock(verificationKey)
+		pqLock := consensus.PQLock(verificationKey)
 		return Address{
 			Index:              index,
 			Change:             change,
@@ -1140,32 +1441,19 @@ func estimateSignedTxBytesForFamilies(inputs []SelectedInput, outputTypes []uint
 
 func estimateSignedTxBytesFromParts(inputCount int, inputBytes int, authBytes int, outputTypes []uint64) int {
 	size := 4 // version
-	size += varIntLenU64(uint64(inputCount))
+	size += types.CanonicalVarIntLen(uint64(inputCount))
 	size += inputBytes
-	size += varIntLenU64(uint64(len(outputTypes)))
+	size += types.CanonicalVarIntLen(uint64(len(outputTypes)))
 	for _, outputType := range outputTypes {
 		size += estimatedOutputBytes(outputType)
 	}
-	size += varIntLenU64(uint64(inputCount))
+	size += types.CanonicalVarIntLen(uint64(inputCount))
 	size += authBytes
 	return size
 }
 
-func varIntLenU64(v uint64) int {
-	switch {
-	case v <= 0xfc:
-		return 1
-	case v <= 0xffff:
-		return 3
-	case v <= 0xffff_ffff:
-		return 5
-	default:
-		return 9
-	}
-}
-
 func estimatedOutputBytes(outputType uint64) int {
-	return len(types.CanonicalVarIntBytes(outputType)) + 8 + 32
+	return types.CanonicalVarIntLen(outputType) + 8 + 32
 }
 
 func estimatedAuthEntryBytes(addr Address) int {
@@ -1178,7 +1466,7 @@ func estimatedAuthEntryBytes(addr Address) int {
 		sigLen := bpcrypto.MLDSA65SignatureSize
 		payloadLen = vkLen + sigLen
 	}
-	return varIntLenU64(uint64(payloadLen)) + payloadLen
+	return types.CanonicalVarIntLen(uint64(payloadLen)) + payloadLen
 }
 
 func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destItem WatchItem, amount uint64, fee uint64, change uint64) (SendPlan, error) {
@@ -1190,10 +1478,6 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 		changeType := inputs[0].Address.OutputType()
 		addr, err := newAddress(nextAddressIndex(*wallet), true, changeType)
 		if err != nil {
-			return SendPlan{}, err
-		}
-		wallet.Addresses = append(wallet.Addresses, addr)
-		if err := s.save(); err != nil {
 			return SendPlan{}, err
 		}
 		changeAddr = &addr
@@ -1340,10 +1624,7 @@ func pendingOutputWatchItem(output PendingOutput) (WatchItem, error) {
 }
 
 func watchItemForOutput(output types.TxOutput) WatchItem {
-	if output.Type == types.OutputXOnlyP2PK && output.Payload32 == ([32]byte{}) {
-		return WatchItem{Type: output.Type, Payload32: output.PubKey}
-	}
-	return WatchItem{Type: output.Type, Payload32: output.Payload32}
+	return WatchItem{Type: output.Type, Payload32: output.CanonicalPayload32()}
 }
 
 func legacyPubKeyForWatchItem(item WatchItem) [32]byte {
@@ -1397,31 +1678,90 @@ func (s *Store) findWallet(name string) (*Wallet, int, bool) {
 }
 
 func (s *Store) save() error {
+	return s.saveWallets(s.wallets)
+}
+
+func (s *Store) saveWallets(wallets []Wallet) error {
 	if s.path == "" {
 		return errors.New("wallet store path is required")
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
-	buf, err := json.MarshalIndent(s.wallets, "", "  ")
+	buf, err := json.MarshalIndent(wallets, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.path, append(buf, '\n'), 0o600)
+	return writeFileAtomic(s.path, append(buf, '\n'), 0o600, true)
 }
 
-func writeFileAtomic(path string, buf []byte, mode os.FileMode) error {
+func writeFileAtomic(path string, buf []byte, mode os.FileMode, overwrite bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
+	uid, gid, hasOwner := existingFileOwner(path)
+	if !hasOwner && overwrite {
+		uid, gid, hasOwner = existingFileOwner(filepath.Dir(path))
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
 	// Replace wallet material atomically so a crash never leaves truncated JSON
 	// in the live store, backup, or export path.
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+	if _, err := tmpFile.Write(buf); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Chmod(tmp, mode); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
+	if hasOwner {
+		if err := os.Chown(tmp, uid, gid); err != nil && os.Geteuid() == 0 {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	if !overwrite {
+		if err := os.Link(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			if errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("%s already exists; pass --overwrite to replace it", path)
+			}
+			return err
+		}
+		return os.Remove(tmp)
+	}
 	return os.Rename(tmp, path)
+}
+
+func existingFileOwner(path string) (int, int, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return int(stat.Uid), int(stat.Gid), true
+}
+
+func sameCleanPath(left string, right string) bool {
+	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
+		return false
+	}
+	leftAbs, leftErr := filepath.Abs(filepath.Clean(left))
+	rightAbs, rightErr := filepath.Abs(filepath.Clean(right))
+	if leftErr == nil && rightErr == nil {
+		return leftAbs == rightAbs
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }

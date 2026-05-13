@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"errors"
+	"fmt"
 	"math/bits"
 	"sort"
 	"sync"
@@ -527,15 +528,37 @@ func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []Persist
 		right := consensus.TxID(&sortedEntries[j].Tx)
 		return bytes.Compare(left[:], right[:]) < 0
 	})
+	restoredEntries := make(map[[32]byte]*Entry, len(sortedEntries))
+	claimedInputs := make(map[types.OutPoint][32]byte)
 	for _, persisted := range sortedEntries {
 		txid := consensus.TxID(&persisted.Tx)
+		if txid != persisted.TxID {
+			return fmt.Errorf("persisted mempool txid mismatch: stored=%x computed=%x", persisted.TxID, txid)
+		}
+		authid := consensus.AuthID(&persisted.Tx)
+		if authid != persisted.AuthID {
+			return fmt.Errorf("persisted mempool authid mismatch for %x", txid)
+		}
+		if persisted.Tx.IsCoinbase() {
+			return fmt.Errorf("persisted mempool entry is coinbase: %x", txid)
+		}
+		if _, exists := restoredEntries[txid]; exists {
+			return fmt.Errorf("duplicate persisted mempool entry: %x", txid)
+		}
+		spent := spentOutPointsForInputs(persisted.Tx.Base.Inputs)
+		for _, outPoint := range spent {
+			if conflict, exists := claimedInputs[outPoint]; exists {
+				return fmt.Errorf("persisted mempool input conflict: %v spent by %x and %x", outPoint, conflict, txid)
+			}
+			claimedInputs[outPoint] = txid
+		}
 		size := persisted.Tx.EncodedLen()
 		entry := &Entry{
 			Tx:             persisted.Tx,
 			TxID:           txid,
-			AuthID:         consensus.AuthID(&persisted.Tx),
+			AuthID:         authid,
 			Summary:        persisted.Summary,
-			SpentOutPoints: spentOutPointsForInputs(persisted.Tx.Base.Inputs),
+			SpentOutPoints: spent,
 			CreatedLeaves:  createdLeavesForOutputs(txid, persisted.Tx.Base.Outputs),
 			Fee:            persisted.Summary.Fee,
 			Size:           size,
@@ -543,11 +566,7 @@ func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []Persist
 			Parents:        make(map[[32]byte]struct{}),
 			Children:       make(map[[32]byte]struct{}),
 		}
-		p.entries[txid] = entry
-		p.noteEntryAddedLocked(entry)
-		if entry.AddedAt > p.sequence {
-			p.sequence = entry.AddedAt
-		}
+		restoredEntries[txid] = entry
 	}
 
 	sortedOrphans := append([]PersistedOrphan(nil), orphans...)
@@ -559,13 +578,30 @@ func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []Persist
 		right := consensus.TxID(&sortedOrphans[j].Tx)
 		return bytes.Compare(left[:], right[:]) < 0
 	})
+	restoredOrphans := make(map[[32]byte]*orphanEntry, len(sortedOrphans))
+	restoredOrphanDeps := make(map[types.OutPoint][][32]byte)
 	for _, persisted := range sortedOrphans {
 		txid := consensus.TxID(&persisted.Tx)
+		if txid != persisted.TxID {
+			return fmt.Errorf("persisted orphan txid mismatch: stored=%x computed=%x", persisted.TxID, txid)
+		}
+		if authid := consensus.AuthID(&persisted.Tx); authid != persisted.AuthID {
+			return fmt.Errorf("persisted orphan authid mismatch for %x", txid)
+		}
+		if persisted.Tx.IsCoinbase() {
+			return fmt.Errorf("persisted orphan is coinbase: %x", txid)
+		}
+		if _, exists := restoredEntries[txid]; exists {
+			return fmt.Errorf("persisted orphan duplicates accepted tx: %x", txid)
+		}
+		if _, exists := restoredOrphans[txid]; exists {
+			return fmt.Errorf("duplicate persisted orphan: %x", txid)
+		}
 		missing := make(map[types.OutPoint]struct{}, len(persisted.Missing))
 		for _, outPoint := range persisted.Missing {
 			missing[outPoint] = struct{}{}
 		}
-		p.orphans[txid] = &orphanEntry{
+		restoredOrphans[txid] = &orphanEntry{
 			Tx:           persisted.Tx,
 			TxID:         txid,
 			Size:         persisted.Tx.EncodedLen(),
@@ -573,11 +609,22 @@ func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []Persist
 			Missing:      missing,
 			MissingCount: len(missing),
 		}
-		for _, outPoint := range persisted.Missing {
-			p.orphanDeps[outPoint] = append(p.orphanDeps[outPoint], txid)
+		for outPoint := range missing {
+			restoredOrphanDeps[outPoint] = append(restoredOrphanDeps[outPoint], txid)
 		}
-		if persisted.AddedAt > p.sequence {
-			p.sequence = persisted.AddedAt
+	}
+	p.entries = restoredEntries
+	p.orphans = restoredOrphans
+	p.orphanDeps = restoredOrphanDeps
+	for _, entry := range p.entries {
+		p.noteEntryAddedLocked(entry)
+		if entry.AddedAt > p.sequence {
+			p.sequence = entry.AddedAt
+		}
+	}
+	for _, orphan := range p.orphans {
+		if orphan.AddedAt > p.sequence {
+			p.sequence = orphan.AddedAt
 		}
 	}
 	p.reindex()
@@ -1507,10 +1554,7 @@ func (p *Pool) resolveInputs(tx types.Transaction, chainLookup consensus.UtxoLoo
 		}
 
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
-		view[input.PrevOut] = consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:     output.PubKey,
-		}
+		view[input.PrevOut] = consensus.UtxoEntryFromOutput(output)
 		if parents == nil {
 			// Parent tracking is only needed for package accounting when a tx
 			// spends a mempool output, not for the common chain-only spend path.
@@ -1553,10 +1597,7 @@ func resolveInputsWithView(tx types.Transaction, chainLookup consensus.UtxoLooku
 		}
 
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
-		view[input.PrevOut] = consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:     output.PubKey,
-		}
+		view[input.PrevOut] = consensus.UtxoEntryFromOutput(output)
 		if parents == nil {
 			parents = make(map[[32]byte]struct{})
 		}
@@ -1597,10 +1638,7 @@ func (p *Pool) resolveInputsAgainstLiveView(tx types.Transaction, chainLookup co
 		}
 
 		output := parent.Tx.Base.Outputs[input.PrevOut.Vout]
-		view[input.PrevOut] = consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:     output.PubKey,
-		}
+		view[input.PrevOut] = consensus.UtxoEntryFromOutput(output)
 		if parents == nil {
 			parents = make(map[[32]byte]struct{})
 		}
@@ -2158,7 +2196,9 @@ func applyTxNoUndo(utxos *consensus.UtxoOverlay, spent []types.OutPoint, created
 	}
 	for _, leaf := range created {
 		utxos.Set(leaf.OutPoint, consensus.UtxoEntry{
+			Type:       leaf.Type,
 			ValueAtoms: leaf.ValueAtoms,
+			Payload32:  leaf.Payload32,
 			PubKey:     leaf.PubKey,
 		})
 	}
@@ -2500,10 +2540,7 @@ func applyTx(utxos consensus.UtxoSet, tx types.Transaction, txid [32]byte) {
 		delete(utxos, input.PrevOut)
 	}
 	for vout, output := range tx.Base.Outputs {
-		utxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:     output.PubKey,
-		}
+		utxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
 	}
 }
 
@@ -2538,15 +2575,11 @@ func createdLeavesForOutputs(txid [32]byte, outputs []types.TxOutput) []utreexo.
 	}
 	created := make([]utreexo.UtxoLeaf, 0, len(outputs))
 	for vout, output := range outputs {
-		payload32 := output.Payload32
-		if output.Type == types.OutputXOnlyP2PK && payload32 == ([32]byte{}) {
-			payload32 = output.PubKey
-		}
 		created = append(created, utreexo.UtxoLeaf{
 			OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
 			Type:       output.Type,
 			ValueAtoms: output.ValueAtoms,
-			Payload32:  payload32,
+			Payload32:  output.CanonicalPayload32(),
 			PubKey:     output.PubKey,
 		})
 	}

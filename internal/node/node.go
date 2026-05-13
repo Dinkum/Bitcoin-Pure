@@ -262,10 +262,7 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 	coinbaseTxID := txids[0]
 	utxos := make(consensus.UtxoSet, len(coinbase.Base.Outputs))
 	for vout, output := range coinbase.Base.Outputs {
-		utxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:     output.PubKey,
-		}
+		utxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
 	}
 	seededBlockSizeState := consensus.NewBlockSizeState(c.params)
 	seededBlockSizeState.BlockSize = uint64(genesis.EncodedLen())
@@ -515,11 +512,11 @@ func (c *ChainState) StoredState() (*storage.StoredChainState, error) {
 	}, nil
 }
 
-func (c *ChainState) StoredStateMeta() (*storage.StoredChainState, error) {
+func (c *ChainState) StoredStateMeta() (*storage.StoredChainStateMeta, error) {
 	if c.height == nil || c.tipHeader == nil {
 		return nil, ErrNoTip
 	}
-	return &storage.StoredChainState{
+	return &storage.StoredChainStateMeta{
 		Profile:        c.Profile(),
 		Height:         *c.height,
 		TipHeader:      *c.tipHeader,
@@ -666,6 +663,25 @@ func openPersistentChainStateFromMeta(path string, profile types.ChainProfile, r
 		}
 		state.recentTimes = recentTimes
 		state.WithRules(rules)
+		walletIndexHeight, err := store.WalletIndexHeight()
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		if walletIndexHeight == nil || *walletIndexHeight != stored.Height {
+			fastSyncState, err := store.LoadFastSyncState()
+			if err != nil {
+				store.Close()
+				return nil, err
+			}
+			if fastSyncState == nil {
+				err = store.RebuildWalletIndexes(stored.Height)
+			}
+			if err != nil {
+				store.Close()
+				return nil, err
+			}
+		}
 		chainLogger.Info("loaded persisted chain state from metadata",
 			slog.Uint64("height", stored.Height),
 			slog.Int("utxo_count", utxoCount),
@@ -693,11 +709,10 @@ func (p *PersistentChainState) InitializeFromGenesisBlock(genesis *types.Block) 
 	if err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
-	stored, err := p.state.StoredStateMeta()
+	stored, err := p.state.StoredState()
 	if err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
-	stored.UTXOs = p.state.UTXOs()
 	if err := p.store.WriteFullState(stored); err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
@@ -717,6 +732,9 @@ func (p *PersistentChainState) InitializeFromGenesisBlock(genesis *types.Block) 
 		return GenesisBootstrapSummary{}, err
 	}
 	if err := p.store.RewriteActiveHeights(0, 0, []storage.BlockIndexEntry{*entry}); err != nil {
+		return GenesisBootstrapSummary{}, err
+	}
+	if err := p.store.RebuildWalletIndexes(0); err != nil {
 		return GenesisBootstrapSummary{}, err
 	}
 	// The persistent node should stay on the metadata-first/store-backed UTXO
@@ -794,10 +812,7 @@ func createdUTXOs(block types.Block) map[types.OutPoint]consensus.UtxoEntry {
 	for _, tx := range block.Txs {
 		txHash := consensus.TxID(&tx)
 		for vout, output := range tx.Base.Outputs {
-			created[types.OutPoint{TxID: txHash, Vout: uint32(vout)}] = consensus.UtxoEntry{
-				ValueAtoms: output.ValueAtoms,
-				PubKey:     output.PubKey,
-			}
+			created[types.OutPoint{TxID: txHash, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
 		}
 	}
 	return created

@@ -62,7 +62,7 @@ func Default() Config {
 		Profile:                     "regtest",
 		DBPath:                      "data/chain",
 		LogLevel:                    "info",
-		LogFormat:                   "text",
+		LogFormat:                   "jsonl",
 		ThroughputSummaryIntervalMS: 60_000,
 		RPCAddr:                     "127.0.0.1:18443",
 		RPCReadTimeoutMS:            5000,
@@ -113,7 +113,93 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	if err := Validate(cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+func Validate(cfg Config) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.Profile)) {
+	case "mainnet", "regtest", "regtest_medium", "regtest_hard", "benchnet":
+	default:
+		return fmt.Errorf("invalid profile %q", cfg.Profile)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {
+	case "", "debug", "info", "warn", "warning", "error":
+	default:
+		return fmt.Errorf("invalid log_level %q", cfg.LogLevel)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.LogFormat)) {
+	case "", "json", "jsonl", "text":
+	default:
+		return fmt.Errorf("invalid log_format %q", cfg.LogFormat)
+	}
+	if strings.TrimSpace(cfg.RPCAddr) != "" {
+		if cfg.RPCReadTimeoutMS <= 0 {
+			return fmt.Errorf("rpc_read_timeout_ms must be positive")
+		}
+		if cfg.RPCWriteTimeoutMS <= 0 {
+			return fmt.Errorf("rpc_write_timeout_ms must be positive")
+		}
+		if cfg.RPCHeaderTimeoutMS <= 0 {
+			return fmt.Errorf("rpc_header_timeout_ms must be positive")
+		}
+		if cfg.RPCIdleTimeoutMS <= 0 {
+			return fmt.Errorf("rpc_idle_timeout_ms must be positive")
+		}
+		if cfg.RPCMaxHeaderBytes <= 0 {
+			return fmt.Errorf("rpc_max_header_bytes must be positive")
+		}
+		if cfg.RPCMaxBodyBytes <= 0 {
+			return fmt.Errorf("rpc_max_body_bytes must be positive")
+		}
+	}
+	if cfg.HandshakeTimeoutMS <= 0 {
+		return fmt.Errorf("handshake_timeout_ms must be positive")
+	}
+	if cfg.StallTimeoutMS <= 0 {
+		return fmt.Errorf("stall_timeout_ms must be positive")
+	}
+	if cfg.MaxMessageBytes <= 0 {
+		return fmt.Errorf("max_message_bytes must be positive")
+	}
+	if cfg.MaxMempoolBytes <= 0 {
+		return fmt.Errorf("max_mempool_bytes must be positive")
+	}
+	if cfg.MaxAncestors <= 0 {
+		return fmt.Errorf("max_ancestors must be positive")
+	}
+	if cfg.MaxDescendants <= 0 {
+		return fmt.Errorf("max_descendants must be positive")
+	}
+	if cfg.MaxOrphans <= 0 {
+		return fmt.Errorf("max_orphans must be positive")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.AvalancheMode)) {
+	case "on", "off":
+	default:
+		return fmt.Errorf("invalid avalanche_mode %q: want on or off", cfg.AvalancheMode)
+	}
+	if cfg.AvalancheKSample <= 0 {
+		return fmt.Errorf("avalanche_k_sample must be positive")
+	}
+	if cfg.AvalancheAlphaDenominator <= 0 {
+		return fmt.Errorf("avalanche_alpha_denominator must be positive")
+	}
+	if cfg.AvalancheAlphaNumerator <= 0 || cfg.AvalancheAlphaNumerator > cfg.AvalancheAlphaDenominator {
+		return fmt.Errorf("avalanche_alpha_numerator must be between 1 and avalanche_alpha_denominator")
+	}
+	if cfg.AvalancheBeta <= 0 {
+		return fmt.Errorf("avalanche_beta must be positive")
+	}
+	if cfg.AvalanchePollIntervalMS <= 0 {
+		return fmt.Errorf("avalanche_poll_interval_ms must be positive")
+	}
+	if cfg.MinerWorkers < 0 {
+		return fmt.Errorf("miner_workers must not be negative")
+	}
+	return nil
 }
 
 func DefaultPathCandidates() []string {
@@ -222,9 +308,9 @@ func renderCommentedYAML(cfg Config) ([]byte, error) {
 			title:       "Logging and Profiling",
 			description: "Operator-visible logs, summaries, and optional local profiling endpoints.",
 			fields: []yamlField{
-				{key: "log_path", description: "Writes daemon logs to a file when set; leave empty to log to stderr only.", value: cfg.LogPath, defaultValue: defaults.LogPath},
+				{key: "log_path", description: "Overrides the daemon log path; leave empty to derive events.jsonl beside the chain database.", value: cfg.LogPath, defaultValue: defaults.LogPath},
 				{key: "log_level", description: "Controls log verbosity.", value: cfg.LogLevel, defaultValue: defaults.LogLevel},
-				{key: "log_format", description: "Chooses structured json logs or human-readable text logs.", value: cfg.LogFormat, defaultValue: defaults.LogFormat},
+				{key: "log_format", description: "Chooses canonical JSONL logs or human-readable text logs.", value: cfg.LogFormat, defaultValue: defaults.LogFormat},
 				{key: "throughput_summary_interval_ms", description: "Emits periodic throughput summaries on this interval in milliseconds.", value: cfg.ThroughputSummaryIntervalMS, defaultValue: defaults.ThroughputSummaryIntervalMS},
 				{key: "pprof_addr", description: "Exposes the local pprof server when set to a loopback listen address.", value: cfg.PprofAddr, defaultValue: defaults.PprofAddr},
 			},
@@ -260,7 +346,7 @@ func renderCommentedYAML(cfg Config) ([]byte, error) {
 			title:       "Mempool Settings",
 			description: "Admission policy for relayed transactions and dependency tracking limits.",
 			fields: []yamlField{
-				{key: "min_relay_fee_per_byte", description: "Rejects transactions whose fee rate falls below this minimum satoshi-per-byte policy floor.", value: cfg.MinRelayFeePerByte, defaultValue: defaults.MinRelayFeePerByte},
+				{key: "min_relay_fee_per_byte", description: "Rejects transactions whose fee rate falls below this minimum atoms-per-byte policy floor.", value: cfg.MinRelayFeePerByte, defaultValue: defaults.MinRelayFeePerByte},
 				{key: "max_mempool_bytes", description: "Caps total admitted mempool bytes; when full, lower-fee packages are evicted before higher-fee arrivals are admitted.", value: cfg.MaxMempoolBytes, defaultValue: defaults.MaxMempoolBytes},
 				{key: "max_ancestors", description: "Caps in-mempool ancestors per transaction.", value: cfg.MaxAncestors, defaultValue: defaults.MaxAncestors},
 				{key: "max_descendants", description: "Caps in-mempool descendants per transaction.", value: cfg.MaxDescendants, defaultValue: defaults.MaxDescendants},
@@ -292,7 +378,7 @@ func renderCommentedYAML(cfg Config) ([]byte, error) {
 			fields: []yamlField{
 				{key: "miner_enabled", description: "Enables local mining workers.", value: cfg.MinerEnabled, defaultValue: defaults.MinerEnabled},
 				{key: "miner_workers", description: "Sets the number of local mining workers; zero uses the node default.", value: cfg.MinerWorkers, defaultValue: defaults.MinerWorkers},
-				{key: "miner_pubkey_hex", description: "Pays coinbase rewards to this compressed public key; leave empty to let wallet auto-provisioning fill it in.", value: cfg.MinerPubKeyHex, defaultValue: defaults.MinerPubKeyHex},
+				{key: "miner_pubkey_hex", description: "Pays coinbase rewards to a 32-byte x-only secp256k1 public key; installed nodes should use ./install --mining on or set this explicitly.", value: cfg.MinerPubKeyHex, defaultValue: defaults.MinerPubKeyHex},
 			},
 		},
 	}

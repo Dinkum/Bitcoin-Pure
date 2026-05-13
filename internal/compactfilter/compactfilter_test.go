@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"bitcoin-pure/internal/consensus"
-	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
 )
 
@@ -17,11 +15,11 @@ func TestBuildAndMatch(t *testing.T) {
 			{Base: types.TxBase{Outputs: []types.TxOutput{{ValueAtoms: 2, PubKey: [32]byte{8}}}}},
 		},
 	}
-	undo := []storage.BlockUndoEntry{
-		{Entry: consensus.UtxoEntry{ValueAtoms: 3, PubKey: [32]byte{9}}},
+	spent := []WatchItem{
+		{Type: types.OutputXOnlyP2PK, Payload32: [32]byte{9}},
 	}
 	blockHash := [32]byte{4}
-	filter := Build(blockHash, block, undo)
+	filter := Build(blockHash, block, spent)
 	for _, pubKey := range [][32]byte{{7}, {8}, {9}} {
 		ok, err := Match(blockHash, filter.Encoded, pubKey)
 		if err != nil {

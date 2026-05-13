@@ -184,6 +184,30 @@ type UtxoEntry struct {
 
 type UtxoSet map[types.OutPoint]UtxoEntry
 
+const PQLockTag = "BPU/PQLOCK/MLDSA65/v1"
+
+// PQLock derives the 32-byte consensus lock committed by PQ outputs.
+func PQLock(verificationKey []byte) [32]byte {
+	return crypto.TaggedHash(PQLockTag, verificationKey)
+}
+
+func UtxoEntryFromOutput(output types.TxOutput) UtxoEntry {
+	if output.Type == types.OutputXOnlyP2PK {
+		pubKey := output.CanonicalPayload32()
+		return UtxoEntry{
+			Type:       output.Type,
+			ValueAtoms: output.ValueAtoms,
+			PubKey:     pubKey,
+		}
+	}
+	return UtxoEntry{
+		Type:       output.Type,
+		ValueAtoms: output.ValueAtoms,
+		Payload32:  output.CanonicalPayload32(),
+		PubKey:     output.PubKey,
+	}
+}
+
 func UtxoLeaves(utxos UtxoSet) []utreexo.UtxoLeaf {
 	leaves := make([]utreexo.UtxoLeaf, 0, len(utxos))
 	for outPoint, coin := range utxos {
@@ -403,12 +427,7 @@ func (o *UtxoOverlay) ApplyTx(tx types.Transaction, txid [32]byte) {
 		o.Spend(input.PrevOut)
 	}
 	for vout, output := range tx.Base.Outputs {
-		o.Set(types.OutPoint{TxID: txid, Vout: uint32(vout)}, UtxoEntry{
-			Type:       output.Type,
-			ValueAtoms: output.ValueAtoms,
-			Payload32:  output.Payload32,
-			PubKey:     output.PubKey,
-		})
+		o.Set(types.OutPoint{TxID: txid, Vout: uint32(vout)}, UtxoEntryFromOutput(output))
 	}
 }
 
@@ -512,6 +531,7 @@ var (
 	ErrDuplicateInput        = errors.New("duplicate input prevout")
 	ErrMissingUTXO           = errors.New("missing UTXO")
 	ErrInvalidOutputPubKey   = errors.New("invalid output pubkey")
+	ErrOutputPayloadMismatch = errors.New("output payload alias mismatch")
 	ErrUnsupportedOutputType = errors.New("unsupported output type")
 	ErrInvalidAuthPayload    = errors.New("invalid auth payload")
 	ErrInvalidPQLock         = errors.New("invalid PQ lock")
@@ -746,41 +766,6 @@ func SubsidyAtoms(height uint64, params ChainParams) uint64 {
 	return subsidy
 }
 
-func writeVarInt(out *[]byte, v uint64) {
-	switch {
-	case v <= 0xfc:
-		*out = append(*out, byte(v))
-	case v <= 0xffff:
-		*out = append(*out, 0xfd, byte(v), byte(v>>8))
-	case v <= 0xffff_ffff:
-		*out = append(*out, 0xfe, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-	default:
-		*out = append(*out, 0xff,
-			byte(v),
-			byte(v>>8),
-			byte(v>>16),
-			byte(v>>24),
-			byte(v>>32),
-			byte(v>>40),
-			byte(v>>48),
-			byte(v>>56),
-		)
-	}
-}
-
-func varIntLen(v uint64) int {
-	switch {
-	case v <= 0xfc:
-		return 1
-	case v <= 0xffff:
-		return 3
-	case v <= 0xffff_ffff:
-		return 5
-	default:
-		return 9
-	}
-}
-
 type sighashContext struct {
 	tag            string
 	version        uint32
@@ -804,8 +789,8 @@ func newSighashContextWithParams(tx *types.Transaction, spentCoins []UtxoEntry, 
 
 	// These serializations are rebuilt for every transaction validation, so
 	// reserve the exact payload size up front and avoid repeated growth.
-	prevouts := make([]byte, 0, varIntLen(uint64(len(tx.Base.Inputs)))+len(tx.Base.Inputs)*36)
-	writeVarInt(&prevouts, uint64(len(tx.Base.Inputs)))
+	prevouts := make([]byte, 0, types.CanonicalVarIntLen(uint64(len(tx.Base.Inputs)))+len(tx.Base.Inputs)*36)
+	prevouts = types.AppendCanonicalVarInt(prevouts, uint64(len(tx.Base.Inputs)))
 	for _, input := range tx.Base.Inputs {
 		prevouts = append(prevouts, input.PrevOut.TxID[:]...)
 		prevouts = append(prevouts,
@@ -816,16 +801,16 @@ func newSighashContextWithParams(tx *types.Transaction, spentCoins []UtxoEntry, 
 		)
 	}
 
-	outputs := make([]byte, 0, varIntLen(uint64(len(tx.Base.Outputs)))+len(tx.Base.Outputs)*49)
-	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
+	outputs := make([]byte, 0, types.CanonicalVarIntLen(uint64(len(tx.Base.Outputs)))+len(tx.Base.Outputs)*49)
+	outputs = types.AppendCanonicalVarInt(outputs, uint64(len(tx.Base.Outputs)))
 	for _, output := range tx.Base.Outputs {
 		outputs = appendTypedCoinEncoding(outputs, output.Type, output.ValueAtoms, canonicalOutputPayload32(output))
 	}
 
 	// Sighash commits to the full spent-coin encoding, not just amounts, so the
 	// authorization domain stays aligned with the canonical UTXO object layout.
-	spentCoinPayload := make([]byte, 0, varIntLen(uint64(len(spentCoins)))+len(spentCoins)*49)
-	writeVarInt(&spentCoinPayload, uint64(len(spentCoins)))
+	spentCoinPayload := make([]byte, 0, types.CanonicalVarIntLen(uint64(len(spentCoins)))+len(spentCoins)*49)
+	spentCoinPayload = types.AppendCanonicalVarInt(spentCoinPayload, uint64(len(spentCoins)))
 	for _, coin := range spentCoins {
 		spentCoinPayload = appendTypedCoinEncoding(spentCoinPayload, coin.Type, coin.ValueAtoms, canonicalUtxoPayload32(coin))
 	}
@@ -923,10 +908,7 @@ func appendValuePubKeyEncoding(dst []byte, valueAtoms uint64, pubKey [32]byte) [
 }
 
 func canonicalOutputPayload32(output types.TxOutput) [32]byte {
-	if output.Type == types.OutputXOnlyP2PK && output.Payload32 == ([32]byte{}) {
-		return output.PubKey
-	}
-	return output.Payload32
+	return output.CanonicalPayload32()
 }
 
 func canonicalUtxoPayload32(entry UtxoEntry) [32]byte {
@@ -939,6 +921,9 @@ func canonicalUtxoPayload32(entry UtxoEntry) [32]byte {
 func validateOutputPayload(output types.TxOutput) error {
 	switch output.Type {
 	case types.OutputXOnlyP2PK:
+		if output.Payload32 != ([32]byte{}) && output.PubKey != ([32]byte{}) && output.Payload32 != output.PubKey {
+			return ErrOutputPayloadMismatch
+		}
 		payload32 := canonicalOutputPayload32(output)
 		if !crypto.IsValidXOnlyPubKey(&payload32) {
 			return ErrInvalidOutputPubKey
@@ -1096,7 +1081,7 @@ func prepareTxValidationWithLookupAndParams(tx *types.Transaction, lookup UtxoLo
 			if len(parsedAuth.VerificationKey) != crypto.MLDSA65VerificationKeySize || len(parsedAuth.Signature) != crypto.MLDSA65SignatureSize {
 				return TxValidationSummary{}, signatureChecks, pqChecks, ErrInvalidAuthPayload
 			}
-			if crypto.PQLock(parsedAuth.VerificationKey) != canonicalUtxoPayload32(utxo) {
+			if PQLock(parsedAuth.VerificationKey) != canonicalUtxoPayload32(utxo) {
 				return TxValidationSummary{}, signatureChecks, pqChecks, ErrInvalidPQLock
 			}
 			pqChecks = append(pqChecks, PQVerifyCheck{
@@ -1833,6 +1818,9 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		skipAuthChecks := validatedTx || (rules.ValidatedAuthCache != nil && rules.ValidatedAuthCache(txids[i], authids[i], params))
 		summary, nextSignatureChecks, nextPQChecks, err := prepareTxValidationWithLookupAndParams(tx, tempUtxos.Lookup, params, signatureChecks, pqChecks, skipAuthChecks, validatedTx)
 		if err != nil {
+			if lookupErr := tempUtxos.Err(); lookupErr != nil {
+				return BlockValidationSummary{}, nil, nil, fmt.Errorf("utxo lookup failed during block validation: %w", lookupErr)
+			}
 			return BlockValidationSummary{}, nil, nil, err
 		}
 		nextFees := totalFees + summary.Fee
@@ -1867,12 +1855,7 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 
 	coinbaseTxID := TxID(coinbase)
 	for vout, output := range coinbase.Base.Outputs {
-		tempUtxos.Set(types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}, UtxoEntry{
-			Type:       output.Type,
-			ValueAtoms: output.ValueAtoms,
-			Payload32:  output.Payload32,
-			PubKey:     output.PubKey,
-		})
+		tempUtxos.Set(types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}, UtxoEntryFromOutput(output))
 	}
 	var nextAccumulator *utreexo.Accumulator
 	if accumulator != nil {

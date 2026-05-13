@@ -7,7 +7,6 @@ import (
 	"sort"
 
 	"bitcoin-pure/internal/crypto"
-	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
 )
 
@@ -31,10 +30,10 @@ type WatchItem struct {
 func Type() string { return filterType }
 
 // Build deterministically encodes the block's created typed watch items and the
-// consumed prevout watch items captured in undo data into a compact probabilistic
+// caller-supplied consumed prevout watch items into a compact probabilistic
 // filter. The filter is non-consensus and keyed by block hash.
-func Build(blockHash [32]byte, block *types.Block, undo []storage.BlockUndoEntry) Filter {
-	fingerprints := collectFingerprints(blockHash, block, undo)
+func Build(blockHash [32]byte, block *types.Block, spent []WatchItem) Filter {
+	fingerprints := collectFingerprints(blockHash, block, spent)
 	encoded := encodeFingerprints(fingerprints)
 	return Filter{
 		BlockHash: blockHash,
@@ -70,25 +69,21 @@ func MatchWatchItem(blockHash [32]byte, encoded []byte, item WatchItem) (bool, e
 	return index < len(fingerprints) && fingerprints[index] == target, nil
 }
 
-func collectFingerprints(blockHash [32]byte, block *types.Block, undo []storage.BlockUndoEntry) []uint64 {
+func WatchItemForOutput(output types.TxOutput) WatchItem {
+	return WatchItem{Type: output.Type, Payload32: output.CanonicalPayload32()}
+}
+
+func collectFingerprints(blockHash [32]byte, block *types.Block, spent []WatchItem) []uint64 {
 	if block == nil {
 		return nil
 	}
 	unique := make(map[WatchItem]struct{})
 	for i := range block.Txs {
 		for _, output := range block.Txs[i].Base.Outputs {
-			item := WatchItem{Type: output.Type, Payload32: output.Payload32}
-			if item.Payload32 == ([32]byte{}) && item.Type == types.OutputXOnlyP2PK {
-				item.Payload32 = output.PubKey
-			}
-			unique[item] = struct{}{}
+			unique[WatchItemForOutput(output)] = struct{}{}
 		}
 	}
-	for _, spent := range undo {
-		item := WatchItem{Type: spent.Entry.Type, Payload32: spent.Entry.Payload32}
-		if item.Payload32 == ([32]byte{}) && item.Type == types.OutputXOnlyP2PK {
-			item.Payload32 = spent.Entry.PubKey
-		}
+	for _, item := range spent {
 		unique[item] = struct{}{}
 	}
 	values := make([]uint64, 0, len(unique))

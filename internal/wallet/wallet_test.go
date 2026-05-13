@@ -225,11 +225,11 @@ func TestBuildSendCreatesSignedTransactionAndChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Wallet: %v", err)
 	}
-	if len(loaded.Addresses) != 3 {
-		t.Fatalf("wallet addresses = %d, want 3 including change", len(loaded.Addresses))
+	if len(loaded.Addresses) != 2 {
+		t.Fatalf("wallet addresses = %d, want unchanged planning wallet", len(loaded.Addresses))
 	}
-	if !loaded.Addresses[2].Change {
-		t.Fatal("expected generated change address to be marked as change")
+	if plan.ChangeAddress == nil || !plan.ChangeAddress.Change {
+		t.Fatal("expected generated change address in unsigned plan")
 	}
 }
 
@@ -256,7 +256,7 @@ func TestBuildSendRejectsAmountFeeOverflow(t *testing.T) {
 	}
 }
 
-func TestReconcilePendingDropsMissingMempoolTransactions(t *testing.T) {
+func TestReconcilePendingKeepsTransactionsMissingFromMempool(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -277,12 +277,100 @@ func TestReconcilePendingDropsMissingMempoolTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
 	}
-	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs); err != nil {
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	removed, err := store.ReconcilePending("alice", map[[32]byte]struct{}{})
 	if err != nil {
 		t.Fatalf("ReconcilePending: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0", removed)
+	}
+	loaded, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatalf("Wallet: %v", err)
+	}
+	if len(loaded.Pending) != 1 {
+		t.Fatalf("pending len = %d, want 1", len(loaded.Pending))
+	}
+}
+
+func TestReconcilePendingWithUTXOsClearsResolvedTransactions(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	spent := types.OutPoint{TxID: [32]byte{1}, Vout: 0}
+	plan, err := store.BuildSend("alice", first.Address, 10, 1, []SpendableUTXO{{
+		OutPoint: spent,
+		Value:    50,
+		PubKey:   keyHash,
+	}})
+	if err != nil {
+		t.Fatalf("BuildSend: %v", err)
+	}
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	removed, err := store.ReconcilePendingWithUTXOs("alice", map[[32]byte]struct{}{}, []SpendableUTXO{{
+		OutPoint: spent,
+		Value:    50,
+		PubKey:   keyHash,
+	}})
+	if err != nil {
+		t.Fatalf("ReconcilePendingWithUTXOs: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	loaded, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatalf("Wallet: %v", err)
+	}
+	if len(loaded.Pending) != 0 {
+		t.Fatalf("pending len = %d, want 0", len(loaded.Pending))
+	}
+}
+
+func TestReconcilePendingWithStatusClearsConfirmedNoChangeSend(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	plan, err := store.BuildSend("alice", first.Address, 49, 1, []SpendableUTXO{{
+		OutPoint: types.OutPoint{TxID: [32]byte{2}, Vout: 0},
+		Value:    50,
+		PubKey:   keyHash,
+	}})
+	if err != nil {
+		t.Fatalf("BuildSend: %v", err)
+	}
+	if plan.Change != 0 || plan.ChangeAddress != nil {
+		t.Fatalf("plan unexpectedly has change: %+v", plan)
+	}
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	removed, err := store.ReconcilePendingWithStatus("alice", map[[32]byte]struct{}{}, nil, map[[32]byte]struct{}{plan.TransactionID: {}})
+	if err != nil {
+		t.Fatalf("ReconcilePendingWithStatus: %v", err)
 	}
 	if removed != 1 {
 		t.Fatalf("removed = %d, want 1", removed)
@@ -365,7 +453,7 @@ func TestBalanceTracksConfirmedAvailableAndReserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
 	}
-	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs); err != nil {
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	summary, err := store.Balance("alice", []SpendableUTXO{
@@ -569,6 +657,124 @@ func TestBackupRestoreExportImportWallet(t *testing.T) {
 	}
 }
 
+func TestImportWalletRejectsProfileMismatchUnlessForced(t *testing.T) {
+	source, err := OpenWithProfile(filepath.Join(t.TempDir(), StoreFileName), types.Mainnet)
+	if err != nil {
+		t.Fatalf("Open source: %v", err)
+	}
+	if _, _, err := source.CreateWallet("alice"); err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	export, err := source.ExportWallet("alice")
+	if err != nil {
+		t.Fatalf("ExportWallet: %v", err)
+	}
+	target, err := OpenWithProfile(filepath.Join(t.TempDir(), StoreFileName), types.Regtest)
+	if err != nil {
+		t.Fatalf("Open target: %v", err)
+	}
+	if _, err := target.ImportWallet(export, "alice"); err == nil {
+		t.Fatal("expected profile mismatch import to fail")
+	}
+	if _, err := target.ImportWalletWithOptions(export, "alice", true); err != nil {
+		t.Fatalf("forced ImportWalletWithOptions: %v", err)
+	}
+}
+
+func TestRestoreBackupRejectsInvalidAddressMaterial(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, _, err := store.CreateWallet("alice"); err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	backupPath := filepath.Join(root, "backup.json")
+	if err := store.Backup(backupPath); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	backup, err := LoadBackupFile(backupPath)
+	if err != nil {
+		t.Fatalf("LoadBackupFile: %v", err)
+	}
+	backup.Wallets[0].Addresses[0].PrivateKeyHex = ""
+	backup.Wallets[0].Addresses[0].SecretKeyHex = ""
+	buf, err := json.Marshal(backup)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	badBackup := filepath.Join(root, "bad-backup.json")
+	if err := os.WriteFile(badBackup, buf, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	restored, err := Open(filepath.Join(root, "restored.json"))
+	if err != nil {
+		t.Fatalf("Open restored: %v", err)
+	}
+	if err := restored.RestoreBackup(badBackup); err == nil || !strings.Contains(err.Error(), "signing secret") {
+		t.Fatalf("RestoreBackup err = %v, want signing secret error", err)
+	}
+}
+
+func TestLoadBackupFileRejectsVersionedEnvelopeWithoutWallets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(path, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := LoadBackupFile(path); err == nil || !strings.Contains(err.Error(), "missing wallets") {
+		t.Fatalf("LoadBackupFile err = %v, want missing wallets", err)
+	}
+}
+
+func TestLoadBackupFileRejectsNullWallets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"wallets":null}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := LoadBackupFile(path); err == nil || (!strings.Contains(err.Error(), "missing wallets") && !strings.Contains(err.Error(), "must be an array")) {
+		t.Fatalf("LoadBackupFile err = %v, want wallets validation error", err)
+	}
+}
+
+func TestLoadBackupFileRejectsLegacyNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(path, []byte(`null`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := LoadBackupFile(path); err == nil || !strings.Contains(err.Error(), "must be an array") {
+		t.Fatalf("LoadBackupFile err = %v, want legacy array error", err)
+	}
+}
+
+func TestRestoreBackupRejectsEmptyWalletList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"wallets":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.RestoreBackup(path); err == nil || !strings.Contains(err.Error(), "contains no wallets") {
+		t.Fatalf("RestoreBackup err = %v, want empty backup rejection", err)
+	}
+}
+
+func TestBackupRejectsLiveWalletStorePath(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, _, err := store.CreateWallet("alice"); err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	if err := store.BackupWithOptions(filepath.Join(root, StoreFileName), true); err == nil || !strings.Contains(err.Error(), "live wallet store") {
+		t.Fatalf("BackupWithOptions err = %v, want live store rejection", err)
+	}
+}
+
 func TestBuildSendAutoChoosesFeeFromEstimatedSize(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
 	if err != nil {
@@ -603,6 +809,50 @@ func TestBuildSendAutoChoosesFeeFromEstimatedSize(t *testing.T) {
 	}
 	if plan.Change == 0 || plan.ChangeAddress == nil {
 		t.Fatal("expected auto-fee send to keep change")
+	}
+}
+
+func TestBuildSendAutoWithKnownAddressesCanSpendPlannedChange(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, first, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	keyHash, err := ParseAddress(first.Address)
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	dest, err := store.NewReceiveAddress("alice")
+	if err != nil {
+		t.Fatalf("NewReceiveAddress: %v", err)
+	}
+	firstPlan, err := store.BuildSendAuto("alice", dest.Address, 1_000, 1, []SpendableUTXO{
+		{OutPoint: types.OutPoint{TxID: [32]byte{9}, Vout: 0}, Value: 3_000, PubKey: keyHash},
+	})
+	if err != nil {
+		t.Fatalf("BuildSendAuto first: %v", err)
+	}
+	if firstPlan.ChangeAddress == nil || firstPlan.Change == 0 {
+		t.Fatalf("first plan did not create change: %+v", firstPlan)
+	}
+	changeItem, err := firstPlan.ChangeAddress.WatchItem()
+	if err != nil {
+		t.Fatalf("Change WatchItem: %v", err)
+	}
+	changeUTXO := SpendableUTXO{
+		OutPoint:  types.OutPoint{TxID: firstPlan.TransactionID, Vout: 1},
+		Value:     firstPlan.Change,
+		Type:      changeItem.Type,
+		Payload32: changeItem.Payload32,
+	}
+	if _, err := store.BuildSendAuto("alice", dest.Address, 500, 1, []SpendableUTXO{changeUTXO}); !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("BuildSendAuto without known change err = %v, want insufficient funds", err)
+	}
+	if _, err := store.BuildSendAutoWithKnownAddresses("alice", dest.Address, 500, 1, []SpendableUTXO{changeUTXO}, []Address{*firstPlan.ChangeAddress}); err != nil {
+		t.Fatalf("BuildSendAutoWithKnownAddresses: %v", err)
 	}
 }
 
@@ -654,7 +904,7 @@ func TestMarkSubmittedTracksWalletOwnedOutputsForCPFP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
 	}
-	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs); err != nil {
+	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	pendingUTXOs, err := store.PendingSpendableUTXOs("alice", &plan.TransactionID)
@@ -691,7 +941,7 @@ func TestBuildCPFPUsesPendingWalletOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSend: %v", err)
 	}
-	if err := store.MarkSubmitted("alice", parent.TransactionID, parent.Transaction, parent.Inputs); err != nil {
+	if err := store.MarkSubmitted("alice", parent.TransactionID, parent.Transaction, parent.Inputs, parent.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	child, err := store.BuildCPFP("alice", parent.TransactionID, 2)

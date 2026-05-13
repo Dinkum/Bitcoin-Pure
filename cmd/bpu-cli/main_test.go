@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"bitcoin-pure/internal/config"
+	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/node"
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/wallet"
@@ -191,6 +193,155 @@ func TestLoadGenesisFixtureSupportsRegtestMediumAndHard(t *testing.T) {
 	}
 }
 
+func TestLogsHelpersUseStandardJSONLPathAndOperationRender(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	logPath := resolveLogPath(cfg)
+	if logPath != filepath.Join(root, "events.jsonl") {
+		t.Fatalf("log path = %q, want events.jsonl beside chain dir", logPath)
+	}
+
+	file, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("create log file: %v", err)
+	}
+	logger, err := logging.NewLogger(file, logging.Config{Format: "jsonl", Level: "info"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+	op := logging.StartOperation(logger, "sync", "sync.blocks", "Started block sync", slog.Uint64("from_height", 1))
+	op.Step("headers", "Resolved locator", slog.Uint64("header_height", 3))
+	op.Finish("Completed block sync", slog.Int("block_count", 2))
+	if err := file.Close(); err != nil {
+		t.Fatalf("close log file: %v", err)
+	}
+
+	lines, err := readLastLogLines(logPath, 2)
+	if err != nil {
+		t.Fatalf("readLastLogLines: %v", err)
+	}
+	if len(lines) != 2 || !strings.Contains(lines[1], "Completed block sync") {
+		t.Fatalf("unexpected tail lines: %v", lines)
+	}
+
+	lastOpID, err := findLastOperationID(logPath)
+	if err != nil {
+		t.Fatalf("findLastOperationID: %v", err)
+	}
+	if lastOpID != op.ID() {
+		t.Fatalf("last op id = %q, want %q", lastOpID, op.ID())
+	}
+	records, err := collectOperationRecords(logPath, op.ID())
+	if err != nil {
+		t.Fatalf("collectOperationRecords: %v", err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("operation record count = %d, want 3", len(records))
+	}
+	if !logRecordMatches(records[0], "sync", "sync.blocks", "info", op.ID(), "started") {
+		t.Fatalf("root record did not match expected filters: %+v", records[0])
+	}
+	rendered := renderOperationRecords(records)
+	for _, want := range []string{"Started block sync", ">> headers", "Completed block sync", "|="} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered log missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestWalletCreateDefaultsToMainWallet(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	configPath := filepath.Join(root, "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	walletDir := filepath.Join(root, "wallets")
+	if err := runWalletCreate([]string{"--config", configPath, "--wallet-dir", walletDir}); err != nil {
+		t.Fatalf("runWalletCreate: %v", err)
+	}
+	store, err := wallet.OpenWithProfile(wallet.StorePath(walletDir), types.Regtest)
+	if err != nil {
+		t.Fatalf("OpenWithProfile: %v", err)
+	}
+	if _, err := store.Wallet("main"); err != nil {
+		t.Fatalf("default wallet not created: %v", err)
+	}
+}
+
+func TestWalletReceiveAndExportInferSingleWallet(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	configPath := filepath.Join(root, "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	walletDir := filepath.Join(root, "wallets")
+	store, err := wallet.OpenWithProfile(wallet.StorePath(walletDir), types.Regtest)
+	if err != nil {
+		t.Fatalf("OpenWithProfile: %v", err)
+	}
+	if _, _, err := store.CreateWallet("main"); err != nil {
+		t.Fatalf("CreateWallet: %v", err)
+	}
+	if err := runWalletReceive([]string{"--config", configPath, "--wallet-dir", walletDir}); err != nil {
+		t.Fatalf("runWalletReceive: %v", err)
+	}
+	reopened, err := wallet.OpenWithProfile(wallet.StorePath(walletDir), types.Regtest)
+	if err != nil {
+		t.Fatalf("reopen wallet store: %v", err)
+	}
+	loaded, err := reopened.Wallet("main")
+	if err != nil {
+		t.Fatalf("Wallet: %v", err)
+	}
+	if len(loaded.Addresses) != 2 {
+		t.Fatalf("addresses = %d, want 2", len(loaded.Addresses))
+	}
+	if err := runWalletExport([]string{"--config", configPath, "--wallet-dir", walletDir}); err != nil {
+		t.Fatalf("runWalletExport: %v", err)
+	}
+	if !fileExists(filepath.Join(walletDir, "main-wallet-export.json")) {
+		t.Fatal("default export file was not written")
+	}
+}
+
+func TestRejectInstalledMiningAutoProvision(t *testing.T) {
+	cfg := config.Default()
+	cfg.MinerEnabled = true
+	if err := rejectInstalledMiningAutoProvision(config.DefaultConfigPath, cfg); err == nil || !strings.Contains(err.Error(), "install --mining on") {
+		t.Fatalf("rejectInstalledMiningAutoProvision err = %v, want install guidance", err)
+	}
+	if err := rejectInstalledMiningAutoProvision(config.LegacyConfigPath, cfg); err == nil || !strings.Contains(err.Error(), "install --mining on") {
+		t.Fatalf("legacy rejectInstalledMiningAutoProvision err = %v, want install guidance", err)
+	}
+	cfg.MinerPubKeyHex = "abcd"
+	if err := rejectInstalledMiningAutoProvision(config.DefaultConfigPath, cfg); err != nil {
+		t.Fatalf("configured pubkey should pass: %v", err)
+	}
+	cfg.MinerPubKeyHex = ""
+	if err := rejectInstalledMiningAutoProvision(filepath.Join(t.TempDir(), "config.yaml"), cfg); err != nil {
+		t.Fatalf("non-installed config should pass: %v", err)
+	}
+}
+
+func TestWalletBackupRejectsEmptyStore(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	configPath := filepath.Join(root, "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+	err := runWalletBackup([]string{"--config", configPath, "--wallet-dir", filepath.Join(root, "wallets")})
+	if err == nil || !strings.Contains(err.Error(), "no wallets found") {
+		t.Fatalf("runWalletBackup err = %v, want empty-store refusal", err)
+	}
+}
+
 func TestParseWalletFeePriority(t *testing.T) {
 	tests := []struct {
 		raw        string
@@ -284,6 +435,29 @@ func TestRenderFanoutPreviewShowsBatchShape(t *testing.T) {
 	for _, want := range []string{"fanout", "miner", "3", "2 addresses", "1.25 BPU", "3.75 BPU", "500 atoms each"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("fanout preview missing %q: %#v", want, view)
+		}
+	}
+}
+
+func TestRenderNodeStatusShowsOperatorSummary(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "chain")
+	status := cliNodeStatus{
+		Info: node.ServiceInfo{
+			Profile:       "regtest",
+			TipHeight:     7,
+			HeaderHeight:  9,
+			TipHeaderHash: strings.Repeat("a", 64),
+			RPCAddr:       "127.0.0.1:18443",
+		},
+		Mempool: node.MempoolInfo{Count: 2, Bytes: 500, MinRelayFeePerByte: 1, MedianFee: 3, HighFee: 5},
+		Mining:  node.MiningInfo{Enabled: true, Workers: 4},
+		Peers:   []node.PeerInfo{{Addr: "127.0.0.1:18444"}},
+	}
+	out := renderNodeStatus(status, cfg)
+	for _, want := range []string{"Bitcoin Pure status", "syncing", "blocks=7 headers=9", "1 peer", "2 tx / 500 bytes", "on (4 workers)", "events.jsonl"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status output missing %q:\n%s", want, out)
 		}
 	}
 }

@@ -287,14 +287,21 @@ type Conn struct {
 }
 
 func NewConn(conn net.Conn, magic uint32, maxPayload int) *Conn {
+	return NewConnWithLimits(conn, magic, maxPayload, types.DefaultCodecLimits())
+}
+
+func NewConnWithLimits(conn net.Conn, magic uint32, maxPayload int, limits types.CodecLimits) *Conn {
 	if maxPayload <= 0 {
 		maxPayload = 64_000_000
+	}
+	if limits == (types.CodecLimits{}) {
+		limits = types.DefaultCodecLimits()
 	}
 	return &Conn{
 		Conn:       conn,
 		magic:      magic,
 		maxPayload: maxPayload,
-		limits:     types.DefaultCodecLimits(),
+		limits:     limits,
 	}
 }
 
@@ -314,6 +321,8 @@ func Handshake(conn *Conn, local VersionMessage, timeout time.Duration) (Version
 	}()
 	msg, err := conn.ReadMessage()
 	if err != nil {
+		_ = conn.Close()
+		<-writeErr
 		return VersionMessage{}, err
 	}
 	if err := <-writeErr; err != nil {
@@ -328,6 +337,8 @@ func Handshake(conn *Conn, local VersionMessage, timeout time.Duration) (Version
 	}()
 	msg, err = conn.ReadMessage()
 	if err != nil {
+		_ = conn.Close()
+		<-writeErr
 		return VersionMessage{}, err
 	}
 	if err := <-writeErr; err != nil {
@@ -424,11 +435,29 @@ func (c *Conn) WriteMessage(msg Message) error {
 	binary.LittleEndian.PutUint32(header[8:12], uint32(len(payload)))
 	checksum := crypto.Sha256d(payload)
 	copy(header[12:16], checksum[:4])
-	if _, err := c.Conn.Write(header); err != nil {
-		return err
+	if err := writeFull(c.Conn, header); err != nil {
+		return fmt.Errorf("write command %d header: %w", msg.Command(), err)
 	}
-	_, err = c.Conn.Write(payload)
-	return err
+	if err := writeFull(c.Conn, payload); err != nil {
+		return fmt.Errorf("write command %d payload: %w", msg.Command(), err)
+	}
+	return nil
+}
+
+func writeFull(w io.Writer, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func MagicForProfile(profile types.ChainProfile) uint32 {

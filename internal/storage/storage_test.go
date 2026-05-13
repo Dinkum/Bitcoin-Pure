@@ -52,6 +52,43 @@ func sampleBlockSizeState() consensus.BlockSizeState {
 	}
 }
 
+func testRegularTx(inputs []types.OutPoint, outputs []types.TxOutput) types.Transaction {
+	txInputs := make([]types.TxInput, 0, len(inputs))
+	for _, input := range inputs {
+		txInputs = append(txInputs, types.TxInput{PrevOut: input})
+	}
+	authEntries := make([]types.TxAuthEntry, len(inputs))
+	return types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  txInputs,
+			Outputs: outputs,
+		},
+		Auth: types.TxAuth{Entries: authEntries},
+	}
+}
+
+func testBlock(prevHash [32]byte, timestamp uint64, nbits uint32, utxos consensus.UtxoSet, txs ...types.Transaction) types.Block {
+	txids := make([][32]byte, 0, len(txs))
+	authids := make([][32]byte, 0, len(txs))
+	for i := range txs {
+		txids = append(txids, consensus.TxID(&txs[i]))
+		authids = append(authids, consensus.AuthID(&txs[i]))
+	}
+	return types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  prevHash,
+			MerkleTxIDRoot: consensus.MerkleRoot(txids),
+			MerkleAuthRoot: consensus.MerkleRoot(authids),
+			UTXORoot:       consensus.ComputedUTXORoot(utxos),
+			Timestamp:      timestamp,
+			NBits:          nbits,
+		},
+		Txs: txs,
+	}
+}
+
 func TestStorageWritePoliciesMatchDurabilityIntent(t *testing.T) {
 	if consensusCriticalWriteOptions == nil || !consensusCriticalWriteOptions.Sync {
 		t.Fatal("consensus-critical storage writes must be synced")
@@ -1133,6 +1170,161 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	}
 	if len(rawHeightIndex) != 32 {
 		t.Fatalf("raw height index len = %d, want 32", len(rawHeightIndex))
+	}
+}
+
+func TestWalletIndexesFollowActiveChainAndReorg(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	genesis, genesisUTXOs := sampleBlockAndUTXOs()
+	genesisHash := consensus.HeaderHash(&genesis.Header)
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	genesisEntry := genesisUTXOs[genesisOut]
+	if err := store.AppendValidatedBlock(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      genesis.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          genesisUTXOs,
+	}, &genesis, &BlockIndexEntry{
+		Height:         0,
+		Header:         genesis.Header,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}, nil, nil, genesisUTXOs); err != nil {
+		t.Fatalf("append genesis: %v", err)
+	}
+
+	oldItem := WalletWatchItem{Type: types.OutputXOnlyP2PK, Payload32: [32]byte{7}}
+	oldUTXOs, err := store.WalletUTXOsByWatchItems([]WalletWatchItem{oldItem, oldItem})
+	if err != nil {
+		t.Fatalf("WalletUTXOsByWatchItems(genesis): %v", err)
+	}
+	if len(oldUTXOs) != 1 || oldUTXOs[0].OutPoint != genesisOut || oldUTXOs[0].Height != 0 {
+		t.Fatalf("genesis wallet utxos = %+v, want one indexed genesis output", oldUTXOs)
+	}
+
+	coinbaseA := testCoinbase(1, []types.TxOutput{{ValueAtoms: 25, PubKey: [32]byte{9}}})
+	spendA := testRegularTx([]types.OutPoint{genesisOut}, []types.TxOutput{{ValueAtoms: 40, PubKey: [32]byte{2}}})
+	coinbaseAOut := types.OutPoint{TxID: consensus.TxID(&coinbaseA), Vout: 0}
+	spendAOut := types.OutPoint{TxID: consensus.TxID(&spendA), Vout: 0}
+	createdA := consensus.UtxoSet{
+		coinbaseAOut: {ValueAtoms: 25, PubKey: [32]byte{9}},
+		spendAOut:    {ValueAtoms: 40, PubKey: [32]byte{2}},
+	}
+	blockA := testBlock(genesisHash, 2, genesis.Header.NBits, createdA, coinbaseA, spendA)
+	entryA := BlockIndexEntry{
+		Height:         1,
+		ParentHash:     genesisHash,
+		Header:         blockA.Header,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}
+	undo := []BlockUndoEntry{{OutPoint: genesisOut, Entry: genesisEntry}}
+	if err := store.AppendValidatedBlock(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         1,
+		TipHeader:      blockA.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          createdA,
+	}, &blockA, &entryA, undo, []types.OutPoint{genesisOut}, createdA); err != nil {
+		t.Fatalf("append active branch: %v", err)
+	}
+
+	coinbaseB := testCoinbase(1, []types.TxOutput{{ValueAtoms: 26, PubKey: [32]byte{8}}})
+	midB := testRegularTx([]types.OutPoint{genesisOut}, []types.TxOutput{{ValueAtoms: 45, PubKey: [32]byte{4}}})
+	midBOut := types.OutPoint{TxID: consensus.TxID(&midB), Vout: 0}
+	spendB := testRegularTx([]types.OutPoint{midBOut}, []types.TxOutput{{ValueAtoms: 41, PubKey: [32]byte{3}}})
+	coinbaseBOut := types.OutPoint{TxID: consensus.TxID(&coinbaseB), Vout: 0}
+	spendBOut := types.OutPoint{TxID: consensus.TxID(&spendB), Vout: 0}
+	createdB := consensus.UtxoSet{
+		coinbaseBOut: {ValueAtoms: 26, PubKey: [32]byte{8}},
+		spendBOut:    {ValueAtoms: 41, PubKey: [32]byte{3}},
+	}
+	blockB := testBlock(genesisHash, 3, genesis.Header.NBits, createdB, coinbaseB, midB, spendB)
+	entryB := BlockIndexEntry{
+		Height:         1,
+		ParentHash:     genesisHash,
+		Header:         blockB.Header,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}
+	if err := store.PutValidatedBlock(&blockB, &entryB, undo); err != nil {
+		t.Fatalf("store side branch: %v", err)
+	}
+	if err := store.CommitReorgDelta(&StoredChainStateMeta{
+		Profile:        types.Regtest,
+		Height:         1,
+		TipHeader:      blockB.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOChecksum:   utxochecksum.Compute(createdB),
+	}, []types.OutPoint{coinbaseAOut, spendAOut}, createdB, 0, 1, []BlockIndexEntry{entryB}); err != nil {
+		t.Fatalf("commit reorg: %v", err)
+	}
+
+	indexHeight, err := store.WalletIndexHeight()
+	if err != nil {
+		t.Fatalf("WalletIndexHeight: %v", err)
+	}
+	if indexHeight == nil || *indexHeight != 1 {
+		t.Fatalf("wallet index height = %v, want 1", indexHeight)
+	}
+	branchAItem := WalletWatchItem{Type: types.OutputXOnlyP2PK, Payload32: [32]byte{2}}
+	branchAUTXOs, err := store.WalletUTXOsByWatchItems([]WalletWatchItem{branchAItem})
+	if err != nil {
+		t.Fatalf("WalletUTXOsByWatchItems(branch A): %v", err)
+	}
+	if len(branchAUTXOs) != 0 {
+		t.Fatalf("reorged-out wallet utxos = %+v, want none", branchAUTXOs)
+	}
+	branchAActivity, err := store.WalletActivityByWatchItems([]WalletWatchItem{branchAItem}, 10)
+	if err != nil {
+		t.Fatalf("WalletActivityByWatchItems(branch A): %v", err)
+	}
+	if len(branchAActivity) != 0 {
+		t.Fatalf("reorged-out wallet activity = %+v, want none", branchAActivity)
+	}
+
+	branchBItem := WalletWatchItem{Type: types.OutputXOnlyP2PK, Payload32: [32]byte{3}}
+	branchBUTXOs, err := store.WalletUTXOsByWatchItems([]WalletWatchItem{branchBItem, branchBItem})
+	if err != nil {
+		t.Fatalf("WalletUTXOsByWatchItems(branch B): %v", err)
+	}
+	if len(branchBUTXOs) != 1 || branchBUTXOs[0].OutPoint != spendBOut || branchBUTXOs[0].Height != 1 {
+		t.Fatalf("branch B wallet utxos = %+v, want one active output", branchBUTXOs)
+	}
+	branchBActivity, err := store.WalletActivityByWatchItems([]WalletWatchItem{branchBItem, branchBItem}, 10)
+	if err != nil {
+		t.Fatalf("WalletActivityByWatchItems(branch B): %v", err)
+	}
+	if len(branchBActivity) != 1 || branchBActivity[0].Height != 1 || branchBActivity[0].Received != 41 {
+		t.Fatalf("branch B wallet activity = %+v, want received activity", branchBActivity)
+	}
+	sameBlockItem := WalletWatchItem{Type: types.OutputXOnlyP2PK, Payload32: [32]byte{4}}
+	sameBlockActivity, err := store.WalletActivityByWatchItems([]WalletWatchItem{sameBlockItem}, 10)
+	if err != nil {
+		t.Fatalf("WalletActivityByWatchItems(same-block): %v", err)
+	}
+	var sameBlockReceived, sameBlockSent, sameBlockFee uint64
+	for _, record := range sameBlockActivity {
+		sameBlockReceived += record.Received
+		sameBlockSent += record.Sent
+		sameBlockFee += record.Fee
+	}
+	if sameBlockReceived != 45 || sameBlockSent != 45 || sameBlockFee != 4 {
+		t.Fatalf("same-block wallet activity = %+v, want receive 45, send 45, fee 4", sameBlockActivity)
+	}
+	spenderActivity, err := store.WalletActivityByWatchItems([]WalletWatchItem{oldItem}, 10)
+	if err != nil {
+		t.Fatalf("WalletActivityByWatchItems(spender): %v", err)
+	}
+	if len(spenderActivity) != 2 || spenderActivity[0].Sent != 50 || spenderActivity[0].Fee != 5 || spenderActivity[1].Received != 50 {
+		t.Fatalf("spender wallet activity = %+v, want active spend plus genesis receive", spenderActivity)
 	}
 }
 

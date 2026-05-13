@@ -242,7 +242,7 @@ func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []Utxo
 	}
 
 	prevouts := make([]byte, 0)
-	writeVarInt(&prevouts, uint64(len(tx.Base.Inputs)))
+	prevouts = types.AppendCanonicalVarInt(prevouts, uint64(len(tx.Base.Inputs)))
 	for _, input := range tx.Base.Inputs {
 		prevouts = append(prevouts, input.PrevOut.TxID[:]...)
 		prevouts = append(prevouts,
@@ -254,13 +254,13 @@ func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []Utxo
 	}
 
 	outputs := make([]byte, 0)
-	writeVarInt(&outputs, uint64(len(tx.Base.Outputs)))
+	outputs = types.AppendCanonicalVarInt(outputs, uint64(len(tx.Base.Outputs)))
 	for _, output := range tx.Base.Outputs {
 		outputs = appendValuePubKeyEncoding(outputs, output.ValueAtoms, output.PubKey)
 	}
 
 	spentCoinPayload := make([]byte, 0)
-	writeVarInt(&spentCoinPayload, uint64(len(spentCoins)))
+	spentCoinPayload = types.AppendCanonicalVarInt(spentCoinPayload, uint64(len(spentCoins)))
 	for _, coin := range spentCoins {
 		spentCoinPayload = appendValuePubKeyEncoding(spentCoinPayload, coin.ValueAtoms, coin.PubKey)
 	}
