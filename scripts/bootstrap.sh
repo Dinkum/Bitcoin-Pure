@@ -189,7 +189,7 @@ PY
 }
 
 resolve_update_tag() {
-	local tag candidate tmp_dir version
+	local tag candidate
 	resolve_repo_url
 	if [[ -n "${REPO_REF}" ]]; then
 		tag="$(normalize_release_tag "${REPO_REF}")"
@@ -203,34 +203,18 @@ resolve_update_tag() {
 		log "using tagged release ${REPO_REF}"
 		return
 	fi
-	tmp_dir="$(mktemp -d "/tmp/${SERVICE_NAME}-tag-list.XXXXXX")"
-	if ! git -C "${tmp_dir}" init -q; then
-		rm -rf "${tmp_dir}"
-		fail "failed to initialize temporary tag resolver"
-	fi
-	if ! git -C "${tmp_dir}" remote add origin "${REPO_URL}"; then
-		rm -rf "${tmp_dir}"
-		fail "failed to configure temporary tag resolver"
-	fi
-	if ! git -C "${tmp_dir}" fetch -q --depth 1 --filter=blob:none origin '+refs/tags/*:refs/tags/*'; then
-		rm -rf "${tmp_dir}"
-		fail "failed to fetch release tags from ${REPO_URL}"
-	fi
 	while IFS= read -r candidate; do
 		tag="$(normalize_release_tag "${candidate}")"
 		[[ -n "${tag}" ]] || continue
 		if tag_is_release_candidate "${tag}"; then
 			continue
 		fi
-		version="$(git -C "${tmp_dir}" show "${tag}:version.json" 2>/dev/null | python3 -c 'import json, sys; print(str(json.load(sys.stdin).get("version", "")).strip())' 2>/dev/null || true)"
-		if [[ -n "${version}" && "${tag}" == "v${version}" ]]; then
+		if tag_matches_version_json "${tag}"; then
 			REPO_REF="${tag}"
-			rm -rf "${tmp_dir}"
 			log "resolved latest tagged release ${REPO_REF}"
 			return
 		fi
-	done < <(git -C "${tmp_dir}" for-each-ref --sort=-v:refname --format='%(refname:short)' refs/tags)
-	rm -rf "${tmp_dir}"
+	done < <(git ls-remote --tags --refs "${REPO_URL}" 'refs/tags/v*' | awk '{print $2}' | sed 's#^refs/tags/##' | LC_ALL=C sort -Vr)
 	fail "no final Bitcoin Pure release tag found on ${REPO_URL}"
 }
 
