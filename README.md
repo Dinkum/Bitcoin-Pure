@@ -2,7 +2,7 @@
 
 Bitcoin Pure is a lean, payments-only proof-of-work protocol. The goal is to preserve the spirit of Bitcoin while making the system simpler, more scalable, and more focused on cash use.
 
-** DISCLAIMER: This project is in beta and very much a proof of concept **
+** DISCLAIMER: This project is in beta and a proof of concept **
 
 ## Protocol Highlights
 
@@ -36,11 +36,7 @@ No cutoff heights, cutoff dates, or forced migration rules are implemented today
 - Authenticated HTTP JSON-RPC for node control and automation.
 - Public ASCII status page served directly from the node so you can watch tip, peers, mempool, mining, and host health from the server IP.
 
-## Screenshots
-
 ![Bitcoin Pure node monitor](assets/screenshots/node-viewer-overview.png)
-
-![Bitcoin Pure installer](assets/screenshots/installer-demo.png)
 
 ## Prerequisites
 
@@ -48,19 +44,18 @@ Bitcoin Pure has only been tested on Ubuntu 24.04.
 
 ## Install
 
-Ubuntu is the supported install target.
-
 ```bash
 git clone https://github.com/Dinkum/Bitcoin-Pure.git
 cd Bitcoin-Pure
 sudo ./install
 ```
 
+![Bitcoin Pure installer](assets/screenshots/installer-demo.png)
+
 Useful flags:
 
 - `--mining off` disables mining during install.
 - `--peer <host:port>` seeds the node with a peer.
-- `--update` installs the latest final tagged release and deploys it atomically.
 
 Fresh installs keep mining off until `miner_pubkey_hex` is configured, so a new node does not mine to an unknown destination by default.
 
@@ -69,7 +64,6 @@ Examples:
 ```bash
 sudo ./install --mining off
 sudo ./install --peer 203.0.113.10:18444
-sudo ./install --update
 ```
 
 What `./install` does:
@@ -83,13 +77,15 @@ What `./install` does:
 - keeps mining disabled until a destination key hash is configured
 - installs and enables a `systemd` service
 - brings up the node with the public monitor page and RPC surface
-- uses staged deploys and rollback checks for `--update`
 
 ## Common Commands (`bpu-cli`)
 
 ```bash
 # Show node status from the configured RPC endpoint.
 bpu-cli status
+
+# Enable mining and provision the local miner wallet.
+sudo bpu-cli config mining on
 
 # Add a peer to a running node.
 bpu-cli peer add 203.0.113.10:18444
