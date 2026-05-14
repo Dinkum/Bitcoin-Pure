@@ -137,7 +137,9 @@ normalize_release_tag() {
 	local tag
 	tag="$1"
 	tag="${tag#refs/tags/}"
-	tag="${tag%^{}}"
+	if [[ "${tag}" == *'^{}' ]]; then
+		tag="${tag:0:${#tag}-3}"
+	fi
 	printf '%s' "${tag}"
 }
 
