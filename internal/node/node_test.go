@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -32,6 +33,7 @@ import (
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 	"bitcoin-pure/internal/utxochecksum"
 )
 
@@ -128,22 +130,60 @@ func spendTxForNodeTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, 
 	if fee >= value {
 		t.Fatalf("fee %d must be less than value %d", fee, value)
 	}
+	return spendTxForNodeTestToOutputs(t, spenderSeed, prevOut, value, []types.TxOutput{
+		types.NewXOnlyOutput(value-fee, nodeSignerPubKey(recipientSeed)),
+	})
+}
+
+func spendTxForNodeTestToOutputs(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint64, outputs []types.TxOutput) types.Transaction {
+	t.Helper()
+	var outputSum uint64
+	for _, output := range outputs {
+		outputSum += output.ValueAtoms
+	}
+	if outputSum > value {
+		t.Fatalf("outputs spend %d, want no more than input value %d", outputSum, value)
+	}
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: prevOut}},
-			Outputs: []types.TxOutput{{ValueAtoms: value - fee, PubKey: nodeSignerPubKey(recipientSeed)}},
+			Outputs: outputs,
 		},
 	}
-	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{{
-		ValueAtoms: value,
-		PubKey:     nodeSignerPubKey(spenderSeed),
-	}}, consensus.RegtestParams())
+	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{
+		consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(value, nodeSignerPubKey(spenderSeed))),
+	}, consensus.RegtestParams())
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
 	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
+	return tx
+}
+
+func spendPQTxForNodeTestToOutputs(t *testing.T, prevOut types.OutPoint, value uint64, verificationKey []byte, privateKey []byte, outputs []types.TxOutput) types.Transaction {
+	t.Helper()
+	pqLock := consensus.PQLock(verificationKey)
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: prevOut}},
+			Outputs: outputs,
+		},
+	}
+	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{
+		consensus.UtxoEntryFromOutput(types.NewPQLockOutput(value, pqLock)),
+	}, consensus.RegtestParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := crypto.SignMLDSA65(privateKey, msg[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	authPayload := append(append([]byte(nil), verificationKey...), signature...)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{AuthPayload: authPayload}}}
 	return tx
 }
 
@@ -252,10 +292,7 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 		tx := &blockTxs[i]
 		txid := consensus.TxID(tx)
 		for vout, output := range tx.Base.Outputs {
-			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntry{
-				ValueAtoms: output.ValueAtoms,
-				PubKey:     output.PubKey,
-			}
+			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
 		}
 	}
 
@@ -267,10 +304,7 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 	blockTxs[0] = coinbase
 	coinbaseTxID := consensus.TxID(&blockTxs[0])
 	for vout, output := range blockTxs[0].Base.Outputs {
-		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntry{
-			ValueAtoms: output.ValueAtoms,
-			PubKey:     output.PubKey,
-		}
+		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
 	}
 
 	txids := make([][32]byte, 0, len(blockTxs))
@@ -638,6 +672,108 @@ func TestPersistentRoundtripFromMeta(t *testing.T) {
 	}
 	if reopened.ChainState().UTXOAccumulator() == nil {
 		t.Fatal("expected accumulator after metadata reopen")
+	}
+}
+
+func TestPersistentChainStatePreservesPQTypedUTXOAcrossReloadSpendAndReorg(t *testing.T) {
+	path := t.TempDir()
+	persistent, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := genesisBlock()
+	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	verificationKey, privateKey, err := crypto.GenerateMLDSA65Key(crand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateMLDSA65Key: %v", err)
+	}
+	pqLock := consensus.PQLock(verificationKey)
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	parentTx := spendTxForNodeTestToOutputs(t, 7, genesisOut, 50, []types.TxOutput{
+		types.NewPQLockOutput(40, pqLock),
+	})
+	parentCoinbase := coinbaseTxForHeight(1, []types.TxOutput{types.NewXOnlyOutput(1, nodeSignerPubKey(9))})
+	parentBlock := blockWithTxsForNodeTest(t, 0, genesis.Header, persistent.ChainState().UTXOs(), []types.Transaction{parentCoinbase, parentTx}, genesis.Header.Timestamp+600)
+	if _, err := persistent.ApplyBlock(&parentBlock); err != nil {
+		t.Fatalf("ApplyBlock(parent): %v", err)
+	}
+	parentTxID := consensus.TxID(&parentTx)
+	parentOut := types.OutPoint{TxID: parentTxID, Vout: 0}
+	parentEntry, ok := persistent.ChainState().UTXOs()[parentOut]
+	if !ok {
+		t.Fatal("missing live PQ parent output")
+	}
+	if parentEntry.Type != types.OutputPQLock32 || parentEntry.Payload32 != pqLock {
+		t.Fatalf("live PQ parent output lost type/payload: %+v", parentEntry)
+	}
+	if err := persistent.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenPersistentChainStateFromMeta(path, types.Regtest)
+	if err != nil {
+		t.Fatalf("OpenPersistentChainStateFromMeta: %v", err)
+	}
+	reopenedEntry, ok := reopened.ChainState().UTXOs()[parentOut]
+	if !ok {
+		t.Fatal("reopened chain missing PQ parent output")
+	}
+	if reopenedEntry != parentEntry {
+		t.Fatalf("reopened PQ parent output = %+v, want %+v", reopenedEntry, parentEntry)
+	}
+	childTx := spendPQTxForNodeTestToOutputs(t, parentOut, 40, verificationKey, privateKey, []types.TxOutput{
+		types.NewXOnlyOutput(30, nodeSignerPubKey(10)),
+	})
+	childCoinbase := coinbaseTxForHeight(2, []types.TxOutput{types.NewXOnlyOutput(1, nodeSignerPubKey(11))})
+	childBlock := blockWithTxsForNodeTest(t, 1, parentBlock.Header, reopened.ChainState().UTXOs(), []types.Transaction{childCoinbase, childTx}, parentBlock.Header.Timestamp+600)
+	if _, err := reopened.ApplyBlock(&childBlock); err != nil {
+		t.Fatalf("ApplyBlock(child): %v", err)
+	}
+	if _, ok := reopened.ChainState().UTXOs()[parentOut]; ok {
+		t.Fatal("spent PQ parent output remained after child block")
+	}
+
+	altState := NewChainState(types.Regtest)
+	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
+		t.Fatal(err)
+	}
+	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 12, genesis.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt1); err != nil {
+		t.Fatal(err)
+	}
+	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 13, alt1.Header.Timestamp+600)
+	if _, err := altState.ApplyBlock(&alt2); err != nil {
+		t.Fatal(err)
+	}
+	alt3 := nextCoinbaseBlock(2, alt2.Header, altState.UTXOs(), 14, alt2.Header.Timestamp+600)
+	if _, err := reopened.ApplyBlock(&alt1); err != nil {
+		t.Fatalf("ApplyBlock(alt1): %v", err)
+	}
+	if _, err := reopened.ApplyBlock(&alt2); err != nil {
+		t.Fatalf("ApplyBlock(alt2): %v", err)
+	}
+	if _, err := reopened.ApplyBlock(&alt3); err != nil {
+		t.Fatalf("ApplyBlock(alt3): %v", err)
+	}
+	if _, ok := reopened.ChainState().UTXOs()[parentOut]; ok {
+		t.Fatal("reorged-out PQ parent output remained live")
+	}
+	if got, want := reopened.ChainState().UTXORoot(), consensus.ComputedUTXORoot(reopened.ChainState().UTXOs()); got != want {
+		t.Fatalf("post-reorg root = %x, want %x", got, want)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	finalReopen, err := OpenPersistentChainState(path, types.Regtest)
+	if err != nil {
+		t.Fatalf("final reopen: %v", err)
+	}
+	defer finalReopen.Close()
+	if _, ok := finalReopen.ChainState().UTXOs()[parentOut]; ok {
+		t.Fatal("final reopen restored reorged-out PQ parent output")
 	}
 }
 
@@ -3263,6 +3399,111 @@ func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
 	}
 	if got := consensus.TxID(&after.Txs[2]); got != firstTxID {
 		t.Fatalf("second non-coinbase tx after append = %x, want %x", got, firstTxID)
+	}
+}
+
+func TestBuildBlockTemplateUsesAtomicLTORAccumulatorDelta(t *testing.T) {
+	minerKey := nodeSignerPubKey(9)
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	svc, err := OpenService(ServiceConfig{
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: minerKey,
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	var parent types.Transaction
+	var child types.Transaction
+	var parentTxID [32]byte
+	foundAtomicLTORPair := false
+	for parentSeed := byte(10); parentSeed < 96 && !foundAtomicLTORPair; parentSeed++ {
+		candidateParent := spendTxForNodeTest(t, 7, genesisOut, 50, parentSeed, 1)
+		candidateParentTxID := consensus.TxID(&candidateParent)
+		for childSeed := byte(96); childSeed < 180; childSeed++ {
+			candidateChild := spendTxForNodeTest(t, parentSeed, types.OutPoint{TxID: candidateParentTxID, Vout: 0}, 49, childSeed, 1)
+			candidateChildTxID := consensus.TxID(&candidateChild)
+			if bytes.Compare(candidateChildTxID[:], candidateParentTxID[:]) < 0 {
+				parent = candidateParent
+				child = candidateChild
+				parentTxID = candidateParentTxID
+				foundAtomicLTORPair = true
+				break
+			}
+		}
+	}
+	if !foundAtomicLTORPair {
+		t.Fatal("failed to construct child-before-parent template fixture")
+	}
+	childTxID := consensus.TxID(&child)
+	if _, err := svc.SubmitTx(parent); err != nil {
+		t.Fatalf("SubmitTx parent: %v", err)
+	}
+	if _, err := svc.SubmitTx(child); err != nil {
+		t.Fatalf("SubmitTx child: %v", err)
+	}
+
+	template, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate: %v", err)
+	}
+	if len(template.Txs) != 3 {
+		t.Fatalf("template tx count = %d, want 3", len(template.Txs))
+	}
+	if got := consensus.TxID(&template.Txs[1]); got != childTxID {
+		t.Fatalf("first non-coinbase tx = %x, want child %x", got, childTxID)
+	}
+	if got := consensus.TxID(&template.Txs[2]); got != parentTxID {
+		t.Fatalf("second non-coinbase tx = %x, want parent %x", got, parentTxID)
+	}
+
+	rules := consensus.DefaultConsensusRules()
+	rules.SkipPow = true
+	state := svc.chainState.ChainState()
+	applied := state.UTXOs()
+	summary, err := consensus.ValidateAndApplyBlock(&template, consensus.PrevBlockContext{
+		Height: 0,
+		Header: genesis.Header,
+	}, state.BlockSizeState(), applied, consensus.RegtestParams(), rules)
+	if err != nil {
+		t.Fatalf("template failed consensus validation: %v", err)
+	}
+	if got, want := summary.TotalFees, uint64(2); got != want {
+		t.Fatalf("template fees = %d, want %d", got, want)
+	}
+	if got, want := consensus.ComputedUTXORoot(applied), template.Header.UTXORoot; got != want {
+		t.Fatalf("applied root = %x, want template root %x", got, want)
+	}
+}
+
+func TestSelectedEntryAccumulatorDeltasCancelInternalAtomicSpends(t *testing.T) {
+	rootOut := types.OutPoint{TxID: [32]byte{0x01}, Vout: 0}
+	parentOut := types.OutPoint{TxID: [32]byte{0x30}, Vout: 0}
+	childOut := types.OutPoint{TxID: [32]byte{0x10}, Vout: 0}
+	parentLeaf := consensus.UtxoLeafFromEntry(parentOut, consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(49, nodeSignerPubKey(3))))
+	childLeaf := consensus.UtxoLeafFromEntry(childOut, consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(48, nodeSignerPubKey(4))))
+
+	spent, created := selectedEntryAccumulatorDeltas([]mempool.SnapshotEntry{
+		{
+			TxID:           childOut.TxID,
+			SpentOutPoints: []types.OutPoint{parentOut},
+			CreatedLeaves:  []utreexo.UtxoLeaf{childLeaf},
+		},
+		{
+			TxID:           parentOut.TxID,
+			SpentOutPoints: []types.OutPoint{rootOut},
+			CreatedLeaves:  []utreexo.UtxoLeaf{parentLeaf},
+		},
+	})
+	if len(spent) != 1 || spent[0] != rootOut {
+		t.Fatalf("spent delta = %+v, want [%+v]", spent, rootOut)
+	}
+	if len(created) != 1 || created[0] != childLeaf {
+		t.Fatalf("created delta = %+v, want [%+v]", created, childLeaf)
 	}
 }
 

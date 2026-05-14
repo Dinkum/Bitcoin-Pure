@@ -18,9 +18,6 @@ import (
 	"bitcoin-pure/internal/consensus"
 	bpcrypto "bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
-
-	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 )
 
 const (
@@ -557,9 +554,9 @@ func validateWalletAddress(addr Address) error {
 	if len(secret) != 32 {
 		return errors.New("xonly signing secret must be 32 bytes")
 	}
-	priv, _ := btcec.PrivKeyFromBytes(secret)
-	var derived [32]byte
-	copy(derived[:], schnorr.SerializePubKey(priv.PubKey()))
+	var secretKey [32]byte
+	copy(secretKey[:], secret)
+	derived := bpcrypto.XOnlyPubKeyFromSecret(secretKey)
 	if derived != payload {
 		return errors.New("private key does not match receive address")
 	}
@@ -905,12 +902,9 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 	if err != nil {
 		return CPFPPlan{}, err
 	}
-	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{{
-		Type:       spentWatchItem.Type,
-		ValueAtoms: input.Value,
-		Payload32:  spentWatchItem.Payload32,
-		PubKey:     legacyPubKeyForWatchItem(spentWatchItem),
-	}}, s.chainParams())
+	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{
+		consensus.UtxoEntryFromOutput(txOutputForWatchItem(input.Value, spentWatchItem)),
+	}, s.chainParams())
 	if err != nil {
 		return CPFPPlan{}, err
 	}
@@ -1208,15 +1202,10 @@ func nextAddressIndex(wallet Wallet) int {
 func newAddress(index int, change bool, outputType uint64) (Address, error) {
 	switch outputType {
 	case types.OutputXOnlyP2PK:
-		privKey, err := btcec.NewPrivateKey()
+		secret, xonly, err := bpcrypto.GenerateXOnlySchnorrKey()
 		if err != nil {
 			return Address{}, err
 		}
-		pubKey := schnorr.SerializePubKey(privKey.PubKey())
-		var xonly [32]byte
-		copy(xonly[:], pubKey)
-		var secret [32]byte
-		copy(secret[:], privKey.Serialize())
 		return Address{
 			Index:         index,
 			Change:        change,
@@ -1257,13 +1246,12 @@ func signAddressAuthEntry(addr Address, msg *[32]byte) (types.TxAuthEntry, error
 		if err != nil || len(secret) != 32 {
 			return types.TxAuthEntry{}, errors.New("wallet private key is invalid")
 		}
-		privKey, _ := btcec.PrivKeyFromBytes(secret)
-		sig, err := schnorr.Sign(privKey, msg[:])
+		var secretKey [32]byte
+		copy(secretKey[:], secret)
+		sigOut, err := bpcrypto.SignXOnlySchnorr(secretKey, *msg)
 		if err != nil {
 			return types.TxAuthEntry{}, err
 		}
-		var sigOut [64]byte
-		copy(sigOut[:], sig.Serialize())
 		return types.NewXOnlyAuthEntry(sigOut), nil
 	case types.OutputPQLock32:
 		secret, err := hex.DecodeString(addr.signingSecretHex())
@@ -1499,12 +1487,7 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 		if err != nil {
 			return SendPlan{}, err
 		}
-		spentCoins[i] = consensus.UtxoEntry{
-			Type:       item.Type,
-			ValueAtoms: coin.Value,
-			Payload32:  item.Payload32,
-			PubKey:     legacyPubKeyForWatchItem(item),
-		}
+		spentCoins[i] = consensus.UtxoEntryFromOutput(txOutputForWatchItem(coin.Value, item))
 		inputTotal += coin.Value
 	}
 	msgs, err := consensus.SighashesWithParams(&tx, spentCoins, s.chainParams())

@@ -16,58 +16,67 @@ import (
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 	"bitcoin-pure/internal/utxochecksum"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 )
 
 var (
-	metaProfileKey           = []byte("meta/profile")
-	metaHeaderTipHeightKey   = []byte("meta/header_tip_height")
-	metaHeaderTipHeaderKey   = []byte("meta/header_tip_header")
-	metaTipHeightKey         = []byte("meta/tip_height")
-	metaTipHeaderKey         = []byte("meta/tip_header")
-	metaBlockSizeStateKey    = []byte("meta/block_size_state")
-	metaUTXOChecksumKey      = []byte("meta/utxo_checksum")
-	metaFastSyncStateKey     = []byte("meta/fast_sync_state")
-	metaMempoolStateKey      = []byte("meta/mempool_state")
-	metaLocalityNextSeqKey   = []byte("meta/locality_next_seq")
-	metaJournalNextSeqKey    = []byte("meta/journal_next_seq")
-	metaDerivedJournalSeqKey = []byte("meta/derived_journal_seq")
-	metaWalletIndexHeightKey = []byte("meta/wallet_index_height")
-	mempoolEntryPrefix       = []byte("mempool_entry/")
-	mempoolOrphanPrefix      = []byte("mempool_orphan/")
-	blockPrefix              = []byte("blocks/")
-	blockIndexPrefix         = []byte("block_index/")
-	blockUndoPrefix          = []byte("block_undo/")
-	headerHeightIndexPrefix  = []byte("header_height_index/")
-	heightIndexPrefix        = []byte("height_index/")
-	knownPeerPrefix          = []byte("known_peer/")
-	journalPrefix            = []byte("journal/")
-	utxoPrefix               = []byte("utxo/")
-	snapshotUTXOPrefix       = []byte("snapshot_utxo/")
-	localitySeqPrefix        = []byte("locality_seq/")
-	localityMetaPrefix       = []byte("locality_meta/")
-	walletOriginPrefix       = []byte("wallet_origin/")
-	walletUTXOPrefix         = []byte("wallet_utxo/")
-	walletActivityItemPrefix = []byte("wallet_activity_item/")
-	walletActivityHtPrefix   = []byte("wallet_activity_height/")
+	metaProfileKey                = []byte("meta/profile")
+	metaHeaderTipHeightKey        = []byte("meta/header_tip_height")
+	metaHeaderTipHeaderKey        = []byte("meta/header_tip_header")
+	metaTipHeightKey              = []byte("meta/tip_height")
+	metaTipHeaderKey              = []byte("meta/tip_header")
+	metaBlockSizeStateKey         = []byte("meta/block_size_state")
+	metaUTXOChecksumKey           = []byte("meta/utxo_checksum")
+	metaUTXOCountKey              = []byte("meta/utxo_count")
+	metaUTXOAccumulatorRootKey    = []byte("meta/utxo_accumulator_root")
+	metaUTXOAccumulatorVersionKey = []byte("meta/utxo_accumulator_version")
+	metaFastSyncStateKey          = []byte("meta/fast_sync_state")
+	metaMempoolStateKey           = []byte("meta/mempool_state")
+	metaLocalityNextSeqKey        = []byte("meta/locality_next_seq")
+	metaJournalNextSeqKey         = []byte("meta/journal_next_seq")
+	metaDerivedJournalSeqKey      = []byte("meta/derived_journal_seq")
+	metaWalletIndexHeightKey      = []byte("meta/wallet_index_height")
+	mempoolEntryPrefix            = []byte("mempool_entry/")
+	mempoolOrphanPrefix           = []byte("mempool_orphan/")
+	blockPrefix                   = []byte("blocks/")
+	blockIndexPrefix              = []byte("block_index/")
+	blockUndoPrefix               = []byte("block_undo/")
+	headerHeightIndexPrefix       = []byte("header_height_index/")
+	heightIndexPrefix             = []byte("height_index/")
+	knownPeerPrefix               = []byte("known_peer/")
+	journalPrefix                 = []byte("journal/")
+	utxoPrefix                    = []byte("utxo/")
+	utxoAccumulatorNodePrefix     = []byte("utxo_acc_node/")
+	snapshotUTXOPrefix            = []byte("snapshot_utxo/")
+	localitySeqPrefix             = []byte("locality_seq/")
+	localityMetaPrefix            = []byte("locality_meta/")
+	walletOriginPrefix            = []byte("wallet_origin/")
+	walletUTXOPrefix              = []byte("wallet_utxo/")
+	walletActivityItemPrefix      = []byte("wallet_activity_item/")
+	walletActivityHtPrefix        = []byte("wallet_activity_height/")
 )
 
-const walletIndexChunkSize = 10_000
+const (
+	walletIndexChunkSize        = 10_000
+	utxoAccumulatorIndexVersion = uint64(1)
+)
 
 var (
-	knownPeerPrefixEnd     = prefixUpperBound(knownPeerPrefix)
-	mempoolEntryPrefixEnd  = prefixUpperBound(mempoolEntryPrefix)
-	mempoolOrphanPrefixEnd = prefixUpperBound(mempoolOrphanPrefix)
-	utxoPrefixEnd          = prefixUpperBound(utxoPrefix)
-	snapshotUTXOPrefixEnd  = prefixUpperBound(snapshotUTXOPrefix)
-	localitySeqPrefixEnd   = prefixUpperBound(localitySeqPrefix)
-	localityMetaPrefixEnd  = prefixUpperBound(localityMetaPrefix)
-	walletOriginPrefixEnd  = prefixUpperBound(walletOriginPrefix)
-	walletUTXOPrefixEnd    = prefixUpperBound(walletUTXOPrefix)
-	walletActItemPrefixEnd = prefixUpperBound(walletActivityItemPrefix)
-	walletActHtPrefixEnd   = prefixUpperBound(walletActivityHtPrefix)
+	knownPeerPrefixEnd           = prefixUpperBound(knownPeerPrefix)
+	mempoolEntryPrefixEnd        = prefixUpperBound(mempoolEntryPrefix)
+	mempoolOrphanPrefixEnd       = prefixUpperBound(mempoolOrphanPrefix)
+	utxoPrefixEnd                = prefixUpperBound(utxoPrefix)
+	utxoAccumulatorNodePrefixEnd = prefixUpperBound(utxoAccumulatorNodePrefix)
+	snapshotUTXOPrefixEnd        = prefixUpperBound(snapshotUTXOPrefix)
+	localitySeqPrefixEnd         = prefixUpperBound(localitySeqPrefix)
+	localityMetaPrefixEnd        = prefixUpperBound(localityMetaPrefix)
+	walletOriginPrefixEnd        = prefixUpperBound(walletOriginPrefix)
+	walletUTXOPrefixEnd          = prefixUpperBound(walletUTXOPrefix)
+	walletActItemPrefixEnd       = prefixUpperBound(walletActivityItemPrefix)
+	walletActHtPrefixEnd         = prefixUpperBound(walletActivityHtPrefix)
 )
 
 var (
@@ -80,23 +89,28 @@ var (
 )
 
 type StoredChainState struct {
-	Profile        types.ChainProfile
-	Height         uint64
-	TipHeader      types.BlockHeader
-	BlockSizeState consensus.BlockSizeState
-	UTXOChecksum   [32]byte
-	UTXOs          consensus.UtxoSet
+	Profile         types.ChainProfile
+	Height          uint64
+	TipHeader       types.BlockHeader
+	BlockSizeState  consensus.BlockSizeState
+	UTXOChecksum    [32]byte
+	UTXOs           consensus.UtxoSet
+	UTXOAccumulator *utreexo.Accumulator
 }
 
 // StoredChainStateMeta holds the chain tip metadata without materializing the
 // full UTXO set. This is the additive building block for the disk-backed UTXO
 // migration path.
 type StoredChainStateMeta struct {
-	Profile        types.ChainProfile
-	Height         uint64
-	TipHeader      types.BlockHeader
-	BlockSizeState consensus.BlockSizeState
-	UTXOChecksum   [32]byte
+	Profile              types.ChainProfile
+	Height               uint64
+	TipHeader            types.BlockHeader
+	BlockSizeState       consensus.BlockSizeState
+	UTXOChecksum         [32]byte
+	UTXOCount            int
+	UTXOAccumulatorRoot  [32]byte
+	UTXOAccumulator      *utreexo.Accumulator
+	UTXOAccumulatorDelta *utreexo.AccumulatorNodeDelta
 }
 
 // FastSyncState persists the trust boundary for an imported snapshot until a
@@ -363,12 +377,13 @@ func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
 		checksum = utxochecksum.Compute(utxos)
 	}
 	return &StoredChainState{
-		Profile:        meta.Profile,
-		Height:         meta.Height,
-		TipHeader:      meta.TipHeader,
-		BlockSizeState: meta.BlockSizeState,
-		UTXOChecksum:   checksum,
-		UTXOs:          utxos,
+		Profile:         meta.Profile,
+		Height:          meta.Height,
+		TipHeader:       meta.TipHeader,
+		BlockSizeState:  meta.BlockSizeState,
+		UTXOChecksum:    checksum,
+		UTXOs:           utxos,
+		UTXOAccumulator: meta.UTXOAccumulator,
 	}, nil
 }
 
@@ -401,6 +416,14 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 		return nil, false, err
 	}
 	checksumBytes, err := s.get(metaUTXOChecksumKey)
+	if err != nil {
+		return nil, false, err
+	}
+	countBytes, err := s.get(metaUTXOCountKey)
+	if err != nil {
+		return nil, false, err
+	}
+	accRootBytes, err := s.get(metaUTXOAccumulatorRootKey)
 	if err != nil {
 		return nil, false, err
 	}
@@ -437,12 +460,30 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 	default:
 		copy(checksum[:], checksumBytes)
 	}
+	var utxoCount int
+	if countBytes != nil {
+		count, err := decodeU64(countBytes)
+		if err != nil {
+			return nil, false, err
+		}
+		utxoCount = int(count)
+	}
+	var accRoot [32]byte
+	switch {
+	case accRootBytes == nil:
+	case len(accRootBytes) != len(accRoot):
+		return nil, false, errors.New("invalid data: bad utxo accumulator root metadata")
+	default:
+		copy(accRoot[:], accRootBytes)
+	}
 	return &StoredChainStateMeta{
-		Profile:        profile,
-		Height:         height,
-		TipHeader:      header,
-		BlockSizeState: blockSizeState,
-		UTXOChecksum:   checksum,
+		Profile:             profile,
+		Height:              height,
+		TipHeader:           header,
+		BlockSizeState:      blockSizeState,
+		UTXOChecksum:        checksum,
+		UTXOCount:           utxoCount,
+		UTXOAccumulatorRoot: accRoot,
 	}, checksumBytes != nil, nil
 }
 
@@ -1257,6 +1298,13 @@ func (s *ChainStore) WriteFullStateWithFastSyncStateMetadata(state *StoredChainS
 }
 
 func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState *FastSyncState, headerState *StoredHeaderState, activeEntries []BlockIndexEntry) error {
+	if state.UTXOAccumulator == nil {
+		acc, err := consensus.UtxoAccumulator(state.UTXOs)
+		if err != nil {
+			return err
+		}
+		state.UTXOAccumulator = acc
+	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeMeta(batch, state); err != nil {
@@ -1304,6 +1352,9 @@ func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState
 		return err
 	}
 	if err := s.rebuildLocalityIndexBatch(batch, state.UTXOs); err != nil {
+		return err
+	}
+	if err := replaceAccumulatorIndexBatch(s.db, batch, state.UTXOAccumulator); err != nil {
 		return err
 	}
 	if len(activeEntries) > 0 {
@@ -1466,6 +1517,13 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if next == nil {
 		return errors.New("next chain state is required")
 	}
+	if next.UTXOAccumulator == nil {
+		acc, err := consensus.UtxoAccumulator(next.UTXOs)
+		if err != nil {
+			return err
+		}
+		next.UTXOAccumulator = acc
+	}
 	if previous == nil {
 		return s.WriteFullState(next)
 	}
@@ -1510,6 +1568,9 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if err := s.applyLocalityRewriteBatch(batch, previous.UTXOs, next.UTXOs); err != nil {
 		return err
 	}
+	if err := replaceAccumulatorIndexBatch(s.db, batch, next.UTXOAccumulator); err != nil {
+		return err
+	}
 	if err := invalidateWalletIndexesBatch(batch); err != nil {
 		return err
 	}
@@ -1533,6 +1594,9 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 	if meta == nil {
 		return errors.New("reorg chain metadata is required")
 	}
+	if err := s.populateAccumulatorDeltaFromUTXODelta(meta, spent, created); err != nil {
+		return err
+	}
 
 	s.walletIndexMu.Lock()
 	defer s.walletIndexMu.Unlock()
@@ -1551,6 +1615,9 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 		if err := batch.Set(utxoKey(outPoint), encodeUTXOEntry(entry), nil); err != nil {
 			return err
 		}
+	}
+	if err := applyAccumulatorStateBatch(s.db, batch, meta); err != nil {
+		return err
 	}
 	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
 		return err
@@ -1725,6 +1792,13 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 }
 
 func (s *ChainStore) AppendBlock(state *StoredChainState, block *types.Block, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	if state.UTXOAccumulator == nil {
+		acc, err := consensus.UtxoAccumulator(state.UTXOs)
+		if err != nil {
+			return err
+		}
+		state.UTXOAccumulator = acc
+	}
 	entry, err := s.buildLinearIndexEntry(state.Height, &block.Header, true, state.BlockSizeState)
 	if err != nil {
 		return err
@@ -1733,12 +1807,22 @@ func (s *ChainStore) AppendBlock(state *StoredChainState, block *types.Block, sp
 }
 
 func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	if state.UTXOAccumulator == nil {
+		acc, err := consensus.UtxoAccumulator(state.UTXOs)
+		if err != nil {
+			return err
+		}
+		state.UTXOAccumulator = acc
+	}
 	return s.AppendValidatedBlockMeta(storedChainStateMeta(state), block, entry, undo, spent, created)
 }
 
 func (s *ChainStore) AppendValidatedBlockMeta(state *StoredChainStateMeta, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
 	if state == nil {
 		return errors.New("chain state metadata is required")
+	}
+	if err := s.populateAccumulatorDeltaFromUTXODelta(state, spent, created); err != nil {
+		return err
 	}
 	s.walletIndexMu.Lock()
 	defer s.walletIndexMu.Unlock()
@@ -1764,6 +1848,9 @@ func (s *ChainStore) AppendValidatedBlockMeta(state *StoredChainStateMeta, block
 		if err := batch.Set(utxoKey(outPoint), encodeUTXOEntry(entry), nil); err != nil {
 			return err
 		}
+	}
+	if err := applyAccumulatorStateBatch(s.db, batch, state); err != nil {
+		return err
 	}
 	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
 		return err
@@ -2937,12 +3024,19 @@ func storedChainStateMeta(state *StoredChainState) *StoredChainStateMeta {
 	if checksum == ([32]byte{}) {
 		checksum = utxochecksum.Compute(state.UTXOs)
 	}
+	accRoot := state.TipHeader.UTXORoot
+	if state.UTXOAccumulator != nil {
+		accRoot = state.UTXOAccumulator.Root()
+	}
 	return &StoredChainStateMeta{
-		Profile:        state.Profile,
-		Height:         state.Height,
-		TipHeader:      state.TipHeader,
-		BlockSizeState: state.BlockSizeState,
-		UTXOChecksum:   checksum,
+		Profile:             state.Profile,
+		Height:              state.Height,
+		TipHeader:           state.TipHeader,
+		BlockSizeState:      state.BlockSizeState,
+		UTXOChecksum:        checksum,
+		UTXOCount:           len(state.UTXOs),
+		UTXOAccumulatorRoot: accRoot,
+		UTXOAccumulator:     state.UTXOAccumulator,
 	}
 }
 
@@ -2963,7 +3057,24 @@ func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
 	if err := batch.Set(metaBlockSizeStateKey, encodeBlockSizeState(state.BlockSizeState), nil); err != nil {
 		return err
 	}
-	return batch.Set(metaUTXOChecksumKey, state.UTXOChecksum[:], nil)
+	if err := batch.Set(metaUTXOChecksumKey, state.UTXOChecksum[:], nil); err != nil {
+		return err
+	}
+	utxoCount := state.UTXOCount
+	if utxoCount == 0 && state.UTXOAccumulator != nil {
+		utxoCount = state.UTXOAccumulator.Count()
+	}
+	if err := batch.Set(metaUTXOCountKey, encodeU64(uint64(utxoCount)), nil); err != nil {
+		return err
+	}
+	accRoot := state.UTXOAccumulatorRoot
+	if accRoot == ([32]byte{}) {
+		accRoot = state.TipHeader.UTXORoot
+	}
+	if err := batch.Set(metaUTXOAccumulatorRootKey, accRoot[:], nil); err != nil {
+		return err
+	}
+	return nil
 }
 
 func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry, active bool) error {
@@ -3388,17 +3499,347 @@ func decodeLocalitySeqFromKey(key []byte) (uint64, error) {
 	return decodeU64(key[len(localitySeqPrefix):])
 }
 
+func (s *ChainStore) LoadUTXOAccumulator() (*utreexo.Accumulator, bool, error) {
+	versionBytes, err := s.get(metaUTXOAccumulatorVersionKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if versionBytes == nil {
+		return nil, false, nil
+	}
+	version, err := decodeU64(versionBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	if version != utxoAccumulatorIndexVersion {
+		return nil, false, fmt.Errorf("unsupported utxo accumulator index version %d", version)
+	}
+	meta, err := s.LoadChainStateMeta()
+	if err != nil {
+		return nil, false, err
+	}
+	if meta == nil {
+		return nil, false, nil
+	}
+	records := make([]utreexo.AccumulatorNodeRecord, 0)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: utxoAccumulatorNodePrefix,
+		UpperBound: utxoAccumulatorNodePrefixEnd,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		path, err := decodeAccumulatorNodeKey(iter.Key())
+		if err != nil {
+			return nil, false, err
+		}
+		record, err := decodeAccumulatorNodeValue(path, iter.Value())
+		if err != nil {
+			return nil, false, err
+		}
+		records = append(records, record)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, false, err
+	}
+	acc, err := utreexo.NewAccumulatorFromNodeRecords(records)
+	if err != nil {
+		return nil, false, err
+	}
+	if acc.Count() != meta.UTXOCount {
+		return nil, false, fmt.Errorf("utxo accumulator count mismatch: index=%d meta=%d", acc.Count(), meta.UTXOCount)
+	}
+	if acc.Root() != meta.TipHeader.UTXORoot {
+		return nil, false, fmt.Errorf("utxo accumulator root mismatch: index=%x header=%x", acc.Root(), meta.TipHeader.UTXORoot)
+	}
+	if meta.UTXOAccumulatorRoot != ([32]byte{}) && acc.Root() != meta.UTXOAccumulatorRoot {
+		return nil, false, fmt.Errorf("utxo accumulator root mismatch: index=%x meta=%x", acc.Root(), meta.UTXOAccumulatorRoot)
+	}
+	return acc, true, nil
+}
+
+func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutPointProof, error) {
+	proof := utreexo.OutPointProof{OutPoint: outPoint}
+	meta, err := s.LoadChainStateMeta()
+	if err != nil {
+		return proof, err
+	}
+	if meta == nil || meta.UTXOCount == 0 {
+		return proof, nil
+	}
+	path := utreexo.AccumulatorNodePath{}
+	node, ok, err := s.accumulatorNode(path)
+	if err != nil {
+		return proof, err
+	}
+	if !ok {
+		return proof, errors.New("missing utxo accumulator root node")
+	}
+	queryKey := utreexo.OutPointKey(outPoint)
+	steps := make([]utreexo.ProofStep, 0, utreexo.KeyBits)
+	for depth := 0; depth < utreexo.KeyBits; depth++ {
+		queryRight := accumulatorBitSet(queryKey, depth)
+		nextPath := accumulatorChildPath(path, queryRight)
+		siblingPath := accumulatorChildPath(path, !queryRight)
+		sibling, siblingOK, err := s.accumulatorNode(siblingPath)
+		if err != nil {
+			return proof, err
+		}
+		step := utreexo.ProofStep{}
+		if siblingOK {
+			step.HasSibling = true
+			step.SiblingHash = sibling.Hash
+		}
+		steps = append(steps, step)
+		next, nextOK, err := s.accumulatorNode(nextPath)
+		if err != nil {
+			return proof, err
+		}
+		if !nextOK {
+			proof.Steps = steps
+			return proof, nil
+		}
+		path = nextPath
+		node = next
+	}
+	if node.Leaf == nil {
+		return proof, errors.New("invalid accumulator proof leaf")
+	}
+	if node.Leaf.OutPoint != outPoint {
+		return proof, fmt.Errorf("accumulator proof leaf mismatch: got %x:%d", node.Leaf.OutPoint.TxID, node.Leaf.OutPoint.Vout)
+	}
+	proof.Exists = true
+	proof.Type = node.Leaf.Type
+	proof.ValueAtoms = node.Leaf.ValueAtoms
+	proof.Payload32 = node.Leaf.Payload32
+	proof.PubKey = node.Leaf.PubKey
+	proof.Steps = steps
+	return proof, nil
+}
+
+func (s *ChainStore) WriteUTXOAccumulator(acc *utreexo.Accumulator) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := replaceAccumulatorIndexBatch(s.db, batch, acc); err != nil {
+		return err
+	}
+	count := 0
+	if acc != nil {
+		count = acc.Count()
+	}
+	if err := batch.Set(metaUTXOCountKey, encodeU64(uint64(count)), nil); err != nil {
+		return err
+	}
+	return batch.Commit(consensusCriticalWriteOptions)
+}
+
+func (s *ChainStore) accumulatorNode(path utreexo.AccumulatorNodePath) (utreexo.AccumulatorNodeRecord, bool, error) {
+	key := accumulatorNodeKey(path)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return utreexo.AccumulatorNodeRecord{}, false, nil
+	}
+	if err != nil {
+		return utreexo.AccumulatorNodeRecord{}, false, err
+	}
+	defer closer.Close()
+	record, err := decodeAccumulatorNodeValue(path, val)
+	if err != nil {
+		return utreexo.AccumulatorNodeRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func applyAccumulatorStateBatch(db *pebble.DB, batch *pebble.Batch, state *StoredChainStateMeta) error {
+	if state == nil {
+		return nil
+	}
+	switch {
+	case state.UTXOAccumulatorDelta != nil:
+		return applyAccumulatorDeltaBatch(batch, *state.UTXOAccumulatorDelta)
+	case state.UTXOAccumulator != nil:
+		return replaceAccumulatorIndexBatch(db, batch, state.UTXOAccumulator)
+	default:
+		return nil
+	}
+}
+
+func (s *ChainStore) populateAccumulatorDeltaFromUTXODelta(state *StoredChainStateMeta, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	if state == nil || state.UTXOAccumulator != nil || state.UTXOAccumulatorDelta != nil {
+		return nil
+	}
+	current, ok, err := s.LoadUTXOAccumulator()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	createdLeaves := make([]utreexo.UtxoLeaf, 0, len(created))
+	for outPoint, entry := range created {
+		createdLeaves = append(createdLeaves, consensus.UtxoLeafFromEntry(outPoint, entry))
+	}
+	next, err := current.Apply(spent, createdLeaves)
+	if err != nil {
+		return err
+	}
+	delta := utreexo.AccumulatorNodeDeltaBetween(current, next)
+	state.UTXOAccumulatorDelta = &delta
+	state.UTXOAccumulatorRoot = next.Root()
+	state.UTXOCount = next.Count()
+	return nil
+}
+
+func replaceAccumulatorIndexBatch(db *pebble.DB, batch *pebble.Batch, acc *utreexo.Accumulator) error {
+	if err := deletePrefixBatch(db, batch, utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd); err != nil {
+		return err
+	}
+	for _, record := range utreexo.AccumulatorNodeRecords(acc) {
+		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
+			return err
+		}
+	}
+	if err := batch.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil); err != nil {
+		return err
+	}
+	if acc == nil {
+		root := utreexo.NewAccumulator().Root()
+		return batch.Set(metaUTXOAccumulatorRootKey, root[:], nil)
+	}
+	root := acc.Root()
+	return batch.Set(metaUTXOAccumulatorRootKey, root[:], nil)
+}
+
+func applyAccumulatorDeltaBatch(batch *pebble.Batch, delta utreexo.AccumulatorNodeDelta) error {
+	for _, path := range delta.Deletes {
+		if err := batch.Delete(accumulatorNodeKey(path), nil); err != nil {
+			return err
+		}
+	}
+	for _, record := range delta.Upserts {
+		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
+			return err
+		}
+	}
+	return batch.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil)
+}
+
+func accumulatorNodeKey(path utreexo.AccumulatorNodePath) []byte {
+	if path.Depth < 0 || path.Depth > utreexo.KeyBits {
+		panic("invalid accumulator node path depth")
+	}
+	keyLen := (path.Depth + 7) / 8
+	buf := make([]byte, 0, len(utxoAccumulatorNodePrefix)+2+keyLen)
+	buf = append(buf, utxoAccumulatorNodePrefix...)
+	buf = append(buf, byte(path.Depth>>8), byte(path.Depth))
+	buf = append(buf, path.Key[:keyLen]...)
+	return buf
+}
+
+func accumulatorChildPath(parent utreexo.AccumulatorNodePath, right bool) utreexo.AccumulatorNodePath {
+	child := utreexo.AccumulatorNodePath{
+		Depth: parent.Depth + 1,
+		Key:   parent.Key,
+	}
+	if right {
+		byteIndex := parent.Depth / 8
+		bitOffset := 7 - (parent.Depth % 8)
+		child.Key[byteIndex] |= 1 << bitOffset
+	}
+	return child
+}
+
+func accumulatorBitSet(key [utreexo.OutPointKeyBytes]byte, depth int) bool {
+	byteIndex := depth / 8
+	bitOffset := 7 - (depth % 8)
+	return ((key[byteIndex] >> bitOffset) & 1) == 1
+}
+
+func decodeAccumulatorNodeKey(key []byte) (utreexo.AccumulatorNodePath, error) {
+	if len(key) < len(utxoAccumulatorNodePrefix)+2 || !bytes.HasPrefix(key, utxoAccumulatorNodePrefix) {
+		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node key")
+	}
+	raw := key[len(utxoAccumulatorNodePrefix):]
+	depth := int(raw[0])<<8 | int(raw[1])
+	if depth < 0 || depth > utreexo.KeyBits {
+		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node depth")
+	}
+	keyLen := (depth + 7) / 8
+	if len(raw) != 2+keyLen {
+		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node path length")
+	}
+	var pathKey [utreexo.OutPointKeyBytes]byte
+	copy(pathKey[:], raw[2:])
+	return utreexo.AccumulatorNodePath{Depth: depth, Key: pathKey}, nil
+}
+
+func encodeAccumulatorNodeValue(record utreexo.AccumulatorNodeRecord) []byte {
+	buf := make([]byte, 0, 1+8+32+36+49)
+	if record.Leaf != nil {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	buf = append(buf, encodeU64(uint64(record.Count))...)
+	buf = append(buf, record.Hash[:]...)
+	if record.Leaf != nil {
+		record.Leaf.OutPoint.Encode(&buf)
+		entry := consensus.UtxoEntryFromLeaf(*record.Leaf)
+		buf = append(buf, encodeUTXOEntry(entry)...)
+	}
+	return buf
+}
+
+func decodeAccumulatorNodeValue(path utreexo.AccumulatorNodePath, buf []byte) (utreexo.AccumulatorNodeRecord, error) {
+	if len(buf) < 41 {
+		return utreexo.AccumulatorNodeRecord{}, errors.New("invalid accumulator node value")
+	}
+	kind := buf[0]
+	count, err := decodeU64(buf[1:9])
+	if err != nil {
+		return utreexo.AccumulatorNodeRecord{}, err
+	}
+	record := utreexo.AccumulatorNodeRecord{
+		Path:  path,
+		Count: int(count),
+	}
+	copy(record.Hash[:], buf[9:41])
+	remaining := buf[41:]
+	switch kind {
+	case 0:
+		if len(remaining) != 0 {
+			return utreexo.AccumulatorNodeRecord{}, errors.New("invalid internal accumulator node payload")
+		}
+	case 1:
+		if len(remaining) < 36 {
+			return utreexo.AccumulatorNodeRecord{}, errors.New("invalid leaf accumulator node payload")
+		}
+		outPoint, err := decodeOutPoint(remaining[:36])
+		if err != nil {
+			return utreexo.AccumulatorNodeRecord{}, err
+		}
+		entry, err := decodeUTXOEntry(remaining[36:])
+		if err != nil {
+			return utreexo.AccumulatorNodeRecord{}, err
+		}
+		leaf := consensus.UtxoLeafFromEntry(outPoint, entry)
+		record.Leaf = &leaf
+	default:
+		return utreexo.AccumulatorNodeRecord{}, errors.New("invalid accumulator node kind")
+	}
+	return record, nil
+}
+
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
+	entry = consensus.NormalizeUtxoEntry(entry)
 	buf := make([]byte, 0, 49)
 	buf = append(buf, types.CanonicalVarIntBytes(entry.Type)...)
 	value := make([]byte, 8)
 	binary.LittleEndian.PutUint64(value, entry.ValueAtoms)
 	buf = append(buf, value...)
-	payload32 := entry.Payload32
-	if payload32 == ([32]byte{}) && entry.Type == types.OutputXOnlyP2PK {
-		payload32 = entry.PubKey
-	}
-	buf = append(buf, payload32[:]...)
+	buf = append(buf, entry.Payload32[:]...)
 	return buf
 }
 
@@ -3514,11 +3955,10 @@ func decodeUTXOEntryWithLen(buf []byte) (consensus.UtxoEntry, int, error) {
 	entry := consensus.UtxoEntry{
 		Type:       outputType,
 		ValueAtoms: binary.LittleEndian.Uint64(remaining[:8]),
+		Payload32:  payload32,
 	}
 	if outputType == types.OutputXOnlyP2PK {
 		entry.PubKey = payload32
-	} else {
-		entry.Payload32 = payload32
 	}
 	return entry, n + 40, nil
 }

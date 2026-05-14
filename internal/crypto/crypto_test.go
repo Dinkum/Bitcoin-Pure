@@ -1,6 +1,41 @@
 package crypto
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestHash32HexRoundTripUsesCanonicalByteOrder(t *testing.T) {
+	raw := "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	hash, err := ParseHash32Hex(raw)
+	if err != nil {
+		t.Fatalf("ParseHash32Hex: %v", err)
+	}
+	if hash.String() != raw {
+		t.Fatalf("String = %s, want %s", hash.String(), raw)
+	}
+	if hash.Array()[0] != 0x00 || hash.Array()[31] != 0x1f {
+		t.Fatalf("hash byte order changed: %x", hash.Array())
+	}
+	bytesCopy := hash.Bytes()
+	bytesCopy[0] = 0xff
+	if hash.Array()[0] != 0x00 {
+		t.Fatal("Bytes returned mutable backing storage")
+	}
+}
+
+func TestParseHash32HexRejectsInvalidInput(t *testing.T) {
+	for _, raw := range []string{
+		"",
+		strings.Repeat("00", 31),
+		strings.Repeat("00", 33),
+		strings.Repeat("zz", 32),
+	} {
+		if _, err := ParseHash32Hex(raw); err == nil {
+			t.Fatalf("ParseHash32Hex(%q) succeeded", raw)
+		}
+	}
+}
 
 func TestTaggedHashIsStable(t *testing.T) {
 	h := TaggedHash("BPU/Test", []byte("abc"))
@@ -29,11 +64,25 @@ func TestPQLockMatchesSpecTagAndPayload(t *testing.T) {
 	}
 }
 
+func TestBIP340ChallengeHashUsesNativeTaggedHash(t *testing.T) {
+	r := arrayOf(0x01)
+	pubKey := arrayOf(0x02)
+	msg := arrayOf(0x03)
+	payload := append(append(append([]byte(nil), r[:]...), pubKey[:]...), msg[:]...)
+	want := TaggedHash(BIP340ChallengeTag, payload)
+	if got := BIP340ChallengeHash(r, pubKey, msg); got != want {
+		t.Fatalf("BIP340ChallengeHash = %x, want %x", got, want)
+	}
+}
+
 func TestSchnorrRoundtrip(t *testing.T) {
 	msg := Sha256([]byte("hello"))
 	pubKey, sig := RandomSignSchnorrForTest(&msg)
 	if !VerifySchnorrXOnly(&pubKey, &sig, &msg) {
 		t.Fatal("signature verification failed")
+	}
+	if !VerifyXOnlySchnorr(pubKey, msg, sig) {
+		t.Fatal("value wrapper signature verification failed")
 	}
 }
 
@@ -114,4 +163,12 @@ func BenchmarkTaggedHash(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = TaggedHash("BPU/mainnet/c1/SigHashV1", payload)
 	}
+}
+
+func arrayOf(value byte) [32]byte {
+	var out [32]byte
+	for i := range out {
+		out[i] = value
+	}
+	return out
 }

@@ -100,6 +100,42 @@ func TestAccumulatorMatchesBulkRoot(t *testing.T) {
 	}
 }
 
+func TestAccumulatorNodeRecordsRoundTripAndDelta(t *testing.T) {
+	leaves := []UtxoLeaf{
+		testLeaf(1, 0, 10, 11),
+		testLeaf(2, 1, 20, 22),
+		testLeaf(3, 2, 30, 33),
+	}
+	acc, err := NewAccumulatorFromLeaves(leaves)
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromLeaves: %v", err)
+	}
+	rebuilt, err := NewAccumulatorFromNodeRecords(AccumulatorNodeRecords(acc))
+	if err != nil {
+		t.Fatalf("NewAccumulatorFromNodeRecords: %v", err)
+	}
+	if rebuilt.Count() != acc.Count() || rebuilt.Root() != acc.Root() {
+		t.Fatalf("rebuilt accumulator = count %d root %x, want count %d root %x", rebuilt.Count(), rebuilt.Root(), acc.Count(), acc.Root())
+	}
+
+	nextLeaf := testLeaf(4, 3, 40, 44)
+	next, err := acc.Apply([]types.OutPoint{leaves[0].OutPoint}, []UtxoLeaf{nextLeaf})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	delta := AccumulatorNodeDeltaBetween(acc, next)
+	if len(delta.Upserts) == 0 || len(delta.Deletes) == 0 {
+		t.Fatalf("delta should contain upserts and deletes: %+v", delta)
+	}
+	nextRebuilt, err := NewAccumulatorFromNodeRecords(AccumulatorNodeRecords(next))
+	if err != nil {
+		t.Fatalf("rebuild next: %v", err)
+	}
+	if nextRebuilt.Count() != next.Count() || nextRebuilt.Root() != next.Root() {
+		t.Fatalf("rebuilt next accumulator = count %d root %x, want count %d root %x", nextRebuilt.Count(), nextRebuilt.Root(), next.Count(), next.Root())
+	}
+}
+
 func TestBulkAccumulatorMatchesIncrementalBuilder(t *testing.T) {
 	if runtime.GOMAXPROCS(0) < 2 {
 		t.Skip("parallel accumulator build needs multiple workers to exercise")

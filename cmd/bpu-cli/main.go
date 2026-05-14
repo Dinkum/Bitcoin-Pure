@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	osuser "os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -174,6 +175,8 @@ func runConfig(args []string) error {
 	switch args[0] {
 	case "normalize":
 		return runConfigNormalize(args[1:])
+	case "mining":
+		return runConfigMining(args[1:])
 	default:
 		return errors.New("unknown config subcommand")
 	}
@@ -200,6 +203,77 @@ func runConfigNormalize(args []string) error {
 		cfg = loaded
 	}
 	return config.Save(strings.TrimSpace(*outPath), cfg)
+}
+
+func runConfigMining(args []string) error {
+	fs := flag.NewFlagSet("config mining", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", "", "")
+	workers := fs.Int("workers", 0, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: bpu-cli config mining [--config PATH] [--workers N] on|off")
+	}
+	mode := strings.ToLower(strings.TrimSpace(fs.Arg(0)))
+	if mode != "on" && mode != "off" {
+		return fmt.Errorf("invalid mining mode %q: want on or off", fs.Arg(0))
+	}
+	if *workers < 0 {
+		return errors.New("--workers must not be negative")
+	}
+	resolvedConfigPath := strings.TrimSpace(*configPath)
+	if resolvedConfigPath == "" {
+		for _, candidate := range config.DefaultPathCandidates() {
+			if fileExists(candidate) {
+				resolvedConfigPath = candidate
+				break
+			}
+		}
+	}
+	if resolvedConfigPath == "" {
+		return errors.New("config mining requires --config when no installed config exists")
+	}
+	cfg, err := config.Load(resolvedConfigPath)
+	if err != nil {
+		return err
+	}
+	cfg.MinerEnabled = mode == "on"
+	if *workers > 0 {
+		cfg.MinerWorkers = *workers
+	}
+	var addr wallet.Address
+	var walletPath string
+	if cfg.MinerEnabled {
+		addr, walletPath, err = ensureMiningWalletProvisioned(resolvedConfigPath, &cfg)
+		if err != nil {
+			return err
+		}
+	}
+	if err := saveCLIConfig(resolvedConfigPath, cfg); err != nil {
+		return err
+	}
+	if cfg.MinerEnabled {
+		fmt.Println("mining: on")
+		if cfg.MinerWorkers > 0 {
+			fmt.Printf("workers: %d\n", cfg.MinerWorkers)
+		} else {
+			fmt.Println("workers: auto")
+		}
+		if strings.TrimSpace(cfg.MinerPubKeyHex) != "" {
+			fmt.Printf("miner_pubkey_hex: %s\n", cfg.MinerPubKeyHex)
+		}
+		if walletPath != "" {
+			fmt.Printf("wallet_dir: %s\n", filepath.Dir(walletPath))
+		}
+		if addr.Address != "" {
+			fmt.Printf("receive_address: %s\n", addr.Address)
+		}
+	} else {
+		fmt.Println("mining: off")
+	}
+	return nil
 }
 
 func runServe(args []string) error {
@@ -2414,10 +2488,39 @@ func ensureMiningWalletProvisioned(configPath string, cfg *config.Config) (walle
 		return wallet.Address{}, "", errors.New("miner wallet did not produce an xonly mining pubkey")
 	}
 	cfg.MinerPubKeyHex = addr.PubKeyHex
-	if err := config.Save(configPath, *cfg); err != nil {
+	if err := saveCLIConfig(configPath, *cfg); err != nil {
 		return wallet.Address{}, "", err
 	}
 	return addr, walletPath, nil
+}
+
+func saveCLIConfig(path string, cfg config.Config) error {
+	if err := config.Save(path, cfg); err != nil {
+		return err
+	}
+	if !isInstalledConfigPath(path) {
+		return nil
+	}
+	group, err := osuser.LookupGroup("bitcoin-pure")
+	if err != nil {
+		return fmt.Errorf("lookup bitcoin-pure group: %w", err)
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return fmt.Errorf("parse bitcoin-pure gid %q: %w", group.Gid, err)
+	}
+	for _, candidate := range []string{config.DefaultConfigPath, config.LegacyConfigPath} {
+		if !fileExists(candidate) {
+			continue
+		}
+		if err := os.Chown(candidate, 0, gid); err != nil {
+			return fmt.Errorf("set owner on %s: %w", candidate, err)
+		}
+		if err := os.Chmod(candidate, 0o640); err != nil {
+			return fmt.Errorf("set mode on %s: %w", candidate, err)
+		}
+	}
+	return nil
 }
 
 func rejectInstalledMiningAutoProvision(configPath string, cfg config.Config) error {
@@ -2428,7 +2531,7 @@ func rejectInstalledMiningAutoProvision(configPath string, cfg config.Config) er
 	if cleanConfig == "" || !isInstalledConfigPath(cleanConfig) {
 		return nil
 	}
-	return errors.New("installed service config has mining enabled without miner_pubkey_hex; run ./install --mining on to provision the miner wallet before service start")
+	return errors.New("installed service config has mining enabled without miner_pubkey_hex; run `sudo bpu-cli config mining on` to provision the miner wallet before service start")
 }
 
 func isInstalledConfigPath(path string) bool {

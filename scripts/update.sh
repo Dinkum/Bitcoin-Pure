@@ -80,6 +80,7 @@ install_go() {
 	want="$(required_go_version)"
 	have="$(current_go_version || true)"
 	if [[ "${have}" == "${want}" ]]; then
+		log "Go ${want} already installed"
 		export PATH="${APP_ROOT}/toolchains/go/bin:${PATH}"
 		return
 	fi
@@ -122,6 +123,7 @@ install_go() {
 	rm -f "${tmp}"
 	rm -rf "${extract_dir}"
 	export PATH="${APP_ROOT}/toolchains/go/bin:${PATH}"
+	log "Go ${want} installed and verified"
 }
 
 ensure_packages() {
@@ -140,6 +142,7 @@ ensure_packages() {
 	log "installing system packages: ${missing[*]}"
 	apt-get update
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+	log "system packages installed"
 }
 
 render_metadata() {
@@ -160,7 +163,7 @@ PY
 }
 
 render_config() {
-	local artifacts_dir current_config_path current_legacy_config_path seed_config seed_existing peers_json mining_override profile_override
+	local artifacts_dir current_config_path current_legacy_config_path seed_config seed_existing peers_json mining_override profile_override config_summary
 	artifacts_dir="${STAGE_DIR}/.artifacts"
 	current_config_path="${CONFIG_PATH}"
 	current_legacy_config_path="${LEGACY_CONFIG_PATH}"
@@ -276,6 +279,20 @@ with open(out_path, "w", encoding="utf-8") as fh:
     fh.write("\n")
 PY
 	chmod 600 "${artifacts_dir}/config.json"
+	config_summary="$(python3 - "${artifacts_dir}/config.json" "${seed_existing}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+source = "existing config" if sys.argv[2] == "1" else "fresh defaults"
+mining = "on" if cfg.get("miner_enabled", False) else "off"
+peers = len(cfg.get("peers") or [])
+print(f"config prepared from {source}: profile={cfg.get('profile', 'unknown')} mining={mining} peers={peers}")
+PY
+)"
+	log "${config_summary}"
 }
 
 normalize_config() {
@@ -322,6 +339,7 @@ for path in paths:
 print(" ".join(out))
 PY
 )"
+	printf '%s\n' "${read_write_paths}" | tr ' ' '\n' >"${artifacts_dir}/runtime-paths"
 	python3 - "${artifacts_dir}/config.json" >"${artifacts_dir}/wallet-paths" <<'PY'
 import json
 import os
@@ -417,6 +435,7 @@ build_binary() {
 		go build -o "${STAGE_DIR}/bin/bpu-cli" ./cmd/bpu-cli
 	)
 	chmod 755 "${STAGE_DIR}/bin/bpu-cli"
+	log "built bpu-cli"
 }
 
 ensure_mining_wallet() {
@@ -572,6 +591,7 @@ main() {
 	APP_ROOT="$(dirname "${CURRENT_LINK}")"
 	[[ -n "${CONFIG_PATH}" ]] || fail "--config-path is required"
 	[[ -n "${SERVICE_NAME}" ]] || fail "--service-name is required"
+	log "validating staged release contents"
 	verify_stage
 	ensure_packages
 	install_go

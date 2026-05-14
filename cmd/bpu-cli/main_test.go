@@ -130,6 +130,68 @@ func TestEnsureMiningWalletProvisionedNoopsWhenMiningDisabled(t *testing.T) {
 	}
 }
 
+func TestRunConfigMiningOnProvisionsWalletAndPersistsConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := runConfigMining([]string{"--config", configPath, "--workers", "2", "on"}); err != nil {
+		t.Fatalf("runConfigMining on: %v", err)
+	}
+
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !loaded.MinerEnabled {
+		t.Fatal("expected mining enabled")
+	}
+	if loaded.MinerWorkers != 2 {
+		t.Fatalf("miner workers = %d, want 2", loaded.MinerWorkers)
+	}
+	if loaded.MinerPubKeyHex == "" {
+		t.Fatal("expected miner pubkey")
+	}
+	store, _, err := openWalletStore("", loaded)
+	if err != nil {
+		t.Fatalf("openWalletStore: %v", err)
+	}
+	if _, err := store.Wallet("miner"); err != nil {
+		t.Fatalf("Wallet(miner): %v", err)
+	}
+}
+
+func TestRunConfigMiningOffPersistsConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(root, "chain")
+	cfg.MinerEnabled = true
+	cfg.MinerPubKeyHex = strings.Repeat("ab", 32)
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := runConfigMining([]string{"--config", configPath, "off"}); err != nil {
+		t.Fatalf("runConfigMining off: %v", err)
+	}
+
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.MinerEnabled {
+		t.Fatal("expected mining disabled")
+	}
+	if loaded.MinerPubKeyHex != cfg.MinerPubKeyHex {
+		t.Fatalf("miner pubkey = %q, want preserved %q", loaded.MinerPubKeyHex, cfg.MinerPubKeyHex)
+	}
+}
+
 func TestConfigNormalizeWritesCanonicalYAMLAndLegacyJSONSidecar(t *testing.T) {
 	root := t.TempDir()
 	inPath := filepath.Join(root, "input.json")
@@ -407,11 +469,11 @@ func TestWalletReceiveAndExportInferSingleWallet(t *testing.T) {
 func TestRejectInstalledMiningAutoProvision(t *testing.T) {
 	cfg := config.Default()
 	cfg.MinerEnabled = true
-	if err := rejectInstalledMiningAutoProvision(config.DefaultConfigPath, cfg); err == nil || !strings.Contains(err.Error(), "install --mining on") {
-		t.Fatalf("rejectInstalledMiningAutoProvision err = %v, want install guidance", err)
+	if err := rejectInstalledMiningAutoProvision(config.DefaultConfigPath, cfg); err == nil || !strings.Contains(err.Error(), "bpu-cli config mining on") {
+		t.Fatalf("rejectInstalledMiningAutoProvision err = %v, want config mining guidance", err)
 	}
-	if err := rejectInstalledMiningAutoProvision(config.LegacyConfigPath, cfg); err == nil || !strings.Contains(err.Error(), "install --mining on") {
-		t.Fatalf("legacy rejectInstalledMiningAutoProvision err = %v, want install guidance", err)
+	if err := rejectInstalledMiningAutoProvision(config.LegacyConfigPath, cfg); err == nil || !strings.Contains(err.Error(), "bpu-cli config mining on") {
+		t.Fatalf("legacy rejectInstalledMiningAutoProvision err = %v, want config mining guidance", err)
 	}
 	cfg.MinerPubKeyHex = "abcd"
 	if err := rejectInstalledMiningAutoProvision(config.DefaultConfigPath, cfg); err != nil {

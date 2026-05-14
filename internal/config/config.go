@@ -378,7 +378,7 @@ func renderCommentedYAML(cfg Config) ([]byte, error) {
 			fields: []yamlField{
 				{key: "miner_enabled", description: "Enables local mining workers.", value: cfg.MinerEnabled, defaultValue: defaults.MinerEnabled},
 				{key: "miner_workers", description: "Sets the number of local mining workers; zero uses the node default.", value: cfg.MinerWorkers, defaultValue: defaults.MinerWorkers},
-				{key: "miner_pubkey_hex", description: "Pays coinbase rewards to a 32-byte x-only secp256k1 public key; installed nodes should use ./install --mining on or set this explicitly.", value: cfg.MinerPubKeyHex, defaultValue: defaults.MinerPubKeyHex},
+				{key: "miner_pubkey_hex", description: "Pays coinbase rewards to a 32-byte x-only secp256k1 public key; installed nodes should use bpu-cli config mining on or set this explicitly.", value: cfg.MinerPubKeyHex, defaultValue: defaults.MinerPubKeyHex},
 			},
 		},
 	}

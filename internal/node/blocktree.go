@@ -195,6 +195,8 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	if existing != nil && existing.Validated {
 		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, ErrBlockAlreadyKnown
 	}
+	nextStateMeta.UTXOAccumulatorDelta = &detail.accumulatorDelta
+	nextStateMeta.UTXOAccumulator = nil
 	if err := p.store.AppendValidatedBlockMeta(nextStateMeta, block, &entry, undo, spent, created); err != nil {
 		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, err
 	}
@@ -269,6 +271,9 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 	if err != nil {
 		return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 	}
+	accumulatorDelta := utreexo.AccumulatorNodeDeltaBetween(p.state.utxoAcc, tempState.utxoAcc)
+	nextStateMeta.UTXOAccumulatorDelta = &accumulatorDelta
+	nextStateMeta.UTXOAccumulator = nil
 	isActiveTipExtension := forkHeight == oldTipHeightForState(p.state) && len(steps) == 1 && parentEntry.Height == bestTipEntry.Height &&
 		consensus.HeaderHash(&parentEntry.Header) == bestTipHash
 	oldTipHeight := *p.state.TipHeight()

@@ -191,33 +191,74 @@ func PQLock(verificationKey []byte) [32]byte {
 	return crypto.TaggedHash(PQLockTag, verificationKey)
 }
 
+// UtxoEntryFromOutput is the consensus boundary for materializing a typed
+// transaction output into the spendable coin representation.
 func UtxoEntryFromOutput(output types.TxOutput) UtxoEntry {
+	payload32 := output.CanonicalPayload32()
 	if output.Type == types.OutputXOnlyP2PK {
-		pubKey := output.CanonicalPayload32()
 		return UtxoEntry{
 			Type:       output.Type,
 			ValueAtoms: output.ValueAtoms,
-			PubKey:     pubKey,
+			Payload32:  payload32,
+			PubKey:     payload32,
 		}
 	}
 	return UtxoEntry{
 		Type:       output.Type,
 		ValueAtoms: output.ValueAtoms,
-		Payload32:  output.CanonicalPayload32(),
+		Payload32:  payload32,
 		PubKey:     output.PubKey,
 	}
+}
+
+// UtxoEntryFromLeaf converts accumulator leaves back to validation coins
+// without losing the x-only compatibility alias.
+func UtxoEntryFromLeaf(leaf utreexo.UtxoLeaf) UtxoEntry {
+	return NormalizeUtxoEntry(UtxoEntry{
+		Type:       leaf.Type,
+		ValueAtoms: leaf.ValueAtoms,
+		Payload32:  leaf.Payload32,
+		PubKey:     leaf.PubKey,
+	})
+}
+
+// UtxoLeafFromOutput materializes a newly-created output for accumulator
+// updates using the same typed payload rules as transaction validation.
+func UtxoLeafFromOutput(outPoint types.OutPoint, output types.TxOutput) utreexo.UtxoLeaf {
+	return UtxoLeafFromEntry(outPoint, UtxoEntryFromOutput(output))
+}
+
+// UtxoLeafFromEntry prepares an existing validation coin for accumulator
+// hashing after normalizing legacy x-only aliases.
+func UtxoLeafFromEntry(outPoint types.OutPoint, entry UtxoEntry) utreexo.UtxoLeaf {
+	entry = NormalizeUtxoEntry(entry)
+	return utreexo.UtxoLeaf{
+		OutPoint:   outPoint,
+		Type:       entry.Type,
+		ValueAtoms: entry.ValueAtoms,
+		Payload32:  entry.Payload32,
+		PubKey:     entry.PubKey,
+	}
+}
+
+// NormalizeUtxoEntry repairs the x-only PubKey/Payload32 alias boundary while
+// leaving typed PQ payloads untouched.
+func NormalizeUtxoEntry(entry UtxoEntry) UtxoEntry {
+	if entry.Type == types.OutputXOnlyP2PK {
+		switch {
+		case entry.Payload32 == ([32]byte{}) && entry.PubKey != ([32]byte{}):
+			entry.Payload32 = entry.PubKey
+		case entry.PubKey == ([32]byte{}) && entry.Payload32 != ([32]byte{}):
+			entry.PubKey = entry.Payload32
+		}
+	}
+	return entry
 }
 
 func UtxoLeaves(utxos UtxoSet) []utreexo.UtxoLeaf {
 	leaves := make([]utreexo.UtxoLeaf, 0, len(utxos))
 	for outPoint, coin := range utxos {
-		leaves = append(leaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			Type:       coin.Type,
-			ValueAtoms: coin.ValueAtoms,
-			Payload32:  canonicalUtxoPayload32(coin),
-			PubKey:     coin.PubKey,
-		})
+		leaves = append(leaves, UtxoLeafFromEntry(outPoint, coin))
 	}
 	return leaves
 }
@@ -234,22 +275,10 @@ func utxoLeavesFromOverlay(overlay *UtxoOverlay) []utreexo.UtxoLeaf {
 		if _, replaced := overlay.created[outPoint]; replaced {
 			continue
 		}
-		leaves = append(leaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			Type:       coin.Type,
-			ValueAtoms: coin.ValueAtoms,
-			Payload32:  canonicalUtxoPayload32(coin),
-			PubKey:     coin.PubKey,
-		})
+		leaves = append(leaves, UtxoLeafFromEntry(outPoint, coin))
 	}
 	for outPoint, coin := range overlay.created {
-		leaves = append(leaves, utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			Type:       coin.Type,
-			ValueAtoms: coin.ValueAtoms,
-			Payload32:  canonicalUtxoPayload32(coin),
-			PubKey:     coin.PubKey,
-		})
+		leaves = append(leaves, UtxoLeafFromEntry(outPoint, coin))
 	}
 	return leaves
 }
@@ -312,12 +341,20 @@ type UtxoLookup func(types.OutPoint) (UtxoEntry, bool)
 // paths that must not silently treat disk I/O faults as "coin not found".
 type UtxoLookupWithErr func(types.OutPoint) (UtxoEntry, bool, error)
 
+type blockCreatedOutput struct {
+	TxIndex int
+	Entry   UtxoEntry
+}
+
 // LookupFromSet adapts a concrete UTXO map to the generic lookup surface used
 // by validation and overlay-backed tentative state transitions.
 func LookupFromSet(utxos UtxoSet) UtxoLookup {
 	return func(out types.OutPoint) (UtxoEntry, bool) {
 		utxo, ok := utxos[out]
-		return utxo, ok
+		if !ok {
+			return UtxoEntry{}, false
+		}
+		return NormalizeUtxoEntry(utxo), true
 	}
 }
 
@@ -326,7 +363,10 @@ func LookupFromSet(utxos UtxoSet) UtxoLookup {
 func LookupWithErrFromSet(utxos UtxoSet) UtxoLookupWithErr {
 	return func(out types.OutPoint) (UtxoEntry, bool, error) {
 		utxo, ok := utxos[out]
-		return utxo, ok, nil
+		if !ok {
+			return UtxoEntry{}, false, nil
+		}
+		return NormalizeUtxoEntry(utxo), true, nil
 	}
 }
 
@@ -335,7 +375,10 @@ func LookupWithErrFromSet(utxos UtxoSet) UtxoLookupWithErr {
 func LookupWithErrFromLookup(lookup UtxoLookup) UtxoLookupWithErr {
 	return func(out types.OutPoint) (UtxoEntry, bool, error) {
 		utxo, ok := lookup(out)
-		return utxo, ok, nil
+		if !ok {
+			return UtxoEntry{}, false, nil
+		}
+		return NormalizeUtxoEntry(utxo), true, nil
 	}
 }
 
@@ -383,7 +426,7 @@ func (o *UtxoOverlay) Lookup(out types.OutPoint) (UtxoEntry, bool) {
 		return UtxoEntry{}, false
 	}
 	if entry, ok := o.created[out]; ok {
-		return entry, true
+		return NormalizeUtxoEntry(entry), true
 	}
 	if _, ok := o.deleted[out]; ok {
 		return UtxoEntry{}, false
@@ -395,7 +438,10 @@ func (o *UtxoOverlay) Lookup(out types.OutPoint) (UtxoEntry, bool) {
 	if err != nil && o.firstErr == nil {
 		o.firstErr = err
 	}
-	return entry, ok
+	if !ok {
+		return UtxoEntry{}, false
+	}
+	return NormalizeUtxoEntry(entry), true
 }
 
 func (o *UtxoOverlay) Spend(out types.OutPoint) {
@@ -411,7 +457,7 @@ func (o *UtxoOverlay) Restore(out types.OutPoint, entry UtxoEntry) {
 		return
 	}
 	delete(o.deleted, out)
-	o.created[out] = entry
+	o.created[out] = NormalizeUtxoEntry(entry)
 }
 
 func (o *UtxoOverlay) Set(out types.OutPoint, entry UtxoEntry) {
@@ -419,7 +465,7 @@ func (o *UtxoOverlay) Set(out types.OutPoint, entry UtxoEntry) {
 		return
 	}
 	delete(o.deleted, out)
-	o.created[out] = entry
+	o.created[out] = NormalizeUtxoEntry(entry)
 }
 
 func (o *UtxoOverlay) ApplyTx(tx types.Transaction, txid [32]byte) {
@@ -812,6 +858,7 @@ func newSighashContextWithParams(tx *types.Transaction, spentCoins []UtxoEntry, 
 	spentCoinPayload := make([]byte, 0, types.CanonicalVarIntLen(uint64(len(spentCoins)))+len(spentCoins)*49)
 	spentCoinPayload = types.AppendCanonicalVarInt(spentCoinPayload, uint64(len(spentCoins)))
 	for _, coin := range spentCoins {
+		coin = NormalizeUtxoEntry(coin)
 		spentCoinPayload = appendTypedCoinEncoding(spentCoinPayload, coin.Type, coin.ValueAtoms, canonicalUtxoPayload32(coin))
 	}
 
@@ -912,9 +959,7 @@ func canonicalOutputPayload32(output types.TxOutput) [32]byte {
 }
 
 func canonicalUtxoPayload32(entry UtxoEntry) [32]byte {
-	if entry.Type == types.OutputXOnlyP2PK && entry.Payload32 == ([32]byte{}) {
-		return entry.PubKey
-	}
+	entry = NormalizeUtxoEntry(entry)
 	return entry.Payload32
 }
 
@@ -1019,6 +1064,7 @@ func prepareTxValidationWithLookupAndParams(tx *types.Transaction, lookup UtxoLo
 		if !ok {
 			return TxValidationSummary{}, signatureChecks, pqChecks, ErrMissingUTXO
 		}
+		utxo = NormalizeUtxoEntry(utxo)
 		next := inputSum + utxo.ValueAtoms
 		if next < inputSum {
 			return TxValidationSummary{}, signatureChecks, pqChecks, ErrAmountOverflow
@@ -1663,11 +1709,9 @@ func blockUtxoDeltaFromIDs(block *types.Block, txids [][32]byte) ([]types.OutPoi
 		}
 	}
 	spent := make([]types.OutPoint, 0, spentCap)
-	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf, outputCap)
-	createdOrder := make([]types.OutPoint, 0, outputCap)
+	createdByOutPoint, createdOrder := blockCreatedOutputsFromIDs(block, txids, outputCap)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
-		txid := txids[i]
 		for _, input := range tx.Base.Inputs {
 			// Outputs created and spent within the same block never exist in the
 			// pre-block accumulator, so they cancel out of the accumulator delta.
@@ -1677,29 +1721,12 @@ func blockUtxoDeltaFromIDs(block *types.Block, txids [][32]byte) ([]types.OutPoi
 			}
 			spent = append(spent, input.PrevOut)
 		}
-		for vout, output := range tx.Base.Outputs {
-			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-			createdByOutPoint[outPoint] = utreexo.UtxoLeaf{
-				OutPoint:   outPoint,
-				Type:       output.Type,
-				ValueAtoms: output.ValueAtoms,
-				Payload32:  canonicalOutputPayload32(output),
-				PubKey:     output.PubKey,
-			}
-			createdOrder = append(createdOrder, outPoint)
-		}
 	}
 	coinbase := &block.Txs[0]
 	coinbaseTxID := txids[0]
 	for vout, output := range coinbase.Base.Outputs {
 		outPoint := types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}
-		createdByOutPoint[outPoint] = utreexo.UtxoLeaf{
-			OutPoint:   outPoint,
-			Type:       output.Type,
-			ValueAtoms: output.ValueAtoms,
-			Payload32:  canonicalOutputPayload32(output),
-			PubKey:     output.PubKey,
-		}
+		createdByOutPoint[outPoint] = UtxoLeafFromOutput(outPoint, output)
 		createdOrder = append(createdOrder, outPoint)
 	}
 	created := make([]utreexo.UtxoLeaf, 0, len(createdByOutPoint))
@@ -1709,6 +1736,21 @@ func blockUtxoDeltaFromIDs(block *types.Block, txids [][32]byte) ([]types.OutPoi
 		}
 	}
 	return spent, created
+}
+
+func blockCreatedOutputsFromIDs(block *types.Block, txids [][32]byte, outputCap int) (map[types.OutPoint]utreexo.UtxoLeaf, []types.OutPoint) {
+	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf, outputCap)
+	createdOrder := make([]types.OutPoint, 0, outputCap)
+	for i := 1; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
+		txid := txids[i]
+		for vout, output := range tx.Base.Outputs {
+			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+			createdByOutPoint[outPoint] = UtxoLeafFromOutput(outPoint, output)
+			createdOrder = append(createdOrder, outPoint)
+		}
+	}
+	return createdByOutPoint, createdOrder
 }
 
 func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, params ChainParams, rules ConsensusRules) (BlockValidationSummary, error) {
@@ -1797,9 +1839,8 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 
 	tempUtxos := NewUtxoOverlayWithBaseLookup(base, lookup)
 	claimedInputs := make(map[types.OutPoint]struct{}, max(0, len(block.Txs)-1))
-	signatureChecks := make([]crypto.SchnorrBatchItem, 0, max(0, len(block.Txs)-1))
-	pqChecks := make([]PQVerifyCheck, 0)
-	var totalFees uint64
+	sameBlockCreated := make(map[types.OutPoint]blockCreatedOutput)
+	createdOrder := make([]types.OutPoint, 0)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		if i > 1 && bytes.Compare(txids[i-1][:], txids[i][:]) >= 0 {
@@ -1811,12 +1852,42 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 			}
 			claimedInputs[input.PrevOut] = struct{}{}
 		}
-		// Blocks are validated as an atomic patch to the pre-block UTXO set, so
-		// later transactions must see outputs created by earlier non-coinbase
-		// transactions in the same block.
+		for vout, output := range tx.Base.Outputs {
+			if err := validateOutputPayload(output); err != nil {
+				return BlockValidationSummary{}, nil, nil, err
+			}
+			outPoint := types.OutPoint{TxID: txids[i], Vout: uint32(vout)}
+			leaf := UtxoLeafFromOutput(outPoint, output)
+			sameBlockCreated[outPoint] = blockCreatedOutput{
+				TxIndex: i,
+				Entry:   UtxoEntryFromLeaf(leaf),
+			}
+			createdOrder = append(createdOrder, outPoint)
+		}
+	}
+	signatureChecks := make([]crypto.SchnorrBatchItem, 0, max(0, len(block.Txs)-1))
+	pqChecks := make([]PQVerifyCheck, 0)
+	sameBlockSpent := make(map[types.OutPoint]struct{})
+	var totalFees uint64
+	for i := 1; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
+		// LTOR is only the serialization order. Consensus spends are resolved
+		// against the atomic block patch, so a transaction may spend an output
+		// created by any other non-coinbase transaction in this block.
+		blockLookup := func(out types.OutPoint) (UtxoEntry, bool) {
+			if entry, ok := tempUtxos.Lookup(out); ok {
+				return entry, true
+			}
+			created, ok := sameBlockCreated[out]
+			if !ok || created.TxIndex == i {
+				return UtxoEntry{}, false
+			}
+			sameBlockSpent[out] = struct{}{}
+			return created.Entry, true
+		}
 		validatedTx := rules.ValidatedTxCache != nil && rules.ValidatedTxCache(txids[i], authids[i], params)
 		skipAuthChecks := validatedTx || (rules.ValidatedAuthCache != nil && rules.ValidatedAuthCache(txids[i], authids[i], params))
-		summary, nextSignatureChecks, nextPQChecks, err := prepareTxValidationWithLookupAndParams(tx, tempUtxos.Lookup, params, signatureChecks, pqChecks, skipAuthChecks, validatedTx)
+		summary, nextSignatureChecks, nextPQChecks, err := prepareTxValidationWithLookupAndParams(tx, blockLookup, params, signatureChecks, pqChecks, skipAuthChecks, true)
 		if err != nil {
 			if lookupErr := tempUtxos.Err(); lookupErr != nil {
 				return BlockValidationSummary{}, nil, nil, fmt.Errorf("utxo lookup failed during block validation: %w", lookupErr)
@@ -1830,7 +1901,6 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		totalFees = nextFees
 		signatureChecks = nextSignatureChecks
 		pqChecks = nextPQChecks
-		tempUtxos.ApplyTx(*tx, txids[i])
 	}
 	verifyStartedAt := time.Now()
 	schnorrResult := verifyBlockSignatureChecks(signatureChecks)
@@ -1854,6 +1924,20 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 	}
 
 	coinbaseTxID := TxID(coinbase)
+	for outPoint := range claimedInputs {
+		if _, ok := sameBlockSpent[outPoint]; ok {
+			delete(sameBlockCreated, outPoint)
+			continue
+		}
+		tempUtxos.Spend(outPoint)
+	}
+	for _, outPoint := range createdOrder {
+		created, ok := sameBlockCreated[outPoint]
+		if !ok {
+			continue
+		}
+		tempUtxos.Set(outPoint, created.Entry)
+	}
 	for vout, output := range coinbase.Base.Outputs {
 		tempUtxos.Set(types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}, UtxoEntryFromOutput(output))
 	}

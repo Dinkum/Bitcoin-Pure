@@ -98,9 +98,10 @@ type PersistentChainState struct {
 }
 
 type appliedBlockDetail struct {
-	summary     consensus.BlockValidationSummary
-	overlay     *consensus.UtxoOverlay
-	createdUTXO map[types.OutPoint]consensus.UtxoEntry
+	summary          consensus.BlockValidationSummary
+	overlay          *consensus.UtxoOverlay
+	createdUTXO      map[types.OutPoint]consensus.UtxoEntry
+	accumulatorDelta utreexo.AccumulatorNodeDelta
 }
 
 func NewChainState(profile types.ChainProfile) *ChainState {
@@ -132,6 +133,9 @@ func ChainStateFromStoredState(stored *storage.StoredChainState) (*ChainState, e
 	if err := state.InitializeTip(stored.Height, stored.TipHeader, stored.BlockSizeState, stored.UTXOs); err != nil {
 		return nil, err
 	}
+	if stored.UTXOAccumulator != nil {
+		state.utxoAcc = stored.UTXOAccumulator
+	}
 	if stored.UTXOChecksum != ([32]byte{}) {
 		state.utxoChecksum = stored.UTXOChecksum
 	}
@@ -161,6 +165,9 @@ func chainStateFromStoredMeta(stored *storage.StoredChainStateMeta, utxos consen
 		state.replaceMaterializedUTXOs(cloneUtxos(utxos))
 	} else {
 		state.utxos = nil
+		if utxoCount == 0 {
+			utxoCount = stored.UTXOCount
+		}
 		state.utxoCount = utxoCount
 	}
 	if lookup != nil {
@@ -325,6 +332,7 @@ func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO m
 	// The published chain UTXO map is immutable. Validation runs against that
 	// shared base view and only swaps in a freshly materialized post-block map
 	// once the block is fully validated.
+	baseAcc := c.utxoAcc
 	summary, overlay, nextAcc, err := consensus.ValidateAndApplyBlockOverlayWithLookup(
 		block,
 		c.prevBlockContext(),
@@ -361,7 +369,12 @@ func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO m
 	}
 	c.utxoAcc = nextAcc
 	c.utxoChecksum = utxochecksum.ApplyDelta(c.utxoChecksum, spentUTXO, createdUTXO)
-	return appliedBlockDetail{summary: summary, overlay: overlay, createdUTXO: createdUTXO}, nil
+	return appliedBlockDetail{
+		summary:          summary,
+		overlay:          overlay,
+		createdUTXO:      createdUTXO,
+		accumulatorDelta: utreexo.AccumulatorNodeDeltaBetween(baseAcc, nextAcc),
+	}, nil
 }
 
 func (c *ChainState) ReplayBlocks(blocks []types.Block) (ChainReplaySummary, error) {
@@ -503,12 +516,13 @@ func (c *ChainState) StoredState() (*storage.StoredChainState, error) {
 		return nil, err
 	}
 	return &storage.StoredChainState{
-		Profile:        c.Profile(),
-		Height:         *c.height,
-		TipHeader:      *c.tipHeader,
-		BlockSizeState: c.blockSizeState,
-		UTXOChecksum:   c.UTXOChecksum(),
-		UTXOs:          utxos,
+		Profile:         c.Profile(),
+		Height:          *c.height,
+		TipHeader:       *c.tipHeader,
+		BlockSizeState:  c.blockSizeState,
+		UTXOChecksum:    c.UTXOChecksum(),
+		UTXOs:           utxos,
+		UTXOAccumulator: c.utxoAcc,
 	}, nil
 }
 
@@ -517,11 +531,14 @@ func (c *ChainState) StoredStateMeta() (*storage.StoredChainStateMeta, error) {
 		return nil, ErrNoTip
 	}
 	return &storage.StoredChainStateMeta{
-		Profile:        c.Profile(),
-		Height:         *c.height,
-		TipHeader:      *c.tipHeader,
-		BlockSizeState: c.blockSizeState,
-		UTXOChecksum:   c.UTXOChecksum(),
+		Profile:             c.Profile(),
+		Height:              *c.height,
+		TipHeader:           *c.tipHeader,
+		BlockSizeState:      c.blockSizeState,
+		UTXOChecksum:        c.UTXOChecksum(),
+		UTXOCount:           c.utxoCount,
+		UTXOAccumulatorRoot: c.UTXORoot(),
+		UTXOAccumulator:     c.utxoAcc,
 	}, nil
 }
 
@@ -577,53 +594,6 @@ func OpenPersistentChainStateFromMetaWithRulesAndLogger(path string, profile typ
 	return openPersistentChainStateFromMeta(path, profile, rules, logger, storage.OpenOptions{})
 }
 
-func openPersistentChainState(path string, profile types.ChainProfile, rules consensus.ConsensusRules, logger *slog.Logger, storeOptions storage.OpenOptions) (*PersistentChainState, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	chainLogger := logging.ComponentWith(logger, "chain")
-	chainLogger.Info("opening persistent chain state", slog.String("path", path), slog.String("profile", profile.String()))
-	store, err := storage.OpenWithLoggerAndOptions(path, logging.ComponentWith(logger, "storage"), storeOptions)
-	if err != nil {
-		return nil, err
-	}
-	stored, err := store.LoadChainState()
-	if err != nil {
-		store.Close()
-		return nil, err
-	}
-	var state *ChainState
-	if stored != nil {
-		if stored.Profile != profile {
-			store.Close()
-			return nil, fmt.Errorf("stored profile mismatch: expected %s, got %s", profile, stored.Profile)
-		}
-		state, err = ChainStateFromStoredState(stored)
-		if err != nil {
-			store.Close()
-			return nil, err
-		}
-		state.WithLogger(chainLogger)
-		recentTimes, err := loadIndexedAncestorTimestamps(store, consensus.HeaderHash(&stored.TipHeader), 11)
-		if err != nil {
-			store.Close()
-			return nil, err
-		}
-		state.recentTimes = recentTimes
-		state.WithRules(rules)
-		state.bindCommittedUTXOBackend(store.UTXOLookupWithErr(), store.ForEachUTXO, len(stored.UTXOs))
-		chainLogger.Info("loaded persisted chain state",
-			slog.Uint64("height", stored.Height),
-			slog.Int("utxo_count", len(stored.UTXOs)),
-			slog.Uint64("block_size_limit", consensus.NextBlockSizeLimit(stored.BlockSizeState, state.params)),
-		)
-	} else {
-		state = NewChainState(profile).WithLogger(chainLogger).WithRules(rules)
-		chainLogger.Info("no persisted chain state found", slog.String("path", path))
-	}
-	return &PersistentChainState{logger: chainLogger, state: state, store: store}, nil
-}
-
 func openPersistentChainStateFromMeta(path string, profile types.ChainProfile, rules consensus.ConsensusRules, logger *slog.Logger, storeOptions storage.OpenOptions) (*PersistentChainState, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -645,10 +615,25 @@ func openPersistentChainStateFromMeta(path string, profile types.ChainProfile, r
 			store.Close()
 			return nil, fmt.Errorf("stored profile mismatch: expected %s, got %s", profile, stored.Profile)
 		}
-		acc, utxoCount, err := buildAccumulatorFromStore(store)
+		acc, hasAccumulatorIndex, err := store.LoadUTXOAccumulator()
 		if err != nil {
 			store.Close()
 			return nil, err
+		}
+		utxoCount := stored.UTXOCount
+		if !hasAccumulatorIndex {
+			acc, utxoCount, err = buildAccumulatorFromStore(store)
+			if err != nil {
+				store.Close()
+				return nil, err
+			}
+			if err := store.WriteUTXOAccumulator(acc); err != nil {
+				store.Close()
+				return nil, err
+			}
+			chainLogger.Info("rebuilt missing utxo accumulator index",
+				slog.Int("utxo_count", utxoCount),
+			)
 		}
 		state, err = chainStateFromStoredMeta(stored, nil, store.UTXOLookupWithErr(), store.ForEachUTXO, utxoCount, acc)
 		if err != nil {

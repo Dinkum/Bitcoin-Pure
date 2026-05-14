@@ -2,6 +2,7 @@ package mempool
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"errors"
 	"strings"
 	"testing"
@@ -57,6 +58,51 @@ func signedSpendTx(tb testing.TB, spenderSeed byte, prevOut types.OutPoint, valu
 	return tx
 }
 
+func signedXOnlySpendToOutputs(tb testing.TB, spenderSeed byte, prevOut types.OutPoint, value uint64, outputs []types.TxOutput) types.Transaction {
+	tb.Helper()
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: prevOut}},
+			Outputs: outputs,
+		},
+	}
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{
+		consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(value, signerPubKey(spenderSeed))),
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{types.NewXOnlyAuthEntry(sig)}}
+	return tx
+}
+
+func signedPQSpendToOutputs(tb testing.TB, prevOut types.OutPoint, value uint64, verificationKey []byte, privateKey []byte, outputs []types.TxOutput) types.Transaction {
+	tb.Helper()
+	pqLock := consensus.PQLock(verificationKey)
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: prevOut}},
+			Outputs: outputs,
+		},
+	}
+	msg, err := consensus.Sighash(&tx, 0, []consensus.UtxoEntry{
+		consensus.UtxoEntryFromOutput(types.NewPQLockOutput(value, pqLock)),
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	signature, err := crypto.SignMLDSA65(privateKey, msg[:])
+	if err != nil {
+		tb.Fatal(err)
+	}
+	authPayload := append(append([]byte(nil), verificationKey...), signature...)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{AuthPayload: authPayload}}}
+	return tx
+}
+
 func orphanTx(t *testing.T, prevOut types.OutPoint, recipientSeed byte) types.Transaction {
 	t.Helper()
 	tx := types.Transaction{
@@ -79,6 +125,15 @@ func findSnapshot(t *testing.T, entries []SnapshotEntry, txid [32]byte) Snapshot
 	}
 	t.Fatalf("missing txid %x", txid)
 	return SnapshotEntry{}
+}
+
+func containsSnapshotTxID(entries []SnapshotEntry, txid [32]byte) bool {
+	for _, entry := range entries {
+		if entry.TxID == txid {
+			return true
+		}
+	}
+	return false
 }
 
 func commitTipHash(seed byte) [32]byte {
@@ -143,6 +198,68 @@ func TestAcceptTxTracksAncestorsAndDescendants(t *testing.T) {
 	}
 	if childEntry.AncestorFees != 2 {
 		t.Fatalf("child ancestor fees = %d, want 2", childEntry.AncestorFees)
+	}
+}
+
+func TestPQParentOutputSurvivesAdmissionAndSelection(t *testing.T) {
+	pool := NewWithConfig(PoolConfig{
+		MinRelayFeePerByte: 0,
+		MaxTxSize:          1_000_000,
+		MaxAncestors:       25,
+		MaxDescendants:     25,
+		MaxOrphans:         8,
+	})
+	verificationKey, privateKey, err := crypto.GenerateMLDSA65Key(crand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateMLDSA65Key: %v", err)
+	}
+	pqLock := consensus.PQLock(verificationKey)
+	prevOut := types.OutPoint{TxID: [32]byte{0x31}, Vout: 0}
+	utxos := consensus.UtxoSet{
+		prevOut: consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(100, signerPubKey(1))),
+	}
+
+	parent := signedXOnlySpendToOutputs(t, 1, prevOut, 100, []types.TxOutput{
+		types.NewPQLockOutput(90, pqLock),
+	})
+	parentAdmission, err := pool.AcceptTx(parent, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept PQ parent: %v", err)
+	}
+	parentOut := types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}
+	child := signedPQSpendToOutputs(t, parentOut, 90, verificationKey, privateKey, []types.TxOutput{
+		types.NewXOnlyOutput(80, signerPubKey(3)),
+	})
+	childAdmission, err := pool.AcceptTx(child, utxos, consensus.DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("accept PQ child: %v", err)
+	}
+
+	selected, _, overlay := pool.SelectForBlockOverlay(utxos, consensus.DefaultConsensusRules(), 1_000_000)
+	if len(selected) != 2 {
+		t.Fatalf("selected %d txs, want parent and child", len(selected))
+	}
+	if !containsSnapshotTxID(selected, parentAdmission.TxID) || !containsSnapshotTxID(selected, childAdmission.TxID) {
+		t.Fatalf("selection missing parent/child: parent %x child %x selected %+v", parentAdmission.TxID, childAdmission.TxID, selected)
+	}
+	parentSelected := findSnapshot(t, selected, parentAdmission.TxID)
+	if len(parentSelected.CreatedLeaves) != 1 {
+		t.Fatalf("selected parent created leaves = %d, want 1", len(parentSelected.CreatedLeaves))
+	}
+	parentLeaf := parentSelected.CreatedLeaves[0]
+	if parentLeaf.Type != types.OutputPQLock32 || parentLeaf.Payload32 != pqLock || parentLeaf.PubKey != ([32]byte{}) {
+		t.Fatalf("PQ parent leaf lost typed payload: %+v", parentLeaf)
+	}
+	if _, ok := overlay.Lookup(parentOut); ok {
+		t.Fatal("selected overlay retained spent PQ parent output")
+	}
+	childOut := types.OutPoint{TxID: childAdmission.TxID, Vout: 0}
+	childEntry, ok := overlay.Lookup(childOut)
+	if !ok {
+		t.Fatal("selected overlay missing child output")
+	}
+	if childEntry.Type != types.OutputXOnlyP2PK || childEntry.Payload32 == ([32]byte{}) {
+		t.Fatalf("child output not normalized in overlay: %+v", childEntry)
 	}
 }
 
@@ -566,7 +683,7 @@ func TestAcceptTxProtectsRequiredParentsDuringMempoolEviction(t *testing.T) {
 	}
 }
 
-func TestSelectForBlockExcludesSameBlockDescendantsAndReturnsLTOR(t *testing.T) {
+func TestSelectForBlockIncludesSameBlockDescendantsAndReturnsLTOR(t *testing.T) {
 	pool := NewWithConfig(PoolConfig{
 		MinRelayFeePerByte: 0,
 		MaxTxSize:          1_000_000,
@@ -596,17 +713,18 @@ func TestSelectForBlockExcludesSameBlockDescendantsAndReturnsLTOR(t *testing.T) 
 	}
 
 	selected, _ := pool.SelectForBlock(utxos, consensus.DefaultConsensusRules(), 1_000_000)
-	if len(selected) != 2 {
-		t.Fatalf("selected count = %d, want 2", len(selected))
+	if len(selected) != 3 {
+		t.Fatalf("selected count = %d, want 3", len(selected))
 	}
-	if selected[0].TxID == childAdmission.TxID || selected[1].TxID == childAdmission.TxID {
-		t.Fatal("expected child spend to be excluded from same block selection")
+	for _, txid := range [][32]byte{parentAdmission.TxID, childAdmission.TxID, mediumAdmission.TxID} {
+		if !containsSnapshotTxID(selected, txid) {
+			t.Fatalf("selection missing txid %x: %+v", txid, selected)
+		}
 	}
-	if (selected[0].TxID != parentAdmission.TxID && selected[0].TxID != mediumAdmission.TxID) || (selected[1].TxID != parentAdmission.TxID && selected[1].TxID != mediumAdmission.TxID) {
-		t.Fatalf("unexpected selected txids: got %x %x", selected[0].TxID, selected[1].TxID)
-	}
-	if bytes.Compare(selected[0].TxID[:], selected[1].TxID[:]) >= 0 {
-		t.Fatalf("selection not in txid order: got %x before %x", selected[0].TxID, selected[1].TxID)
+	for i := 1; i < len(selected); i++ {
+		if bytes.Compare(selected[i-1].TxID[:], selected[i].TxID[:]) >= 0 {
+			t.Fatalf("selection not in txid order: got %x before %x", selected[i-1].TxID, selected[i].TxID)
+		}
 	}
 }
 
@@ -1269,8 +1387,8 @@ func TestAppendForBlockOnlyReturnsNewSelections(t *testing.T) {
 	preBlockUtxos := cloneUtxos(utxos)
 	currentUtxos := cloneUtxos(utxos)
 	selected, _ := pool.SelectForBlock(currentUtxos, consensus.DefaultConsensusRules(), 1_000_000)
-	if len(selected) != 1 {
-		t.Fatalf("initial selection len = %d, want 1", len(selected))
+	if len(selected) != 2 {
+		t.Fatalf("initial selection len = %d, want 2", len(selected))
 	}
 
 	late := spendTx(t, 4, otherPrev, 50, 5, 1)
@@ -1456,17 +1574,17 @@ func TestSelectForBlockOverlayTracksTentativeState(t *testing.T) {
 	}
 
 	selected, _, overlay := pool.SelectForBlockOverlay(utxos, consensus.DefaultConsensusRules(), 1_000_000)
-	if len(selected) != 1 {
-		t.Fatalf("selected len = %d, want 1", len(selected))
+	if len(selected) != 2 {
+		t.Fatalf("selected len = %d, want 2", len(selected))
 	}
 	if _, ok := overlay.Lookup(rootPrev); ok {
 		t.Fatalf("expected original prevout to be spent from tentative overlay")
 	}
-	if _, ok := overlay.Lookup(types.OutPoint{TxID: childTxID, Vout: 0}); ok {
-		t.Fatalf("did not expect descendant output to exist in selected block view")
+	if _, ok := overlay.Lookup(types.OutPoint{TxID: childTxID, Vout: 0}); !ok {
+		t.Fatalf("expected descendant output to exist in selected block view")
 	}
-	if _, ok := overlay.Lookup(types.OutPoint{TxID: parentTxID, Vout: 0}); !ok {
-		t.Fatalf("expected selected output to remain in tentative overlay")
+	if _, ok := overlay.Lookup(types.OutPoint{TxID: parentTxID, Vout: 0}); ok {
+		t.Fatalf("expected same-block parent output to be spent in tentative overlay")
 	}
 }
 

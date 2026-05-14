@@ -23,6 +23,11 @@ const (
 	parallelTreeBuildThreshold = 256
 )
 
+const (
+	OutPointKeyBytes = outPointBytes
+	KeyBits          = keyBits
+)
+
 type UtxoLeaf struct {
 	OutPoint   types.OutPoint
 	Type       uint64
@@ -63,6 +68,23 @@ type OutPointProof struct {
 type ProofStep struct {
 	HasSibling  bool
 	SiblingHash [32]byte
+}
+
+type AccumulatorNodePath struct {
+	Depth int
+	Key   [OutPointKeyBytes]byte
+}
+
+type AccumulatorNodeRecord struct {
+	Path  AccumulatorNodePath
+	Hash  [32]byte
+	Count int
+	Leaf  *UtxoLeaf
+}
+
+type AccumulatorNodeDelta struct {
+	Upserts []AccumulatorNodeRecord
+	Deletes []AccumulatorNodePath
 }
 
 func LeafHash(leaf UtxoLeaf) [32]byte {
@@ -125,6 +147,28 @@ func NewAccumulatorFromLeaves(leaves []UtxoLeaf) (*Accumulator, error) {
 		root:  buildAccumulatorTree(sorted, 0, parallelBuildBudget()),
 		count: len(sorted),
 	}, nil
+}
+
+func NewAccumulatorFromNodeRecords(records []AccumulatorNodeRecord) (*Accumulator, error) {
+	nodes := make(map[AccumulatorNodePath]AccumulatorNodeRecord, len(records))
+	for _, record := range records {
+		if record.Path.Depth < 0 || record.Path.Depth > keyBits {
+			return nil, fmt.Errorf("invalid accumulator node depth %d", record.Path.Depth)
+		}
+		record.Path.Key = maskPathKey(record.Path.Key, record.Path.Depth)
+		if _, exists := nodes[record.Path]; exists {
+			return nil, fmt.Errorf("duplicate accumulator node at depth %d", record.Path.Depth)
+		}
+		nodes[record.Path] = record
+	}
+	root, err := rebuildNodeFromRecords(nodes, AccumulatorNodePath{}, 0)
+	if err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return NewAccumulator(), nil
+	}
+	return &Accumulator{root: root, count: root.count}, nil
 }
 
 func (a *Accumulator) Root() [32]byte {
@@ -223,6 +267,29 @@ func (a *Accumulator) Apply(spent []types.OutPoint, created []UtxoLeaf) (*Accumu
 	return &Accumulator{root: root, count: root.count}, nil
 }
 
+func AccumulatorNodeRecords(acc *Accumulator) []AccumulatorNodeRecord {
+	if acc == nil || acc.root == nil {
+		return nil
+	}
+	records := make([]AccumulatorNodeRecord, 0, acc.count*2)
+	collectNodeRecords(acc.root, AccumulatorNodePath{}, &records)
+	return records
+}
+
+func AccumulatorNodeDeltaBetween(before *Accumulator, after *Accumulator) AccumulatorNodeDelta {
+	var delta AccumulatorNodeDelta
+	diffAccumulatorNodes(rootOf(before), rootOf(after), AccumulatorNodePath{}, &delta)
+	return delta
+}
+
+func OutPointKey(outPoint types.OutPoint) [OutPointKeyBytes]byte {
+	return leafKey(outPoint)
+}
+
+func OutPointFromKey(key [OutPointKeyBytes]byte) types.OutPoint {
+	return outPointFromKey(key)
+}
+
 // Prove returns a single-outpoint Merklix proof over the current accumulator
 // root. Exclusion proofs terminate at the first missing branch on the queried
 // path; membership proofs carry the committed leaf payload.
@@ -308,6 +375,182 @@ func VerifyProof(root [32]byte, proof OutPointProof) bool {
 		}
 	}
 	return root == crypto.TaggedHash(UTXORootTag, current[:])
+}
+
+func rebuildNodeFromRecords(records map[AccumulatorNodePath]AccumulatorNodeRecord, path AccumulatorNodePath, depth int) (*accNode, error) {
+	record, ok := records[path]
+	if !ok {
+		return nil, nil
+	}
+	if record.Leaf != nil {
+		if depth != keyBits {
+			return nil, fmt.Errorf("leaf accumulator node at non-leaf depth %d", depth)
+		}
+		keyed := keyedLeaf{
+			key:  leafKey(record.Leaf.OutPoint),
+			hash: LeafHash(*record.Leaf),
+			utxo: *record.Leaf,
+		}
+		if keyed.key != path.Key {
+			return nil, fmt.Errorf("accumulator leaf key mismatch at depth %d", depth)
+		}
+		if keyed.hash != record.Hash || record.Count != 1 {
+			return nil, fmt.Errorf("accumulator leaf hash/count mismatch at depth %d", depth)
+		}
+		leafCopy := keyed
+		return &accNode{leaf: &leafCopy, hash: record.Hash, count: 1}, nil
+	}
+	if depth >= keyBits {
+		return nil, fmt.Errorf("internal accumulator node at leaf depth")
+	}
+	leftPath := childPath(path, depth, false)
+	rightPath := childPath(path, depth, true)
+	left, err := rebuildNodeFromRecords(records, leftPath, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	right, err := rebuildNodeFromRecords(records, rightPath, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	node := makeAccNode(left, right)
+	if node == nil {
+		return nil, fmt.Errorf("empty accumulator node recorded at depth %d", depth)
+	}
+	if node.hash != record.Hash || node.count != record.Count {
+		return nil, fmt.Errorf("accumulator node hash/count mismatch at depth %d", depth)
+	}
+	return node, nil
+}
+
+func collectNodeRecords(node *accNode, path AccumulatorNodePath, records *[]AccumulatorNodeRecord) {
+	if node == nil {
+		return
+	}
+	record := AccumulatorNodeRecord{
+		Path:  path,
+		Hash:  node.hash,
+		Count: node.count,
+	}
+	if node.leaf != nil {
+		leaf := node.leaf.utxo
+		record.Leaf = &leaf
+	}
+	*records = append(*records, record)
+	if node.leaf != nil {
+		return
+	}
+	depth := path.Depth
+	collectNodeRecords(node.left, childPath(path, depth, false), records)
+	collectNodeRecords(node.right, childPath(path, depth, true), records)
+}
+
+func diffAccumulatorNodes(before, after *accNode, path AccumulatorNodePath, delta *AccumulatorNodeDelta) {
+	if before == after {
+		return
+	}
+	if before != nil && after == nil {
+		collectNodeDeletes(before, path, delta)
+		return
+	}
+	if after != nil {
+		record := AccumulatorNodeRecord{
+			Path:  path,
+			Hash:  after.hash,
+			Count: after.count,
+		}
+		if after.leaf != nil {
+			leaf := after.leaf.utxo
+			record.Leaf = &leaf
+		}
+		delta.Upserts = append(delta.Upserts, record)
+	}
+	if before == nil {
+		collectNodeUpserts(after.left, childPath(path, path.Depth, false), delta)
+		collectNodeUpserts(after.right, childPath(path, path.Depth, true), delta)
+		return
+	}
+	if after == nil || after.leaf != nil {
+		return
+	}
+	diffAccumulatorNodes(before.left, after.left, childPath(path, path.Depth, false), delta)
+	diffAccumulatorNodes(before.right, after.right, childPath(path, path.Depth, true), delta)
+}
+
+func collectNodeUpserts(node *accNode, path AccumulatorNodePath, delta *AccumulatorNodeDelta) {
+	if node == nil {
+		return
+	}
+	record := AccumulatorNodeRecord{
+		Path:  path,
+		Hash:  node.hash,
+		Count: node.count,
+	}
+	if node.leaf != nil {
+		leaf := node.leaf.utxo
+		record.Leaf = &leaf
+	}
+	delta.Upserts = append(delta.Upserts, record)
+	if node.leaf != nil {
+		return
+	}
+	collectNodeUpserts(node.left, childPath(path, path.Depth, false), delta)
+	collectNodeUpserts(node.right, childPath(path, path.Depth, true), delta)
+}
+
+func collectNodeDeletes(node *accNode, path AccumulatorNodePath, delta *AccumulatorNodeDelta) {
+	if node == nil {
+		return
+	}
+	delta.Deletes = append(delta.Deletes, path)
+	if node.leaf != nil {
+		return
+	}
+	collectNodeDeletes(node.left, childPath(path, path.Depth, false), delta)
+	collectNodeDeletes(node.right, childPath(path, path.Depth, true), delta)
+}
+
+func rootOf(acc *Accumulator) *accNode {
+	if acc == nil {
+		return nil
+	}
+	return acc.root
+}
+
+func childPath(parent AccumulatorNodePath, depth int, right bool) AccumulatorNodePath {
+	child := AccumulatorNodePath{
+		Depth: depth + 1,
+		Key:   parent.Key,
+	}
+	if right {
+		byteIndex := depth / 8
+		bitOffset := 7 - (depth % 8)
+		child.Key[byteIndex] |= 1 << bitOffset
+	}
+	return child
+}
+
+func maskPathKey(key [OutPointKeyBytes]byte, depth int) [OutPointKeyBytes]byte {
+	if depth <= 0 {
+		return [OutPointKeyBytes]byte{}
+	}
+	if depth >= keyBits {
+		return key
+	}
+	fullBytes := depth / 8
+	remainingBits := depth % 8
+	for i := fullBytes + 1; i < len(key); i++ {
+		key[i] = 0
+	}
+	if remainingBits == 0 {
+		for i := fullBytes; i < len(key); i++ {
+			key[i] = 0
+		}
+		return key
+	}
+	mask := byte(0xff << (8 - remainingBits))
+	key[fullBytes] &= mask
+	return key
 }
 
 func sortedKeyedLeaves(leaves []UtxoLeaf) []keyedLeaf {

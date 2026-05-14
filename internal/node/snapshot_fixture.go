@@ -190,10 +190,7 @@ func decodeSnapshotUTXOs(entries []UTXOSnapshotFixtureEntry) (consensus.UtxoSet,
 		}
 		hasPrev = true
 		prev = outPoint
-		utxos[outPoint] = consensus.UtxoEntry{
-			ValueAtoms: entry.ValueAtoms,
-			PubKey:     pubKey,
-		}
+		utxos[outPoint] = consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(entry.ValueAtoms, pubKey))
 	}
 	return utxos, nil
 }

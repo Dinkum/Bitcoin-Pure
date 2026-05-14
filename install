@@ -2,6 +2,113 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_PATH="${BPU_INSTALLER_LOG:-${PWD}/bpu-installer.log}"
+
+redact_env_value() {
+	local name value
+	name="$1"
+	value="$2"
+	case "${name}" in
+		*TOKEN*|*Token*|*token*|*SECRET*|*Secret*|*secret*|*PASSWORD*|*Password*|*password*|*PASS*|*Pass*|*pass*|*KEY*|*Key*|*key*|*AUTH*|*Auth*|*auth*|*COOKIE*|*Cookie*|*cookie*|*SESSION*|*Session*|*session*)
+			printf '%s=<redacted>\n' "${name}"
+			;;
+		*)
+			printf '%s=%s\n' "${name}" "${value}"
+			;;
+	esac
+}
+
+write_log_header() {
+	local name value
+	{
+		printf 'Bitcoin Pure installer log\n'
+		printf 'started_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+		printf 'log_path=%s\n' "${LOG_PATH}"
+		printf 'caller_pwd=%s\n' "${PWD}"
+		printf 'repo_root=%s\n' "${REPO_ROOT}"
+		printf 'argv='
+		printf '%q ' "$0" "$@"
+		printf '\n'
+		printf 'shell=%s\n' "${SHELL:-unknown}"
+		printf 'bash_version=%s\n' "${BASH_VERSION:-unknown}"
+		printf 'path=%s\n' "${PATH:-}"
+		printf '\n[identity]\n'
+		id || true
+		printf '\n[kernel]\n'
+		uname -a || true
+		if [[ -f /etc/os-release ]]; then
+			printf '\n[os-release]\n'
+			cat /etc/os-release
+		fi
+		printf '\n[hostname]\n'
+		hostname || true
+		hostname -f 2>/dev/null || true
+		printf '\n[working-tree]\n'
+		ls -la "${REPO_ROOT}" || true
+		if command -v git >/dev/null 2>&1 && [[ -d "${REPO_ROOT}/.git" ]]; then
+			printf '\n[git]\n'
+			git -C "${REPO_ROOT}" rev-parse --show-toplevel || true
+			git -C "${REPO_ROOT}" rev-parse HEAD || true
+			git -C "${REPO_ROOT}" status --short || true
+			git -C "${REPO_ROOT}" remote -v || true
+			git -C "${REPO_ROOT}" tag --points-at HEAD || true
+		fi
+		printf '\n[required-commands]\n'
+		for name in bash curl git python3 systemctl tar; do
+			if command -v "${name}" >/dev/null 2>&1; then
+				printf '%s=%s\n' "${name}" "$(command -v "${name}")"
+				"${name}" --version 2>/dev/null | sed -n '1p' || true
+			else
+				printf '%s=<missing>\n' "${name}"
+			fi
+		done
+		printf '\n[disk]\n'
+		df -h "${PWD}" || true
+		df -h / /opt /etc /var /tmp 2>/dev/null || true
+		printf '\n[mounts]\n'
+		mount 2>/dev/null || true
+		if command -v free >/dev/null 2>&1; then
+			printf '\n[memory]\n'
+			free -h || true
+		fi
+		if [[ -r /proc/meminfo ]]; then
+			printf '\n[meminfo]\n'
+			sed -n '1,20p' /proc/meminfo
+		fi
+		printf '\n[network]\n'
+		ip addr 2>/dev/null || true
+		ip route 2>/dev/null || true
+		printf '\n[systemd]\n'
+		systemctl --version 2>/dev/null | sed -n '1,8p' || true
+		systemctl is-system-running 2>/dev/null || true
+		printf '\n[limits]\n'
+		ulimit -a || true
+		if [[ -r /proc/self/limits ]]; then
+			cat /proc/self/limits
+		fi
+		printf '\n[environment]\n'
+		printf '# Values with secret-like variable names are redacted.\n'
+		while IFS='=' read -r name value; do
+			redact_env_value "${name}" "${value}"
+		done < <(printenv | LC_ALL=C sort)
+		printf '\n[installer-output]\n'
+	} >"${LOG_PATH}"
+}
+
+if [[ -z "${BPU_INSTALLER_LOG_ACTIVE:-}" ]]; then
+	touch "${LOG_PATH}" || {
+		echo "install: unable to write ${LOG_PATH}" >&2
+		exit 1
+	}
+	write_log_header "$@"
+	export BPU_INSTALLER_LOG_ACTIVE=1
+	export BPU_INSTALLER_LOG="${LOG_PATH}"
+	set +e
+	"${REPO_ROOT}/install" "$@" 2>&1 | tee -a "${LOG_PATH}"
+	status="${PIPESTATUS[0]}"
+	printf '[%s] installer exited with status %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "${status}" | tee -a "${LOG_PATH}"
+	exit "${status}"
+fi
 
 if [[ ! -x "${REPO_ROOT}/scripts/bootstrap.sh" ]]; then
 	echo "install: missing scripts/bootstrap.sh" >&2

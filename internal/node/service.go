@@ -2909,30 +2909,12 @@ func storageWatchItems(items []compactfilter.WatchItem) []storage.WalletWatchIte
 	return out
 }
 
-// The node-side accumulator/template paths must build the exact same typed leaf
-// payloads that consensus commits under utxo_root, otherwise mined blocks can
-// drift from the validator's canonical UTXO root when non-x-only output
-// families appear in the block.
 func utxoLeafForOutput(outPoint types.OutPoint, output types.TxOutput) utreexo.UtxoLeaf {
-	item := compactFilterItemForOutput(output)
-	return utreexo.UtxoLeaf{
-		OutPoint:   outPoint,
-		Type:       item.Type,
-		ValueAtoms: output.ValueAtoms,
-		Payload32:  item.Payload32,
-		PubKey:     output.PubKey,
-	}
+	return consensus.UtxoLeafFromOutput(outPoint, output)
 }
 
 func utxoLeafForEntry(outPoint types.OutPoint, entry consensus.UtxoEntry) utreexo.UtxoLeaf {
-	item := compactFilterItemForUTXO(entry)
-	return utreexo.UtxoLeaf{
-		OutPoint:   outPoint,
-		Type:       item.Type,
-		ValueAtoms: entry.ValueAtoms,
-		Payload32:  item.Payload32,
-		PubKey:     entry.PubKey,
-	}
+	return consensus.UtxoLeafFromEntry(outPoint, entry)
 }
 
 func (s *Service) submitDecodedTxs(txs []types.Transaction) ([]mempool.Admission, []error, int, int) {
@@ -5234,10 +5216,9 @@ func stressLaneReservePubKey() [32]byte {
 }
 
 func signStressLaneTx(tx types.Transaction, prevValue uint64) (types.Transaction, error) {
-	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{{
-		ValueAtoms: prevValue,
-		PubKey:     stressLaneReservePubKey(),
-	}}, consensus.RegtestParams())
+	msg, err := consensus.SighashWithParams(&tx, 0, []consensus.UtxoEntry{
+		consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(prevValue, stressLaneReservePubKey())),
+	}, consensus.RegtestParams())
 	if err != nil {
 		return types.Transaction{}, err
 	}

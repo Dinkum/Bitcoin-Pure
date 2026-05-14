@@ -630,6 +630,9 @@ func mergeSnapshotEntriesByTxID(left, right []mempool.SnapshotEntry) []mempool.S
 }
 
 func selectedEntryAccumulatorDeltas(entries []mempool.SnapshotEntry) ([]types.OutPoint, []utreexo.UtxoLeaf) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
 	totalSpent := 0
 	totalCreated := 0
 	for _, entry := range entries {
@@ -637,10 +640,37 @@ func selectedEntryAccumulatorDeltas(entries []mempool.SnapshotEntry) ([]types.Ou
 		totalCreated += len(entry.CreatedLeaves)
 	}
 	spent := make([]types.OutPoint, 0, totalSpent)
-	created := make([]utreexo.UtxoLeaf, 0, totalCreated)
+	if totalCreated == 0 {
+		for _, entry := range entries {
+			spent = append(spent, entry.SpentOutPoints...)
+		}
+		return spent, nil
+	}
+	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf, totalCreated)
+	createdOrder := make([]types.OutPoint, 0, totalCreated)
 	for _, entry := range entries {
-		spent = append(spent, entry.SpentOutPoints...)
-		created = append(created, entry.CreatedLeaves...)
+		for _, leaf := range entry.CreatedLeaves {
+			createdByOutPoint[leaf.OutPoint] = leaf
+			createdOrder = append(createdOrder, leaf.OutPoint)
+		}
+	}
+	for _, entry := range entries {
+		for _, outPoint := range entry.SpentOutPoints {
+			// Template selection is an atomic candidate set. Outputs created and
+			// spent inside that same set never exist in the pre-block
+			// accumulator, so they cancel out before the batch Apply.
+			if _, ok := createdByOutPoint[outPoint]; ok {
+				delete(createdByOutPoint, outPoint)
+				continue
+			}
+			spent = append(spent, outPoint)
+		}
+	}
+	created := make([]utreexo.UtxoLeaf, 0, len(createdByOutPoint))
+	for _, outPoint := range createdOrder {
+		if leaf, ok := createdByOutPoint[outPoint]; ok {
+			created = append(created, leaf)
+		}
 	}
 	return spent, created
 }

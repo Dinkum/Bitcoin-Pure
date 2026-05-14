@@ -2160,6 +2160,7 @@ func filterCandidateEntriesInto(scratch *selectionScratch, candidate packageCand
 
 func applyCandidatePackageSnapshot(preBlockUtxos consensus.UtxoLookup, currentUtxos *consensus.UtxoOverlay, claimed map[types.OutPoint]struct{}, entries []SnapshotEntry, scratch *selectionScratch, _ consensus.ConsensusRules) (uint64, bool) {
 	defer scratch.resetSeenPackageClaims()
+	createdInPackage := make(map[types.OutPoint]struct{})
 	for _, entry := range entries {
 		for _, spent := range entry.SpentOutPoints {
 			if _, ok := claimed[spent]; ok {
@@ -2170,9 +2171,18 @@ func applyCandidatePackageSnapshot(preBlockUtxos consensus.UtxoLookup, currentUt
 			}
 			scratch.seenPackageClaims[spent] = struct{}{}
 			scratch.seenPackageClaimOrder = append(scratch.seenPackageClaimOrder, spent)
-			if _, ok := preBlockUtxos(spent); !ok {
+			if _, ok := preBlockUtxos(spent); ok {
+				continue
+			}
+			if _, ok := currentUtxos.Lookup(spent); ok {
+				continue
+			}
+			if _, ok := createdInPackage[spent]; !ok {
 				return 0, false
 			}
+		}
+		for _, leaf := range entry.CreatedLeaves {
+			createdInPackage[leaf.OutPoint] = struct{}{}
 		}
 	}
 	// Selection runs only over mempool entries that already passed admission
@@ -2195,12 +2205,7 @@ func applyTxNoUndo(utxos *consensus.UtxoOverlay, spent []types.OutPoint, created
 		utxos.Spend(outPoint)
 	}
 	for _, leaf := range created {
-		utxos.Set(leaf.OutPoint, consensus.UtxoEntry{
-			Type:       leaf.Type,
-			ValueAtoms: leaf.ValueAtoms,
-			Payload32:  leaf.Payload32,
-			PubKey:     leaf.PubKey,
-		})
+		utxos.Set(leaf.OutPoint, consensus.UtxoEntryFromLeaf(leaf))
 	}
 }
 
@@ -2575,13 +2580,8 @@ func createdLeavesForOutputs(txid [32]byte, outputs []types.TxOutput) []utreexo.
 	}
 	created := make([]utreexo.UtxoLeaf, 0, len(outputs))
 	for vout, output := range outputs {
-		created = append(created, utreexo.UtxoLeaf{
-			OutPoint:   types.OutPoint{TxID: txid, Vout: uint32(vout)},
-			Type:       output.Type,
-			ValueAtoms: output.ValueAtoms,
-			Payload32:  output.CanonicalPayload32(),
-			PubKey:     output.PubKey,
-		})
+		outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+		created = append(created, consensus.UtxoLeafFromOutput(outPoint, output))
 	}
 	return created
 }

@@ -203,6 +203,28 @@ func TestParsePQAuthPayloadUsesSpecFixedLayout(t *testing.T) {
 	}
 }
 
+func TestTypedUTXOEntryAndLeafPreservePayloads(t *testing.T) {
+	xonlyPayload := consensusTestPubKey(4)
+	xonly := UtxoEntryFromOutput(types.NewXOnlyOutput(50, xonlyPayload))
+	if xonly.Type != types.OutputXOnlyP2PK || xonly.Payload32 != xonlyPayload || xonly.PubKey != xonlyPayload {
+		t.Fatalf("x-only entry not fully typed: %+v", xonly)
+	}
+	xonlyLeaf := UtxoLeafFromEntry(types.OutPoint{TxID: [32]byte{1}, Vout: 0}, xonly)
+	if roundTrip := UtxoEntryFromLeaf(xonlyLeaf); roundTrip != xonly {
+		t.Fatalf("x-only leaf round trip = %+v, want %+v", roundTrip, xonly)
+	}
+
+	pqLock := crypto.TaggedHash("test-pq-lock", []byte("vk"))
+	pq := UtxoEntryFromOutput(types.NewPQLockOutput(75, pqLock))
+	if pq.Type != types.OutputPQLock32 || pq.Payload32 != pqLock || pq.PubKey != ([32]byte{}) {
+		t.Fatalf("PQ entry not fully typed: %+v", pq)
+	}
+	pqLeaf := UtxoLeafFromOutput(types.OutPoint{TxID: [32]byte{2}, Vout: 1}, types.NewPQLockOutput(75, pqLock))
+	if pqLeaf.Type != types.OutputPQLock32 || pqLeaf.Payload32 != pqLock || pqLeaf.PubKey != ([32]byte{}) {
+		t.Fatalf("PQ leaf not fully typed: %+v", pqLeaf)
+	}
+}
+
 func TestVerifyBlockSignatureChecksUsesExactVerifier(t *testing.T) {
 	items := make([]crypto.SchnorrBatchItem, 0, 4)
 	for i := 0; i < 4; i++ {
@@ -1138,15 +1160,9 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	delete(nextUTXOs, prevOut)
 	delete(nextUTXOs, types.OutPoint{TxID: parentTxID, Vout: 0})
 	childTxID := txids[2]
-	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntry{
-		ValueAtoms: child.Base.Outputs[0].ValueAtoms,
-		PubKey:     child.Base.Outputs[0].PubKey,
-	}
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntryFromOutput(child.Base.Outputs[0])
 	coinbaseTxID := txids[0]
-	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntry{
-		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
-		PubKey:     coinbase.Base.Outputs[0].PubKey,
-	}
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntryFromOutput(coinbase.Base.Outputs[0])
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
 		t.Fatal(err)
@@ -1178,6 +1194,100 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	}
 	if got, want := applied, nextUTXOs; !equalUtxoSets(got, want) {
 		t.Fatalf("post-block utxos mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestValidateAndApplyBlockAcceptsAtomicLTORSameBlockSpendWithChildBeforeParent(t *testing.T) {
+	params := RegtestParams()
+	prevOut := types.OutPoint{TxID: [32]byte{9}, Vout: 0}
+	utxos := UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: consensusTestPubKey(9)},
+	}
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	var parent types.Transaction
+	var child types.Transaction
+	var parentTxID [32]byte
+	foundAtomicLTORPair := false
+	for parentSeed := byte(10); parentSeed < 96 && !foundAtomicLTORPair; parentSeed++ {
+		candidateParent := signedSpendTxForConsensusTest(t, 9, prevOut, 50, parentSeed, 1)
+		candidateParentTxID := TxID(&candidateParent)
+		for childSeed := byte(96); childSeed < 180; childSeed++ {
+			candidateChild := signedSpendTxForConsensusTest(t, parentSeed, types.OutPoint{TxID: candidateParentTxID, Vout: 0}, 49, childSeed, 1)
+			candidateChildTxID := TxID(&candidateChild)
+			if bytes.Compare(candidateChildTxID[:], candidateParentTxID[:]) < 0 {
+				parent = candidateParent
+				child = candidateChild
+				parentTxID = candidateParentTxID
+				foundAtomicLTORPair = true
+				break
+			}
+		}
+	}
+	if !foundAtomicLTORPair {
+		t.Fatal("failed to construct child-before-parent LTOR same-block spend fixture")
+	}
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{{ValueAtoms: 1, PubKey: consensusTestPubKey(8)}})
+	txs := []types.Transaction{coinbase, child, parent}
+	txids, _, txRoot, authRoot := BuildBlockRoots(txs)
+	if bytes.Compare(txids[1][:], txids[2][:]) >= 0 {
+		t.Fatalf("fixture is not LTOR: child %x parent %x", txids[1], txids[2])
+	}
+
+	nextUTXOs := cloneUtxos(utxos)
+	delete(nextUTXOs, prevOut)
+	childTxID := txids[1]
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntryFromOutput(child.Base.Outputs[0])
+	coinbaseTxID := txids[0]
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntryFromOutput(coinbase.Base.Outputs[0])
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := types.Block{
+		Header: types.BlockHeader{
+			Version:        1,
+			PrevBlockHash:  HeaderHash(&prevHeader),
+			MerkleTxIDRoot: txRoot,
+			MerkleAuthRoot: authRoot,
+			UTXORoot:       ComputedUTXORoot(nextUTXOs),
+			Timestamp:      prevHeader.Timestamp + 600,
+			NBits:          nbits,
+		},
+		Txs: txs,
+	}
+	block.Header = mineHeaderForTest(block.Header)
+
+	applied := cloneUtxos(utxos)
+	summary, err := ValidateAndApplyBlock(&block, prev, NewBlockSizeState(params), applied, params, DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("validate block: %v", err)
+	}
+	if got, want := summary.TotalFees, uint64(2); got != want {
+		t.Fatalf("total fees = %d, want %d", got, want)
+	}
+	if _, ok := applied[types.OutPoint{TxID: parentTxID, Vout: 0}]; ok {
+		t.Fatal("parent output should be spent by child even though parent serializes later")
+	}
+	if got, want := applied, nextUTXOs; !equalUtxoSets(got, want) {
+		t.Fatalf("post-block utxos mismatch: got %v want %v", got, want)
+	}
+
+	acc, err := UtxoAccumulator(utxos)
+	if err != nil {
+		t.Fatalf("pre-block accumulator: %v", err)
+	}
+	accApplied := cloneUtxos(utxos)
+	_, nextAcc, err := ValidateAndApplyBlockWithAccumulator(&block, prev, NewBlockSizeState(params), accApplied, acc, params, DefaultConsensusRules())
+	if err != nil {
+		t.Fatalf("validate block with accumulator: %v", err)
+	}
+	if nextAcc.Root() != block.Header.UTXORoot {
+		t.Fatalf("next accumulator root = %x, want %x", nextAcc.Root(), block.Header.UTXORoot)
 	}
 }
 

@@ -85,10 +85,7 @@ func (s *Service) UTXOProof(outPoint types.OutPoint) (AnchoredUTXOProof, error) 
 	if !ok {
 		return AnchoredUTXOProof{}, ErrNoTip
 	}
-	if view.UTXOAcc == nil {
-		return AnchoredUTXOProof{}, fmt.Errorf("missing committed utxo accumulator")
-	}
-	proof, err := view.UTXOAcc.Prove(outPoint)
+	proof, err := s.chainState.Store().UTXOAccumulatorProof(outPoint)
 	if err != nil {
 		return AnchoredUTXOProof{}, err
 	}
@@ -107,12 +104,9 @@ func (s *Service) UTXOProofBatch(outPoints []types.OutPoint) (AnchoredUTXOProofB
 	if !ok {
 		return AnchoredUTXOProofBatch{}, ErrNoTip
 	}
-	if view.UTXOAcc == nil {
-		return AnchoredUTXOProofBatch{}, fmt.Errorf("missing committed utxo accumulator")
-	}
 	proofs := make([]utreexo.OutPointProof, 0, len(outPoints))
 	for _, outPoint := range outPoints {
-		proof, err := view.UTXOAcc.Prove(outPoint)
+		proof, err := s.chainState.Store().UTXOAccumulatorProof(outPoint)
 		if err != nil {
 			return AnchoredUTXOProofBatch{}, err
 		}

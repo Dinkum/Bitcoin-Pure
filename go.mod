@@ -4,7 +4,6 @@ go 1.26.0
 
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1
 	github.com/cloudflare/circl v1.6.3
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1
@@ -14,6 +13,7 @@ require (
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/fifo v0.0.0-20240606204812-0bbfbd93a7ce // indirect

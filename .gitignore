@@ -31,6 +31,7 @@
 /AGENTS.md
 /agents.md
 /ROADMAP.md
+/config.yaml
 
 # This project does not use GitHub Actions CI.
 /.github/workflows/

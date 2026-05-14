@@ -8,6 +8,7 @@ import (
 
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utreexo"
 	"bitcoin-pure/internal/utxochecksum"
 	"github.com/cockroachdb/pebble"
 )
@@ -28,7 +29,7 @@ func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {
 	coinbase := testCoinbase(0, []types.TxOutput{{ValueAtoms: 50, PubKey: [32]byte{7}}})
 	coinbaseTxID := consensus.TxID(&coinbase)
 	utxos := consensus.UtxoSet{
-		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: {ValueAtoms: 50, PubKey: [32]byte{7}},
+		types.OutPoint{TxID: coinbaseTxID, Vout: 0}: testXOnlyUTXOEntry(50, [32]byte{7}),
 	}
 	block := types.Block{
 		Header: types.BlockHeader{
@@ -42,6 +43,121 @@ func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {
 		Txs: []types.Transaction{coinbase},
 	}
 	return block, utxos
+}
+
+func testXOnlyUTXOEntry(value uint64, pubKey [32]byte) consensus.UtxoEntry {
+	return consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(value, pubKey))
+}
+
+func TestUTXOEntryEncodingPreservesTypedPayloads(t *testing.T) {
+	xonlyPayload := [32]byte{0x07}
+	xonly := consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(50, xonlyPayload))
+	decodedXOnly, err := decodeUTXOEntry(encodeUTXOEntry(xonly))
+	if err != nil {
+		t.Fatalf("decode x-only utxo: %v", err)
+	}
+	if decodedXOnly != xonly {
+		t.Fatalf("decoded x-only entry = %+v, want %+v", decodedXOnly, xonly)
+	}
+
+	pqLock := [32]byte{0x42}
+	pq := consensus.UtxoEntryFromOutput(types.NewPQLockOutput(75, pqLock))
+	decodedPQ, err := decodeUTXOEntry(encodeUTXOEntry(pq))
+	if err != nil {
+		t.Fatalf("decode PQ utxo: %v", err)
+	}
+	if decodedPQ != pq {
+		t.Fatalf("decoded PQ entry = %+v, want %+v", decodedPQ, pq)
+	}
+}
+
+func TestUTXOAccumulatorIndexPersistsAndUpdatesWithChainDeltas(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	genesis, utxos := sampleBlockAndUTXOs()
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      genesis.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, ok, err := store.LoadUTXOAccumulator()
+	if err != nil {
+		t.Fatalf("LoadUTXOAccumulator: %v", err)
+	}
+	if !ok {
+		t.Fatal("missing persisted accumulator index")
+	}
+	if acc.Count() != 1 || acc.Root() != genesis.Header.UTXORoot {
+		t.Fatalf("accumulator after full state = count %d root %x, want count 1 root %x", acc.Count(), acc.Root(), genesis.Header.UTXORoot)
+	}
+	proof, err := store.UTXOAccumulatorProof(genesisOut)
+	if err != nil {
+		t.Fatalf("UTXOAccumulatorProof: %v", err)
+	}
+	if !proof.Exists || !utreexo.VerifyProof(genesis.Header.UTXORoot, proof) {
+		t.Fatal("persisted accumulator proof failed for genesis output")
+	}
+
+	nextCoinbase := testCoinbase(1, []types.TxOutput{{ValueAtoms: 25, PubKey: [32]byte{9}}})
+	nextTxID := consensus.TxID(&nextCoinbase)
+	nextOut := types.OutPoint{TxID: nextTxID, Vout: 0}
+	nextEntry := testXOnlyUTXOEntry(25, [32]byte{9})
+	nextUTXOs := consensus.UtxoSet{
+		genesisOut: utxos[genesisOut],
+		nextOut:    nextEntry,
+	}
+	next := testBlock(consensus.HeaderHash(&genesis.Header), 2, genesis.Header.NBits, nextUTXOs, nextCoinbase)
+	nextAcc, err := acc.Apply(nil, []utreexo.UtxoLeaf{consensus.UtxoLeafFromEntry(nextOut, nextEntry)})
+	if err != nil {
+		t.Fatalf("next accumulator: %v", err)
+	}
+	delta := utreexo.AccumulatorNodeDeltaBetween(acc, nextAcc)
+	if err := store.AppendValidatedBlockMeta(&StoredChainStateMeta{
+		Profile:              types.Regtest,
+		Height:               1,
+		TipHeader:            next.Header,
+		BlockSizeState:       sampleBlockSizeState(),
+		UTXOChecksum:         utxochecksum.Compute(nextUTXOs),
+		UTXOCount:            nextAcc.Count(),
+		UTXOAccumulatorRoot:  nextAcc.Root(),
+		UTXOAccumulatorDelta: &delta,
+	}, &next, &BlockIndexEntry{
+		Height:         1,
+		ParentHash:     next.Header.PrevBlockHash,
+		Header:         next.Header,
+		Validated:      true,
+		BlockSizeState: sampleBlockSizeState(),
+	}, nil, nil, map[types.OutPoint]consensus.UtxoEntry{nextOut: nextEntry}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, ok, err := store.LoadUTXOAccumulator()
+	if err != nil {
+		t.Fatalf("reload accumulator: %v", err)
+	}
+	if !ok {
+		t.Fatal("missing updated accumulator index")
+	}
+	if reloaded.Count() != nextAcc.Count() || reloaded.Root() != next.Header.UTXORoot {
+		t.Fatalf("updated accumulator = count %d root %x, want count %d root %x", reloaded.Count(), reloaded.Root(), nextAcc.Count(), next.Header.UTXORoot)
+	}
+	nextProof, err := store.UTXOAccumulatorProof(nextOut)
+	if err != nil {
+		t.Fatalf("next proof: %v", err)
+	}
+	if !nextProof.Exists || !utreexo.VerifyProof(next.Header.UTXORoot, nextProof) {
+		t.Fatal("persisted accumulator proof failed for appended output")
+	}
 }
 
 func sampleBlockSizeState() consensus.BlockSizeState {
@@ -1106,7 +1222,7 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	}
 	nextTxID := consensus.TxID(&next.Txs[0])
 	nextOut := types.OutPoint{TxID: nextTxID, Vout: 0}
-	nextEntry := consensus.UtxoEntry{ValueAtoms: 25, PubKey: [32]byte{9}}
+	nextEntry := testXOnlyUTXOEntry(25, [32]byte{9})
 	nextWork, err := consensus.BlockWork(next.Header.NBits)
 	if err != nil {
 		t.Fatal(err)
@@ -1505,9 +1621,9 @@ func TestRewriteFullStateDeltaReplacesOnlyChangedUTXOs(t *testing.T) {
 		TipHeader:      block.Header,
 		BlockSizeState: sampleBlockSizeState(),
 		UTXOs: consensus.UtxoSet{
-			unchangedOut: {ValueAtoms: 11, PubKey: [32]byte{1}},
-			updatedOut:   {ValueAtoms: 12, PubKey: [32]byte{2}},
-			deletedOut:   {ValueAtoms: 13, PubKey: [32]byte{3}},
+			unchangedOut: testXOnlyUTXOEntry(11, [32]byte{1}),
+			updatedOut:   testXOnlyUTXOEntry(12, [32]byte{2}),
+			deletedOut:   testXOnlyUTXOEntry(13, [32]byte{3}),
 		},
 	}
 	if err := store.WriteFullState(initial); err != nil {
@@ -1522,9 +1638,9 @@ func TestRewriteFullStateDeltaReplacesOnlyChangedUTXOs(t *testing.T) {
 		TipHeader:      nextHeader,
 		BlockSizeState: consensus.BlockSizeState{BlockSize: 512, Epsilon: 16_000_000, Beta: 16_000_000},
 		UTXOs: consensus.UtxoSet{
-			unchangedOut: {ValueAtoms: 11, PubKey: [32]byte{1}},
-			updatedOut:   {ValueAtoms: 99, PubKey: [32]byte{4}},
-			createdOut:   {ValueAtoms: 21, PubKey: [32]byte{5}},
+			unchangedOut: testXOnlyUTXOEntry(11, [32]byte{1}),
+			updatedOut:   testXOnlyUTXOEntry(99, [32]byte{4}),
+			createdOut:   testXOnlyUTXOEntry(21, [32]byte{5}),
 		},
 	}
 	if err := store.RewriteFullStateDelta(initial, next); err != nil {

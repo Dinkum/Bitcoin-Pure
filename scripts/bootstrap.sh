@@ -41,9 +41,9 @@ No flags are required for a normal Ubuntu install from the current checkout.
 The installer keeps existing config where possible and uses sane defaults otherwise.
 
 Options:
-  --update         Fetch a fresh checkout from the configured Git remote and deploy it atomically
+  --update         Fetch the latest non-rc tagged release from the configured Git remote and deploy it atomically
   --repo-url URL   Git remote to use for --update (otherwise uses the stored origin URL)
-  --ref REF        Branch, tag, or ref to deploy during --update
+  --ref REF        Release tag to deploy during --update; release candidates are rejected
   --mining MODE    Override miner_enabled in config with on or off; enabling auto-provisions a miner wallet when needed
   --profile NAME   Override chain profile in config
   --peer HOST:PORT Add/replace configured peers
@@ -76,12 +76,14 @@ require_command() {
 }
 
 ensure_service_account() {
+	log "ensuring ${SERVICE_USER} service account"
 	if ! getent group "${SERVICE_GROUP}" >/dev/null; then
 		groupadd --system "${SERVICE_GROUP}"
 	fi
 	if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
 		useradd --system --gid "${SERVICE_GROUP}" --home-dir "${DATA_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
 	fi
+	log "service account ready"
 }
 
 acquire_lock() {
@@ -131,6 +133,107 @@ resolve_repo_url() {
 	[[ -n "${REPO_URL}" ]] || fail "--update requires --repo-url or a previously stored origin URL"
 }
 
+normalize_release_tag() {
+	local tag
+	tag="$1"
+	tag="${tag#refs/tags/}"
+	tag="${tag%^{}}"
+	printf '%s' "${tag}"
+}
+
+tag_is_release_candidate() {
+	local tag
+	tag="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	[[ "${tag}" == *rc* ]]
+}
+
+tag_exists_on_remote() {
+	local tag
+	tag="$1"
+	git ls-remote --exit-code --tags --refs "${REPO_URL}" "refs/tags/${tag}" >/dev/null 2>&1
+}
+
+tag_matches_version_json() {
+	local tag tmp_dir version
+	tag="$1"
+	tmp_dir="$(mktemp -d "/tmp/${SERVICE_NAME}-tag-check.XXXXXX")"
+	if ! git -C "${tmp_dir}" init -q; then
+		rm -rf "${tmp_dir}"
+		return 1
+	fi
+	if ! git -C "${tmp_dir}" remote add origin "${REPO_URL}"; then
+		rm -rf "${tmp_dir}"
+		return 1
+	fi
+	if ! git -C "${tmp_dir}" fetch -q --depth 1 origin "refs/tags/${tag}"; then
+		rm -rf "${tmp_dir}"
+		return 1
+	fi
+	if ! git -C "${tmp_dir}" checkout -q --detach FETCH_HEAD; then
+		rm -rf "${tmp_dir}"
+		return 1
+	fi
+	if [[ ! -f "${tmp_dir}/version.json" ]]; then
+		rm -rf "${tmp_dir}"
+		return 1
+	fi
+	version="$(python3 - "${tmp_dir}/version.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    print(str(json.load(fh).get("version", "")).strip())
+PY
+)"
+	rm -rf "${tmp_dir}"
+	[[ -n "${version}" && "${tag}" == "v${version}" ]]
+}
+
+resolve_update_tag() {
+	local tag candidate tmp_dir version
+	resolve_repo_url
+	if [[ -n "${REPO_REF}" ]]; then
+		tag="$(normalize_release_tag "${REPO_REF}")"
+		[[ -n "${tag}" ]] || fail "--ref must name a release tag"
+		if tag_is_release_candidate "${tag}"; then
+			fail "--ref ${tag} is a release candidate; use a final release tag"
+		fi
+		tag_exists_on_remote "${tag}" || fail "--ref ${tag} is not a tag on ${REPO_URL}"
+		tag_matches_version_json "${tag}" || fail "--ref ${tag} is not a Bitcoin Pure release tag"
+		REPO_REF="${tag}"
+		log "using tagged release ${REPO_REF}"
+		return
+	fi
+	tmp_dir="$(mktemp -d "/tmp/${SERVICE_NAME}-tag-list.XXXXXX")"
+	if ! git -C "${tmp_dir}" init -q; then
+		rm -rf "${tmp_dir}"
+		fail "failed to initialize temporary tag resolver"
+	fi
+	if ! git -C "${tmp_dir}" remote add origin "${REPO_URL}"; then
+		rm -rf "${tmp_dir}"
+		fail "failed to configure temporary tag resolver"
+	fi
+	if ! git -C "${tmp_dir}" fetch -q --depth 1 --filter=blob:none origin '+refs/tags/*:refs/tags/*'; then
+		rm -rf "${tmp_dir}"
+		fail "failed to fetch release tags from ${REPO_URL}"
+	fi
+	while IFS= read -r candidate; do
+		tag="$(normalize_release_tag "${candidate}")"
+		[[ -n "${tag}" ]] || continue
+		if tag_is_release_candidate "${tag}"; then
+			continue
+		fi
+		version="$(git -C "${tmp_dir}" show "${tag}:version.json" 2>/dev/null | python3 -c 'import json, sys; print(str(json.load(sys.stdin).get("version", "")).strip())' 2>/dev/null || true)"
+		if [[ -n "${version}" && "${tag}" == "v${version}" ]]; then
+			REPO_REF="${tag}"
+			rm -rf "${tmp_dir}"
+			log "resolved latest tagged release ${REPO_REF}"
+			return
+		fi
+	done < <(git -C "${tmp_dir}" for-each-ref --sort=-v:refname --format='%(refname:short)' refs/tags)
+	rm -rf "${tmp_dir}"
+	fail "no final Bitcoin Pure release tag found on ${REPO_URL}"
+}
+
 stage_checkout() {
 	mkdir -p "${RELEASES_DIR}"
 	STAGE_DIR="${RELEASES_DIR}/release-$(date -u '+%Y%m%d%H%M%S')-$$"
@@ -168,16 +271,11 @@ stage_checkout() {
 			)
 		fi
 	else
-		resolve_repo_url
-		log "cloning ${REPO_URL}"
+		resolve_update_tag
+		log "cloning ${REPO_URL} at ${REPO_REF}"
 		rm -rf "${STAGE_DIR}"
-		if [[ -n "${REPO_REF}" ]]; then
-			git clone --depth 1 "${REPO_URL}" "${STAGE_DIR}"
-			git -C "${STAGE_DIR}" fetch --depth 1 origin "${REPO_REF}"
-			git -C "${STAGE_DIR}" checkout --detach FETCH_HEAD
-		else
-			git clone --depth 1 "${REPO_URL}" "${STAGE_DIR}"
-		fi
+		git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${STAGE_DIR}"
+		git -C "${STAGE_DIR}" checkout --detach "${REPO_REF}"
 	fi
 	[[ -x "${STAGE_DIR}/scripts/update.sh" ]] || chmod +x "${STAGE_DIR}/scripts/update.sh"
 	[[ -x "${STAGE_DIR}/scripts/update.sh" ]] || fail "staged release is missing scripts/update.sh"
@@ -269,6 +367,7 @@ refresh_live_metadata() {
 
 backup_live_state() {
 	BACKUP_DIR="/var/tmp/${SERVICE_NAME}-rollback-$(date -u '+%Y%m%d%H%M%S')-$$"
+	log "saving rollback snapshot in ${BACKUP_DIR}"
 	mkdir -p "${BACKUP_DIR}"
 	if [[ -L "${CURRENT_LINK}" || -d "${CURRENT_LINK}" ]]; then
 		PREVIOUS_RELEASE="$(readlink -f "${CURRENT_LINK}" || true)"
@@ -293,6 +392,7 @@ backup_live_state() {
 	if [[ -e "${BIN_LINK}" ]]; then
 		cp -a "${BIN_LINK}" "${BACKUP_DIR}/bpu-cli"
 	fi
+	log "rollback snapshot ready"
 	return 0
 }
 
@@ -323,7 +423,7 @@ ensure_live_service() {
 }
 
 chown_wallet_paths() {
-	local wallet_path wallet_file
+	local wallet_path wallet_file count=0
 	[[ -f "$1" ]] || return 0
 	while IFS= read -r wallet_path; do
 		[[ -n "${wallet_path}" ]] || continue
@@ -334,7 +434,27 @@ chown_wallet_paths() {
 		if [[ -e "${wallet_file}" ]]; then
 			chown "${SERVICE_USER}:${SERVICE_GROUP}" "${wallet_file}"
 		fi
+		count=$((count + 1))
 	done <"$1"
+	if (( count > 0 )); then
+		log "wallet storage ready (${count} path(s))"
+	fi
+}
+
+chown_runtime_paths() {
+	local runtime_path count=0
+	[[ -f "$1" ]] || return 0
+	log "preparing service runtime directories"
+	while IFS= read -r runtime_path; do
+		[[ -n "${runtime_path}" ]] || continue
+		[[ "${runtime_path}" = /* ]] || fail "staged runtime path must be absolute: ${runtime_path}"
+		# systemd requires ReadWritePaths targets to exist before it creates
+		# the service mount namespace.
+		mkdir -p "${runtime_path}"
+		chown "${SERVICE_USER}:${SERVICE_GROUP}" "${runtime_path}"
+		count=$((count + 1))
+	done <"$1"
+	log "service runtime directories ready (${count} path(s))"
 }
 
 apply_release() {
@@ -348,6 +468,7 @@ apply_release() {
 
 	mkdir -p "${APP_ROOT}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
 	chown "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}" "${LOG_DIR}"
+	chown_runtime_paths "${artifacts_dir}/runtime-paths"
 	chown_wallet_paths "${artifacts_dir}/wallet-paths"
 
 	if release_is_unchanged; then
@@ -368,16 +489,19 @@ apply_release() {
 	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" 644 root root
 	log "installing ssh monitor banner"
 	install_candidate_file "${artifacts_dir}/${SERVICE_NAME}.motd" "${MOTD_PATH}" 755 root root
-	log "switching current release"
+	log "activating staged release"
 	switch_current_link
-	log "switching command symlink"
+	log "refreshing bpu-cli command symlink"
 	switch_bin_link
 
+	log "reloading systemd"
 	systemctl daemon-reload
 	if [[ -f "${BACKUP_DIR}/unit.service" ]]; then
+		log "restarting ${SERVICE_NAME}.service"
 		systemctl enable "${SERVICE_NAME}.service" >/dev/null
 		systemctl restart "${SERVICE_NAME}.service"
 	else
+		log "enabling and starting ${SERVICE_NAME}.service"
 		systemctl enable --now "${SERVICE_NAME}.service"
 	fi
 	KEEP_STAGE_DIR=1
@@ -470,13 +594,32 @@ PY
 	return 1
 }
 
+print_service_diagnostics() {
+	log "service status follows"
+	systemctl status "${SERVICE_NAME}.service" --no-pager -l || true
+	log "recent service journal follows"
+	journalctl -u "${SERVICE_NAME}.service" --no-pager -n 80 || true
+}
+
 verify_release() {
 	log "verifying systemd state"
-	systemctl is-active --quiet "${SERVICE_NAME}.service" || fail "service did not become active"
+	if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+		print_service_diagnostics
+		fail "service did not become active"
+	fi
+	log "systemd service is active"
 	log "verifying public dashboard"
-	wait_for_http || fail "dashboard health check failed"
+	if ! wait_for_http; then
+		print_service_diagnostics
+		fail "dashboard health check failed"
+	fi
+	log "public dashboard responded"
 	log "verifying authenticated rpc"
-	wait_for_rpc || fail "rpc health check failed"
+	if ! wait_for_rpc; then
+		print_service_diagnostics
+		fail "rpc health check failed"
+	fi
+	log "authenticated rpc responded"
 }
 
 discover_public_ip() {
@@ -494,6 +637,25 @@ ssh_tunnel_user() {
 		return
 	fi
 	id -un 2>/dev/null || printf 'root'
+}
+
+summary_border() {
+	printf '+======================================================================+\n'
+}
+
+summary_line() {
+	local text width
+	text="${1:-}"
+	width=69
+	while (( ${#text} > width )); do
+		printf '| %-69s|\n' "${text:0:width}"
+		text="${text:width}"
+	done
+	printf '| %-69s|\n' "${text}"
+}
+
+summary_blank() {
+	summary_line ""
 }
 
 print_install_summary() {
@@ -532,60 +694,57 @@ PY
 	miner_wallet_dir="$(miner_wallet_marker_value "wallet_dir")"
 	miner_receive_address="$(miner_wallet_marker_value "receive_address")"
 
-	cat <<EOF
-
-+======================================================================+
-| Bitcoin Pure install summary                                         |
-+======================================================================+
-| Result   : ${DEPLOY_RESULT:-complete}
-| Version  : ${version:-unknown}
-| Service  : ${SERVICE_NAME}.service (${service_state:-unknown})
-| Profile  : ${profile:-unknown}
-| Mining   : ${miner_enabled:-unknown} (workers: ${miner_workers:-unknown})
-| RPC      : ${rpc_addr:-unknown}
-| P2P      : ${p2p_addr:-unknown}
-| Config   : ${CONFIG_PATH}
-| Data     : ${DATA_DIR}
-| Release  : ${current_path:-${CURRENT_LINK}}
-+======================================================================+
-| Monitor  : ${monitor_local}
-EOF
+	printf '\n'
+	summary_border
+	summary_line "Bitcoin Pure install summary"
+	summary_border
+	summary_line "Result   : ${DEPLOY_RESULT:-complete}"
+	summary_line "Version  : ${version:-unknown}"
+	summary_line "Service  : ${SERVICE_NAME}.service (${service_state:-unknown})"
+	summary_line "Profile  : ${profile:-unknown}"
+	summary_line "Mining   : ${miner_enabled:-unknown} (workers: ${miner_workers:-unknown})"
+	summary_line "RPC      : ${rpc_addr:-unknown}"
+	summary_line "P2P      : ${p2p_addr:-unknown}"
+	summary_line "Config   : ${CONFIG_PATH}"
+	summary_line "Data     : ${DATA_DIR}"
+	summary_line "Release  : ${current_path:-${CURRENT_LINK}}"
+	summary_border
+	summary_line "Monitor  : ${monitor_local}"
 	if [[ -n "${monitor_public}" ]]; then
-		printf '| Public   : %s\n' "${monitor_public}"
+		summary_line "Public   : ${monitor_public}"
 	fi
-	cat <<EOF
-+======================================================================+
-| Next                                                                |
-|   systemctl status ${SERVICE_NAME} --no-pager
-|   journalctl -u ${SERVICE_NAME} -f
-|   ssh -L ${rpc_port}:127.0.0.1:${rpc_port} ${tunnel_target}
-|   curl ${monitor_local}
-|   TOKEN=\$(python3 -c 'import json; print(json.load(open("${LEGACY_CONFIG_PATH}"))["rpc_auth_token"])')
-|   curl -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
-|     --data '{"method":"getinfo","params":{}}' ${monitor_local}
-EOF
+	summary_border
+	summary_line "Next steps"
+	summary_blank
+	summary_line "Check if the service is healthy:"
+	summary_line "  systemctl status ${SERVICE_NAME} --no-pager"
+	summary_blank
+	summary_line "Watch live node logs:"
+	summary_line "  journalctl -u ${SERVICE_NAME} -f"
+	summary_blank
+	summary_line "Open the monitor from your laptop with an SSH tunnel:"
+	summary_line "  ssh -L ${rpc_port}:127.0.0.1:${rpc_port} ${tunnel_target}"
+	summary_line "  then open ${monitor_local}"
+	summary_blank
+	summary_line "Check the node status via CLI:"
+	summary_line "  bpu-cli status"
 	if [[ "${miner_enabled}" != "on" ]]; then
-		cat <<EOF
-|                                                                      |
-| To enable mining with automatic wallet setup later:                  |
-|   sudo ${CURRENT_LINK}/install --update --mining on
-EOF
+		summary_blank
+		summary_line "Enable mining:"
+		summary_line "  sudo bpu-cli config mining on"
+		summary_line "  sudo systemctl restart ${SERVICE_NAME}"
 	fi
 	if [[ -n "${miner_wallet_dir}" ]]; then
-		cat <<EOF
-|                                                                      |
-| Miner wallet was provisioned. Back it up now:                        |
-|   sudo bpu-cli wallet backup --config ${CONFIG_PATH} --out /root/bitcoin-pure-wallets.backup.json
-| Keep the backup private; it can spend mined rewards.                  |
-EOF
+		summary_blank
+		summary_line "Miner wallet was provisioned. Back it up now:"
+		summary_line "  sudo bpu-cli wallet backup --config ${CONFIG_PATH} --out /root/bitcoin-pure-wallets.backup.json"
+		summary_line "Keep the backup private; it can spend mined rewards."
 		if [[ -n "${miner_receive_address}" ]]; then
-			printf '| Miner receive address: %s\n' "${miner_receive_address}"
+			summary_line "Miner receive address: ${miner_receive_address}"
 		fi
 	fi
-	cat <<EOF
-+======================================================================+
-
-EOF
+	summary_border
+	printf '\n'
 }
 
 restore_or_remove() {
@@ -736,11 +895,13 @@ parse_args() {
 main() {
 	parse_args "$@"
 	require_root
+	log "checking Ubuntu host prerequisites"
 	looks_like_ubuntu || fail "Ubuntu is required for ./install"
 	require_command git
 	require_command python3
 	require_command systemctl
 	require_command curl
+	log "host prerequisites ready"
 	acquire_lock
 	ensure_service_account
 	stage_checkout

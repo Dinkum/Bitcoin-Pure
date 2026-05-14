@@ -4,15 +4,25 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
-type Hash32 = [32]byte
+const (
+	BIP340ChallengeTag = "BIP0340/challenge"
+)
+
+var ErrInvalidHash32Hex = errors.New("invalid 32-byte hash hex")
+
+// Hash32 is BPU's native protocol identity value. It deliberately keeps string
+// and byte forms in the same canonical order instead of inheriting display
+// conventions from Bitcoin libraries.
+type Hash32 [32]byte
 
 type SchnorrBatchItem struct {
 	PubKey    [32]byte
@@ -27,16 +37,53 @@ type SchnorrBatchResult struct {
 
 var taggedHashCache sync.Map
 
-func Sha256(buf []byte) Hash32 {
+func Hash32FromArray(raw [32]byte) Hash32 {
+	return Hash32(raw)
+}
+
+func ParseHash32Hex(raw string) (Hash32, error) {
+	if len(raw) != 64 {
+		return Hash32{}, ErrInvalidHash32Hex
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil {
+		return Hash32{}, ErrInvalidHash32Hex
+	}
+	var out Hash32
+	copy(out[:], decoded)
+	return out, nil
+}
+
+func (h Hash32) Array() [32]byte {
+	return [32]byte(h)
+}
+
+func (h Hash32) Bytes() []byte {
+	out := make([]byte, len(h))
+	copy(out, h[:])
+	return out
+}
+
+func (h Hash32) String() string {
+	return hex.EncodeToString(h[:])
+}
+
+func Sha256(buf []byte) [32]byte {
 	return sha256.Sum256(buf)
 }
 
-func Sha256d(buf []byte) Hash32 {
+// Hash256 returns the consensus double-SHA-256 identity hash used for txids,
+// authids, block hashes, and other BPU fixed-width commitments.
+func Hash256(buf []byte) Hash32 {
 	first := Sha256(buf)
-	return Sha256(first[:])
+	return Hash32(Sha256(first[:]))
 }
 
-func TaggedHash(tag string, payload []byte) Hash32 {
+func Sha256d(buf []byte) [32]byte {
+	return Hash256(buf).Array()
+}
+
+func TaggedHash32(tag string, payload []byte) Hash32 {
 	// Tags are low-cardinality protocol constants, so caching their SHA-256
 	// avoids repeating identical work on every tagged hash invocation.
 	tagHash := cachedTagHash(tag)
@@ -49,13 +96,25 @@ func TaggedHash(tag string, payload []byte) Hash32 {
 	return out
 }
 
-func cachedTagHash(tag string) Hash32 {
+func TaggedHash(tag string, payload []byte) [32]byte {
+	return TaggedHash32(tag, payload).Array()
+}
+
+func BIP340ChallengeHash(r32 [32]byte, pubKey32 [32]byte, msg32 [32]byte) [32]byte {
+	payload := make([]byte, 0, 96)
+	payload = append(payload, r32[:]...)
+	payload = append(payload, pubKey32[:]...)
+	payload = append(payload, msg32[:]...)
+	return TaggedHash(BIP340ChallengeTag, payload)
+}
+
+func cachedTagHash(tag string) [32]byte {
 	if cached, ok := taggedHashCache.Load(tag); ok {
-		return cached.(Hash32)
+		return cached.([32]byte)
 	}
 	hash := Sha256([]byte(tag))
 	cached, _ := taggedHashCache.LoadOrStore(tag, hash)
-	return cached.(Hash32)
+	return cached.([32]byte)
 }
 
 func IsValidXOnlyPubKey(pubKey *[32]byte) bool {
@@ -73,6 +132,10 @@ func VerifySchnorrXOnly(pubKey *[32]byte, sig *[64]byte, msg *[32]byte) bool {
 		return false
 	}
 	return parsedSig.Verify(msg[:], parsedPubKey)
+}
+
+func VerifyXOnlySchnorr(pubKey [32]byte, msg [32]byte, sig [64]byte) bool {
+	return VerifySchnorrXOnly(&pubKey, &sig, &msg)
 }
 
 // VerifySchnorrXOnlyItems verifies each signature independently. This is the
@@ -132,14 +195,11 @@ func VerifySchnorrBatchXOnly(items []SchnorrBatchItem) bool {
 		r.Y.Set(&rY)
 		r.Z.SetInt(1)
 
-		commitment := chainhash.TaggedHash(
-			chainhash.TagBIP0340Challenge,
-			item.Signature[:32],
-			item.PubKey[:],
-			item.Msg[:],
-		)
+		var challengeR [32]byte
+		copy(challengeR[:], item.Signature[:32])
+		commitment := BIP340ChallengeHash(challengeR, item.PubKey, item.Msg)
 		var e secp.ModNScalar
-		e.SetBytes((*[32]byte)(commitment))
+		e.SetBytes(&commitment)
 
 		coeff, ok := scalars.scalar(i)
 		if !ok {
@@ -207,6 +267,30 @@ func XOnlyPubKeyFromSecret(secretKey [32]byte) [32]byte {
 func SignSchnorr(secretKey [32]byte, msg *[32]byte) ([32]byte, [64]byte) {
 	privKey, _ := btcec.PrivKeyFromBytes(secretKey[:])
 	return signWithPrivKey(privKey, msg)
+}
+
+func SignXOnlySchnorr(secretKey [32]byte, msg [32]byte) ([64]byte, error) {
+	privKey, _ := btcec.PrivKeyFromBytes(secretKey[:])
+	sig, err := schnorr.Sign(privKey, msg[:])
+	if err != nil {
+		return [64]byte{}, err
+	}
+	var encodedSig [64]byte
+	copy(encodedSig[:], sig.Serialize())
+	return encodedSig, nil
+}
+
+func GenerateXOnlySchnorrKey() ([32]byte, [32]byte, error) {
+	privKey, err := btcec.NewPrivateKey()
+	if err != nil {
+		return [32]byte{}, [32]byte{}, err
+	}
+	pubKey := schnorr.SerializePubKey(privKey.PubKey())
+	var xonly [32]byte
+	copy(xonly[:], pubKey)
+	var secret [32]byte
+	copy(secret[:], privKey.Serialize())
+	return secret, xonly, nil
 }
 
 func SignSchnorrForTest(secretKey [32]byte, msg *[32]byte) ([32]byte, [64]byte) {

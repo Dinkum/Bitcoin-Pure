@@ -60,7 +60,7 @@ Useful flags:
 
 - `--mining off` disables mining during install.
 - `--peer <host:port>` seeds the node with a peer.
-- `--update` pulls a fresh checkout from Git and deploys it atomically.
+- `--update` installs the latest final tagged release and deploys it atomically.
 
 Fresh installs keep mining off until `miner_pubkey_hex` is configured, so a new node does not mine to an unknown destination by default.
 
@@ -69,7 +69,7 @@ Examples:
 ```bash
 sudo ./install --mining off
 sudo ./install --peer 203.0.113.10:18444
-sudo ./install --update --repo-url git@github.com:Dinkum/Bitcoin-Pure.git --ref main
+sudo ./install --update
 ```
 
 What `./install` does:
