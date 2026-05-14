@@ -596,6 +596,36 @@ func TestRenderFanoutPreviewShowsBatchShape(t *testing.T) {
 	}
 }
 
+func TestFormatWalletFeeShowsEffectiveRateForExactFee(t *testing.T) {
+	got := formatWalletFee(123, 0, 61)
+	for _, want := range []string{"0.000000123 BPU / 123 atoms", "effective 2.02 atoms/B", "61 B"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatted exact fee missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestRenderSendPreviewWarnsForPQInputs(t *testing.T) {
+	view := renderSendPreview(wallet.SendPlan{
+		WalletName:     "main",
+		ToAddress:      "bpu:qdest",
+		Amount:         1,
+		Fee:            2,
+		EstimatedBytes: 3,
+		Inputs: []wallet.SelectedInput{{
+			Address: wallet.Address{Type: types.OutputPQLock32},
+		}},
+	}, nil)
+	var text strings.Builder
+	for _, row := range view.rows {
+		text.WriteString(row.label)
+		text.WriteString(row.value)
+	}
+	if !strings.Contains(text.String(), "warning") || !strings.Contains(text.String(), "PQ input") || !strings.Contains(text.String(), "auth payloads are large") {
+		t.Fatalf("send preview missing PQ warning: %#v", view)
+	}
+}
+
 func TestRenderNodeStatusShowsOperatorSummary(t *testing.T) {
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(t.TempDir(), "chain")

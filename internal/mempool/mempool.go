@@ -791,32 +791,16 @@ func (v SharedAdmissionView) Release() {
 	}
 }
 
-func (p *Pool) PrepareAdmission(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.PrepareAdmissionWithParams(tx, snapshot, chainUtxos, consensus.MainnetParams(), rules)
-}
-
 func (p *Pool) PrepareAdmissionWithLookup(tx types.Transaction, snapshot AdmissionSnapshot, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	return p.PrepareAdmissionWithLookupAndParams(tx, snapshot, chainLookup, consensus.MainnetParams(), rules)
-}
-
-func (p *Pool) PrepareAdmissionWithParams(tx types.Transaction, snapshot AdmissionSnapshot, chainUtxos consensus.UtxoSet, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.PrepareAdmissionWithLookupAndParams(tx, snapshot, consensus.LookupFromSet(chainUtxos), params, rules)
 }
 
 func (p *Pool) PrepareAdmissionWithLookupAndParams(tx types.Transaction, snapshot AdmissionSnapshot, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	return p.prepareAdmission(tx, snapshot.Epoch, snapshot.Entries, snapshot.Spent, snapshot.Orphans, chainLookup, params, rules)
 }
 
-func (p *Pool) PrepareAdmissionShared(tx types.Transaction, view SharedAdmissionView, chainUtxos consensus.UtxoSet, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.PrepareAdmissionSharedWithParams(tx, view, chainUtxos, consensus.MainnetParams(), rules)
-}
-
 func (p *Pool) PrepareAdmissionSharedWithLookup(tx types.Transaction, view SharedAdmissionView, chainLookup consensus.UtxoLookup, rules consensus.ConsensusRules) (PreparedAdmission, error) {
 	return p.PrepareAdmissionSharedWithLookupAndParams(tx, view, chainLookup, consensus.MainnetParams(), rules)
-}
-
-func (p *Pool) PrepareAdmissionSharedWithParams(tx types.Transaction, view SharedAdmissionView, chainUtxos consensus.UtxoSet, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {
-	return p.PrepareAdmissionSharedWithLookupAndParams(tx, view, consensus.LookupFromSet(chainUtxos), params, rules)
 }
 
 func (p *Pool) PrepareAdmissionSharedWithLookupAndParams(tx types.Transaction, view SharedAdmissionView, chainLookup consensus.UtxoLookup, params consensus.ChainParams, rules consensus.ConsensusRules) (PreparedAdmission, error) {

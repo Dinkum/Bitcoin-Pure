@@ -1753,45 +1753,11 @@ func blockCreatedOutputsFromIDs(block *types.Block, txids [][32]byte, outputCap 
 	return createdByOutPoint, createdOrder
 }
 
-func ValidateAndApplyBlock(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, params ChainParams, rules ConsensusRules) (BlockValidationSummary, error) {
-	summary, overlay, _, err := validateAndApplyBlockOverlay(block, prev, blockSizeState, utxos, nil, params, rules)
-	if err != nil {
-		return BlockValidationSummary{}, err
-	}
-	overlay.ApplyToSet(utxos)
-	return summary, nil
-}
-
-func ValidateAndApplyBlockWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *utreexo.Accumulator, error) {
-	summary, overlay, nextAcc, err := validateAndApplyBlockOverlay(block, prev, blockSizeState, utxos, accumulator, params, rules)
-	if err != nil {
-		return BlockValidationSummary{}, nil, err
-	}
-	overlay.ApplyToSet(utxos)
-	return summary, nextAcc, nil
-}
-
-func ValidateAndApplyBlockOverlayWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
-	return validateAndApplyBlockOverlay(block, prev, blockSizeState, utxos, accumulator, params, rules)
-}
-
 // ValidateAndApplyBlockOverlayWithLookup validates against an explicit lookup
 // backend while optionally keeping a materialized base set for callers that
-// still need to materialize the full post-block view during the transition.
+// need to materialize the full post-block view.
 func ValidateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, base UtxoSet, lookup UtxoLookupWithErr, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
 	return validateAndApplyBlockOverlayWithLookup(block, prev, blockSizeState, base, lookup, accumulator, params, rules)
-}
-
-func ValidateAndApplyBlockViewWithAccumulator(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, UtxoSet, *utreexo.Accumulator, error) {
-	summary, overlay, nextAcc, err := validateAndApplyBlockOverlay(block, prev, blockSizeState, utxos, accumulator, params, rules)
-	if err != nil {
-		return BlockValidationSummary{}, nil, nil, err
-	}
-	return summary, overlay.Materialize(), nextAcc, nil
-}
-
-func validateAndApplyBlockOverlay(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, utxos UtxoSet, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
-	return validateAndApplyBlockOverlayWithLookup(block, prev, blockSizeState, utxos, LookupWithErrFromSet(utxos), accumulator, params, rules)
 }
 
 func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, base UtxoSet, lookup UtxoLookupWithErr, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
@@ -2017,15 +1983,6 @@ func verifyBlockSignatureChecks(items []crypto.SchnorrBatchItem) crypto.SchnorrB
 
 func exactSchnorrResult(items []crypto.SchnorrBatchItem) crypto.SchnorrBatchResult {
 	return crypto.SchnorrBatchResult{Valid: crypto.VerifySchnorrXOnlyItems(items)}
-}
-
-func replaceUtxoSet(dst UtxoSet, src UtxoSet) {
-	for k := range dst {
-		delete(dst, k)
-	}
-	for k, v := range src {
-		dst[k] = v
-	}
 }
 
 func DecodeTxHex(raw string, limits types.CodecLimits) (types.Transaction, error) {
