@@ -1,6 +1,8 @@
 package node
 
 import (
+	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,25 @@ import (
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/types"
 )
+
+func TestIncomingBlockTransferIdleExpiryReleasesSpool(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "block-transfer-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := file.Name()
+	hash := [32]byte{1}
+	peer := &peerConn{blockTransfers: map[[32]byte]*incomingBlockTransfer{
+		hash: {file: file, updated: time.Now().Add(-incomingBlockTransferIdleTimeout - time.Second)},
+	}}
+	pruneExpiredBlockTransfersLocked(peer, time.Now())
+	if len(peer.blockTransfers) != 0 {
+		t.Fatal("expired incoming block transfer remained retained")
+	}
+	if _, err := os.Stat(name); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired block spool still exists: %v", err)
+	}
+}
 
 func TestPendingThinStateIsCountAndByteBounded(t *testing.T) {
 	svc := &Service{thinStateBudget: p2p.NewPayloadBudget(1 << 20)}

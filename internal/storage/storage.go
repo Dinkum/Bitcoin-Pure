@@ -2106,6 +2106,9 @@ func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
 	if err != nil {
 		return nil, err
 	}
+	if got := consensus.HeaderHash(&header); got != *blockHash {
+		return nil, fmt.Errorf("stored block header hash mismatch: key=%x header=%x", *blockHash, got)
+	}
 	maxBytes := uint64(len(buf))
 	index, err := s.GetBlockIndex(blockHash)
 	if err != nil {

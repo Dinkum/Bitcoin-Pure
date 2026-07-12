@@ -165,6 +165,7 @@ func (s *Service) onBlockStartMessage(peer *peerConn, msg p2p.BlockStartMessage)
 	hash := consensus.HeaderHash(&msg.Header)
 	peer.blockTransferMu.Lock()
 	defer peer.blockTransferMu.Unlock()
+	pruneExpiredBlockTransfersLocked(peer, time.Now())
 	if _, duplicate := peer.blockTransfers[hash]; duplicate {
 		return fmt.Errorf("duplicate chunked block transfer %x", hash)
 	}
@@ -180,6 +181,7 @@ func (s *Service) onBlockStartMessage(peer *peerConn, msg p2p.BlockStartMessage)
 		total:    msg.TotalSize,
 		checksum: msg.Checksum,
 		file:     file,
+		updated:  time.Now(),
 	}
 	return nil
 }
@@ -189,6 +191,7 @@ func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage)
 		return errors.New("invalid chunked block frame")
 	}
 	peer.blockTransferMu.Lock()
+	pruneExpiredBlockTransfersLocked(peer, time.Now())
 	transfer := peer.blockTransfers[msg.BlockHash]
 	if transfer == nil {
 		peer.blockTransferMu.Unlock()
@@ -204,6 +207,7 @@ func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage)
 		return err
 	}
 	transfer.next = end
+	transfer.updated = time.Now()
 	if transfer.next != transfer.total {
 		peer.blockTransferMu.Unlock()
 		return nil
@@ -233,6 +237,26 @@ func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage)
 	}
 	peer.deletePendingThin(msg.BlockHash)
 	return s.acceptPeerBlockMessage(peer, &block)
+}
+
+const incomingBlockTransferIdleTimeout = 2 * time.Minute
+
+func pruneExpiredBlockTransfersLocked(peer *peerConn, now time.Time) {
+	for hash, transfer := range peer.blockTransfers {
+		if transfer == nil {
+			delete(peer.blockTransfers, hash)
+			continue
+		}
+		if transfer.updated.IsZero() || now.Sub(transfer.updated) <= incomingBlockTransferIdleTimeout {
+			continue
+		}
+		if transfer.file != nil {
+			name := transfer.file.Name()
+			_ = transfer.file.Close()
+			_ = os.Remove(name)
+		}
+		delete(peer.blockTransfers, hash)
+	}
 }
 
 func (s *Service) requestSync(peer *peerConn) error { return s.syncManager().requestSync(peer) }

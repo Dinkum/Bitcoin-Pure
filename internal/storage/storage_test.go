@@ -65,6 +65,17 @@ func TestBlockStorageUsesVerifiedChunks(t *testing.T) {
 	if loaded == nil || !bytes.Equal(loaded.Encode(), block.Encode()) {
 		t.Fatal("multi-chunk block roundtrip mismatch")
 	}
+	chunk, err := store.get(blockChunkKey(hash, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk[0] ^= 0xff
+	if err := store.db.Set(blockChunkKey(hash, 1), chunk, pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetBlock(&hash); err == nil {
+		t.Fatal("corrupted stored block chunk was accepted")
+	}
 }
 
 func sampleBlockAndUTXOs() (types.Block, consensus.UtxoSet) {

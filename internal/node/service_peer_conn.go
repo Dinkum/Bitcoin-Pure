@@ -80,6 +80,7 @@ type incomingBlockTransfer struct {
 	next     uint64
 	checksum [32]byte
 	file     *os.File
+	updated  time.Time
 }
 
 func (p *peerConn) allowBlockServeBytes(size int, now time.Time, maxMessageBytes int) bool {
