@@ -213,6 +213,266 @@ func TestUTXOAccumulatorIndexPersistsAndUpdatesWithChainDeltas(t *testing.T) {
 	}
 }
 
+func TestUTXOAccumulatorV1MigrationRebuildsAndAtomicallyActivatesV2(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, utxos := sampleBlockAndUTXOs()
+	secondOut := types.OutPoint{TxID: [32]byte{0x91}, Vout: 3}
+	utxos[secondOut] = testXOnlyUTXOEntry(77, [32]byte{0x44})
+	acc, err := consensus.UtxoAccumulator(utxos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block.Header.UTXORoot = acc.Root()
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:         types.Regtest,
+		Height:          0,
+		TipHeader:       block.Header,
+		BlockSizeState:  sampleBlockSizeState(),
+		UTXOs:           utxos,
+		UTXOAccumulator: acc,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacySentinel := append(cloneBytes(legacyUTXOAccumulatorNodePrefix), []byte("stale-v1-node")...)
+	if err := store.db.Set(legacySentinel, []byte("legacy"), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.DeleteRange(utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd, pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	partialV2 := append(cloneBytes(utxoAccumulatorNodePrefix), []byte("interrupted-staging")...)
+	if err := store.db.Set(partialV2, []byte("incomplete"), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexV1), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrating v1 index: %v", err)
+	}
+	defer reopened.Close()
+	version, err := reopened.get(metaUTXOAccumulatorVersionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := decodeU64(version); err != nil || got != utxoAccumulatorIndexVersion {
+		t.Fatalf("migrated version = (%d, %v), want %d", got, err, utxoAccumulatorIndexVersion)
+	}
+	if stale, err := reopened.get(legacySentinel); err != nil || stale != nil {
+		t.Fatalf("legacy node after activation = (%x, %v), want absent", stale, err)
+	}
+	migrated, ok, err := reopened.LoadUTXOAccumulator()
+	if err != nil || !ok {
+		t.Fatalf("LoadUTXOAccumulator after migration = (_, %v, %v)", ok, err)
+	}
+	if migrated.Count() != len(utxos) || migrated.Root() != block.Header.UTXORoot {
+		t.Fatalf("migrated accumulator = count %d root %x, want count %d root %x", migrated.Count(), migrated.Root(), len(utxos), block.Header.UTXORoot)
+	}
+	for outPoint := range utxos {
+		proof, err := reopened.UTXOAccumulatorProof(outPoint)
+		if err != nil || !proof.Exists || !utreexo.VerifyProof(block.Header.UTXORoot, proof) {
+			t.Fatalf("membership proof for %x:%d = (exists=%v, err=%v)", outPoint.TxID, outPoint.Vout, proof.Exists, err)
+		}
+	}
+	absent := types.OutPoint{TxID: [32]byte{0xff}, Vout: 9}
+	proof, err := reopened.UTXOAccumulatorProof(absent)
+	if err != nil || proof.Exists || !utreexo.VerifyProof(block.Header.UTXORoot, proof) {
+		t.Fatalf("exclusion proof after migration = (exists=%v, err=%v)", proof.Exists, err)
+	}
+}
+
+func TestUTXOAccumulatorV2OpenRetriesLegacyCleanup(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, utxos := sampleBlockAndUTXOs()
+	if err := store.WriteFullState(&StoredChainState{Profile: types.Regtest, TipHeader: block.Header, BlockSizeState: sampleBlockSizeState(), UTXOs: utxos}); err != nil {
+		t.Fatal(err)
+	}
+	legacySentinel := append(cloneBytes(legacyUTXOAccumulatorNodePrefix), []byte("cleanup-retry")...)
+	if err := store.db.Set(legacySentinel, []byte("legacy"), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if stale, err := reopened.get(legacySentinel); err != nil || stale != nil {
+		t.Fatalf("legacy node after v2 cleanup retry = (%x, %v), want absent", stale, err)
+	}
+}
+
+func TestUTXOAccumulatorEmptyV1Migration(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := sampleBlockAndUTXOs()
+	empty := utreexo.NewAccumulator()
+	block.Header.UTXORoot = empty.Root()
+	if err := store.WriteFullState(&StoredChainState{Profile: types.Regtest, TipHeader: block.Header, BlockSizeState: sampleBlockSizeState(), UTXOs: consensus.UtxoSet{}, UTXOAccumulator: empty}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexV1), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrating empty v1 index: %v", err)
+	}
+	defer reopened.Close()
+	acc, ok, err := reopened.LoadUTXOAccumulator()
+	if err != nil || !ok || acc.Count() != 0 || acc.Root() != empty.Root() {
+		t.Fatalf("empty migrated accumulator = (count=%d, ok=%v, err=%v)", acc.Count(), ok, err)
+	}
+	if rootPath, err := reopened.get(metaUTXOAccumulatorRootPathKey); err != nil || rootPath != nil {
+		t.Fatalf("empty migrated root path = (%x, %v), want absent", rootPath, err)
+	}
+}
+
+func TestUTXOAccumulatorV2LargeIndexReopensAndStreamsValidation(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	utxos := make(consensus.UtxoSet, 1024)
+	for i := uint64(1); i <= 1024; i++ {
+		var txid [32]byte
+		binary.LittleEndian.PutUint64(txid[:8], i)
+		outPoint := types.OutPoint{TxID: txid, Vout: uint32(i % 5)}
+		utxos[outPoint] = testXOnlyUTXOEntry(i, [32]byte{byte(i), byte(i >> 8)})
+	}
+	acc, err := consensus.UtxoAccumulator(utxos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := types.BlockHeader{NBits: consensus.RegtestParams().GenesisBits, UTXORoot: acc.Root()}
+	if err := store.WriteFullState(&StoredChainState{Profile: types.Regtest, TipHeader: header, BlockSizeState: sampleBlockSizeState(), UTXOs: utxos, UTXOAccumulator: acc}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open streaming v2 validation: %v", err)
+	}
+	defer reopened.Close()
+	loaded, ok, err := reopened.LoadUTXOAccumulator()
+	if err != nil || !ok {
+		t.Fatalf("LoadUTXOAccumulator = (_, %v, %v)", ok, err)
+	}
+	if loaded.Count() != len(utxos) || loaded.Root() != acc.Root() {
+		t.Fatalf("loaded large accumulator = count %d root %x, want count %d root %x", loaded.Count(), loaded.Root(), len(utxos), acc.Root())
+	}
+}
+
+func TestUTXOAccumulatorV1MigrationValidationFailureLeavesV1Active(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, utxos := sampleBlockAndUTXOs()
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacySentinel := append(cloneBytes(legacyUTXOAccumulatorNodePrefix), []byte("must-survive")...)
+	if err := store.db.Set(legacySentinel, []byte("legacy"), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexV1), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	badRoot := [32]byte{0xde, 0xad}
+	if err := store.db.Set(metaUTXOAccumulatorRootKey, badRoot[:], pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path); err == nil {
+		t.Fatal("Open unexpectedly activated v2 despite accumulator root mismatch")
+	}
+	db, err := pebble.Open(path, &pebble.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	version, closer, err := db.Get(metaUTXOAccumulatorVersionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionCopy := cloneBytes(version)
+	closer.Close()
+	if got, err := decodeU64(versionCopy); err != nil || got != utxoAccumulatorIndexV1 {
+		t.Fatalf("version after failed migration = (%d, %v), want v1", got, err)
+	}
+	legacy, closer, err := db.Get(legacySentinel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCopy := cloneBytes(legacy)
+	closer.Close()
+	if string(legacyCopy) != "legacy" {
+		t.Fatalf("legacy index mutated after failed migration: %q", legacyCopy)
+	}
+}
+
+func TestLoadUTXOAccumulatorRejectsPersistedNonCanonicalNodeKey(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	block, utxos := sampleBlockAndUTXOs()
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Depth one has one significant high bit. Setting a low unused bit creates
+	// a second physical key that normalizes to a different logical lookup key.
+	malformedKey := append(cloneBytes(utxoAccumulatorNodePrefix), 0, 1, 1)
+	if err := store.db.Set(malformedKey, make([]byte, 41), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.LoadUTXOAccumulator(); err == nil || !bytes.Contains([]byte(err.Error()), []byte("non-canonical accumulator node path key")) {
+		t.Fatalf("LoadUTXOAccumulator error = %v, want non-canonical path rejection", err)
+	}
+}
+
 func sampleBlockSizeState() consensus.BlockSizeState {
 	return consensus.BlockSizeState{
 		BlockSize: types.BlockHeaderEncodedLen,
@@ -595,6 +855,30 @@ func TestLoadChainStateRequiresCoinOriginSchema(t *testing.T) {
 	}
 	if _, err := store.LoadChainStateMeta(); !errors.Is(err, ErrChainstateReindexRequired) {
 		t.Fatalf("legacy chainstate error = %v, want ErrChainstateReindexRequired", err)
+	}
+}
+
+func TestLoadChainStateMetaRejectsUTXOCountIntOverflow(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	block, utxos := sampleBlockAndUTXOs()
+	if err := store.WriteFullState(&StoredChainState{
+		Profile:        types.Regtest,
+		Height:         0,
+		TipHeader:      block.Header,
+		BlockSizeState: sampleBlockSizeState(),
+		UTXOs:          utxos,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Set(metaUTXOCountKey, encodeU64(^uint64(0)), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadChainStateMeta(); err == nil || !bytes.Contains([]byte(err.Error()), []byte("utxo count exceeds platform int capacity")) {
+		t.Fatalf("LoadChainStateMeta error = %v, want int-capacity rejection", err)
 	}
 }
 

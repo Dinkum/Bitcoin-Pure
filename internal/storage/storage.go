@@ -25,47 +25,50 @@ import (
 )
 
 var (
-	metaProfileKey                 = []byte("meta/profile")
-	metaHeaderTipHeightKey         = []byte("meta/header_tip_height")
-	metaHeaderTipHeaderKey         = []byte("meta/header_tip_header")
-	metaTipHeightKey               = []byte("meta/tip_height")
-	metaTipHeaderKey               = []byte("meta/tip_header")
-	metaBlockSizeStateKey          = []byte("meta/block_size_state")
-	metaUTXOChecksumKey            = []byte("meta/utxo_checksum")
-	metaUTXOCountKey               = []byte("meta/utxo_count")
-	metaUTXOAccumulatorRootKey     = []byte("meta/utxo_accumulator_root")
-	metaUTXOAccumulatorVersionKey  = []byte("meta/utxo_accumulator_version")
-	metaChainstateSchemaVersionKey = []byte("meta/chainstate_schema_version")
-	metaFastSyncStateKey           = []byte("meta/fast_sync_state")
-	metaMempoolStateKey            = []byte("meta/mempool_state")
-	metaLocalityNextSeqKey         = []byte("meta/locality_next_seq")
-	metaJournalNextSeqKey          = []byte("meta/journal_next_seq")
-	metaDerivedJournalSeqKey       = []byte("meta/derived_journal_seq")
-	metaWalletIndexHeightKey       = []byte("meta/wallet_index_height")
-	mempoolEntryPrefix             = []byte("mempool_entry/")
-	mempoolOrphanPrefix            = []byte("mempool_orphan/")
-	blockPrefix                    = []byte("blocks/")
-	blockChunkPrefix               = []byte("block_chunks/")
-	blockIndexPrefix               = []byte("block_index/")
-	blockUndoPrefix                = []byte("block_undo/")
-	headerHeightIndexPrefix        = []byte("header_height_index/")
-	heightIndexPrefix              = []byte("height_index/")
-	knownPeerPrefix                = []byte("known_peer/")
-	journalPrefix                  = []byte("journal/")
-	utxoPrefix                     = []byte("utxo/")
-	utxoAccumulatorNodePrefix      = []byte("utxo_acc_node/")
-	snapshotUTXOPrefix             = []byte("snapshot_utxo/")
-	localitySeqPrefix              = []byte("locality_seq/")
-	localityMetaPrefix             = []byte("locality_meta/")
-	walletOriginPrefix             = []byte("wallet_origin/")
-	walletUTXOPrefix               = []byte("wallet_utxo/")
-	walletActivityItemPrefix       = []byte("wallet_activity_item/")
-	walletActivityHtPrefix         = []byte("wallet_activity_height/")
+	metaProfileKey                  = []byte("meta/profile")
+	metaHeaderTipHeightKey          = []byte("meta/header_tip_height")
+	metaHeaderTipHeaderKey          = []byte("meta/header_tip_header")
+	metaTipHeightKey                = []byte("meta/tip_height")
+	metaTipHeaderKey                = []byte("meta/tip_header")
+	metaBlockSizeStateKey           = []byte("meta/block_size_state")
+	metaUTXOChecksumKey             = []byte("meta/utxo_checksum")
+	metaUTXOCountKey                = []byte("meta/utxo_count")
+	metaUTXOAccumulatorRootKey      = []byte("meta/utxo_accumulator_root")
+	metaUTXOAccumulatorRootPathKey  = []byte("meta/utxo_accumulator_root_path")
+	metaUTXOAccumulatorVersionKey   = []byte("meta/utxo_accumulator_version")
+	metaChainstateSchemaVersionKey  = []byte("meta/chainstate_schema_version")
+	metaFastSyncStateKey            = []byte("meta/fast_sync_state")
+	metaMempoolStateKey             = []byte("meta/mempool_state")
+	metaLocalityNextSeqKey          = []byte("meta/locality_next_seq")
+	metaJournalNextSeqKey           = []byte("meta/journal_next_seq")
+	metaDerivedJournalSeqKey        = []byte("meta/derived_journal_seq")
+	metaWalletIndexHeightKey        = []byte("meta/wallet_index_height")
+	mempoolEntryPrefix              = []byte("mempool_entry/")
+	mempoolOrphanPrefix             = []byte("mempool_orphan/")
+	blockPrefix                     = []byte("blocks/")
+	blockChunkPrefix                = []byte("block_chunks/")
+	blockIndexPrefix                = []byte("block_index/")
+	blockUndoPrefix                 = []byte("block_undo/")
+	headerHeightIndexPrefix         = []byte("header_height_index/")
+	heightIndexPrefix               = []byte("height_index/")
+	knownPeerPrefix                 = []byte("known_peer/")
+	journalPrefix                   = []byte("journal/")
+	utxoPrefix                      = []byte("utxo/")
+	legacyUTXOAccumulatorNodePrefix = []byte("utxo_acc_node/")
+	utxoAccumulatorNodePrefix       = []byte("utxo_acc_node_v2/")
+	snapshotUTXOPrefix              = []byte("snapshot_utxo/")
+	localitySeqPrefix               = []byte("locality_seq/")
+	localityMetaPrefix              = []byte("locality_meta/")
+	walletOriginPrefix              = []byte("wallet_origin/")
+	walletUTXOPrefix                = []byte("wallet_utxo/")
+	walletActivityItemPrefix        = []byte("wallet_activity_item/")
+	walletActivityHtPrefix          = []byte("wallet_activity_height/")
 )
 
 const (
 	walletIndexChunkSize        = 10_000
-	utxoAccumulatorIndexVersion = uint64(1)
+	utxoAccumulatorIndexVersion = uint64(2)
+	utxoAccumulatorIndexV1      = uint64(1)
 	chainstateSchemaVersion     = uint64(2)
 	storedBlockManifestVersion  = byte(1)
 	storedBlockChunkBytes       = 4 << 20
@@ -74,18 +77,19 @@ const (
 var ErrChainstateReindexRequired = errors.New("chainstate reindex required")
 
 var (
-	knownPeerPrefixEnd           = prefixUpperBound(knownPeerPrefix)
-	mempoolEntryPrefixEnd        = prefixUpperBound(mempoolEntryPrefix)
-	mempoolOrphanPrefixEnd       = prefixUpperBound(mempoolOrphanPrefix)
-	utxoPrefixEnd                = prefixUpperBound(utxoPrefix)
-	utxoAccumulatorNodePrefixEnd = prefixUpperBound(utxoAccumulatorNodePrefix)
-	snapshotUTXOPrefixEnd        = prefixUpperBound(snapshotUTXOPrefix)
-	localitySeqPrefixEnd         = prefixUpperBound(localitySeqPrefix)
-	localityMetaPrefixEnd        = prefixUpperBound(localityMetaPrefix)
-	walletOriginPrefixEnd        = prefixUpperBound(walletOriginPrefix)
-	walletUTXOPrefixEnd          = prefixUpperBound(walletUTXOPrefix)
-	walletActItemPrefixEnd       = prefixUpperBound(walletActivityItemPrefix)
-	walletActHtPrefixEnd         = prefixUpperBound(walletActivityHtPrefix)
+	knownPeerPrefixEnd                 = prefixUpperBound(knownPeerPrefix)
+	mempoolEntryPrefixEnd              = prefixUpperBound(mempoolEntryPrefix)
+	mempoolOrphanPrefixEnd             = prefixUpperBound(mempoolOrphanPrefix)
+	utxoPrefixEnd                      = prefixUpperBound(utxoPrefix)
+	legacyUTXOAccumulatorNodePrefixEnd = prefixUpperBound(legacyUTXOAccumulatorNodePrefix)
+	utxoAccumulatorNodePrefixEnd       = prefixUpperBound(utxoAccumulatorNodePrefix)
+	snapshotUTXOPrefixEnd              = prefixUpperBound(snapshotUTXOPrefix)
+	localitySeqPrefixEnd               = prefixUpperBound(localitySeqPrefix)
+	localityMetaPrefixEnd              = prefixUpperBound(localityMetaPrefix)
+	walletOriginPrefixEnd              = prefixUpperBound(walletOriginPrefix)
+	walletUTXOPrefixEnd                = prefixUpperBound(walletUTXOPrefix)
+	walletActItemPrefixEnd             = prefixUpperBound(walletActivityItemPrefix)
+	walletActHtPrefixEnd               = prefixUpperBound(walletActivityHtPrefix)
 )
 
 var (
@@ -341,6 +345,10 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		deriveNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 	}
+	if err := store.migrateUTXOAccumulatorIndex(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	store.wg.Add(1)
 	go func() {
 		defer store.wg.Done()
@@ -488,6 +496,9 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		if count > uint64(math.MaxInt) {
+			return nil, false, errors.New("invalid data: utxo count exceeds platform int capacity")
+		}
 		utxoCount = int(count)
 	}
 	var accRoot [32]byte
@@ -507,6 +518,207 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 		UTXOCount:           utxoCount,
 		UTXOAccumulatorRoot: accRoot,
 	}, checksumBytes != nil, nil
+}
+
+// migrateUTXOAccumulatorIndex rebuilds the v1 derived index from the canonical
+// UTXO keyspace into a separate, bounded-write staging namespace. Only the
+// final synced metadata batch activates v2, so an interrupted migration leaves
+// the complete v1 index visible rather than a partially written v2 index.
+func (s *ChainStore) migrateUTXOAccumulatorIndex() error {
+	versionBytes, err := s.get(metaUTXOAccumulatorVersionKey)
+	if err != nil || versionBytes == nil {
+		return err
+	}
+	version, err := decodeU64(versionBytes)
+	if err != nil {
+		return err
+	}
+	switch version {
+	case utxoAccumulatorIndexVersion:
+		if _, ok, err := s.LoadUTXOAccumulator(); err != nil {
+			return fmt.Errorf("validate utxo accumulator index: %w", err)
+		} else if !ok {
+			return errors.New("utxo accumulator v2 metadata is present without an index")
+		}
+		s.cleanupLegacyUTXOAccumulatorIndex()
+		return nil
+	case utxoAccumulatorIndexV1:
+	default:
+		return fmt.Errorf("unsupported utxo accumulator index version %d", version)
+	}
+
+	meta, err := s.LoadChainStateMeta()
+	if err != nil {
+		return fmt.Errorf("load chain metadata for utxo accumulator migration: %w", err)
+	}
+	if meta == nil {
+		return errors.New("cannot migrate utxo accumulator index without chain metadata")
+	}
+	acc := utreexo.NewAccumulator()
+	if err := s.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
+		next, err := acc.Add(consensus.UtxoLeafFromEntry(outPoint, entry))
+		if err != nil {
+			return err
+		}
+		acc = next
+		return nil
+	}); err != nil {
+		return fmt.Errorf("scan canonical utxos for accumulator migration: %w", err)
+	}
+	if acc.Count() != meta.UTXOCount {
+		return fmt.Errorf("refusing utxo accumulator migration: rebuilt count=%d meta=%d", acc.Count(), meta.UTXOCount)
+	}
+	root := acc.Root()
+	if root != meta.TipHeader.UTXORoot {
+		return fmt.Errorf("refusing utxo accumulator migration: rebuilt root=%x header=%x", root, meta.TipHeader.UTXORoot)
+	}
+	if meta.UTXOAccumulatorRoot != ([32]byte{}) && root != meta.UTXOAccumulatorRoot {
+		return fmt.Errorf("refusing utxo accumulator migration: rebuilt root=%x meta=%x", root, meta.UTXOAccumulatorRoot)
+	}
+
+	// v2 lives in a separate namespace. Populate it in bounded synced chunks
+	// while v1 remains active, then make the completed generation visible with
+	// one metadata batch. A restart after interrupted staging simply discards
+	// the inactive v2 namespace and starts it again.
+	clearBatch := s.db.NewBatch()
+	if err := clearBatch.DeleteRange(utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd, nil); err != nil {
+		clearBatch.Close()
+		return err
+	}
+	if err := clearBatch.Commit(consensusCriticalWriteOptions); err != nil {
+		clearBatch.Close()
+		return fmt.Errorf("clear incomplete utxo accumulator staging index: %w", err)
+	}
+	clearBatch.Close()
+
+	if err := s.stageAccumulatorIndex(acc); err != nil {
+		return err
+	}
+	if err := s.validateAccumulatorIndexRecords(acc); err != nil {
+		return fmt.Errorf("validate staged utxo accumulator index: %w", err)
+	}
+
+	activation := s.db.NewBatch()
+	if rootPath, ok := utreexo.AccumulatorRootPath(acc); ok {
+		if err := activation.Set(metaUTXOAccumulatorRootPathKey, encodeAccumulatorPath(rootPath), nil); err != nil {
+			activation.Close()
+			return err
+		}
+	} else if err := activation.Delete(metaUTXOAccumulatorRootPathKey, nil); err != nil {
+		activation.Close()
+		return err
+	}
+	if err := activation.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil); err != nil {
+		activation.Close()
+		return err
+	}
+	if err := activation.Commit(consensusCriticalWriteOptions); err != nil {
+		activation.Close()
+		return fmt.Errorf("activate utxo accumulator index migration: %w", err)
+	}
+	activation.Close()
+
+	s.cleanupLegacyUTXOAccumulatorIndex()
+	s.logger.Info("migrated utxo accumulator index", slog.Uint64("from_version", version), slog.Uint64("to_version", utxoAccumulatorIndexVersion), slog.Int("utxo_count", acc.Count()))
+	return nil
+}
+
+func (s *ChainStore) stageAccumulatorIndex(acc *utreexo.Accumulator) error {
+	const migrationRecordBatchSize = 4096
+	batch := s.db.NewBatch()
+	defer func() { batch.Close() }()
+	batchCount := 0
+	flush := func() error {
+		if batchCount == 0 {
+			return nil
+		}
+		if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+			return err
+		}
+		batch.Close()
+		batch = s.db.NewBatch()
+		batchCount = 0
+		return nil
+	}
+	err := utreexo.ForEachAccumulatorNodeRecord(acc, func(record utreexo.AccumulatorNodeRecord) error {
+		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
+			return err
+		}
+		batchCount++
+		if batchCount == migrationRecordBatchSize {
+			return flush()
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("stage utxo accumulator index records: %w", err)
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("stage utxo accumulator index records: %w", err)
+	}
+	return nil
+}
+
+func (s *ChainStore) validateAccumulatorIndexRecords(acc *utreexo.Accumulator) error {
+	expectedCount := 0
+	if err := utreexo.ForEachAccumulatorNodeRecord(acc, func(record utreexo.AccumulatorNodeRecord) error {
+		expectedCount++
+		value, closer, err := s.db.Get(accumulatorNodeKey(record.Path))
+		if err != nil {
+			return err
+		}
+		matches := bytes.Equal(value, encodeAccumulatorNodeValue(record))
+		closer.Close()
+		if !matches {
+			return fmt.Errorf("staged accumulator record mismatch at depth %d", record.Path.Depth)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	actualCount := 0
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: utxoAccumulatorNodePrefix, UpperBound: utxoAccumulatorNodePrefixEnd})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		actualCount++
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	if actualCount != expectedCount {
+		return fmt.Errorf("staged accumulator record count=%d, want %d", actualCount, expectedCount)
+	}
+	return nil
+}
+
+func (s *ChainStore) cleanupLegacyUTXOAccumulatorIndex() {
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: legacyUTXOAccumulatorNodePrefix, UpperBound: legacyUTXOAccumulatorNodePrefixEnd})
+	if err != nil {
+		s.logger.Warn("failed to inspect legacy utxo accumulator index", slog.String("error", err.Error()))
+		return
+	}
+	hasLegacy := iter.First()
+	iterErr := iter.Error()
+	iter.Close()
+	if iterErr != nil {
+		s.logger.Warn("failed to inspect legacy utxo accumulator index", slog.String("error", iterErr.Error()))
+		return
+	}
+	if !hasLegacy {
+		return
+	}
+	cleanup := s.db.NewBatch()
+	defer cleanup.Close()
+	if err := cleanup.DeleteRange(legacyUTXOAccumulatorNodePrefix, legacyUTXOAccumulatorNodePrefixEnd, nil); err != nil {
+		s.logger.Warn("failed to schedule legacy utxo accumulator cleanup", slog.String("error", err.Error()))
+		return
+	}
+	if err := cleanup.Commit(bestEffortWriteOptions); err != nil {
+		s.logger.Warn("failed to clean legacy utxo accumulator index", slog.String("error", err.Error()))
+	}
 }
 
 // GetUTXO performs a single-key Pebble lookup for a committed UTXO entry.
@@ -3633,6 +3845,10 @@ func (s *ChainStore) LoadUTXOAccumulator() (*utreexo.Accumulator, bool, error) {
 	if version != utxoAccumulatorIndexVersion {
 		return nil, false, fmt.Errorf("unsupported utxo accumulator index version %d", version)
 	}
+	rootPathBytes, err := s.get(metaUTXOAccumulatorRootPathKey)
+	if err != nil {
+		return nil, false, err
+	}
 	meta, err := s.LoadChainStateMeta()
 	if err != nil {
 		return nil, false, err
@@ -3640,31 +3856,14 @@ func (s *ChainStore) LoadUTXOAccumulator() (*utreexo.Accumulator, bool, error) {
 	if meta == nil {
 		return nil, false, nil
 	}
-	records := make([]utreexo.AccumulatorNodeRecord, 0)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: utxoAccumulatorNodePrefix,
-		UpperBound: utxoAccumulatorNodePrefixEnd,
-	})
+	acc, physicalRecordCount, err := s.loadAccumulatorFromLeafRecords(utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd)
 	if err != nil {
 		return nil, false, err
 	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		path, err := decodeAccumulatorNodeKey(iter.Key())
-		if err != nil {
-			return nil, false, err
-		}
-		record, err := decodeAccumulatorNodeValue(path, iter.Value())
-		if err != nil {
-			return nil, false, err
-		}
-		records = append(records, record)
+	if physicalRecordCount != utreexo.MaterialNodeCount(acc) {
+		return nil, false, fmt.Errorf("utxo accumulator physical record count=%d, want %d", physicalRecordCount, utreexo.MaterialNodeCount(acc))
 	}
-	if err := iter.Error(); err != nil {
-		return nil, false, err
-	}
-	acc, err := utreexo.NewAccumulatorFromNodeRecords(records)
-	if err != nil {
+	if err := s.validateAccumulatorIndexRecords(acc); err != nil {
 		return nil, false, err
 	}
 	if acc.Count() != meta.UTXOCount {
@@ -3676,7 +3875,53 @@ func (s *ChainStore) LoadUTXOAccumulator() (*utreexo.Accumulator, bool, error) {
 	if meta.UTXOAccumulatorRoot != ([32]byte{}) && acc.Root() != meta.UTXOAccumulatorRoot {
 		return nil, false, fmt.Errorf("utxo accumulator root mismatch: index=%x meta=%x", acc.Root(), meta.UTXOAccumulatorRoot)
 	}
+	rootPath, hasRoot := utreexo.AccumulatorRootPath(acc)
+	if !hasRoot {
+		if len(rootPathBytes) != 0 {
+			return nil, false, errors.New("utxo accumulator root path present for empty index")
+		}
+	} else {
+		persistedRootPath, err := decodeAccumulatorPath(rootPathBytes)
+		if err != nil {
+			return nil, false, fmt.Errorf("invalid utxo accumulator root path: %w", err)
+		}
+		if persistedRootPath != rootPath {
+			return nil, false, errors.New("utxo accumulator root path mismatch")
+		}
+	}
 	return acc, true, nil
+}
+
+func (s *ChainStore) loadAccumulatorFromLeafRecords(lower, upper []byte) (*utreexo.Accumulator, int, error) {
+	acc := utreexo.NewAccumulator()
+	physicalRecordCount := 0
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		physicalRecordCount++
+		path, err := decodeAccumulatorNodeKey(iter.Key())
+		if err != nil {
+			return nil, 0, err
+		}
+		record, err := decodeAccumulatorNodeValue(path, iter.Value())
+		if err != nil {
+			return nil, 0, err
+		}
+		if record.Leaf != nil {
+			next, err := acc.Add(*record.Leaf)
+			if err != nil {
+				return nil, 0, err
+			}
+			acc = next
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, 0, err
+	}
+	return acc, physicalRecordCount, nil
 }
 
 func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutPointProof, error) {
@@ -3688,7 +3933,14 @@ func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutP
 	if meta == nil || meta.UTXOCount == 0 {
 		return proof, nil
 	}
-	path := utreexo.AccumulatorNodePath{}
+	rootPathBytes, err := s.get(metaUTXOAccumulatorRootPathKey)
+	if err != nil {
+		return proof, err
+	}
+	path, err := decodeAccumulatorPath(rootPathBytes)
+	if err != nil {
+		return proof, fmt.Errorf("invalid utxo accumulator root path: %w", err)
+	}
 	node, ok, err := s.accumulatorNode(path)
 	if err != nil {
 		return proof, err
@@ -3697,30 +3949,48 @@ func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutP
 		return proof, errors.New("missing utxo accumulator root node")
 	}
 	queryKey := utreexo.OutPointKey(outPoint)
-	steps := make([]utreexo.ProofStep, 0, utreexo.KeyBits)
-	for depth := 0; depth < utreexo.KeyBits; depth++ {
-		queryRight := accumulatorBitSet(queryKey, depth)
-		nextPath := accumulatorChildPath(path, queryRight)
-		siblingPath := accumulatorChildPath(path, !queryRight)
-		sibling, siblingOK, err := s.accumulatorNode(siblingPath)
+	if !accumulatorPathMatchesKey(path, queryKey) {
+		terminal, err := s.firstAccumulatorLeaf(path)
 		if err != nil {
 			return proof, err
 		}
-		step := utreexo.ProofStep{}
-		if siblingOK {
-			step.HasSibling = true
-			step.SiblingHash = sibling.Hash
+		membership, err := s.UTXOAccumulatorProof(terminal.OutPoint)
+		if err != nil {
+			return proof, err
 		}
-		steps = append(steps, step)
-		next, nextOK, err := s.accumulatorNode(nextPath)
+		terminalCopy := *terminal
+		proof.Terminal = &terminalCopy
+		proof.Steps = membership.Steps
+		return proof, nil
+	}
+	steps := make([]utreexo.ProofStep, utreexo.KeyBits)
+	for node.Leaf == nil {
+		if node.LeftPath == nil || node.RightPath == nil || !validAccumulatorChildren(path, *node.LeftPath, *node.RightPath) {
+			return proof, errors.New("invalid accumulator branch record")
+		}
+		queryRight := accumulatorBitSet(queryKey, path.Depth)
+		nextPath := node.LeftPath
+		siblingPath := node.RightPath
+		if queryRight {
+			nextPath, siblingPath = node.RightPath, node.LeftPath
+		}
+		sibling, siblingOK, err := s.accumulatorNode(*siblingPath)
+		if err != nil {
+			return proof, err
+		}
+		if !siblingOK {
+			return proof, errors.New("missing accumulator sibling node")
+		}
+		steps[path.Depth] = utreexo.ProofStep{HasSibling: true, SiblingHash: sibling.Hash}
+		next, nextOK, err := s.accumulatorNode(*nextPath)
 		if err != nil {
 			return proof, err
 		}
 		if !nextOK {
-			if !siblingOK {
-				return proof, errors.New("missing accumulator exclusion witness")
-			}
-			terminal, err := s.firstAccumulatorLeaf(siblingPath)
+			return proof, errors.New("missing accumulator child node")
+		}
+		if !accumulatorPathMatchesKey(*nextPath, queryKey) {
+			terminal, err := s.firstAccumulatorLeaf(*nextPath)
 			if err != nil {
 				return proof, err
 			}
@@ -3736,7 +4006,7 @@ func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutP
 			proof.Steps = membership.Steps
 			return proof, nil
 		}
-		path = nextPath
+		path = *nextPath
 		node = next
 	}
 	if node.Leaf == nil {
@@ -3755,7 +4025,7 @@ func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutP
 }
 
 func (s *ChainStore) firstAccumulatorLeaf(path utreexo.AccumulatorNodePath) (*utreexo.UtxoLeaf, error) {
-	for path.Depth <= utreexo.KeyBits {
+	for {
 		node, ok, err := s.accumulatorNode(path)
 		if err != nil {
 			return nil, err
@@ -3767,16 +4037,11 @@ func (s *ChainStore) firstAccumulatorLeaf(path utreexo.AccumulatorNodePath) (*ut
 			leaf := *node.Leaf
 			return &leaf, nil
 		}
-		left := accumulatorChildPath(path, false)
-		if _, ok, err := s.accumulatorNode(left); err != nil {
-			return nil, err
-		} else if ok {
-			path = left
-			continue
+		if node.LeftPath == nil || node.RightPath == nil || !validAccumulatorChildren(path, *node.LeftPath, *node.RightPath) {
+			return nil, errors.New("invalid accumulator branch record")
 		}
-		path = accumulatorChildPath(path, true)
+		path = *node.LeftPath
 	}
-	return nil, errors.New("accumulator exclusion witness did not reach a leaf")
 }
 
 func (s *ChainStore) WriteUTXOAccumulator(acc *utreexo.Accumulator) error {
@@ -3856,12 +4121,19 @@ func replaceAccumulatorIndexBatch(db *pebble.DB, batch *pebble.Batch, acc *utree
 	if err := deletePrefixBatch(db, batch, utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd); err != nil {
 		return err
 	}
-	for _, record := range utreexo.AccumulatorNodeRecords(acc) {
-		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
-			return err
-		}
+	if err := utreexo.ForEachAccumulatorNodeRecord(acc, func(record utreexo.AccumulatorNodeRecord) error {
+		return batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil)
+	}); err != nil {
+		return err
 	}
 	if err := batch.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil); err != nil {
+		return err
+	}
+	if rootPath, ok := utreexo.AccumulatorRootPath(acc); ok {
+		if err := batch.Set(metaUTXOAccumulatorRootPathKey, encodeAccumulatorPath(rootPath), nil); err != nil {
+			return err
+		}
+	} else if err := batch.Delete(metaUTXOAccumulatorRootPathKey, nil); err != nil {
 		return err
 	}
 	if acc == nil {
@@ -3882,6 +4154,13 @@ func applyAccumulatorDeltaBatch(batch *pebble.Batch, delta utreexo.AccumulatorNo
 		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
 			return err
 		}
+	}
+	if delta.RootPath != nil {
+		if err := batch.Set(metaUTXOAccumulatorRootPathKey, encodeAccumulatorPath(*delta.RootPath), nil); err != nil {
+			return err
+		}
+	} else if err := batch.Delete(metaUTXOAccumulatorRootPathKey, nil); err != nil {
+		return err
 	}
 	return batch.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil)
 }
@@ -3930,13 +4209,19 @@ func decodeAccumulatorNodeKey(key []byte) (utreexo.AccumulatorNodePath, error) {
 	if len(raw) != 2+keyLen {
 		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node path length")
 	}
+	if depth%8 != 0 && keyLen > 0 {
+		unusedMask := byte((1 << (8 - depth%8)) - 1)
+		if raw[2+keyLen-1]&unusedMask != 0 {
+			return utreexo.AccumulatorNodePath{}, errors.New("non-canonical accumulator node path key")
+		}
+	}
 	var pathKey [utreexo.OutPointKeyBytes]byte
 	copy(pathKey[:], raw[2:])
 	return utreexo.AccumulatorNodePath{Depth: depth, Key: pathKey}, nil
 }
 
 func encodeAccumulatorNodeValue(record utreexo.AccumulatorNodeRecord) []byte {
-	buf := make([]byte, 0, 1+8+32+36+49)
+	buf := make([]byte, 0, 1+8+32+2*(2+utreexo.OutPointKeyBytes)+36+49)
 	if record.Leaf != nil {
 		buf = append(buf, 1)
 	} else {
@@ -3948,6 +4233,12 @@ func encodeAccumulatorNodeValue(record utreexo.AccumulatorNodeRecord) []byte {
 		record.Leaf.OutPoint.Encode(&buf)
 		entry := consensus.UtxoEntryFromLeaf(*record.Leaf)
 		buf = append(buf, encodeCommittedCoin(entry)...)
+	} else {
+		if record.LeftPath == nil || record.RightPath == nil {
+			panic("internal accumulator record is missing child paths")
+		}
+		buf = append(buf, encodeAccumulatorPath(*record.LeftPath)...)
+		buf = append(buf, encodeAccumulatorPath(*record.RightPath)...)
 	}
 	return buf
 }
@@ -3969,9 +4260,19 @@ func decodeAccumulatorNodeValue(path utreexo.AccumulatorNodePath, buf []byte) (u
 	remaining := buf[41:]
 	switch kind {
 	case 0:
-		if len(remaining) != 0 {
+		left, consumed, err := decodeAccumulatorPathPrefix(remaining)
+		if err != nil {
+			return utreexo.AccumulatorNodeRecord{}, fmt.Errorf("invalid left accumulator child path: %w", err)
+		}
+		right, rightConsumed, err := decodeAccumulatorPathPrefix(remaining[consumed:])
+		if err != nil {
+			return utreexo.AccumulatorNodeRecord{}, fmt.Errorf("invalid right accumulator child path: %w", err)
+		}
+		if consumed+rightConsumed != len(remaining) {
 			return utreexo.AccumulatorNodeRecord{}, errors.New("invalid internal accumulator node payload")
 		}
+		record.LeftPath = &left
+		record.RightPath = &right
 	case 1:
 		if len(remaining) < 36 {
 			return utreexo.AccumulatorNodeRecord{}, errors.New("invalid leaf accumulator node payload")
@@ -3990,6 +4291,77 @@ func decodeAccumulatorNodeValue(path utreexo.AccumulatorNodePath, buf []byte) (u
 		return utreexo.AccumulatorNodeRecord{}, errors.New("invalid accumulator node kind")
 	}
 	return record, nil
+}
+
+func encodeAccumulatorPath(path utreexo.AccumulatorNodePath) []byte {
+	if path.Depth < 0 || path.Depth > utreexo.KeyBits {
+		panic("invalid accumulator path depth")
+	}
+	keyLen := (path.Depth + 7) / 8
+	buf := make([]byte, 2+keyLen)
+	buf[0] = byte(path.Depth >> 8)
+	buf[1] = byte(path.Depth)
+	copy(buf[2:], path.Key[:keyLen])
+	return buf
+}
+
+func decodeAccumulatorPath(buf []byte) (utreexo.AccumulatorNodePath, error) {
+	path, consumed, err := decodeAccumulatorPathPrefix(buf)
+	if err != nil {
+		return utreexo.AccumulatorNodePath{}, err
+	}
+	if consumed != len(buf) {
+		return utreexo.AccumulatorNodePath{}, errors.New("trailing accumulator path bytes")
+	}
+	return path, nil
+}
+
+func decodeAccumulatorPathPrefix(buf []byte) (utreexo.AccumulatorNodePath, int, error) {
+	if len(buf) < 2 {
+		return utreexo.AccumulatorNodePath{}, 0, errors.New("truncated accumulator path")
+	}
+	depth := int(buf[0])<<8 | int(buf[1])
+	if depth < 0 || depth > utreexo.KeyBits {
+		return utreexo.AccumulatorNodePath{}, 0, errors.New("invalid accumulator path depth")
+	}
+	keyLen := (depth + 7) / 8
+	if len(buf) < 2+keyLen {
+		return utreexo.AccumulatorNodePath{}, 0, errors.New("truncated accumulator path key")
+	}
+	var key [utreexo.OutPointKeyBytes]byte
+	copy(key[:], buf[2:2+keyLen])
+	if depth%8 != 0 && keyLen > 0 {
+		unusedMask := byte((1 << (8 - depth%8)) - 1)
+		if key[keyLen-1]&unusedMask != 0 {
+			return utreexo.AccumulatorNodePath{}, 0, errors.New("non-canonical accumulator path key")
+		}
+	}
+	return utreexo.AccumulatorNodePath{Depth: depth, Key: key}, 2 + keyLen, nil
+}
+
+func accumulatorPathMatchesKey(path utreexo.AccumulatorNodePath, key [utreexo.OutPointKeyBytes]byte) bool {
+	fullBytes := path.Depth / 8
+	if !bytes.Equal(path.Key[:fullBytes], key[:fullBytes]) {
+		return false
+	}
+	remaining := path.Depth % 8
+	if remaining == 0 {
+		return true
+	}
+	mask := byte(0xff << (8 - remaining))
+	return path.Key[fullBytes]&mask == key[fullBytes]&mask
+}
+
+func validAccumulatorChildren(parent, left, right utreexo.AccumulatorNodePath) bool {
+	if parent.Depth < 0 || parent.Depth >= utreexo.KeyBits ||
+		left.Depth <= parent.Depth || left.Depth > utreexo.KeyBits ||
+		right.Depth <= parent.Depth || right.Depth > utreexo.KeyBits {
+		return false
+	}
+	if !accumulatorPathMatchesKey(parent, left.Key) || !accumulatorPathMatchesKey(parent, right.Key) {
+		return false
+	}
+	return !accumulatorBitSet(left.Key, parent.Depth) && accumulatorBitSet(right.Key, parent.Depth)
 }
 
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
