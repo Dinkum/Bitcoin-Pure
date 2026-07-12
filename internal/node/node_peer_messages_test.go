@@ -291,9 +291,14 @@ func TestOnGetDataMessageCapsServedBlocksPerRequest(t *testing.T) {
 	var sawNotFound bool
 	for i := 0; i < maxServedBlocksPerGetData+1; i++ {
 		envelope := <-peer.sendQ
-		switch msg := envelope.msg.(type) {
-		case p2p.BlockMessage:
+		if envelope.blockRef != nil {
+			if envelope.blockRef.item.Type != p2p.InvTypeBlockFull {
+				t.Fatalf("unexpected lazy block type: %+v", envelope.blockRef.item)
+			}
 			sawBlocks++
+			continue
+		}
+		switch msg := envelope.msg.(type) {
 		case p2p.NotFoundMessage:
 			if len(msg.Items) != len(overflow) {
 				t.Fatalf("notfound count = %d, want %d", len(msg.Items), len(overflow))
@@ -518,6 +523,7 @@ func TestOnPeerTxBatchIgnoresDuplicateAdmissionError(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
 	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)

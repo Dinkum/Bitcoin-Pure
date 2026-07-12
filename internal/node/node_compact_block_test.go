@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+func acceptThinExpectationForTest(*peerConn, types.BlockHeader) error { return nil }
+
 func TestReconstructXThinBlockFromMempoolOverlap(t *testing.T) {
 	pool := mempool.NewWithConfig(mempool.PoolConfig{
 		MinRelayFeePerByte: 0,
@@ -144,7 +146,7 @@ func TestOnXThinBlockRequestsMissingIndexes(t *testing.T) {
 		},
 	}
 	thin := buildXThinBlockMessage(block).(p2p.XThinBlockMessage)
-	svc := &Service{pool: pool}
+	svc := &Service{pool: pool, thinExpectationFn: acceptThinExpectationForTest}
 	peer := &peerConn{
 		sendQ:       make(chan outboundMessage, 4),
 		closed:      make(chan struct{}),
@@ -170,7 +172,7 @@ func TestOnXThinBlockRequestsMissingIndexes(t *testing.T) {
 }
 
 func TestOnXThinBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
-	svc := &Service{pool: mempool.New()}
+	svc := &Service{pool: mempool.New(), thinExpectationFn: acceptThinExpectationForTest}
 	peer := &peerConn{
 		sendQ:       make(chan outboundMessage, 4),
 		closed:      make(chan struct{}),
@@ -234,7 +236,7 @@ func TestOnCompactBlockRequestsMissingIndexes(t *testing.T) {
 		},
 	}
 	compact := buildCompactBlockMessage(block).(p2p.CompactBlockMessage)
-	svc := &Service{pool: pool}
+	svc := &Service{pool: pool, thinExpectationFn: acceptThinExpectationForTest}
 	peer := &peerConn{
 		sendQ:       make(chan outboundMessage, 4),
 		closed:      make(chan struct{}),
@@ -257,7 +259,7 @@ func TestOnCompactBlockRequestsMissingIndexes(t *testing.T) {
 }
 
 func TestOnCompactBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
-	svc := &Service{pool: mempool.New()}
+	svc := &Service{pool: mempool.New(), thinExpectationFn: acceptThinExpectationForTest}
 	peer := &peerConn{
 		sendQ:       make(chan outboundMessage, 4),
 		closed:      make(chan struct{}),
@@ -294,7 +296,7 @@ func TestOnCompactBlockFallsBackToFullBlockWhenOverlapIsLow(t *testing.T) {
 }
 
 func TestOnCompactBlockFallsBackToFullBlockWithoutExtendedSupport(t *testing.T) {
-	svc := &Service{pool: mempool.New()}
+	svc := &Service{pool: mempool.New(), thinExpectationFn: acceptThinExpectationForTest}
 	peer := &peerConn{
 		sendQ:       make(chan outboundMessage, 4),
 		closed:      make(chan struct{}),

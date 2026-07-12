@@ -19,17 +19,15 @@ func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	chainUTXOs := consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {
-			ValueAtoms: 50,
-			PubKey:     nodeSignerPubKey(7),
-		},
-	}
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
-	block := blockWithTxsForNodeTest(t, 0, genesis.Header, chainUTXOs, []types.Transaction{coinbase}, genesis.Header.Timestamp+1)
-	orphanTx := spendTxForNodeTest(t, 9, types.OutPoint{TxID: consensus.TxID(&coinbase), Vout: 0}, 1, 8, 0)
+	prevHeight := *svc.chainState.ChainState().TipHeight()
+	prevHeader := *svc.chainState.ChainState().TipHeader()
+	parentTx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 9, 1)
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(10)}})
+	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, parentTx}, prevHeader.Timestamp+1)
+	orphanTx := spendTxForNodeTest(t, 9, types.OutPoint{TxID: consensus.TxID(&parentTx), Vout: 0}, 49, 8, 0)
 	peer := newPeerConnForTests("127.0.0.1:18444")
 
 	if err := svc.onPeerMessage(peer, p2p.TxBatchMessage{Txs: []types.Transaction{orphanTx}}); err != nil {
@@ -69,12 +67,12 @@ func TestReorgEvictsMempoolConflictsConfirmedOnWinningBranch(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
-	baseState := NewChainState(types.Regtest)
-	if _, err := baseState.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
-	}
-	active := nextCoinbaseBlock(0, genesis.Header, baseState.UTXOs(), 3, genesis.Header.Timestamp+600)
+	baseState := detachedChainStateForNodeTest(t, svc.chainState.ChainState())
+	baseHeight := *baseState.TipHeight()
+	baseHeader := *baseState.TipHeader()
+	active := nextCoinbaseBlock(baseHeight, baseHeader, baseState.UTXOs(), 3, baseHeader.Timestamp+600)
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders active: %v", err)
 	}
@@ -93,21 +91,18 @@ func TestReorgEvictsMempoolConflictsConfirmedOnWinningBranch(t *testing.T) {
 		t.Fatalf("expected mempool to contain %x before reorg", mempoolTxID)
 	}
 
-	altState := NewChainState(types.Regtest)
-	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
-	}
-	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	altState := baseState.Clone()
+	alt1 := nextCoinbaseBlock(baseHeight, baseHeader, altState.UTXOs(), 4, baseHeader.Timestamp+601)
 	if _, err := altState.ApplyBlock(&alt1); err != nil {
 		t.Fatal(err)
 	}
-	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
+	alt2 := nextCoinbaseBlock(baseHeight+1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
 	if _, err := altState.ApplyBlock(&alt2); err != nil {
 		t.Fatal(err)
 	}
 	conflict := spendTxForNodeTest(t, 7, genesisOut, 50, 9, 1)
-	alt3Coinbase := coinbaseTxForHeight(3, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(6)}})
-	alt3 := blockWithTxsForNodeTest(t, 2, alt2.Header, altState.UTXOs(), []types.Transaction{alt3Coinbase, conflict}, alt2.Header.Timestamp+600)
+	alt3Coinbase := coinbaseTxForHeight(baseHeight+3, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(6)}})
+	alt3 := blockWithTxsForNodeTest(t, baseHeight+2, alt2.Header, altState.UTXOs(), []types.Transaction{alt3Coinbase, conflict}, alt2.Header.Timestamp+600)
 
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{alt1.Header, alt2.Header, alt3.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders competing branch: %v", err)
@@ -143,6 +138,7 @@ func TestServiceReloadsPersistedMempoolOnSameTip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
 	}
+	matureGenesisForNodeTest(t, svc)
 
 	genesisOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
 	parent := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
@@ -298,6 +294,7 @@ func TestServiceReprocessesPersistedMempoolAfterTipChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenService: %v", err)
 	}
+	matureGenesisForNodeTest(t, svc)
 
 	genesisOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
 	tx := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
@@ -329,8 +326,9 @@ func TestServiceReprocessesPersistedMempoolAfterTipChange(t *testing.T) {
 	}
 	chain := persistent.ChainState()
 	conflict := spendTxForNodeTest(t, 7, genesisOut, 50, 9, 1)
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(6)}})
-	block := blockWithTxsForNodeTest(t, 0, *chain.TipHeader(), chain.UTXOs(), []types.Transaction{coinbase, conflict}, chain.TipHeader().Timestamp+600)
+	prevHeight := *chain.TipHeight()
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(6)}})
+	block := blockWithTxsForNodeTest(t, prevHeight, *chain.TipHeader(), chain.UTXOs(), []types.Transaction{coinbase, conflict}, chain.TipHeader().Timestamp+600)
 	if _, err := persistent.ApplyBlock(&block); err != nil {
 		t.Fatalf("ApplyBlock: %v", err)
 	}
@@ -388,17 +386,17 @@ func TestReorgReprocessesDisconnectedBranchTransactions(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	genesisOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
 	confirmed := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
 	confirmedTxID := consensus.TxID(&confirmed)
 
-	activeState := NewChainState(types.Regtest)
-	if _, err := activeState.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
-	}
-	activeCoinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(3)}})
-	active := blockWithTxsForNodeTest(t, 0, genesis.Header, activeState.UTXOs(), []types.Transaction{activeCoinbase, confirmed}, genesis.Header.Timestamp+600)
+	baseState := detachedChainStateForNodeTest(t, svc.chainState.ChainState())
+	baseHeight := *baseState.TipHeight()
+	baseHeader := *baseState.TipHeader()
+	activeCoinbase := coinbaseTxForHeight(baseHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(3)}})
+	active := blockWithTxsForNodeTest(t, baseHeight, baseHeader, baseState.UTXOs(), []types.Transaction{activeCoinbase, confirmed}, baseHeader.Timestamp+600)
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{active.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders active: %v", err)
 	}
@@ -410,19 +408,16 @@ func TestReorgReprocessesDisconnectedBranchTransactions(t *testing.T) {
 		t.Fatalf("mempool count after confirmation = %d, want 0", got)
 	}
 
-	altState := NewChainState(types.Regtest)
-	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
-	}
-	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 4, genesis.Header.Timestamp+601)
+	altState := baseState.Clone()
+	alt1 := nextCoinbaseBlock(baseHeight, baseHeader, altState.UTXOs(), 4, baseHeader.Timestamp+601)
 	if _, err := altState.ApplyBlock(&alt1); err != nil {
 		t.Fatal(err)
 	}
-	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
+	alt2 := nextCoinbaseBlock(baseHeight+1, alt1.Header, altState.UTXOs(), 5, alt1.Header.Timestamp+600)
 	if _, err := altState.ApplyBlock(&alt2); err != nil {
 		t.Fatal(err)
 	}
-	alt3 := nextCoinbaseBlock(2, alt2.Header, altState.UTXOs(), 6, alt2.Header.Timestamp+600)
+	alt3 := nextCoinbaseBlock(baseHeight+2, alt2.Header, altState.UTXOs(), 6, alt2.Header.Timestamp+600)
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{alt1.Header, alt2.Header, alt3.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders competing branch: %v", err)
 	}

@@ -3,6 +3,7 @@ package node
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -142,9 +143,10 @@ func BuildSnapshotChainMaterial(profile types.ChainProfile, genesis *types.Block
 	}, nil
 }
 
-// ImportUTXOSnapshotFastSync seeds persistent chain state from a validated
-// snapshot anchor immediately, then leaves a retained copy of the imported
-// UTXO set for background historical replay to verify from genesis.
+// ImportUTXOSnapshotFastSync validates the complete supplied history before it
+// makes snapshot-derived chainstate active. Snapshot import remains faster than
+// ordinary sync persistence, but unverified bodies never cross the live-state
+// trust boundary.
 func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture, genesis *types.Block, blocks []types.Block, logger *slog.Logger) (SnapshotImportSummary, error) {
 	if loaded == nil {
 		return SnapshotImportSummary{}, fmt.Errorf("snapshot fixture is required")
@@ -156,7 +158,7 @@ func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture
 	if err != nil {
 		return SnapshotImportSummary{}, err
 	}
-	material, err := BuildSnapshotChainMaterial(profile, genesis, blocks, loaded.Fixture.Height)
+	material, undos, err := validateSnapshotHistory(profile, genesis, blocks, loaded)
 	if err != nil {
 		return SnapshotImportSummary{}, err
 	}
@@ -169,6 +171,9 @@ func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture
 	if loaded.ExpectedChecksum != loaded.ComputedChecksum {
 		return SnapshotImportSummary{}, fmt.Errorf("snapshot checksum mismatch: expected %x, got %x", loaded.ExpectedChecksum, loaded.ComputedChecksum)
 	}
+	if err := verifySnapshotOrigins(loaded.UTXOs, genesis, blocks, loaded.Fixture.Height); err != nil {
+		return SnapshotImportSummary{}, err
+	}
 	store, err := storage.OpenWithLogger(filepath.Clean(dbPath), logging.ComponentWith(logger, "storage"))
 	if err != nil {
 		return SnapshotImportSummary{}, err
@@ -176,13 +181,6 @@ func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture
 	defer store.Close()
 	if err := ensureSnapshotImportTargetEmpty(store); err != nil {
 		return SnapshotImportSummary{}, err
-	}
-	fastSyncState := &storage.FastSyncState{
-		SnapshotHeight:     material.Height,
-		SnapshotHeaderHash: material.TipHash,
-		SnapshotUTXORoot:   loaded.ComputedUTXORoot,
-		SnapshotChecksum:   loaded.ComputedChecksum,
-		SnapshotUTXOCount:  len(loaded.UTXOs),
 	}
 	importBlocks := make([]types.Block, 0, len(material.Entries))
 	importBlocks = append(importBlocks, *genesis)
@@ -192,17 +190,26 @@ func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture
 	if err := store.PutValidatedBlocksWithoutWalletIndex(importBlocks, material.Entries); err != nil {
 		return SnapshotImportSummary{}, err
 	}
-	if err := store.WriteFullStateWithFastSyncStateMetadata(&storage.StoredChainState{
+	if err := store.WriteFullStateWithHeaderMetadata(&storage.StoredChainState{
 		Profile:        profile,
 		Height:         material.Height,
 		TipHeader:      material.TipHeader,
 		BlockSizeState: material.BlockSizeState,
 		UTXOChecksum:   loaded.ComputedChecksum,
 		UTXOs:          loaded.UTXOs,
-	}, fastSyncState, &material.HeaderState, material.Entries); err != nil {
+	}, &material.HeaderState, material.Entries); err != nil {
 		return SnapshotImportSummary{}, err
 	}
-	logger.Info("imported snapshot fast-sync state",
+	for height := uint64(1); height <= material.Height; height++ {
+		entry := material.Entries[height]
+		if err := store.PutValidatedBlockUndo(&entry, undos[height-1]); err != nil {
+			return SnapshotImportSummary{}, err
+		}
+	}
+	if _, err := store.RebuildWalletIndexesAtCurrentTip(); err != nil {
+		return SnapshotImportSummary{}, err
+	}
+	logger.Info("imported historically validated snapshot state",
 		slog.String("db_path", filepath.Clean(dbPath)),
 		slog.Uint64("height", material.Height),
 		slog.String("header_hash", fmt.Sprintf("%x", material.TipHash)),
@@ -216,6 +223,123 @@ func ImportUTXOSnapshotFastSync(dbPath string, loaded *LoadedUTXOSnapshotFixture
 		Checksum:   loaded.ComputedChecksum,
 		UTXOCount:  len(loaded.UTXOs),
 	}, nil
+}
+
+func validateSnapshotHistory(profile types.ChainProfile, genesis *types.Block, blocks []types.Block, loaded *LoadedUTXOSnapshotFixture) (SnapshotChainMaterial, [][]storage.BlockUndoEntry, error) {
+	if loaded == nil || genesis == nil {
+		return SnapshotChainMaterial{}, nil, errors.New("snapshot history and genesis are required")
+	}
+	if loaded.Fixture.Height > uint64(len(blocks)) {
+		return SnapshotChainMaterial{}, nil, fmt.Errorf("snapshot height %d exceeds available blocks %d", loaded.Fixture.Height, len(blocks))
+	}
+	state := NewChainState(profile).WithLogger(logging.Component("snapshot-validation"))
+	if _, err := state.InitializeFromGenesisBlock(genesis); err != nil {
+		return SnapshotChainMaterial{}, nil, fmt.Errorf("validate snapshot genesis: %w", err)
+	}
+	undos := make([][]storage.BlockUndoEntry, 0, loaded.Fixture.Height)
+	for height := uint64(1); height <= loaded.Fixture.Height; height++ {
+		detail, err := state.applyBlockDetailed(&blocks[height-1])
+		if err != nil {
+			return SnapshotChainMaterial{}, nil, fmt.Errorf("validate snapshot block at height %d: %w", height, err)
+		}
+		undos = append(undos, []storage.BlockUndoEntry(detail.spentPreBlock))
+	}
+	view, ok := state.CommittedView()
+	if !ok {
+		return SnapshotChainMaterial{}, nil, ErrNoTip
+	}
+	if view.Height != loaded.Fixture.Height || view.TipHash != loaded.ExpectedHeaderHash {
+		return SnapshotChainMaterial{}, nil, errors.New("validated snapshot history does not reach the declared anchor")
+	}
+	if view.UTXORoot != loaded.ComputedUTXORoot || view.UTXOChecksum != loaded.ComputedChecksum || view.UTXOCount != len(loaded.UTXOs) {
+		return SnapshotChainMaterial{}, nil, errors.New("validated snapshot history does not produce the imported UTXO state")
+	}
+	if err := compareSnapshotUTXOs(state.UTXOs(), loaded.UTXOs); err != nil {
+		return SnapshotChainMaterial{}, nil, fmt.Errorf("validated snapshot UTXOs: %w", err)
+	}
+	material, err := BuildSnapshotChainMaterial(profile, genesis, blocks, loaded.Fixture.Height)
+	if err != nil {
+		return SnapshotChainMaterial{}, nil, err
+	}
+	if material.BlockSizeState != view.BlockSizeState {
+		return SnapshotChainMaterial{}, nil, errors.New("snapshot ABLA state differs from validated history")
+	}
+	return material, undos, nil
+}
+
+// verifySnapshotOrigins authenticates the non-committed maturity metadata
+// against transaction bodies whose roots are committed by the header chain.
+// It intentionally does not replace the later full historical validation.
+func verifySnapshotOrigins(snapshot consensus.UtxoSet, genesis *types.Block, blocks []types.Block, height uint64) error {
+	if genesis == nil || len(genesis.Txs) != 1 {
+		return fmt.Errorf("snapshot origin verification requires a canonical genesis block")
+	}
+	verifyBodyRoots := func(block *types.Block, blockHeight uint64) error {
+		if block == nil || len(block.Txs) == 0 {
+			return fmt.Errorf("snapshot block at height %d has no transactions", blockHeight)
+		}
+		_, _, txRoot, authRoot := consensus.BuildBlockRoots(block.Txs)
+		if txRoot != block.Header.MerkleTxIDRoot || authRoot != block.Header.MerkleAuthRoot {
+			return fmt.Errorf("snapshot block body roots mismatch at height %d", blockHeight)
+		}
+		return nil
+	}
+	if err := verifyBodyRoots(genesis, 0); err != nil {
+		return err
+	}
+
+	live := make(consensus.UtxoSet)
+	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	for vout, output := range genesis.Txs[0].Base.Outputs {
+		outPoint := types.OutPoint{TxID: genesisTxID, Vout: uint32(vout)}
+		live[outPoint] = consensus.UtxoEntryFromOutputAtHeight(output, 0, true)
+	}
+	type createdOutput struct {
+		txIndex int
+		entry   consensus.UtxoEntry
+	}
+	for blockHeight := uint64(1); blockHeight <= height; blockHeight++ {
+		block := &blocks[blockHeight-1]
+		if err := verifyBodyRoots(block, blockHeight); err != nil {
+			return err
+		}
+		created := make(map[types.OutPoint]createdOutput)
+		for txIndex := range block.Txs {
+			txid := consensus.TxID(&block.Txs[txIndex])
+			for vout, output := range block.Txs[txIndex].Base.Outputs {
+				outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
+				created[outPoint] = createdOutput{
+					txIndex: txIndex,
+					entry:   consensus.UtxoEntryFromOutputAtHeight(output, blockHeight, txIndex == 0),
+				}
+			}
+		}
+		claimed := make(map[types.OutPoint]struct{})
+		for txIndex := 1; txIndex < len(block.Txs); txIndex++ {
+			for _, input := range block.Txs[txIndex].Base.Inputs {
+				if _, duplicate := claimed[input.PrevOut]; duplicate {
+					return fmt.Errorf("duplicate snapshot block input at height %d: %v", blockHeight, input.PrevOut)
+				}
+				claimed[input.PrevOut] = struct{}{}
+				if _, ok := live[input.PrevOut]; ok {
+					delete(live, input.PrevOut)
+					continue
+				}
+				output, ok := created[input.PrevOut]
+				if !ok || output.txIndex == 0 || output.txIndex == txIndex {
+					return fmt.Errorf("unresolvable snapshot block input at height %d: %v", blockHeight, input.PrevOut)
+				}
+				delete(created, input.PrevOut)
+			}
+		}
+		for outPoint, output := range created {
+			live[outPoint] = output.entry
+		}
+	}
+	if err := compareSnapshotUTXOs(live, snapshot); err != nil {
+		return fmt.Errorf("snapshot origin metadata mismatch: %w", err)
+	}
+	return nil
 }
 
 // VerifyFastSyncSnapshotFromStore replays the stored active chain from genesis
@@ -250,15 +374,13 @@ func VerifyFastSyncSnapshotFromStore(store *storage.ChainStore, profile types.Ch
 		if block == nil {
 			return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("missing stored block at height %d", height)
 		}
-		undo, err := captureUndoEntries(block, state.utxoLookup)
+		detail, err := state.applyBlockDetailed(block)
 		if err != nil {
-			return SnapshotHistoricalVerificationSummary{}, err
-		}
-		if _, err := state.applyBlockDetailedWithSpent(block, spentCommittedUTXOsFromUndo(undo)); err != nil {
 			fastSyncState.LastError = err.Error()
 			_ = store.UpdateFastSyncState(fastSyncState)
 			return SnapshotHistoricalVerificationSummary{}, fmt.Errorf("historical snapshot replay failed at height %d: %w", height, err)
 		}
+		undo := []storage.BlockUndoEntry(detail.spentPreBlock)
 		entry, err := store.GetBlockIndexByHeight(height)
 		if err != nil {
 			return SnapshotHistoricalVerificationSummary{}, err
@@ -382,10 +504,12 @@ func encodeSnapshotFixtureEntries(utxos consensus.UtxoSet) []UTXOSnapshotFixture
 	for _, outPoint := range ordered {
 		entry := utxos[outPoint]
 		entries = append(entries, UTXOSnapshotFixtureEntry{
-			TxIDHex:    hex.EncodeToString(outPoint.TxID[:]),
-			Vout:       outPoint.Vout,
-			ValueAtoms: entry.ValueAtoms,
-			PubKeyHex:  hex.EncodeToString(entry.PubKey[:]),
+			TxIDHex:       hex.EncodeToString(outPoint.TxID[:]),
+			Vout:          outPoint.Vout,
+			ValueAtoms:    entry.ValueAtoms,
+			PubKeyHex:     hex.EncodeToString(entry.PubKey[:]),
+			CreatedHeight: entry.CreatedHeight,
+			Coinbase:      entry.Coinbase,
 		})
 	}
 	return entries
@@ -409,10 +533,12 @@ func encodeSnapshotFixtureEntriesFromIterator(utxoCount int, iterate func(func(t
 	fixtureEntries := make([]UTXOSnapshotFixtureEntry, 0, len(entries))
 	for _, item := range entries {
 		fixtureEntries = append(fixtureEntries, UTXOSnapshotFixtureEntry{
-			TxIDHex:    hex.EncodeToString(item.outPoint.TxID[:]),
-			Vout:       item.outPoint.Vout,
-			ValueAtoms: item.entry.ValueAtoms,
-			PubKeyHex:  hex.EncodeToString(item.entry.PubKey[:]),
+			TxIDHex:       hex.EncodeToString(item.outPoint.TxID[:]),
+			Vout:          item.outPoint.Vout,
+			ValueAtoms:    item.entry.ValueAtoms,
+			PubKeyHex:     hex.EncodeToString(item.entry.PubKey[:]),
+			CreatedHeight: item.entry.CreatedHeight,
+			Coinbase:      item.entry.Coinbase,
 		})
 	}
 	return fixtureEntries, nil

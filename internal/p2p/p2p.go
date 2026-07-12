@@ -23,6 +23,7 @@ const (
 	maxAddrPayloadBytes   = 4 + maxAddrPerMessage*(4+maxAddrStringBytes)
 	maxTxBatchPerMessage  = 256
 	maxThinBlockTxs       = 200_000
+	maxCompactPrefilled   = 16
 	maxAvalanchePollItems = 256
 )
 
@@ -33,6 +34,7 @@ var (
 	ErrBadCommand      = errors.New("invalid command")
 	ErrBadHandshake    = errors.New("invalid handshake sequence")
 	ErrTrailingPayload = errors.New("trailing payload bytes")
+	ErrPayloadBudget   = errors.New("inbound payload budget exhausted")
 )
 
 const (
@@ -49,6 +51,9 @@ const (
 	ServiceGrapheneMempoolRepair
 	// ServiceAvalancheOverlay enables the non-consensus Avalanche poll/vote path.
 	ServiceAvalancheOverlay
+	// ServiceChunkedBlockRelay supports uint64-sized full-block transfers split
+	// across independently bounded wire frames.
+	ServiceChunkedBlockRelay
 )
 
 // ServiceGrapheneBlockRelay is kept as a compatibility alias for the compact
@@ -83,6 +88,8 @@ const (
 	CmdXBlockTx
 	CmdAvaPoll
 	CmdAvaVote
+	CmdBlockStart
+	CmdBlockChunk
 )
 
 type InvType uint8
@@ -182,6 +189,30 @@ type BlockMessage struct {
 }
 
 func (BlockMessage) Command() Command { return CmdBlock }
+
+type BlockStartMessage struct {
+	Header    types.BlockHeader
+	TotalSize uint64
+	Checksum  [32]byte
+}
+
+func (BlockStartMessage) Command() Command { return CmdBlockStart }
+
+type BlockChunkMessage struct {
+	BlockHash [32]byte
+	Offset    uint64
+	Data      []byte
+}
+
+func (BlockChunkMessage) Command() Command { return CmdBlockChunk }
+
+// ChunkedBlockTransferMessage is an outbound-only wrapper. Conn.WriteMessage
+// expands it into one BlockStart frame followed by bounded BlockChunk frames.
+type ChunkedBlockTransferMessage struct {
+	Block types.Block
+}
+
+func (ChunkedBlockTransferMessage) Command() Command { return CmdBlockStart }
 
 type TxMessage struct {
 	Tx types.Transaction
@@ -284,6 +315,7 @@ type Conn struct {
 	magic      uint32
 	maxPayload int
 	limits     types.CodecLimits
+	budget     *PayloadBudget
 }
 
 func NewConn(conn net.Conn, magic uint32, maxPayload int) *Conn {
@@ -291,6 +323,10 @@ func NewConn(conn net.Conn, magic uint32, maxPayload int) *Conn {
 }
 
 func NewConnWithLimits(conn net.Conn, magic uint32, maxPayload int, limits types.CodecLimits) *Conn {
+	return NewConnWithLimitsAndBudget(conn, magic, maxPayload, limits, nil)
+}
+
+func NewConnWithLimitsAndBudget(conn net.Conn, magic uint32, maxPayload int, limits types.CodecLimits, budget *PayloadBudget) *Conn {
 	if maxPayload <= 0 {
 		maxPayload = 64_000_000
 	}
@@ -302,6 +338,7 @@ func NewConnWithLimits(conn net.Conn, magic uint32, maxPayload int, limits types
 		magic:      magic,
 		maxPayload: maxPayload,
 		limits:     limits,
+		budget:     budget,
 	}
 }
 
@@ -367,6 +404,11 @@ func (c *Conn) ReadMessage() (Message, error) {
 	if payloadLen < 0 || payloadLen > maxPayload {
 		return nil, ErrPayloadTooLarge
 	}
+	release, ok := c.budget.TryAcquire(payloadLen)
+	if !ok {
+		return nil, ErrPayloadBudget
+	}
+	defer release()
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(c.Conn, payload); err != nil {
 		return nil, err
@@ -406,6 +448,9 @@ func maxPayloadForCommand(cmd Command, globalMax int) (int, bool) {
 		max = minInt(max, 8+4+maxAvalanchePollItems*(32+4))
 	case CmdAvaVote:
 		max = minInt(max, 8+4+maxAvalanchePollItems*(1+32))
+	case CmdBlockStart:
+		max = minInt(max, types.BlockHeaderEncodedLen+8+32)
+	case CmdBlockChunk:
 	case CmdBlock, CmdTx, CmdTxBatch, CmdCompactBlock, CmdBlockTx, CmdXThinBlock, CmdXBlockTx:
 	default:
 		return 0, false
@@ -421,6 +466,9 @@ func minInt(left int, right int) int {
 }
 
 func (c *Conn) WriteMessage(msg Message) error {
+	if transfer, ok := msg.(ChunkedBlockTransferMessage); ok {
+		return c.writeChunkedBlock(transfer.Block)
+	}
 	payload, err := encodeMessage(msg)
 	if err != nil {
 		return err
@@ -440,6 +488,35 @@ func (c *Conn) WriteMessage(msg Message) error {
 	}
 	if err := writeFull(c.Conn, payload); err != nil {
 		return fmt.Errorf("write command %d payload: %w", msg.Command(), err)
+	}
+	return nil
+}
+
+func (c *Conn) writeChunkedBlock(block types.Block) error {
+	encoded := block.Encode()
+	checksum := crypto.Sha256d(encoded)
+	if err := c.WriteMessage(BlockStartMessage{
+		Header:    block.Header,
+		TotalSize: uint64(len(encoded)),
+		Checksum:  checksum,
+	}); err != nil {
+		return err
+	}
+	const preferredChunkBytes = 4 << 20
+	chunkBytes := minInt(preferredChunkBytes, c.maxPayload-(32+8+4))
+	if chunkBytes <= 0 {
+		return ErrPayloadTooLarge
+	}
+	blockHash := crypto.Sha256d(block.Header.Encode())
+	for offset := 0; offset < len(encoded); offset += chunkBytes {
+		end := minInt(offset+chunkBytes, len(encoded))
+		if err := c.WriteMessage(BlockChunkMessage{
+			BlockHash: blockHash,
+			Offset:    uint64(offset),
+			Data:      encoded[offset:end],
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -487,7 +564,7 @@ func encodeMessage(msg Message) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[20:28], m.Nonce)
 		buf = appendString(buf, m.UserAgent)
 		return buf, nil
-	case VerAckMessage, PingMessage, PongMessage, GetAddrMessage, AddrMessage, InvMessage, GetDataMessage, NotFoundMessage, GetHeadersMessage, HeadersMessage, GetBlocksMessage, BlockMessage, TxMessage, TxBatchMessage, TxReconMessage, TxRequestMessage, CompactBlockMessage, GetBlockTxMessage, BlockTxMessage, XThinBlockMessage, GetXBlockTxMessage, XBlockTxMessage, AvaPollMessage, AvaVoteMessage:
+	case VerAckMessage, PingMessage, PongMessage, GetAddrMessage, AddrMessage, InvMessage, GetDataMessage, NotFoundMessage, GetHeadersMessage, HeadersMessage, GetBlocksMessage, BlockMessage, TxMessage, TxBatchMessage, TxReconMessage, TxRequestMessage, CompactBlockMessage, GetBlockTxMessage, BlockTxMessage, XThinBlockMessage, GetXBlockTxMessage, XBlockTxMessage, AvaPollMessage, AvaVoteMessage, BlockStartMessage, BlockChunkMessage:
 		return encodePayload(msg)
 	default:
 		return nil, fmt.Errorf("unsupported message type %T", msg)
@@ -526,6 +603,19 @@ func encodePayload(msg Message) ([]byte, error) {
 		buf := make([]byte, 0, 4+m.Block.EncodedLen())
 		buf = appendLengthPrefix(buf, m.Block.EncodedLen())
 		return m.Block.AppendEncode(buf), nil
+	case BlockStartMessage:
+		buf := make([]byte, 0, types.BlockHeaderEncodedLen+8+32)
+		buf = m.Header.AppendEncode(buf)
+		buf = appendU64(buf, m.TotalSize)
+		buf = append(buf, m.Checksum[:]...)
+		return buf, nil
+	case BlockChunkMessage:
+		buf := make([]byte, 0, 32+8+4+len(m.Data))
+		buf = append(buf, m.BlockHash[:]...)
+		buf = appendU64(buf, m.Offset)
+		buf = appendLengthPrefix(buf, len(m.Data))
+		buf = append(buf, m.Data...)
+		return buf, nil
 	case TxMessage:
 		buf := make([]byte, 0, 4+m.Tx.EncodedLen())
 		buf = appendLengthPrefix(buf, m.Tx.EncodedLen())
@@ -540,7 +630,7 @@ func encodePayload(msg Message) ([]byte, error) {
 		buf := make([]byte, 0, types.BlockHeaderEncodedLen+8+prefilledTxsEncodedLen(m.Prefilled)+4+len(m.ShortIDs)*8)
 		buf = m.Header.AppendEncode(buf)
 		buf = appendU64(buf, m.Nonce)
-		buf, err := encodePrefilledTxs(buf, m.Prefilled, maxThinBlockTxs)
+		buf, err := encodePrefilledTxs(buf, m.Prefilled, maxCompactPrefilled)
 		if err != nil {
 			return nil, err
 		}
@@ -678,11 +768,50 @@ func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (
 		if err != nil {
 			return nil, err
 		}
-		block, err := types.DecodeBlockWithLimits(blockBytes, limits)
+		// Full block validity is bounded by the candidate's parent-derived ABLA
+		// state in the node. The wire codec must not impose an independent count
+		// or block-size consensus rule after the frame itself was admitted.
+		block, err := types.DecodeBlockWithBudget(blockBytes, uint64(len(blockBytes)))
 		if err != nil {
 			return nil, err
 		}
 		return BlockMessage{Block: block}, nil
+	case CmdBlockStart:
+		headerBytes, err := r.take(types.BlockHeaderEncodedLen)
+		if err != nil {
+			return nil, err
+		}
+		header, err := types.DecodeBlockHeader(headerBytes)
+		if err != nil {
+			return nil, err
+		}
+		totalSize, err := r.readU64()
+		if err != nil {
+			return nil, err
+		}
+		checksumBytes, err := r.take(32)
+		if err != nil {
+			return nil, err
+		}
+		var checksum [32]byte
+		copy(checksum[:], checksumBytes)
+		return BlockStartMessage{Header: header, TotalSize: totalSize, Checksum: checksum}, nil
+	case CmdBlockChunk:
+		hashBytes, err := r.take(32)
+		if err != nil {
+			return nil, err
+		}
+		var blockHash [32]byte
+		copy(blockHash[:], hashBytes)
+		offset, err := r.readU64()
+		if err != nil {
+			return nil, err
+		}
+		data, err := r.readBytes()
+		if err != nil {
+			return nil, err
+		}
+		return BlockChunkMessage{BlockHash: blockHash, Offset: offset, Data: data}, nil
 	case CmdTx:
 		txBytes, err := r.readBytes()
 		if err != nil {
@@ -724,7 +853,7 @@ func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (
 		if err != nil {
 			return nil, err
 		}
-		prefilled, err := r.readPrefilledTxs(maxThinBlockTxs, limits)
+		prefilled, err := r.readPrefilledTxs(maxCompactPrefilled, limits)
 		if err != nil {
 			return nil, err
 		}

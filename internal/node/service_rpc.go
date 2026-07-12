@@ -864,7 +864,26 @@ func (s *Service) rpcSeedStressLanes(params rpcSeedStressLanesParams) (rpcSeedSt
 }
 
 func (s *Service) rpcSubmitBlock(params rpcSubmitBlockParams) (rpcSubmitBlockResult, error) {
-	block, err := consensus.DecodeBlockHex(params.Hex, types.DefaultCodecLimits())
+	raw, err := hex.DecodeString(params.Hex)
+	if err != nil {
+		return rpcSubmitBlockResult{}, err
+	}
+	if len(raw) < types.BlockHeaderEncodedLen {
+		return rpcSubmitBlockResult{}, types.ErrUnexpectedEOF
+	}
+	header, err := types.DecodeBlockHeader(raw[:types.BlockHeaderEncodedLen])
+	if err != nil {
+		return rpcSubmitBlockResult{}, err
+	}
+	parent, err := s.chainState.Store().GetBlockIndex(&header.PrevBlockHash)
+	if err != nil {
+		return rpcSubmitBlockResult{}, err
+	}
+	if parent == nil {
+		return rpcSubmitBlockResult{}, ErrUnknownParent
+	}
+	maxBytes := consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(s.cfg.Profile))
+	block, err := types.DecodeBlockWithBudget(raw, maxBytes)
 	if err != nil {
 		return rpcSubmitBlockResult{}, err
 	}

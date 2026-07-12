@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "profile": "regtest",
   "genesis_fixture": "../genesis/regtest.json",
   "height": 0,
@@ -12,7 +12,9 @@
       "txid_hex": "8059dd87cc30c5d7e63310471041e3556f271e48a6275b911a332bc8e878e149",
       "vout": 0,
       "value_atoms": 1000000000000,
-      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "created_height": 0,
+      "coinbase": true
     }
   ]
 }

@@ -19,6 +19,7 @@ func TestSubmitDecodedTxsCachesPermanentRejects(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
@@ -67,6 +68,7 @@ func TestSubmitDecodedTxsCachesLowFeeRejects(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 1_000, 8, 1)
 	_, errs, _, _ := svc.submitDecodedTxsFrom([]types.Transaction{tx}, nil)
@@ -116,6 +118,7 @@ func TestSubmitDecodedTxsTemporaryRejectExpiresAfterStateChange(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	if _, err := svc.SubmitTx(filler); err != nil {
 		t.Fatalf("SubmitTx filler: %v", err)
@@ -138,10 +141,12 @@ func TestSubmitDecodedTxsTemporaryRejectExpiresAfterStateChange(t *testing.T) {
 		t.Fatalf("reject cache hits after replay = %d, want %d", afterCachedReplay.Hits, afterFirstReject.Hits+1)
 	}
 
-	block := blockWithTxsForNodeTest(t, 0, genesis.Header, svc.chainState.ChainState().UTXOs(), []types.Transaction{
-		coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(11)}}),
+	prevHeight := *svc.chainState.ChainState().TipHeight()
+	prevHeader := *svc.chainState.ChainState().TipHeader()
+	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{
+		coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(11)}}),
 		filler,
-	}, genesis.Header.Timestamp+600)
+	}, prevHeader.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(block); err != nil {
 		t.Fatalf("acceptMinedBlock: %v", err)
 	}
@@ -169,17 +174,15 @@ func TestApplyPeerBlockCachesOrphanPromotionRejects(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
-	chainUTXOs := consensus.UtxoSet{
-		types.OutPoint{TxID: genesisTxID, Vout: 0}: {
-			ValueAtoms: 50,
-			PubKey:     nodeSignerPubKey(7),
-		},
-	}
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
-	block := blockWithTxsForNodeTest(t, 0, genesis.Header, chainUTXOs, []types.Transaction{coinbase}, genesis.Header.Timestamp+1)
-	orphanTx := spendTxForNodeTest(t, 9, types.OutPoint{TxID: consensus.TxID(&coinbase), Vout: 0}, 1, 8, 0)
+	prevHeight := *svc.chainState.ChainState().TipHeight()
+	prevHeader := *svc.chainState.ChainState().TipHeader()
+	parentTx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 9, 1)
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(10)}})
+	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, parentTx}, prevHeader.Timestamp+1)
+	orphanTx := spendTxForNodeTest(t, 9, types.OutPoint{TxID: consensus.TxID(&parentTx), Vout: 0}, 49, 8, 0)
 	orphanTx.Auth.Entries[0].Signature[0] ^= 0xff
 	peer := newPeerConnForTests("127.0.0.1:18444")
 
@@ -238,6 +241,7 @@ func TestSubmitDecodedTxsAcceptsDependentChainBatch(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	txs := make([]types.Transaction, 0, 64)
 	prevOut := types.OutPoint{TxID: genesisTxID, Vout: 0}

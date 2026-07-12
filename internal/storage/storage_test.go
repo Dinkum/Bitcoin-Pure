@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -22,6 +23,47 @@ func testCoinbase(height uint64, outputs []types.TxOutput) types.Transaction {
 			CoinbaseExtraNonce: &extraNonce,
 			Outputs:            outputs,
 		},
+	}
+}
+
+func TestBlockStorageUsesVerifiedChunks(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// Derive the fixture size from the storage boundary so this remains a
+	// multi-chunk roundtrip if the canonical output encoding changes.
+	outputSize := types.NewXOnlyOutput(1, [32]byte{}).EncodedLen()
+	outputs := make([]types.TxOutput, storedBlockChunkBytes/outputSize+1)
+	for i := range outputs {
+		outputs[i] = types.NewXOnlyOutput(1, [32]byte{byte(i)})
+	}
+	block := types.Block{
+		Header: types.BlockHeader{NBits: consensus.RegtestParams().GenesisBits},
+		Txs:    []types.Transaction{testCoinbase(0, outputs)},
+	}
+	if err := store.PutBlock(0, &block); err != nil {
+		t.Fatalf("put multi-chunk block: %v", err)
+	}
+	hash := consensus.HeaderHash(&block.Header)
+	manifest, err := store.get(blockKey(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, chunks, _, err := decodeStoredBlockManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunks < 2 {
+		t.Fatalf("stored chunks = %d, want at least 2", chunks)
+	}
+	loaded, err := store.GetBlock(&hash)
+	if err != nil {
+		t.Fatalf("get multi-chunk block: %v", err)
+	}
+	if loaded == nil || !bytes.Equal(loaded.Encode(), block.Encode()) {
+		t.Fatal("multi-chunk block roundtrip mismatch")
 	}
 }
 
@@ -502,6 +544,55 @@ func TestWriteFastSyncStateRejectsCountMismatch(t *testing.T) {
 	state := &FastSyncState{SnapshotUTXOCount: len(utxos) + 1}
 	if err := store.WriteFastSyncState(state, utxos); err == nil {
 		t.Fatal("expected fast-sync count mismatch")
+	}
+}
+
+func TestUTXOEntryCodecPreservesAndStrictlyValidatesOrigin(t *testing.T) {
+	entry := consensus.UtxoEntryFromOutputAtHeight(types.NewXOnlyOutput(50, [32]byte{7}), 123, true)
+	encoded := encodeUTXOEntry(entry)
+	decoded, err := decodeUTXOEntry(encoded)
+	if err != nil {
+		t.Fatalf("decode UTXO entry: %v", err)
+	}
+	if decoded != entry {
+		t.Fatalf("decoded entry = %+v, want %+v", decoded, entry)
+	}
+
+	encoded[len(encoded)-1] = 2
+	if _, err := decodeUTXOEntry(encoded); err == nil {
+		t.Fatal("non-canonical coinbase flag was accepted")
+	}
+}
+
+func TestLoadChainStateRequiresCoinOriginSchema(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	header := types.BlockHeader{NBits: consensus.RegtestParams().GenesisBits}
+	legacyMetadata := map[string][]byte{
+		string(metaProfileKey):        []byte(types.Regtest.String()),
+		string(metaTipHeightKey):      encodeU64(0),
+		string(metaTipHeaderKey):      header.Encode(),
+		string(metaBlockSizeStateKey): encodeBlockSizeState(sampleBlockSizeState()),
+	}
+	for key, value := range legacyMetadata {
+		if err := store.db.Set([]byte(key), value, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.LoadChainStateMeta(); !errors.Is(err, ErrChainstateReindexRequired) {
+		t.Fatalf("legacy chainstate error = %v, want ErrChainstateReindexRequired", err)
+	}
+}
+
+func TestCommittedCoinEncodingExcludesOriginMetadata(t *testing.T) {
+	output := types.NewXOnlyOutput(50, [32]byte{7})
+	coinbase := consensus.UtxoEntryFromOutputAtHeight(output, 123, true)
+	ordinary := consensus.UtxoEntryFromOutputAtHeight(output, 999, false)
+	if !bytes.Equal(encodeCommittedCoin(coinbase), encodeCommittedCoin(ordinary)) {
+		t.Fatal("non-committed origin metadata changed the accumulator coin encoding")
 	}
 }
 

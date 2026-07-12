@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "profile": "regtest",
   "genesis_fixture": "../genesis/regtest.json",
   "chain_fixture": "../chains/regtest_bootstrap.json",
@@ -13,19 +13,25 @@
       "txid_hex": "8059dd87cc30c5d7e63310471041e3556f271e48a6275b911a332bc8e878e149",
       "vout": 0,
       "value_atoms": 1000000000000,
-      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "created_height": 0,
+      "coinbase": true
     },
     {
       "txid_hex": "8500745bb104c87afdba9316cf8df8d3b762d03e5923fd407763e409866fa814",
       "vout": 0,
       "value_atoms": 1,
-      "pubkey_hex": "4444444444444444444444444444444444444444444444444444444444444444"
+      "pubkey_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "created_height": 2,
+      "coinbase": true
     },
     {
       "txid_hex": "bc8abbb4b41ac089415af1ef7d34ac9da3a41c1d2d0fcaef0d8583c0ccd5bc10",
       "vout": 0,
       "value_atoms": 1,
-      "pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+      "pubkey_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "created_height": 1,
+      "coinbase": true
     }
   ]
 }

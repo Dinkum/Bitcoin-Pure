@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
+	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/utreexo"
@@ -23,46 +25,53 @@ import (
 )
 
 var (
-	metaProfileKey                = []byte("meta/profile")
-	metaHeaderTipHeightKey        = []byte("meta/header_tip_height")
-	metaHeaderTipHeaderKey        = []byte("meta/header_tip_header")
-	metaTipHeightKey              = []byte("meta/tip_height")
-	metaTipHeaderKey              = []byte("meta/tip_header")
-	metaBlockSizeStateKey         = []byte("meta/block_size_state")
-	metaUTXOChecksumKey           = []byte("meta/utxo_checksum")
-	metaUTXOCountKey              = []byte("meta/utxo_count")
-	metaUTXOAccumulatorRootKey    = []byte("meta/utxo_accumulator_root")
-	metaUTXOAccumulatorVersionKey = []byte("meta/utxo_accumulator_version")
-	metaFastSyncStateKey          = []byte("meta/fast_sync_state")
-	metaMempoolStateKey           = []byte("meta/mempool_state")
-	metaLocalityNextSeqKey        = []byte("meta/locality_next_seq")
-	metaJournalNextSeqKey         = []byte("meta/journal_next_seq")
-	metaDerivedJournalSeqKey      = []byte("meta/derived_journal_seq")
-	metaWalletIndexHeightKey      = []byte("meta/wallet_index_height")
-	mempoolEntryPrefix            = []byte("mempool_entry/")
-	mempoolOrphanPrefix           = []byte("mempool_orphan/")
-	blockPrefix                   = []byte("blocks/")
-	blockIndexPrefix              = []byte("block_index/")
-	blockUndoPrefix               = []byte("block_undo/")
-	headerHeightIndexPrefix       = []byte("header_height_index/")
-	heightIndexPrefix             = []byte("height_index/")
-	knownPeerPrefix               = []byte("known_peer/")
-	journalPrefix                 = []byte("journal/")
-	utxoPrefix                    = []byte("utxo/")
-	utxoAccumulatorNodePrefix     = []byte("utxo_acc_node/")
-	snapshotUTXOPrefix            = []byte("snapshot_utxo/")
-	localitySeqPrefix             = []byte("locality_seq/")
-	localityMetaPrefix            = []byte("locality_meta/")
-	walletOriginPrefix            = []byte("wallet_origin/")
-	walletUTXOPrefix              = []byte("wallet_utxo/")
-	walletActivityItemPrefix      = []byte("wallet_activity_item/")
-	walletActivityHtPrefix        = []byte("wallet_activity_height/")
+	metaProfileKey                 = []byte("meta/profile")
+	metaHeaderTipHeightKey         = []byte("meta/header_tip_height")
+	metaHeaderTipHeaderKey         = []byte("meta/header_tip_header")
+	metaTipHeightKey               = []byte("meta/tip_height")
+	metaTipHeaderKey               = []byte("meta/tip_header")
+	metaBlockSizeStateKey          = []byte("meta/block_size_state")
+	metaUTXOChecksumKey            = []byte("meta/utxo_checksum")
+	metaUTXOCountKey               = []byte("meta/utxo_count")
+	metaUTXOAccumulatorRootKey     = []byte("meta/utxo_accumulator_root")
+	metaUTXOAccumulatorVersionKey  = []byte("meta/utxo_accumulator_version")
+	metaChainstateSchemaVersionKey = []byte("meta/chainstate_schema_version")
+	metaFastSyncStateKey           = []byte("meta/fast_sync_state")
+	metaMempoolStateKey            = []byte("meta/mempool_state")
+	metaLocalityNextSeqKey         = []byte("meta/locality_next_seq")
+	metaJournalNextSeqKey          = []byte("meta/journal_next_seq")
+	metaDerivedJournalSeqKey       = []byte("meta/derived_journal_seq")
+	metaWalletIndexHeightKey       = []byte("meta/wallet_index_height")
+	mempoolEntryPrefix             = []byte("mempool_entry/")
+	mempoolOrphanPrefix            = []byte("mempool_orphan/")
+	blockPrefix                    = []byte("blocks/")
+	blockChunkPrefix               = []byte("block_chunks/")
+	blockIndexPrefix               = []byte("block_index/")
+	blockUndoPrefix                = []byte("block_undo/")
+	headerHeightIndexPrefix        = []byte("header_height_index/")
+	heightIndexPrefix              = []byte("height_index/")
+	knownPeerPrefix                = []byte("known_peer/")
+	journalPrefix                  = []byte("journal/")
+	utxoPrefix                     = []byte("utxo/")
+	utxoAccumulatorNodePrefix      = []byte("utxo_acc_node/")
+	snapshotUTXOPrefix             = []byte("snapshot_utxo/")
+	localitySeqPrefix              = []byte("locality_seq/")
+	localityMetaPrefix             = []byte("locality_meta/")
+	walletOriginPrefix             = []byte("wallet_origin/")
+	walletUTXOPrefix               = []byte("wallet_utxo/")
+	walletActivityItemPrefix       = []byte("wallet_activity_item/")
+	walletActivityHtPrefix         = []byte("wallet_activity_height/")
 )
 
 const (
 	walletIndexChunkSize        = 10_000
 	utxoAccumulatorIndexVersion = uint64(1)
+	chainstateSchemaVersion     = uint64(2)
+	storedBlockManifestVersion  = byte(1)
+	storedBlockChunkBytes       = 4 << 20
 )
+
+var ErrChainstateReindexRequired = errors.New("chainstate reindex required")
 
 var (
 	knownPeerPrefixEnd           = prefixUpperBound(knownPeerPrefix)
@@ -199,10 +208,9 @@ type BlockIndexEntry struct {
 	BlockSizeState consensus.BlockSizeState
 }
 
-type BlockUndoEntry struct {
-	OutPoint types.OutPoint
-	Entry    consensus.UtxoEntry
-}
+// BlockUndoEntry is the durable representation of consensus's authoritative
+// pre-block spend delta. The alias keeps the existing byte layout unchanged.
+type BlockUndoEntry = consensus.SpentUTXO
 
 type WalletWatchItem struct {
 	Type      uint64
@@ -432,6 +440,20 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 	}
 	if heightBytes == nil || headerBytes == nil || blockSizeBytes == nil {
 		return nil, false, errors.New("invalid data: missing chain metadata")
+	}
+	schemaBytes, err := s.get(metaChainstateSchemaVersionKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if schemaBytes == nil {
+		return nil, false, fmt.Errorf("%w: missing coin-origin schema metadata", ErrChainstateReindexRequired)
+	}
+	schemaVersion, err := decodeU64(schemaBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	if schemaVersion != chainstateSchemaVersion {
+		return nil, false, fmt.Errorf("%w: unsupported chainstate schema version %d", ErrChainstateReindexRequired, schemaVersion)
 	}
 
 	profile, err := types.ParseChainProfile(string(profileBytes))
@@ -1288,6 +1310,12 @@ func (s *ChainStore) WriteFullState(state *StoredChainState) error {
 	return s.writeFullStateLocked(state, nil, nil, nil)
 }
 
+func (s *ChainStore) WriteFullStateWithHeaderMetadata(state *StoredChainState, headerState *StoredHeaderState, activeEntries []BlockIndexEntry) error {
+	s.walletIndexMu.Lock()
+	defer s.walletIndexMu.Unlock()
+	return s.writeFullStateLocked(state, nil, headerState, activeEntries)
+}
+
 func (s *ChainStore) WriteFullStateWithFastSyncStateMetadata(state *StoredChainState, fastSyncState *FastSyncState, headerState *StoredHeaderState, activeEntries []BlockIndexEntry) error {
 	if fastSyncState == nil {
 		return errors.New("fast sync state is required")
@@ -2040,14 +2068,68 @@ func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
 }
 
 func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
-	buf, err := s.get(blockKey(*blockHash))
+	manifest, err := s.get(blockKey(*blockHash))
 	if err != nil {
 		return nil, err
 	}
-	if buf == nil {
+	if manifest == nil {
 		return nil, nil
 	}
-	block, err := types.DecodeBlockWithLimits(buf, types.DefaultCodecLimits())
+	totalSize, chunkCount, checksum, err := decodeStoredBlockManifest(manifest)
+	if err != nil {
+		return nil, err
+	}
+	if totalSize > uint64(math.MaxInt) {
+		return nil, fmt.Errorf("stored block is too large to materialize: %d bytes", totalSize)
+	}
+	buf := make([]byte, 0, int(totalSize))
+	for chunkIndex := uint32(0); chunkIndex < chunkCount; chunkIndex++ {
+		chunk, err := s.get(blockChunkKey(*blockHash, chunkIndex))
+		if err != nil {
+			return nil, err
+		}
+		if chunk == nil {
+			return nil, fmt.Errorf("missing stored block chunk %d for %x", chunkIndex, *blockHash)
+		}
+		buf = append(buf, chunk...)
+	}
+	if uint64(len(buf)) != totalSize {
+		return nil, fmt.Errorf("stored block size mismatch: manifest=%d chunks=%d", totalSize, len(buf))
+	}
+	if got := crypto.Sha256d(buf); got != checksum {
+		return nil, errors.New("stored block chunk checksum mismatch")
+	}
+	if len(buf) < types.BlockHeaderEncodedLen {
+		return nil, errors.New("stored block is shorter than its canonical header")
+	}
+	header, err := types.DecodeBlockHeader(buf[:types.BlockHeaderEncodedLen])
+	if err != nil {
+		return nil, err
+	}
+	maxBytes := uint64(len(buf))
+	index, err := s.GetBlockIndex(blockHash)
+	if err != nil {
+		return nil, err
+	}
+	if index != nil && index.Height > 0 {
+		parent, err := s.GetBlockIndex(&header.PrevBlockHash)
+		if err != nil {
+			return nil, err
+		}
+		if parent == nil {
+			return nil, fmt.Errorf("missing parent block index for stored block %x", *blockHash)
+		}
+		profileBytes, err := s.get(metaProfileKey)
+		if err != nil {
+			return nil, err
+		}
+		profile, err := types.ParseChainProfile(string(profileBytes))
+		if err != nil {
+			return nil, err
+		}
+		maxBytes = consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(profile))
+	}
+	block, err := types.DecodeBlockWithBudget(buf, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -2723,7 +2805,7 @@ func putWalletOriginsForBlockBatchWithMap(batch *pebble.Batch, height uint64, _ 
 		txid := consensus.TxID(&block.Txs[txIndex])
 		for vout, output := range block.Txs[txIndex].Base.Outputs {
 			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-			entry := consensus.UtxoEntryFromOutput(output)
+			entry := consensus.UtxoEntryFromOutputAtHeight(output, height, txIndex == 0)
 			record := walletOriginRecord{Entry: entry, Height: height, Coinbase: txIndex == 0}
 			if origins != nil {
 				origins[outPoint] = record
@@ -2740,9 +2822,11 @@ func putWalletActivityForBlockBatch(batch *pebble.Batch, height uint64, hash [32
 	if block == nil {
 		return nil
 	}
+	resolvedInputs, err := consensus.ResolveBlockInputEntries(block, undo)
+	if err != nil {
+		return fmt.Errorf("resolve wallet activity inputs at height %d: %w", height, err)
+	}
 	timestamp := block.Header.Timestamp
-	undoIndex := 0
-	createdInBlock := make(map[types.OutPoint]consensus.UtxoEntry)
 	for txIndex, tx := range block.Txs {
 		type itemDelta struct {
 			received uint64
@@ -2758,23 +2842,10 @@ func putWalletActivityForBlockBatch(batch *pebble.Batch, height uint64, hash [32
 		inputSum := uint64(0)
 		if txIndex > 0 {
 			for _, input := range tx.Base.Inputs {
-				if entry, ok := createdInBlock[input.PrevOut]; ok {
-					inputSum += entry.ValueAtoms
-					item := walletWatchItemForEntry(entry)
-					delta := deltas[item]
-					delta.sent += entry.ValueAtoms
-					deltas[item] = delta
-					continue
+				entry, ok := resolvedInputs[input.PrevOut]
+				if !ok {
+					return fmt.Errorf("missing resolved wallet activity input at height %d: %v", height, input.PrevOut)
 				}
-				if undoIndex >= len(undo) {
-					return fmt.Errorf("missing wallet activity undo for height %d input %v", height, input.PrevOut)
-				}
-				undoEntry := undo[undoIndex]
-				if undoEntry.OutPoint != input.PrevOut {
-					return fmt.Errorf("wallet activity undo mismatch for height %d input %v: got %v", height, input.PrevOut, undoEntry.OutPoint)
-				}
-				entry := undoEntry.Entry
-				undoIndex++
 				inputSum += entry.ValueAtoms
 				item := walletWatchItemForEntry(entry)
 				delta := deltas[item]
@@ -2783,9 +2854,6 @@ func putWalletActivityForBlockBatch(batch *pebble.Batch, height uint64, hash [32
 			}
 		}
 		txid := consensus.TxID(&tx)
-		for vout, output := range tx.Base.Outputs {
-			createdInBlock[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
-		}
 		if len(deltas) == 0 {
 			continue
 		}
@@ -2823,9 +2891,6 @@ func putWalletActivityForBlockBatch(batch *pebble.Batch, height uint64, hash [32
 				return err
 			}
 		}
-	}
-	if undoIndex != len(undo) {
-		return fmt.Errorf("unused wallet activity undo entries at height %d: used=%d total=%d", height, undoIndex, len(undo))
 	}
 	return nil
 }
@@ -3051,6 +3116,9 @@ func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
 	if err := batch.Set(metaTipHeightKey, encodeU64(state.Height), nil); err != nil {
 		return err
 	}
+	if err := batch.Set(metaChainstateSchemaVersionKey, encodeU64(chainstateSchemaVersion), nil); err != nil {
+		return err
+	}
 	if err := batch.Set(metaTipHeaderKey, state.TipHeader.Encode(), nil); err != nil {
 		return err
 	}
@@ -3079,8 +3147,22 @@ func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
 
 func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry, active bool) error {
 	blockHash := consensus.HeaderHash(&block.Header)
-	if err := batch.Set(blockKey(blockHash), block.Encode(), nil); err != nil {
+	encoded := block.Encode()
+	chunkCount64 := (uint64(len(encoded)) + storedBlockChunkBytes - 1) / storedBlockChunkBytes
+	if chunkCount64 > math.MaxUint32 {
+		return errors.New("encoded block requires too many storage chunks")
+	}
+	chunkCount := uint32(chunkCount64)
+	manifest := encodeStoredBlockManifest(uint64(len(encoded)), chunkCount, crypto.Sha256d(encoded))
+	if err := batch.Set(blockKey(blockHash), manifest, nil); err != nil {
 		return err
+	}
+	for chunkIndex := uint32(0); chunkIndex < chunkCount; chunkIndex++ {
+		start := int(chunkIndex) * storedBlockChunkBytes
+		end := min(start+storedBlockChunkBytes, len(encoded))
+		if err := batch.Set(blockChunkKey(blockHash, chunkIndex), encoded[start:end], nil); err != nil {
+			return err
+		}
 	}
 	return putHeaderBatch(batch, entry, active)
 }
@@ -3169,6 +3251,40 @@ func decodeI64(buf []byte) (int64, error) {
 
 func blockKey(hash [32]byte) []byte {
 	return append(append([]byte(nil), blockPrefix...), hash[:]...)
+}
+
+func blockChunkKey(hash [32]byte, chunkIndex uint32) []byte {
+	key := append(append([]byte(nil), blockChunkPrefix...), hash[:]...)
+	var index [4]byte
+	binary.BigEndian.PutUint32(index[:], chunkIndex)
+	return append(key, index[:]...)
+}
+
+func encodeStoredBlockManifest(totalSize uint64, chunkCount uint32, checksum [32]byte) []byte {
+	manifest := make([]byte, 1+8+4+32)
+	manifest[0] = storedBlockManifestVersion
+	binary.LittleEndian.PutUint64(manifest[1:9], totalSize)
+	binary.LittleEndian.PutUint32(manifest[9:13], chunkCount)
+	copy(manifest[13:], checksum[:])
+	return manifest
+}
+
+func decodeStoredBlockManifest(manifest []byte) (uint64, uint32, [32]byte, error) {
+	var checksum [32]byte
+	if len(manifest) != 1+8+4+32 || manifest[0] != storedBlockManifestVersion {
+		return 0, 0, checksum, errors.New("invalid stored block manifest")
+	}
+	totalSize := binary.LittleEndian.Uint64(manifest[1:9])
+	chunkCount := binary.LittleEndian.Uint32(manifest[9:13])
+	expectedChunks := uint64(0)
+	if totalSize > 0 {
+		expectedChunks = (totalSize + storedBlockChunkBytes - 1) / storedBlockChunkBytes
+	}
+	if expectedChunks > math.MaxUint32 || uint64(chunkCount) != expectedChunks {
+		return 0, 0, checksum, errors.New("invalid stored block manifest chunk count")
+	}
+	copy(checksum[:], manifest[13:])
+	return totalSize, chunkCount, checksum, nil
 }
 
 func blockIndexKey(hash [32]byte) []byte {
@@ -3561,7 +3677,7 @@ func (s *ChainStore) LoadUTXOAccumulator() (*utreexo.Accumulator, bool, error) {
 }
 
 func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutPointProof, error) {
-	proof := utreexo.OutPointProof{OutPoint: outPoint}
+	proof := utreexo.OutPointProof{Version: utreexo.ProofVersion, OutPoint: outPoint}
 	meta, err := s.LoadChainStateMeta()
 	if err != nil {
 		return proof, err
@@ -3598,7 +3714,23 @@ func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutP
 			return proof, err
 		}
 		if !nextOK {
-			proof.Steps = steps
+			if !siblingOK {
+				return proof, errors.New("missing accumulator exclusion witness")
+			}
+			terminal, err := s.firstAccumulatorLeaf(siblingPath)
+			if err != nil {
+				return proof, err
+			}
+			membership, err := s.UTXOAccumulatorProof(terminal.OutPoint)
+			if err != nil {
+				return proof, err
+			}
+			if !membership.Exists {
+				return proof, errors.New("accumulator exclusion witness is not a member")
+			}
+			terminalCopy := *terminal
+			proof.Terminal = &terminalCopy
+			proof.Steps = membership.Steps
 			return proof, nil
 		}
 		path = nextPath
@@ -3617,6 +3749,31 @@ func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutP
 	proof.PubKey = node.Leaf.PubKey
 	proof.Steps = steps
 	return proof, nil
+}
+
+func (s *ChainStore) firstAccumulatorLeaf(path utreexo.AccumulatorNodePath) (*utreexo.UtxoLeaf, error) {
+	for path.Depth <= utreexo.KeyBits {
+		node, ok, err := s.accumulatorNode(path)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errors.New("missing accumulator exclusion witness node")
+		}
+		if node.Leaf != nil {
+			leaf := *node.Leaf
+			return &leaf, nil
+		}
+		left := accumulatorChildPath(path, false)
+		if _, ok, err := s.accumulatorNode(left); err != nil {
+			return nil, err
+		} else if ok {
+			path = left
+			continue
+		}
+		path = accumulatorChildPath(path, true)
+	}
+	return nil, errors.New("accumulator exclusion witness did not reach a leaf")
 }
 
 func (s *ChainStore) WriteUTXOAccumulator(acc *utreexo.Accumulator) error {
@@ -3787,7 +3944,7 @@ func encodeAccumulatorNodeValue(record utreexo.AccumulatorNodeRecord) []byte {
 	if record.Leaf != nil {
 		record.Leaf.OutPoint.Encode(&buf)
 		entry := consensus.UtxoEntryFromLeaf(*record.Leaf)
-		buf = append(buf, encodeUTXOEntry(entry)...)
+		buf = append(buf, encodeCommittedCoin(entry)...)
 	}
 	return buf
 }
@@ -3820,7 +3977,7 @@ func decodeAccumulatorNodeValue(path utreexo.AccumulatorNodePath, buf []byte) (u
 		if err != nil {
 			return utreexo.AccumulatorNodeRecord{}, err
 		}
-		entry, err := decodeUTXOEntry(remaining[36:])
+		entry, err := decodeCommittedCoin(remaining[36:])
 		if err != nil {
 			return utreexo.AccumulatorNodeRecord{}, err
 		}
@@ -3833,6 +3990,19 @@ func decodeAccumulatorNodeValue(path utreexo.AccumulatorNodePath, buf []byte) (u
 }
 
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
+	buf := encodeCommittedCoin(entry)
+	var height [8]byte
+	binary.LittleEndian.PutUint64(height[:], entry.CreatedHeight)
+	buf = append(buf, height[:]...)
+	if entry.Coinbase {
+		return append(buf, 1)
+	}
+	return append(buf, 0)
+}
+
+// encodeCommittedCoin is the commitment-only coin shape used inside durable
+// accumulator nodes. Creation origin must not enter the committed leaf hash.
+func encodeCommittedCoin(entry consensus.UtxoEntry) []byte {
 	entry = consensus.NormalizeUtxoEntry(entry)
 	buf := make([]byte, 0, 49)
 	buf = append(buf, types.CanonicalVarIntBytes(entry.Type)...)
@@ -3942,6 +4112,38 @@ func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {
 }
 
 func decodeUTXOEntryWithLen(buf []byte) (consensus.UtxoEntry, int, error) {
+	entry, consumed, err := decodeCommittedCoinWithLen(buf)
+	if err != nil {
+		return consensus.UtxoEntry{}, 0, err
+	}
+	remaining := buf[consumed:]
+	if len(remaining) < 9 {
+		return consensus.UtxoEntry{}, 0, errors.New("invalid utxo origin encoding")
+	}
+	entry.CreatedHeight = binary.LittleEndian.Uint64(remaining[:8])
+	switch remaining[8] {
+	case 0:
+		entry.Coinbase = false
+	case 1:
+		entry.Coinbase = true
+	default:
+		return consensus.UtxoEntry{}, 0, errors.New("invalid utxo coinbase flag")
+	}
+	return entry, consumed + 9, nil
+}
+
+func decodeCommittedCoin(buf []byte) (consensus.UtxoEntry, error) {
+	entry, consumed, err := decodeCommittedCoinWithLen(buf)
+	if err != nil {
+		return consensus.UtxoEntry{}, err
+	}
+	if consumed != len(buf) {
+		return consensus.UtxoEntry{}, errors.New("unexpected trailing committed coin data")
+	}
+	return entry, nil
+}
+
+func decodeCommittedCoinWithLen(buf []byte) (consensus.UtxoEntry, int, error) {
 	outputType, n, err := decodeCanonicalVarInt(buf)
 	if err != nil {
 		return consensus.UtxoEntry{}, 0, err
@@ -4070,7 +4272,7 @@ func decodeBlockUndo(buf []byte) ([]BlockUndoEntry, error) {
 	}
 	count := binary.LittleEndian.Uint64(buf[:8])
 	buf = buf[8:]
-	const minEncodedUndoEntryBytes = 36 + 1 + 8 + 32
+	const minEncodedUndoEntryBytes = 36 + 1 + 8 + 32 + 8 + 1
 	if count > uint64(len(buf)/minEncodedUndoEntryBytes) {
 		return nil, errors.New("invalid block undo count")
 	}

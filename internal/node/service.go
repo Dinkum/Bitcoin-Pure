@@ -3,6 +3,7 @@ package node
 import (
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/mempool"
+	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
 	"errors"
@@ -276,6 +277,9 @@ type Service struct {
 	recentBlks          recentBlockCache
 	rejectCache         *txRejectCache
 	validAuth           *validAuthCache
+	payloadBudget       *p2p.PayloadBudget
+	thinStateBudget     *p2p.PayloadBudget
+	blockServeBudget    *p2p.PayloadBudget
 	mempoolPersistCh    chan struct{}
 	mempoolPersistMu    sync.Mutex
 	mempoolPersistState persistedMempoolState
@@ -285,6 +289,7 @@ type Service struct {
 	minerMgr            *minerManager
 	avaMgr              *avalancheManager
 	mineHeaderFn        func(types.BlockHeader, consensus.ChainParams, func(uint64) bool) (types.BlockHeader, bool, error)
+	thinExpectationFn   func(*peerConn, types.BlockHeader) error
 	nodeID              string
 	dashboard           dashboardCache
 	systemStats         dashboardSystemStats
@@ -326,8 +331,13 @@ const (
 	txRelayBatchMaxItems              = 256
 	maxKnownPeerAddrs                 = 256
 	defaultMaxMessageBytes            = 64_000_000
+	defaultInflightPayloadMultiplier  = 2
 	stressLaneConfirmTimeout          = 8 * time.Minute
 	defaultLocalTxBatchEnqueueTimeout = 500 * time.Millisecond
 	maxLocalTxBatchEnqueueTimeout     = 5 * time.Second
 	compactCatchupMempoolMin          = 1024
+	maxPendingThinPerPeer             = 2
+	pendingThinStateTTL               = 30 * time.Second
+	thinWorkTokenBurst                = 4.0
+	thinWorkTokensPerSecond           = 2.0
 )

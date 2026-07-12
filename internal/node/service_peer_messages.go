@@ -2,12 +2,14 @@ package node
 
 import (
 	"bitcoin-pure/internal/consensus"
+	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/mempool"
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/types"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 )
@@ -69,6 +71,10 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 	case p2p.BlockMessage:
 		peer.deletePendingThin(consensus.HeaderHash(&m.Block.Header))
 		return s.acceptPeerBlockMessage(peer, &m.Block)
+	case p2p.BlockStartMessage:
+		return s.onBlockStartMessage(peer, m)
+	case p2p.BlockChunkMessage:
+		return s.onBlockChunkMessage(peer, m)
 	case p2p.XThinBlockMessage:
 		return s.onXThinBlockMessage(peer, m)
 	case p2p.GetXBlockTxMessage:
@@ -136,6 +142,97 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 		return s.onBlockTxMessage(peer, m)
 	}
 	return nil
+}
+
+func (s *Service) onBlockStartMessage(peer *peerConn, msg p2p.BlockStartMessage) error {
+	if peer == nil {
+		return errors.New("chunked block transfer requires a peer")
+	}
+	if msg.TotalSize < types.BlockHeaderEncodedLen {
+		return errors.New("chunked block total is shorter than its header")
+	}
+	parent, err := s.chainState.Store().GetBlockIndex(&msg.Header.PrevBlockHash)
+	if err != nil {
+		return err
+	}
+	if parent == nil || !parent.Validated {
+		return ErrUnknownParent
+	}
+	maxBytes := consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(s.cfg.Profile))
+	if msg.TotalSize > maxBytes {
+		return consensus.ErrBlockTooLarge
+	}
+	hash := consensus.HeaderHash(&msg.Header)
+	peer.blockTransferMu.Lock()
+	defer peer.blockTransferMu.Unlock()
+	if _, duplicate := peer.blockTransfers[hash]; duplicate {
+		return fmt.Errorf("duplicate chunked block transfer %x", hash)
+	}
+	if len(peer.blockTransfers) >= 2 {
+		return errors.New("too many concurrent chunked block transfers")
+	}
+	file, err := os.CreateTemp("", "bpu-block-transfer-*")
+	if err != nil {
+		return err
+	}
+	peer.blockTransfers[hash] = &incomingBlockTransfer{
+		header:   msg.Header,
+		total:    msg.TotalSize,
+		checksum: msg.Checksum,
+		file:     file,
+	}
+	return nil
+}
+
+func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage) error {
+	if peer == nil || len(msg.Data) == 0 {
+		return errors.New("invalid chunked block frame")
+	}
+	peer.blockTransferMu.Lock()
+	transfer := peer.blockTransfers[msg.BlockHash]
+	if transfer == nil {
+		peer.blockTransferMu.Unlock()
+		return fmt.Errorf("chunk for unknown block transfer %x", msg.BlockHash)
+	}
+	end := msg.Offset + uint64(len(msg.Data))
+	if msg.Offset != transfer.next || end < msg.Offset || end > transfer.total {
+		peer.blockTransferMu.Unlock()
+		return fmt.Errorf("non-contiguous block chunk offset=%d expected=%d", msg.Offset, transfer.next)
+	}
+	if _, err := transfer.file.Write(msg.Data); err != nil {
+		peer.blockTransferMu.Unlock()
+		return err
+	}
+	transfer.next = end
+	if transfer.next != transfer.total {
+		peer.blockTransferMu.Unlock()
+		return nil
+	}
+	delete(peer.blockTransfers, msg.BlockHash)
+	peer.blockTransferMu.Unlock()
+
+	name := transfer.file.Name()
+	if err := transfer.file.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	defer os.Remove(name)
+	raw, err := os.ReadFile(name)
+	if err != nil {
+		return err
+	}
+	if uint64(len(raw)) != transfer.total || crypto.Sha256d(raw) != transfer.checksum {
+		return errors.New("chunked block transfer checksum mismatch")
+	}
+	block, err := types.DecodeBlockWithBudget(raw, transfer.total)
+	if err != nil {
+		return err
+	}
+	if block.Header != transfer.header || consensus.HeaderHash(&block.Header) != msg.BlockHash {
+		return errors.New("chunked block header mismatch")
+	}
+	peer.deletePendingThin(msg.BlockHash)
+	return s.acceptPeerBlockMessage(peer, &block)
 }
 
 func (s *Service) requestSync(peer *peerConn) error { return s.syncManager().requestSync(peer) }
@@ -314,6 +411,10 @@ func (p *peerConn) supportsCompactBlockRelay() bool {
 	return p.advertisesService(p2p.ServiceCompactBlockRelay)
 }
 
+func (p *peerConn) supportsChunkedBlockRelay() bool {
+	return p.advertisesService(p2p.ServiceChunkedBlockRelay)
+}
+
 func (p *peerConn) supportsGrapheneExtended() bool {
 	return p.advertisesService(p2p.ServiceGrapheneExtended)
 }
@@ -463,6 +564,8 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 	send := make([]p2p.Message, 0, len(msg.Items))
 	requestedTxIDs := make([][32]byte, 0, len(msg.Items))
 	servedBlocks := 0
+	queuedBlockHashes := make(map[[32]byte]struct{})
+	blockBatch := newBlockServeBatch(int64(s.blockServingLimit()))
 	for _, item := range msg.Items {
 		switch item.Type {
 		case p2p.InvTypeTx:
@@ -472,45 +575,39 @@ func (s *Service) onGetDataMessage(peer *peerConn, msg p2p.GetDataMessage) error
 				notFound = append(notFound, p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: item.Hash})
 				continue
 			}
-			blockMsg, ok, err := s.preferredBlockRelayMessage(peer, item.Hash)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				notFound = append(notFound, item)
+			if _, duplicate := queuedBlockHashes[item.Hash]; duplicate {
 				continue
 			}
-			send = append(send, blockMsg)
+			queuedBlockHashes[item.Hash] = struct{}{}
+			if err := peer.enqueueBlockReference(item, blockBatch); err != nil {
+				return err
+			}
 			servedBlocks++
 		case p2p.InvTypeBlockExtended:
 			if servedBlocks >= maxServedBlocksPerGetData {
 				notFound = append(notFound, item)
 				continue
 			}
-			block, ok, err := s.loadBlock(item.Hash)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				notFound = append(notFound, item)
+			if _, duplicate := queuedBlockHashes[item.Hash]; duplicate {
 				continue
 			}
-			send = append(send, buildXThinBlockMessage(block))
+			queuedBlockHashes[item.Hash] = struct{}{}
+			if err := peer.enqueueBlockReference(item, blockBatch); err != nil {
+				return err
+			}
 			servedBlocks++
 		case p2p.InvTypeBlockFull:
 			if servedBlocks >= maxServedBlocksPerGetData {
 				notFound = append(notFound, item)
 				continue
 			}
-			block, ok, err := s.loadBlock(item.Hash)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				notFound = append(notFound, item)
+			if _, duplicate := queuedBlockHashes[item.Hash]; duplicate {
 				continue
 			}
-			send = append(send, p2p.BlockMessage{Block: block})
+			queuedBlockHashes[item.Hash] = struct{}{}
+			if err := peer.enqueueBlockReference(item, blockBatch); err != nil {
+				return err
+			}
 			servedBlocks++
 		default:
 			notFound = append(notFound, item)
@@ -562,6 +659,16 @@ func (s *Service) onNotFoundMessage(peer *peerConn, msg p2p.NotFoundMessage) err
 }
 
 func (s *Service) onXThinBlockMessage(peer *peerConn, msg p2p.XThinBlockMessage) error {
+	hash := consensus.HeaderHash(&msg.Header)
+	known, err := s.validateThinBlockExpectation(peer, msg.Header)
+	if err != nil {
+		return err
+	}
+	if known {
+		s.releaseBlockRequest(hash)
+		peer.deletePendingThin(hash)
+		return nil
+	}
 	matches := s.pool.ShortIDMatches(func(txid [32]byte) uint64 {
 		return thinBlockShortID(msg.Nonce, txid)
 	}, xThinShortIDSet(msg))
@@ -582,16 +689,20 @@ func (s *Service) onXThinBlockMessage(peer *peerConn, msg p2p.XThinBlockMessage)
 		peer.clearGrapheneRecoveryPending(state.hash)
 		return s.requestFullBlock(peer, state.hash)
 	}
-	peer.storePendingThin(state)
+	if !peer.storePendingThin(state) {
+		return s.requestFullBlock(peer, state.hash)
+	}
 	return peer.send(p2p.GetXBlockTxMessage{BlockHash: state.hash, Indexes: missing})
 }
 
 func (s *Service) onCompactBlockMessage(peer *peerConn, msg p2p.CompactBlockMessage) error {
 	s.noteCompactBlockReceived()
 	hash := consensus.HeaderHash(&msg.Header)
-	if ok, err := s.hasKnownBlock(hash); err != nil {
+	known, err := s.validateThinBlockExpectation(peer, msg.Header)
+	if err != nil {
 		return err
-	} else if ok {
+	}
+	if known {
 		s.releaseBlockRequest(hash)
 		peer.deletePendingThin(hash)
 		return nil
@@ -617,9 +728,73 @@ func (s *Service) onCompactBlockMessage(peer *peerConn, msg p2p.CompactBlockMess
 		s.noteGrapheneDecodeFailure()
 		return s.requestGrapheneExtendedBlock(peer, state.hash)
 	}
-	peer.storePendingThin(state)
+	if !peer.storePendingThin(state) {
+		return s.requestGrapheneExtendedBlock(peer, state.hash)
+	}
 	s.noteCompactBlockTxRequest()
 	return peer.send(p2p.GetBlockTxMessage{BlockHash: state.hash, Indexes: missing})
+}
+
+func (s *Service) validateThinBlockExpectation(peer *peerConn, header types.BlockHeader) (bool, error) {
+	if peer == nil {
+		return false, errors.New("compact block requires a peer")
+	}
+	if s.thinExpectationFn != nil {
+		if err := s.thinExpectationFn(peer, header); err != nil {
+			return false, err
+		}
+		if !peer.allowThinBlockWork(time.Now()) {
+			return false, errors.New("compact block work budget exhausted")
+		}
+		return false, nil
+	}
+	if s.chainState == nil || s.chainState.Store() == nil {
+		return false, errors.New("compact block expectation requires chain state")
+	}
+	hash := consensus.HeaderHash(&header)
+	entry, err := s.chainState.Store().GetBlockIndex(&hash)
+	if err != nil {
+		return false, err
+	}
+	if entry == nil || entry.Header != header {
+		return false, fmt.Errorf("unexpected compact block for unknown header %x", hash)
+	}
+	if entry.Validated {
+		return true, nil
+	}
+	if s.blockRequestOwnedByPeer(hash, peer.addr) {
+		if !peer.allowThinBlockWork(time.Now()) {
+			return false, errors.New("compact block work budget exhausted")
+		}
+		return false, nil
+	}
+	s.stateMu.RLock()
+	view, ok := s.chainState.sharedCommittedView()
+	s.stateMu.RUnlock()
+	if !ok || entry.Height != view.Height+1 || header.PrevBlockHash != view.TipHash {
+		return false, fmt.Errorf("unexpected compact block outside active-tip window %x", hash)
+	}
+	if !peer.allowThinBlockWork(time.Now()) {
+		return false, errors.New("compact block work budget exhausted")
+	}
+	return false, nil
+}
+
+func (s *Service) blockServingLimit() int {
+	if s != nil && s.cfg.MaxMessageBytes > 0 {
+		return s.cfg.MaxMessageBytes
+	}
+	return defaultMaxMessageBytes
+}
+
+func (s *Service) blockRequestOwnedByPeer(hash [32]byte, peerAddr string) bool {
+	s.downloadMu.Lock()
+	defer s.downloadMu.Unlock()
+	req, ok := s.blockRequests[hash]
+	if !ok || req.peerAddr != peerAddr {
+		return false
+	}
+	return time.Since(req.requestedAt) < s.syncManager().blockRequestTimeout()
 }
 
 func (s *Service) onGetXBlockTxMessage(peer *peerConn, msg p2p.GetXBlockTxMessage) error {
@@ -738,15 +913,46 @@ func (s *Service) preferredBlockRelayMessage(peer *peerConn, hash [32]byte) (p2p
 	if err != nil || !ok {
 		return nil, ok, err
 	}
+	return s.preferredBlockRelayMessageForBlock(peer, block), true, nil
+}
+
+func (s *Service) preferredBlockRelayMessageForBlock(peer *peerConn, block types.Block) p2p.Message {
 	plan := selectBlockRelayPlan(peer, block)
 	s.noteBlockRelayPlan(plan)
 	switch plan {
 	case blockRelayPlanGrapheneExtended:
-		return buildXThinBlockMessage(block), true, nil
+		return buildXThinBlockMessage(block)
 	case blockRelayPlanCompactFallback:
-		return buildCompactBlockMessage(block), true, nil
+		return buildCompactBlockMessage(block)
 	default:
-		return p2p.BlockMessage{Block: block}, true, nil
+		if peer != nil && peer.supportsChunkedBlockRelay() {
+			return p2p.ChunkedBlockTransferMessage{Block: block}
+		}
+		return p2p.BlockMessage{Block: block}
+	}
+}
+
+func (s *Service) resolveQueuedBlockReference(peer *peerConn, ref *outboundBlockReference) (p2p.Message, error) {
+	if ref == nil {
+		return nil, errors.New("missing queued block reference")
+	}
+	block, ok, err := s.loadBlock(ref.item.Hash)
+	if err != nil {
+		return nil, err
+	}
+	blockBytes := block.EncodedLen()
+	if !ok || !ref.batch.tryCharge(blockBytes) || !peer.allowBlockServeBytes(blockBytes, time.Now(), s.blockServingLimit()) {
+		return p2p.NotFoundMessage{Items: []p2p.InvVector{ref.item}}, nil
+	}
+	switch ref.item.Type {
+	case p2p.InvTypeBlock:
+		return s.preferredBlockRelayMessageForBlock(peer, block), nil
+	case p2p.InvTypeBlockExtended:
+		return buildXThinBlockMessage(block), nil
+	case p2p.InvTypeBlockFull:
+		return p2p.BlockMessage{Block: block}, nil
+	default:
+		return p2p.NotFoundMessage{Items: []p2p.InvVector{ref.item}}, nil
 	}
 }
 

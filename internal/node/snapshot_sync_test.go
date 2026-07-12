@@ -7,6 +7,7 @@ import (
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
+	"bitcoin-pure/internal/utxochecksum"
 )
 
 func TestExportUTXOSnapshotFileRoundTrip(t *testing.T) {
@@ -97,8 +98,8 @@ func TestImportUTXOSnapshotFastSyncStoresChainState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFastSyncState: %v", err)
 	}
-	if fastSyncState == nil || fastSyncState.SnapshotHeight != loaded.Fixture.Height {
-		t.Fatalf("fast sync state = %+v, want height %d", fastSyncState, loaded.Fixture.Height)
+	if fastSyncState != nil {
+		t.Fatalf("validated import left pending fast sync state: %+v", fastSyncState)
 	}
 	retained, err := store.LoadFastSyncSnapshotUTXOs()
 	if err != nil {
@@ -111,8 +112,8 @@ func TestImportUTXOSnapshotFastSyncStoresChainState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WalletIndexHeight after import: %v", err)
 	}
-	if walletIndexHeight != nil {
-		t.Fatalf("wallet index height after import = %v, want nil until verification", walletIndexHeight)
+	if walletIndexHeight == nil || *walletIndexHeight != loaded.Fixture.Height {
+		t.Fatalf("wallet index height after import = %v, want %d", walletIndexHeight, loaded.Fixture.Height)
 	}
 }
 
@@ -142,8 +143,8 @@ func TestVerifyFastSyncSnapshotFromStoreClearsTrustState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyFastSyncSnapshotFromStore: %v", err)
 	}
-	if summary.Height != loaded.Fixture.Height {
-		t.Fatalf("verification height = %d, want %d", summary.Height, loaded.Fixture.Height)
+	if summary != (SnapshotHistoricalVerificationSummary{}) {
+		t.Fatalf("already validated import returned verification work: %+v", summary)
 	}
 	fastSyncState, err := store.LoadFastSyncState()
 	if err != nil {
@@ -168,5 +169,113 @@ func TestVerifyFastSyncSnapshotFromStoreClearsTrustState(t *testing.T) {
 	}
 	if !entry.Validated {
 		t.Fatal("expected historical verification to leave height 2 validated")
+	}
+}
+
+func TestImportUTXOSnapshotRejectsBodyPoisonBeforeActivation(t *testing.T) {
+	loaded, err := LoadUTXOSnapshotFixture("../../fixtures/snapshots/regtest_bootstrap_tip.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := loadSnapshotTestGenesis(loaded.ResolveReferencePath(loaded.Fixture.GenesisFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := loadSnapshotTestBlocks(loaded.ResolveReferencePath(loaded.Fixture.ChainFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks[0].Txs = append(blocks[0].Txs, types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: types.OutPoint{TxID: [32]byte{1}}}},
+			Outputs: []types.TxOutput{types.NewXOnlyOutput(1, [32]byte{2})},
+		},
+		Auth: types.TxAuth{Entries: []types.TxAuthEntry{{AuthPayload: make([]byte, 1024)}}},
+	})
+	dbPath := t.TempDir()
+	if _, err := ImportUTXOSnapshotFastSync(dbPath, loaded, &genesis, blocks, nil); err == nil {
+		t.Fatal("body-poisoned snapshot import succeeded")
+	}
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	state, err := store.LoadChainStateMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != nil {
+		t.Fatalf("rejected snapshot activated chain state: %+v", state)
+	}
+}
+
+func TestImportUTXOSnapshotRejectsOriginTamperBeforeActivation(t *testing.T) {
+	loaded, err := LoadUTXOSnapshotFixture("../../fixtures/snapshots/regtest_bootstrap_tip.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := loadSnapshotTestGenesis(loaded.ResolveReferencePath(loaded.Fixture.GenesisFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := loadSnapshotTestBlocks(loaded.ResolveReferencePath(loaded.Fixture.ChainFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRoot := consensus.ComputedUTXORoot(loaded.UTXOs)
+	originalChecksum := loaded.ComputedChecksum
+	for outPoint, entry := range loaded.UTXOs {
+		entry.Coinbase = !entry.Coinbase
+		entry.CreatedHeight++
+		loaded.UTXOs[outPoint] = entry
+		break
+	}
+	// Origin is deliberately outside both commitments, so successful rejection
+	// proves import authenticates it from validated block history.
+	if got := consensus.ComputedUTXORoot(loaded.UTXOs); got != originalRoot {
+		t.Fatalf("origin tamper changed UTXO root: got %x want %x", got, originalRoot)
+	}
+	if got := utxochecksum.Compute(loaded.UTXOs); got != originalChecksum {
+		t.Fatalf("origin tamper changed UTXO checksum: got %x want %x", got, originalChecksum)
+	}
+
+	dbPath := t.TempDir()
+	if _, err := ImportUTXOSnapshotFastSync(dbPath, loaded, &genesis, blocks, nil); err == nil {
+		t.Fatal("origin-tampered snapshot import succeeded")
+	}
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	state, err := store.LoadChainStateMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != nil {
+		t.Fatalf("rejected origin-tampered snapshot activated chain state: %+v", state)
+	}
+}
+
+func TestOpenPersistentChainStateRejectsLegacyPendingFastSync(t *testing.T) {
+	dbPath := t.TempDir()
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteFastSyncStateMetadata(&storage.FastSyncState{SnapshotHeight: 42}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := OpenPersistentChainState(dbPath, types.Regtest)
+	if err == nil {
+		state.Close()
+		t.Fatal("legacy pending fast-sync state was activated")
 	}
 }

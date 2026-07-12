@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 )
 
 type OutPoint struct {
@@ -166,6 +167,13 @@ func (r *reader) take(n int) ([]byte, error) {
 	out := r.buf[r.pos:end]
 	r.pos = end
 	return out, nil
+}
+
+func (r *reader) remaining() int {
+	if r == nil || r.pos >= len(r.buf) {
+		return 0
+	}
+	return len(r.buf) - r.pos
 }
 
 func (r *reader) readU8() (uint8, error) {
@@ -334,12 +342,18 @@ func CanonicalVarIntBytes(v uint64) []byte {
 	return AppendCanonicalVarInt(nil, v)
 }
 
-func readCount(r *reader, max int, field string) (int, error) {
+func readCountBoundedByBytes(r *reader, minEncodedBytes uint64, intrinsicMax uint64, field string) (int, error) {
 	raw, err := r.readVarInt()
 	if err != nil {
 		return 0, err
 	}
-	if raw > uint64(max) {
+	if intrinsicMax != 0 && raw > intrinsicMax {
+		return 0, LimitExceededError{Field: field}
+	}
+	if minEncodedBytes != 0 && raw > uint64(r.remaining())/minEncodedBytes {
+		return 0, LimitExceededError{Field: field}
+	}
+	if raw > uint64(math.MaxInt) {
 		return 0, LimitExceededError{Field: field}
 	}
 	return int(raw), nil
@@ -437,6 +451,9 @@ func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
 	if err != nil {
 		return TxAuthEntry{}, err
 	}
+	if authLen > uint64(r.remaining()) || authLen > uint64(math.MaxInt) {
+		return TxAuthEntry{}, LimitExceededError{Field: "tx.auth_payload"}
+	}
 	authPayload, err := r.take(int(authLen))
 	if err != nil {
 		return TxAuthEntry{}, err
@@ -493,12 +510,12 @@ func (b TxBase) EncodedLen() int {
 	return size
 }
 
-func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
+func decodeTxBase(r *reader) (TxBase, error) {
 	version, err := r.readU32LE()
 	if err != nil {
 		return TxBase{}, err
 	}
-	inputCount, err := readCount(r, limits.MaxInputs, "tx.inputs")
+	inputCount, err := readCountBoundedByBytes(r, 36, 0, "tx.inputs")
 	if err != nil {
 		return TxBase{}, err
 	}
@@ -526,7 +543,8 @@ func decodeTxBase(r *reader, limits CodecLimits) (TxBase, error) {
 		}
 		inputs = append(inputs, input)
 	}
-	outputCount, err := readCount(r, limits.MaxOutputs, "tx.outputs")
+	const maxRepresentableOutputs = uint64(math.MaxUint32) + 1
+	outputCount, err := readCountBoundedByBytes(r, 41, maxRepresentableOutputs, "tx.outputs")
 	if err != nil {
 		return TxBase{}, err
 	}
@@ -562,10 +580,13 @@ func (a TxAuth) EncodedLen() int {
 	return size
 }
 
-func decodeTxAuth(r *reader, maxEntries int) (TxAuth, error) {
-	count, err := readCount(r, maxEntries, "tx.auth")
+func decodeTxAuth(r *reader, expectedEntries int) (TxAuth, error) {
+	count, err := readCountBoundedByBytes(r, 1, uint64(expectedEntries), "tx.auth")
 	if err != nil {
 		return TxAuth{}, err
+	}
+	if count != expectedEntries {
+		return TxAuth{}, InvalidFormatError{Reason: "auth entry count must equal input count"}
 	}
 	entries := make([]TxAuthEntry, 0, count)
 	for range count {
@@ -609,12 +630,12 @@ func (t Transaction) EncodedLen() int {
 	return t.Base.EncodedLen() + t.Auth.EncodedLen()
 }
 
-func decodeTransactionFromReader(r *reader, limits CodecLimits) (Transaction, error) {
-	base, err := decodeTxBase(r, limits)
+func decodeTransactionFromReader(r *reader) (Transaction, error) {
+	base, err := decodeTxBase(r)
 	if err != nil {
 		return Transaction{}, err
 	}
-	auth, err := decodeTxAuth(r, limits.MaxInputs)
+	auth, err := decodeTxAuth(r, len(base.Inputs))
 	if err != nil {
 		return Transaction{}, err
 	}
@@ -643,8 +664,12 @@ func decodeTransactionFromReader(r *reader, limits CodecLimits) (Transaction, er
 }
 
 func DecodeTransactionWithLimits(buf []byte, limits CodecLimits) (Transaction, error) {
+	maxBytes := limits.MaxBlockBytes
+	if maxBytes > 0 && len(buf) > maxBytes {
+		return Transaction{}, LimitExceededError{Field: "tx.bytes"}
+	}
 	r := newReader(buf)
-	tx, err := decodeTransactionFromReader(r, limits)
+	tx, err := decodeTransactionFromReader(r)
 	if err != nil {
 		return Transaction{}, err
 	}
@@ -764,7 +789,15 @@ func (b Block) EncodedLen() int {
 }
 
 func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
-	if len(buf) > limits.MaxBlockBytes {
+	return DecodeBlockWithBudget(buf, uint64(max(0, limits.MaxBlockBytes)))
+}
+
+// DecodeBlockWithBudget decodes canonical block bytes under the contextual
+// parent-derived consensus budget. Counts are bounded by remaining bytes before
+// allocation; no independent count constant can reject an otherwise valid
+// block.
+func DecodeBlockWithBudget(buf []byte, maxBytes uint64) (Block, error) {
+	if maxBytes > 0 && uint64(len(buf)) > maxBytes {
 		return Block{}, LimitExceededError{Field: "block.bytes"}
 	}
 	r := newReader(buf)
@@ -772,13 +805,13 @@ func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
 	if err != nil {
 		return Block{}, err
 	}
-	txCount, err := readCount(r, limits.MaxTxsPerBlock, "block.txs")
+	txCount, err := readCountBoundedByBytes(r, 64, 0, "block.txs")
 	if err != nil {
 		return Block{}, err
 	}
 	txs := make([]Transaction, 0, txCount)
 	for range txCount {
-		tx, err := decodeTransactionFromReader(r, limits)
+		tx, err := decodeTransactionFromReader(r)
 		if err != nil {
 			return Block{}, err
 		}
@@ -796,6 +829,14 @@ func DecodeBlockHex(raw string, limits CodecLimits) (Block, error) {
 		return Block{}, err
 	}
 	return DecodeBlockWithLimits(buf, limits)
+}
+
+func DecodeBlockHexWithBudget(raw string, maxBytes uint64) (Block, error) {
+	buf, err := hex.DecodeString(raw)
+	if err != nil {
+		return Block{}, err
+	}
+	return DecodeBlockWithBudget(buf, maxBytes)
 }
 
 func NewXOnlyOutput(valueAtoms uint64, pubKey [32]byte) TxOutput {

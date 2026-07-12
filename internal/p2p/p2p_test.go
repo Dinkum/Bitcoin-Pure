@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -68,6 +69,69 @@ func TestConnMessageRoundTrip(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("write message: %v", err)
+	}
+}
+
+func TestChunkedBlockTransferUsesBoundedFrames(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	const maxPayload = 512
+	magic := MagicForProfile(types.Regtest)
+	sender := NewConn(left, magic, maxPayload)
+	receiver := NewConn(right, magic, maxPayload)
+	height := uint64(1)
+	var extraNonce [types.CoinbaseExtraNonceLen]byte
+	outputs := make([]types.TxOutput, 40)
+	for i := range outputs {
+		outputs[i] = types.NewXOnlyOutput(1, [32]byte{byte(i)})
+	}
+	block := types.Block{Txs: []types.Transaction{{Base: types.TxBase{
+		Version:            1,
+		CoinbaseHeight:     &height,
+		CoinbaseExtraNonce: &extraNonce,
+		Outputs:            outputs,
+	}}}}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sender.WriteMessage(ChunkedBlockTransferMessage{Block: block})
+	}()
+
+	startMessage, err := receiver.ReadMessage()
+	if err != nil {
+		t.Fatalf("read block start: %v", err)
+	}
+	start, ok := startMessage.(BlockStartMessage)
+	if !ok {
+		t.Fatalf("first message type = %T, want BlockStartMessage", startMessage)
+	}
+	raw := make([]byte, 0, int(start.TotalSize))
+	for uint64(len(raw)) < start.TotalSize {
+		message, err := receiver.ReadMessage()
+		if err != nil {
+			t.Fatalf("read block chunk: %v", err)
+		}
+		chunk, ok := message.(BlockChunkMessage)
+		if !ok {
+			t.Fatalf("chunk message type = %T", message)
+		}
+		if chunk.Offset != uint64(len(raw)) {
+			t.Fatalf("chunk offset = %d, want %d", chunk.Offset, len(raw))
+		}
+		raw = append(raw, chunk.Data...)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("write chunked block: %v", err)
+	}
+	if got := crypto.Sha256d(raw); got != start.Checksum {
+		t.Fatal("chunked transfer checksum mismatch")
+	}
+	decoded, err := types.DecodeBlockWithBudget(raw, start.TotalSize)
+	if err != nil {
+		t.Fatalf("decode transferred block: %v", err)
+	}
+	if !bytes.Equal(decoded.Encode(), block.Encode()) {
+		t.Fatal("chunked block roundtrip mismatch")
 	}
 }
 

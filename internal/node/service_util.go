@@ -216,12 +216,12 @@ func randomNonce() uint64 {
 }
 
 func (s *Service) localVersion() p2p.VersionMessage {
-	services := p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceCompactBlockRelay | p2p.ServiceGrapheneExtended
+	services := p2p.ServiceNodeNetwork | p2p.ServiceErlayTxRelay | p2p.ServiceCompactBlockRelay | p2p.ServiceGrapheneExtended | p2p.ServiceChunkedBlockRelay
 	if s.avalancheManager().enabled() {
 		services |= p2p.ServiceAvalancheOverlay
 	}
 	return p2p.VersionMessage{
-		Protocol:  1,
+		Protocol:  2,
 		Services:  services,
 		Height:    s.blockHeight(),
 		Nonce:     randomNonce(),

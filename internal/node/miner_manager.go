@@ -268,7 +268,10 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxT
 		maxTemplateBytes -= 1024
 	}
 	selectStartedAt := time.Now()
-	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlayWithLookupLimit(baseLookup, consensus.DefaultConsensusRules(), maxTemplateBytes, maxTxs)
+	selectedEntries, totalFees, selectionView := m.svc.pool.SelectForBlockOverlayWithLookupLimit(baseLookup, consensus.TxValidationContext{
+		Params:      consensus.ParamsForProfile(m.svc.cfg.Profile),
+		SpendHeight: snapshot.height + 1,
+	}, consensus.DefaultConsensusRules(), maxTemplateBytes, maxTxs)
 	if m.stopping() {
 		return types.Block{}, nil, nil, nil, nil, 0, 0, nil, nil, nil, ErrServiceStopping
 	}
@@ -413,7 +416,10 @@ func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoc
 	}
 
 	appendSelectStartedAt := time.Now()
-	added, addedFees := m.svc.pool.AppendForBlockOverlayWithLookup(m.template.baseLookup, m.template.selectionView, consensus.DefaultConsensusRules(), maxTemplateBytes, m.template.selected)
+	added, addedFees := m.svc.pool.AppendForBlockOverlayWithLookup(m.template.baseLookup, m.template.selectionView, consensus.TxValidationContext{
+		Params:      consensus.ParamsForProfile(m.svc.cfg.Profile),
+		SpendHeight: ctx.height + 1,
+	}, consensus.DefaultConsensusRules(), maxTemplateBytes, m.template.selected)
 	m.svc.perf.noteTemplateSelectDuration(time.Since(appendSelectStartedAt))
 	if len(added) == 0 {
 		m.template.mempoolEpoch = mempoolEpoch

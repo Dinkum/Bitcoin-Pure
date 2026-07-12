@@ -101,6 +101,7 @@ type appliedBlockDetail struct {
 	summary          consensus.BlockValidationSummary
 	overlay          *consensus.UtxoOverlay
 	createdUTXO      map[types.OutPoint]consensus.UtxoEntry
+	spentPreBlock    []consensus.SpentUTXO
 	accumulatorDelta utreexo.AccumulatorNodeDelta
 }
 
@@ -269,7 +270,7 @@ func (c *ChainState) InitializeFromGenesisBlock(genesis *types.Block) (GenesisBo
 	coinbaseTxID := txids[0]
 	utxos := make(consensus.UtxoSet, len(coinbase.Base.Outputs))
 	for vout, output := range coinbase.Base.Outputs {
-		utxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
+		utxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutputAtHeight(output, 0, true)
 	}
 	seededBlockSizeState := consensus.NewBlockSizeState(c.params)
 	seededBlockSizeState.BlockSize = uint64(genesis.EncodedLen())
@@ -322,10 +323,6 @@ func (c *ChainState) ApplyBlock(block *types.Block) (consensus.BlockValidationSu
 }
 
 func (c *ChainState) applyBlockDetailed(block *types.Block) (appliedBlockDetail, error) {
-	return c.applyBlockDetailedWithSpent(block, nil)
-}
-
-func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO map[types.OutPoint]consensus.UtxoEntry) (appliedBlockDetail, error) {
 	if c.height == nil || c.tipHeader == nil {
 		return appliedBlockDetail{}, ErrNoTip
 	}
@@ -333,7 +330,7 @@ func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO m
 	// shared base view and only swaps in a freshly materialized post-block map
 	// once the block is fully validated.
 	baseAcc := c.utxoAcc
-	summary, overlay, nextAcc, err := consensus.ValidateAndApplyBlockOverlayWithLookup(
+	delta, err := consensus.ValidateAndApplyBlockDeltaWithLookup(
 		block,
 		c.prevBlockContext(),
 		c.blockSizeState,
@@ -346,13 +343,13 @@ func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO m
 	if err != nil {
 		return appliedBlockDetail{}, err
 	}
+	summary := delta.Summary
+	overlay := delta.Overlay
+	nextAcc := delta.NextAccumulator
 	createdUTXO := overlay.CreatedEntriesClone()
-	if spentUTXO == nil {
-		var err error
-		spentUTXO, err = blockSpentCommittedUTXOs(c.utxoLookup, block)
-		if err != nil {
-			return appliedBlockDetail{}, err
-		}
+	spentUTXO := make(map[types.OutPoint]consensus.UtxoEntry, len(delta.SpentPreBlock))
+	for _, spent := range delta.SpentPreBlock {
+		spentUTXO[spent.OutPoint] = spent.Entry
 	}
 	height := summary.Height
 	c.height = &height
@@ -373,6 +370,7 @@ func (c *ChainState) applyBlockDetailedWithSpent(block *types.Block, spentUTXO m
 		summary:          summary,
 		overlay:          overlay,
 		createdUTXO:      createdUTXO,
+		spentPreBlock:    delta.SpentPreBlock,
 		accumulatorDelta: utreexo.AccumulatorNodeDeltaBetween(baseAcc, nextAcc),
 	}, nil
 }
@@ -542,34 +540,6 @@ func (c *ChainState) StoredStateMeta() (*storage.StoredChainStateMeta, error) {
 	}, nil
 }
 
-func blockSpentCommittedUTXOs(lookup consensus.UtxoLookupWithErr, block *types.Block) (map[types.OutPoint]consensus.UtxoEntry, error) {
-	spent := make(map[types.OutPoint]consensus.UtxoEntry)
-	for i := 1; i < len(block.Txs); i++ {
-		for _, input := range block.Txs[i].Base.Inputs {
-			entry, ok, err := lookup(input.PrevOut)
-			if err != nil {
-				return nil, fmt.Errorf("spent utxo lookup failed: %w", err)
-			}
-			if !ok {
-				continue
-			}
-			spent[input.PrevOut] = entry
-		}
-	}
-	return spent, nil
-}
-
-func spentCommittedUTXOsFromUndo(undo []storage.BlockUndoEntry) map[types.OutPoint]consensus.UtxoEntry {
-	if len(undo) == 0 {
-		return map[types.OutPoint]consensus.UtxoEntry{}
-	}
-	spent := make(map[types.OutPoint]consensus.UtxoEntry, len(undo))
-	for _, entry := range undo {
-		spent[entry.OutPoint] = entry.Entry
-	}
-	return spent
-}
-
 func OpenPersistentChainState(path string, profile types.ChainProfile) (*PersistentChainState, error) {
 	return OpenPersistentChainStateWithRulesAndLogger(path, profile, consensus.DefaultConsensusRules(), slog.Default())
 }
@@ -603,6 +573,15 @@ func openPersistentChainStateFromMeta(path string, profile types.ChainProfile, r
 	store, err := storage.OpenWithLoggerAndOptions(path, logging.ComponentWith(logger, "storage"), storeOptions)
 	if err != nil {
 		return nil, err
+	}
+	pendingFastSync, err := store.LoadFastSyncState()
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	if pendingFastSync != nil {
+		store.Close()
+		return nil, fmt.Errorf("refusing to activate unverified fast-sync state at height %d", pendingFastSync.SnapshotHeight)
 	}
 	stored, err := store.LoadChainStateMeta()
 	if err != nil {

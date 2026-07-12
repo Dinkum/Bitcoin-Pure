@@ -138,13 +138,29 @@ func (s *Service) stressLaneInfo() StressLaneInfo {
 }
 
 func (s *Service) ensureStressLaneReserve() error {
-	if s.stressLaneInfo().ReserveUTXOs > 0 {
-		return nil
+	for _, utxo := range s.UTXOsByPubKeys([][32]byte{stressLaneReservePubKey()}) {
+		if utxo.Mature {
+			return nil
+		}
 	}
 	// Seed a confirmed reserve output once so live stress funding can fan out a
 	// normal signed transaction and let any network miner confirm it.
-	_, err := s.MineFundingOutputs([][32]byte{stressLaneReservePubKey()})
-	return err
+	return s.mineMatureStressLaneReserve()
+}
+
+func (s *Service) mineMatureStressLaneReserve() error {
+	if _, err := s.MineFundingOutputs([][32]byte{stressLaneReservePubKey()}); err != nil {
+		return err
+	}
+	params := consensus.ParamsForProfile(s.cfg.Profile)
+	for confirmations := uint64(1); confirmations < params.CoinbaseMaturity; confirmations++ {
+		// Stress-lane bootstrapping is self-contained and does not require the
+		// operator to configure the ordinary mining payout key.
+		if _, err := s.MineFundingOutputs([][32]byte{stressLaneReservePubKey()}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool) (stressLaneBatch, StressLaneInfo, error) {
@@ -154,6 +170,13 @@ func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool)
 		}
 	}
 	reserveUTXOs := s.UTXOsByPubKeys([][32]byte{stressLaneReservePubKey()})
+	matureReserves := reserveUTXOs[:0]
+	for _, utxo := range reserveUTXOs {
+		if utxo.Mature {
+			matureReserves = append(matureReserves, utxo)
+		}
+	}
+	reserveUTXOs = matureReserves
 	if len(reserveUTXOs) == 0 {
 		return stressLaneBatch{}, s.stressLaneInfo(), errors.New("no confirmed stress reserve is available")
 	}
@@ -165,10 +188,17 @@ func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool)
 	}
 	tx, outputs, err := buildStressLaneFanoutTx(best.OutPoint, best.Value, keyHashes)
 	if err != nil && reserveTopUp && errors.Is(err, consensus.ErrInputsLessThanOutputs) {
-		if _, topUpErr := s.MineFundingOutputs([][32]byte{stressLaneReservePubKey()}); topUpErr != nil {
+		if topUpErr := s.mineMatureStressLaneReserve(); topUpErr != nil {
 			return stressLaneBatch{}, StressLaneInfo{}, topUpErr
 		}
 		reserveUTXOs = s.UTXOsByPubKeys([][32]byte{stressLaneReservePubKey()})
+		matureReserves = reserveUTXOs[:0]
+		for _, utxo := range reserveUTXOs {
+			if utxo.Mature {
+				matureReserves = append(matureReserves, utxo)
+			}
+		}
+		reserveUTXOs = matureReserves
 		if len(reserveUTXOs) == 0 {
 			return stressLaneBatch{}, StressLaneInfo{}, errors.New("stress reserve top-up did not publish a spendable output")
 		}

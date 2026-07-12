@@ -34,8 +34,9 @@ use:
 
 - `target_spacing_secs = 600`
 - `asert_half_life_secs = 86400`
-- `halving_interval = 2_500_000`
-- `initial_subsidy_atoms = 1_000_000_000_000`
+- `halving_interval = 525_600`
+- `initial_subsidy_atoms = 5_000_000_000_000`
+- `tail_subsidy_atoms = 1_000_000_000`
 - `block_size_floor = 32_000_000`
 - `coinbase_maturity = 100`
 - `address_prefix = "bpu"`

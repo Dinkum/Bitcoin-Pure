@@ -198,17 +198,13 @@ func TestDisconnectBlockRestoresAccumulatorState(t *testing.T) {
 	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
 		t.Fatal(err)
 	}
-	genesisUTXOs := cloneUtxos(state.UTXOs())
 	genesisBlockSizeState := state.BlockSizeState()
 
 	first := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 3, genesis.Header.Timestamp+600)
 	if _, err := state.ApplyBlock(&first); err != nil {
 		t.Fatal(err)
 	}
-	undo, err := captureUndoEntries(&first, consensus.LookupWithErrFromSet(genesisUTXOs))
-	if err != nil {
-		t.Fatalf("capture undo: %v", err)
-	}
+	var undo []storage.BlockUndoEntry
 	parentEntry := &storage.BlockIndexEntry{
 		Height:         0,
 		Header:         genesis.Header,
@@ -366,6 +362,13 @@ func TestPersistentChainStatePreservesPQTypedUTXOAcrossReloadSpendAndReorg(t *te
 	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
 		t.Fatal(err)
 	}
+	maturePersistentGenesisForNodeTest(t, persistent)
+	// Copy the branch point into a detached state because this fixture remains
+	// in use after the persistent store is deliberately closed and reopened.
+	baseHeight := *persistent.ChainState().TipHeight()
+	baseHeader := *persistent.ChainState().TipHeader()
+	baseBlockSizeState := persistent.ChainState().BlockSizeState()
+	baseUTXOs := persistent.ChainState().UTXOs()
 	verificationKey, privateKey, err := crypto.GenerateMLDSA65Key(crand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateMLDSA65Key: %v", err)
@@ -376,8 +379,8 @@ func TestPersistentChainStatePreservesPQTypedUTXOAcrossReloadSpendAndReorg(t *te
 	parentTx := spendTxForNodeTestToOutputs(t, 7, genesisOut, 50, []types.TxOutput{
 		types.NewPQLockOutput(40, pqLock),
 	})
-	parentCoinbase := coinbaseTxForHeight(1, []types.TxOutput{types.NewXOnlyOutput(1, nodeSignerPubKey(9))})
-	parentBlock := blockWithTxsForNodeTest(t, 0, genesis.Header, persistent.ChainState().UTXOs(), []types.Transaction{parentCoinbase, parentTx}, genesis.Header.Timestamp+600)
+	parentCoinbase := coinbaseTxForHeight(baseHeight+1, []types.TxOutput{types.NewXOnlyOutput(1, nodeSignerPubKey(9))})
+	parentBlock := blockWithTxsForNodeTest(t, baseHeight, baseHeader, persistent.ChainState().UTXOs(), []types.Transaction{parentCoinbase, parentTx}, baseHeader.Timestamp+600)
 	if _, err := persistent.ApplyBlock(&parentBlock); err != nil {
 		t.Fatalf("ApplyBlock(parent): %v", err)
 	}
@@ -408,8 +411,8 @@ func TestPersistentChainStatePreservesPQTypedUTXOAcrossReloadSpendAndReorg(t *te
 	childTx := spendPQTxForNodeTestToOutputs(t, parentOut, 40, verificationKey, privateKey, []types.TxOutput{
 		types.NewXOnlyOutput(30, nodeSignerPubKey(10)),
 	})
-	childCoinbase := coinbaseTxForHeight(2, []types.TxOutput{types.NewXOnlyOutput(1, nodeSignerPubKey(11))})
-	childBlock := blockWithTxsForNodeTest(t, 1, parentBlock.Header, reopened.ChainState().UTXOs(), []types.Transaction{childCoinbase, childTx}, parentBlock.Header.Timestamp+600)
+	childCoinbase := coinbaseTxForHeight(baseHeight+2, []types.TxOutput{types.NewXOnlyOutput(1, nodeSignerPubKey(11))})
+	childBlock := blockWithTxsForNodeTest(t, baseHeight+1, parentBlock.Header, reopened.ChainState().UTXOs(), []types.Transaction{childCoinbase, childTx}, parentBlock.Header.Timestamp+600)
 	if _, err := reopened.ApplyBlock(&childBlock); err != nil {
 		t.Fatalf("ApplyBlock(child): %v", err)
 	}
@@ -418,18 +421,18 @@ func TestPersistentChainStatePreservesPQTypedUTXOAcrossReloadSpendAndReorg(t *te
 	}
 
 	altState := NewChainState(types.Regtest)
-	if _, err := altState.InitializeFromGenesisBlock(&genesis); err != nil {
+	if err := altState.InitializeTip(baseHeight, baseHeader, baseBlockSizeState, baseUTXOs); err != nil {
 		t.Fatal(err)
 	}
-	alt1 := nextCoinbaseBlock(0, genesis.Header, altState.UTXOs(), 12, genesis.Header.Timestamp+600)
+	alt1 := nextCoinbaseBlock(baseHeight, baseHeader, altState.UTXOs(), 12, baseHeader.Timestamp+601)
 	if _, err := altState.ApplyBlock(&alt1); err != nil {
 		t.Fatal(err)
 	}
-	alt2 := nextCoinbaseBlock(1, alt1.Header, altState.UTXOs(), 13, alt1.Header.Timestamp+600)
+	alt2 := nextCoinbaseBlock(baseHeight+1, alt1.Header, altState.UTXOs(), 13, alt1.Header.Timestamp+600)
 	if _, err := altState.ApplyBlock(&alt2); err != nil {
 		t.Fatal(err)
 	}
-	alt3 := nextCoinbaseBlock(2, alt2.Header, altState.UTXOs(), 14, alt2.Header.Timestamp+600)
+	alt3 := nextCoinbaseBlock(baseHeight+2, alt2.Header, altState.UTXOs(), 14, alt2.Header.Timestamp+600)
 	if _, err := reopened.ApplyBlock(&alt1); err != nil {
 		t.Fatalf("ApplyBlock(alt1): %v", err)
 	}
@@ -623,7 +626,6 @@ func TestPersistentChainStateReorgsToHigherWorkBranch(t *testing.T) {
 	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
 		t.Fatal(err)
 	}
-
 	active := NewChainState(types.Regtest)
 	if _, err := active.InitializeFromGenesisBlock(&genesis); err != nil {
 		t.Fatal(err)
@@ -720,35 +722,41 @@ func TestPersistentChainStateApplyBlockReturnsBranchTransition(t *testing.T) {
 	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
 		t.Fatal(err)
 	}
-
-	active := NewChainState(types.Regtest)
-	if _, err := active.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
+	maturePersistentGenesisForNodeTest(t, persistent)
+	baseHeight := *persistent.ChainState().TipHeight()
+	baseHeader := *persistent.ChainState().TipHeader()
+	baseBlockSizeState := persistent.ChainState().BlockSizeState()
+	baseUTXOs := persistent.ChainState().UTXOs()
+	newBranch := func() *ChainState {
+		branch := NewChainState(types.Regtest)
+		if err := branch.InitializeTip(baseHeight, baseHeader, baseBlockSizeState, baseUTXOs); err != nil {
+			t.Fatal(err)
+		}
+		return branch
 	}
-	a1 := nextCoinbaseBlock(0, genesis.Header, active.UTXOs(), 3, genesis.Header.Timestamp+600)
+
+	active := newBranch()
+	a1 := nextCoinbaseBlock(baseHeight, baseHeader, active.UTXOs(), 3, baseHeader.Timestamp+600)
 	if _, err := active.ApplyBlock(&a1); err != nil {
 		t.Fatal(err)
 	}
 	spend := spendTxForNodeTest(t, 7, types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}, 50, 8, 1)
-	a2Coinbase := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(3)}})
-	a2 := blockWithTxsForNodeTest(t, 1, a1.Header, active.UTXOs(), []types.Transaction{a2Coinbase, spend}, a1.Header.Timestamp+600)
+	a2Coinbase := coinbaseTxForHeight(baseHeight+2, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(3)}})
+	a2 := blockWithTxsForNodeTest(t, baseHeight+1, a1.Header, active.UTXOs(), []types.Transaction{a2Coinbase, spend}, a1.Header.Timestamp+600)
 	if _, err := active.ApplyBlock(&a2); err != nil {
 		t.Fatal(err)
 	}
 
-	side := NewChainState(types.Regtest)
-	if _, err := side.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
-	}
-	b1 := nextCoinbaseBlock(0, genesis.Header, side.UTXOs(), 9, genesis.Header.Timestamp+600)
+	side := newBranch()
+	b1 := nextCoinbaseBlock(baseHeight, baseHeader, side.UTXOs(), 9, baseHeader.Timestamp+601)
 	if _, err := side.ApplyBlock(&b1); err != nil {
 		t.Fatal(err)
 	}
-	b2 := nextCoinbaseBlock(1, b1.Header, side.UTXOs(), 10, b1.Header.Timestamp+600)
+	b2 := nextCoinbaseBlock(baseHeight+1, b1.Header, side.UTXOs(), 10, b1.Header.Timestamp+600)
 	if _, err := side.ApplyBlock(&b2); err != nil {
 		t.Fatal(err)
 	}
-	b3 := nextCoinbaseBlock(2, b2.Header, side.UTXOs(), 11, b2.Header.Timestamp+600)
+	b3 := nextCoinbaseBlock(baseHeight+2, b2.Header, side.UTXOs(), 11, b2.Header.Timestamp+600)
 
 	_, transition, err := persistent.ApplyBlockWithTransition(&a1)
 	if err != nil {
@@ -897,6 +905,9 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	if _, err := persistent.InitializeFromGenesisBlock(&genesis); err != nil {
 		t.Fatal(err)
 	}
+	maturePersistentGenesisForNodeTest(t, persistent)
+	baseHeight := *persistent.ChainState().TipHeight()
+	baseHeader := *persistent.ChainState().TipHeader()
 
 	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
 	var parent types.Transaction
@@ -908,7 +919,9 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 		for childSeed := byte(64); childSeed < 128; childSeed++ {
 			candidateChild := spendTxForNodeTest(t, parentSeed, types.OutPoint{TxID: candidateParentTxID, Vout: 0}, 49, childSeed, 1)
 			candidateChildTxID := consensus.TxID(&candidateChild)
-			if bytes.Compare(candidateParentTxID[:], candidateChildTxID[:]) < 0 {
+			// LTOR can place a child before its parent because ordering is by txid,
+			// not dependency. This is the persistence case that previously lost undo.
+			if bytes.Compare(candidateChildTxID[:], candidateParentTxID[:]) < 0 {
 				parent = candidateParent
 				child = candidateChild
 				foundLTORPair = true
@@ -919,35 +932,28 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	if !foundLTORPair {
 		t.Fatal("failed to construct LTOR-compliant same-block spend fixture")
 	}
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(10)}})
-	txs := []types.Transaction{coinbase, parent, child}
+	coinbase := coinbaseTxForHeight(baseHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(10)}})
+	txs := []types.Transaction{coinbase, child, parent}
 	txids, _, txRoot, authRoot := consensus.BuildBlockRoots(txs)
 	nextUTXOs := cloneUtxos(persistent.ChainState().UTXOs())
 	delete(nextUTXOs, genesisOut)
-	parentTxID := txids[1]
-	delete(nextUTXOs, types.OutPoint{TxID: parentTxID, Vout: 0})
-	childTxID := txids[2]
-	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = consensus.UtxoEntry{
-		ValueAtoms: child.Base.Outputs[0].ValueAtoms,
-		PubKey:     child.Base.Outputs[0].PubKey,
-	}
+	childTxID := txids[1]
+	parentTxID := txids[2]
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = consensus.UtxoEntryFromOutputAtHeight(child.Base.Outputs[0], baseHeight+1, false)
 	coinbaseTxID := txids[0]
-	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
-		ValueAtoms: coinbase.Base.Outputs[0].ValueAtoms,
-		PubKey:     coinbase.Base.Outputs[0].PubKey,
-	}
-	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: 0, Header: genesis.Header}, params)
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntryFromOutputAtHeight(coinbase.Base.Outputs[0], baseHeight+1, true)
+	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: baseHeight, Header: baseHeader}, params)
 	if err != nil {
 		t.Fatal(err)
 	}
 	block := types.Block{
 		Header: types.BlockHeader{
 			Version:        1,
-			PrevBlockHash:  consensus.HeaderHash(&genesis.Header),
+			PrevBlockHash:  consensus.HeaderHash(&baseHeader),
 			MerkleTxIDRoot: txRoot,
 			MerkleAuthRoot: authRoot,
 			UTXORoot:       consensus.ComputedUTXORoot(nextUTXOs),
-			Timestamp:      genesis.Header.Timestamp + 600,
+			Timestamp:      baseHeader.Timestamp + 600,
 			NBits:          nbits,
 		},
 		Txs: txs,
@@ -961,7 +967,7 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	if got, want := summary.TotalFees, uint64(2); got != want {
 		t.Fatalf("total fees = %d, want %d", got, want)
 	}
-	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != 1 {
+	if persistent.ChainState().TipHeight() == nil || *persistent.ChainState().TipHeight() != baseHeight+1 {
 		t.Fatalf("unexpected tip after accepted block: %v", persistent.ChainState().TipHeight())
 	}
 	if _, ok := persistent.ChainState().UTXOs()[genesisOut]; ok {
@@ -972,6 +978,14 @@ func TestPersistentChainStateAcceptsBlockWithIntraBlockSpend(t *testing.T) {
 	}
 	if got, want := persistent.ChainState().UTXORoot(), consensus.ComputedUTXORoot(nextUTXOs); got != want {
 		t.Fatalf("utxo root after accepted block = %x, want %x", got, want)
+	}
+	blockHash := consensus.HeaderHash(&block.Header)
+	undo, err := persistent.Store().GetUndo(&blockHash)
+	if err != nil {
+		t.Fatalf("read persisted undo: %v", err)
+	}
+	if len(undo) != 1 || undo[0].OutPoint != genesisOut {
+		t.Fatalf("persisted undo = %+v, want only pre-block genesis spend", undo)
 	}
 }
 

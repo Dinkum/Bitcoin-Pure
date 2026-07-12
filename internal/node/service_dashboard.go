@@ -441,6 +441,10 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 	if err != nil {
 		return dashboardBlockPage{}, err
 	}
+	resolvedInputs, err := consensus.ResolveBlockInputEntries(block, undo)
+	if err != nil {
+		return dashboardBlockPage{}, fmt.Errorf("resolve block inputs at height %d: %w", height, err)
+	}
 	page := dashboardBlockPage{
 		Height:      height,
 		Hash:        *hash,
@@ -456,7 +460,6 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 	}
 	fees := make([]uint64, 0, len(block.Txs))
 	feeRates := make([]uint64, 0, len(block.Txs))
-	undoIndex := 0
 	for i, tx := range block.Txs {
 		txPage := dashboardTxPage{
 			BlockHeight: height,
@@ -482,15 +485,14 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 			page.TotalUserTxs++
 			txPage.Inputs = make([]dashboardTxInput, 0, len(tx.Base.Inputs))
 			for _, input := range tx.Base.Inputs {
-				if undoIndex >= len(undo) {
-					return dashboardBlockPage{}, fmt.Errorf("missing undo entry for block %x", *hash)
+				entry, ok := resolvedInputs[input.PrevOut]
+				if !ok {
+					return dashboardBlockPage{}, fmt.Errorf("missing resolved input %v for block %x", input.PrevOut, *hash)
 				}
-				entry := undo[undoIndex]
-				undoIndex++
-				txPage.InputSum += entry.Entry.ValueAtoms
+				txPage.InputSum += entry.ValueAtoms
 				txPage.Inputs = append(txPage.Inputs, dashboardTxInput{
 					PrevOut: input.PrevOut,
-					Amount:  entry.Entry.ValueAtoms,
+					Amount:  entry.ValueAtoms,
 				})
 			}
 			txPage.Fee = txPage.InputSum - txPage.OutputSum

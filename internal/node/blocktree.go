@@ -71,7 +71,7 @@ func (c *ChainState) DisconnectBlock(block *types.Block, undo []storage.BlockUnd
 		return err
 	}
 	workingUtxos := consensus.NewUtxoOverlay(baseUtxos)
-	nextAcc, err := disconnectBlockOverlay(workingUtxos, c.utxoAcc, block, undo)
+	nextAcc, err := disconnectBlockOverlay(workingUtxos, c.utxoAcc, block, undo, parent.Header.UTXORoot)
 	if err != nil {
 		return err
 	}
@@ -151,14 +151,11 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	// Validate against an immutable snapshot without holding the write lock. If
 	// the tip moves before commit, we discard this work and fall back to the
 	// general locked path.
-	undo, err := captureUndoEntries(block, snapshot.utxoLookup)
+	detail, err := snapshot.applyBlockDetailed(block)
 	if err != nil {
 		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
 	}
-	detail, err := snapshot.applyBlockDetailedWithSpent(block, spentCommittedUTXOsFromUndo(undo))
-	if err != nil {
-		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
-	}
+	undo := []storage.BlockUndoEntry(detail.spentPreBlock)
 	nextStateMeta, err := snapshot.StoredStateMeta()
 	if err != nil {
 		return consensus.BlockValidationSummary{}, 0, committedBranchTransition{}, true, err
@@ -416,14 +413,11 @@ func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uin
 	connectedBlocks := make([]types.Block, 0, len(steps))
 	var summary consensus.BlockValidationSummary
 	for _, step := range steps {
-		undo, err := captureUndoEntries(&step.block, tempState.utxoLookup)
+		detail, err := tempState.applyBlockDetailed(&step.block)
 		if err != nil {
 			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
 		}
-		detail, err := tempState.applyBlockDetailedWithSpent(&step.block, spentCommittedUTXOsFromUndo(undo))
-		if err != nil {
-			return nil, nil, nil, nil, nil, committedBranchTransition{}, consensus.BlockValidationSummary{}, err
-		}
+		undo := []storage.BlockUndoEntry(detail.spentPreBlock)
 		mergeOverlayDelta(reorgOverlay, detail.overlay)
 		summary = detail.summary
 		entry := step.entry
@@ -498,7 +492,7 @@ func (p *PersistentChainState) disconnectToHeight(state *ChainState, targetHeigh
 		checksumRestored := undoEntriesToUtxoMap(undo)
 		state.utxoChecksum = utxochecksum.ApplyDelta(state.utxoChecksum, checksumSpent, checksumRestored)
 		state.utxoCount += len(checksumRestored) - len(checksumSpent)
-		workingAcc, err = disconnectBlockOverlay(workingUtxos, workingAcc, block, undo)
+		workingAcc, err = disconnectBlockOverlay(workingUtxos, workingAcc, block, undo, parentEntry.Header.UTXORoot)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -551,7 +545,7 @@ func disconnectedBranchTransactions(blocks []types.Block) []types.Transaction {
 	return txs
 }
 
-func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utreexo.Accumulator, block *types.Block, undo []storage.BlockUndoEntry) (*utreexo.Accumulator, error) {
+func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utreexo.Accumulator, block *types.Block, undo []storage.BlockUndoEntry, expectedRoot [32]byte) (*utreexo.Accumulator, error) {
 	if currentUtxos == nil {
 		return nil, fmt.Errorf("missing rollback utxo overlay")
 	}
@@ -571,84 +565,28 @@ func disconnectBlockOverlay(currentUtxos *consensus.UtxoOverlay, currentAcc *utr
 		}
 	}
 
-	undoIndex := 0
+	resolved, err := consensus.ResolveBlockInputEntries(block, undo)
+	if err != nil {
+		return nil, fmt.Errorf("invalid block undo: %w", err)
+	}
 	restoredLeaves := make([]utreexo.UtxoLeaf, 0, len(undo))
-	// Outputs created earlier in the same block are removed above and should not be
-	// restored from undo; only spends that reached into the pre-block UTXO set
-	// consume undo entries.
-	intraBlockOutputs := make(map[types.OutPoint]struct{})
-	for i := 1; i < len(block.Txs); i++ {
-		for _, input := range block.Txs[i].Base.Inputs {
-			if _, ok := intraBlockOutputs[input.PrevOut]; ok {
-				continue
-			}
-			if undoIndex >= len(undo) {
-				return nil, fmt.Errorf("block undo mismatch: missing undo entry for input %v", input.PrevOut)
-			}
-			entry := undo[undoIndex]
-			undoIndex++
-			if entry.OutPoint != input.PrevOut {
-				return nil, fmt.Errorf("undo outpoint mismatch for input %v", input.PrevOut)
-			}
-			currentUtxos.Restore(input.PrevOut, entry.Entry)
-			restoredLeaves = append(restoredLeaves, utxoLeafForEntry(entry.OutPoint, entry.Entry))
+	for _, spent := range undo {
+		entry, ok := resolved[spent.OutPoint]
+		if !ok {
+			return nil, fmt.Errorf("invalid block undo: unresolved pre-block input %v", spent.OutPoint)
 		}
-		txid := consensus.TxID(&block.Txs[i])
-		for vout := range block.Txs[i].Base.Outputs {
-			intraBlockOutputs[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = struct{}{}
-		}
-	}
-	if undoIndex != len(undo) {
-		return nil, fmt.Errorf("block undo mismatch: unused undo entries %d", len(undo)-undoIndex)
+		currentUtxos.Restore(spent.OutPoint, entry)
+		restoredLeaves = append(restoredLeaves, utxoLeafForEntry(spent.OutPoint, entry))
 	}
 
-	return currentAcc.Apply(spentOutputs, restoredLeaves)
-}
-
-func captureUndoEntries(block *types.Block, lookup consensus.UtxoLookupWithErr) ([]storage.BlockUndoEntry, error) {
-	if block == nil || len(block.Txs) <= 1 {
-		return nil, nil
+	nextAccumulator, err := currentAcc.Apply(spentOutputs, restoredLeaves)
+	if err != nil {
+		return nil, err
 	}
-	inputCap := max(0, len(block.Txs)-1)
-	outputCap := len(block.Txs)
-	for i := 1; i < len(block.Txs); i++ {
-		tx := &block.Txs[i]
-		if len(tx.Base.Inputs) > 1 {
-			inputCap += len(tx.Base.Inputs) - 1
-		}
-		if len(tx.Base.Outputs) > 1 {
-			outputCap += len(tx.Base.Outputs) - 1
-		}
+	if nextAccumulator.Root() != expectedRoot {
+		return nil, fmt.Errorf("block undo accumulator root mismatch: expected %x, got %x", expectedRoot, nextAccumulator.Root())
 	}
-	undo := make([]storage.BlockUndoEntry, 0, inputCap)
-	spent := make(map[types.OutPoint]struct{}, inputCap)
-	created := make(map[types.OutPoint]consensus.UtxoEntry, outputCap)
-	for i := 1; i < len(block.Txs); i++ {
-		tx := &block.Txs[i]
-		txid := consensus.TxID(tx)
-		for _, input := range block.Txs[i].Base.Inputs {
-			if _, duplicate := spent[input.PrevOut]; duplicate {
-				return nil, fmt.Errorf("missing utxo for undo capture: %v", input.PrevOut)
-			}
-			spent[input.PrevOut] = struct{}{}
-			// Only spends that reach into the pre-block UTXO set need an undo record.
-			// Same-block dependency edges are rewound by deleting this block's outputs.
-			if entry, existed, err := lookup(input.PrevOut); err != nil {
-				return nil, fmt.Errorf("undo capture lookup failed: %w", err)
-			} else if existed {
-				undo = append(undo, storage.BlockUndoEntry{OutPoint: input.PrevOut, Entry: entry})
-				continue
-			}
-			if _, ok := created[input.PrevOut]; !ok {
-				return nil, fmt.Errorf("missing utxo for undo capture: %v", input.PrevOut)
-			}
-			delete(created, input.PrevOut)
-		}
-		for vout, output := range tx.Base.Outputs {
-			created[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
-		}
-	}
-	return undo, nil
+	return nextAccumulator, nil
 }
 
 func activeTipDelta(undo []storage.BlockUndoEntry, created map[types.OutPoint]consensus.UtxoEntry) ([]types.OutPoint, map[types.OutPoint]consensus.UtxoEntry) {

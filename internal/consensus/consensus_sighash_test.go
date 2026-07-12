@@ -33,7 +33,7 @@ func TestValidateSignedSpend(t *testing.T) {
 	}
 	_, sig := crypto.SignSchnorrForTest(seed, &msg)
 	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
-	summary, err := ValidateTx(&tx, utxos, DefaultConsensusRules())
+	summary, err := ValidateTx(&tx, utxos, TxValidationContext{Params: MainnetParams()}, DefaultConsensusRules())
 	if err != nil {
 		t.Fatalf("validate tx: %v", err)
 	}

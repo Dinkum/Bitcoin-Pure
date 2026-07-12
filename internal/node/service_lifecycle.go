@@ -4,6 +4,7 @@ import (
 	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/logging"
 	"bitcoin-pure/internal/mempool"
+	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
 	"context"
@@ -208,6 +209,9 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 		recentBlks:          recentBlockCache{items: make(map[[32]byte]types.Block)},
 		rejectCache:         newTxRejectCache(txRejectCacheCapacity, txRejectCachePermanentTTL, txRejectCacheTemporaryTTL),
 		validAuth:           newValidAuthCache(validAuthCacheCapacity),
+		payloadBudget:       p2p.NewPayloadBudget(int64(cfg.MaxMessageBytes) * defaultInflightPayloadMultiplier),
+		thinStateBudget:     p2p.NewPayloadBudget(int64(cfg.MaxMessageBytes) * defaultInflightPayloadMultiplier),
+		blockServeBudget:    p2p.NewPayloadBudget(int64(cfg.MaxMessageBytes) * defaultInflightPayloadMultiplier),
 		mempoolPersistCh:    make(chan struct{}, 1),
 		startedAt:           time.Now(),
 		nodeID:              nodeID,

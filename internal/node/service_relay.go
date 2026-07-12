@@ -1104,15 +1104,50 @@ func (p *peerConn) releaseRelayBatch(msg p2p.Message) {
 	}
 }
 
-func (p *peerConn) storePendingThin(state *pendingThinBlock) {
+func (p *peerConn) storePendingThin(state *pendingThinBlock) bool {
+	if p == nil || state == nil {
+		return false
+	}
 	p.thinMu.Lock()
 	defer p.thinMu.Unlock()
+	p.pruneExpiredPendingThinLocked(time.Now())
+	if previous := p.pendingThin[state.hash]; previous != nil {
+		p.releasePendingThinLocked(previous)
+		delete(p.pendingThin, state.hash)
+	}
+	if len(p.pendingThin) >= maxPendingThinPerPeer {
+		return false
+	}
+	retained := pendingThinRetainedBytes(state)
+	if retained == 0 || retained > uint64(^uint(0)>>1) {
+		return false
+	}
+	var budget *p2p.PayloadBudget
+	if p.svc != nil && p.svc.stopCh != nil && p.closed != nil {
+		budget = p.svc.thinStateBudget
+	}
+	release, ok := budget.TryAcquire(int(retained))
+	if !ok {
+		return false
+	}
+	state.retainedBytes = retained
+	state.expiresAt = time.Now().Add(pendingThinStateTTL)
+	state.releaseBudget = release
 	p.pendingThin[state.hash] = state
+	if p.svc != nil {
+		hash := state.hash
+		expiresAt := state.expiresAt
+		p.svc.safeGo("pending-thin-expiry", func() {
+			p.expirePendingThinAt(hash, expiresAt)
+		})
+	}
+	return true
 }
 
 func (p *peerConn) pendingThinState(hash [32]byte) (*pendingThinBlock, bool) {
 	p.thinMu.Lock()
 	defer p.thinMu.Unlock()
+	p.pruneExpiredPendingThinLocked(time.Now())
 	state, ok := p.pendingThin[hash]
 	return state, ok
 }
@@ -1120,7 +1155,70 @@ func (p *peerConn) pendingThinState(hash [32]byte) (*pendingThinBlock, bool) {
 func (p *peerConn) deletePendingThin(hash [32]byte) {
 	p.thinMu.Lock()
 	defer p.thinMu.Unlock()
+	if state := p.pendingThin[hash]; state != nil {
+		p.releasePendingThinLocked(state)
+	}
 	delete(p.pendingThin, hash)
+}
+
+func (p *peerConn) pruneExpiredPendingThinLocked(now time.Time) {
+	for hash, state := range p.pendingThin {
+		if state == nil || state.expiresAt.IsZero() || now.Before(state.expiresAt) {
+			continue
+		}
+		p.releasePendingThinLocked(state)
+		delete(p.pendingThin, hash)
+	}
+}
+
+func (p *peerConn) releasePendingThinLocked(state *pendingThinBlock) {
+	if state != nil && state.releaseBudget != nil {
+		state.releaseBudget()
+		state.releaseBudget = nil
+	}
+}
+
+func (p *peerConn) expirePendingThinAt(hash [32]byte, expiresAt time.Time) {
+	wait := time.Until(expiresAt)
+	if wait < 0 {
+		wait = 0
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-p.svc.stopCh:
+		return
+	case <-p.closed:
+		return
+	case <-timer.C:
+	}
+	p.thinMu.Lock()
+	defer p.thinMu.Unlock()
+	state := p.pendingThin[hash]
+	if state == nil || !state.expiresAt.Equal(expiresAt) || time.Now().Before(expiresAt) {
+		return
+	}
+	p.releasePendingThinLocked(state)
+	delete(p.pendingThin, hash)
+}
+
+func (p *peerConn) allowThinBlockWork(now time.Time) bool {
+	p.thinMu.Lock()
+	defer p.thinMu.Unlock()
+	if p.thinWorkRefill.IsZero() {
+		p.thinWorkTokens = thinWorkTokenBurst
+		p.thinWorkRefill = now
+	}
+	elapsed := now.Sub(p.thinWorkRefill).Seconds()
+	if elapsed > 0 {
+		p.thinWorkTokens = math.Min(thinWorkTokenBurst, p.thinWorkTokens+elapsed*thinWorkTokensPerSecond)
+		p.thinWorkRefill = now
+	}
+	if p.thinWorkTokens < 1 {
+		return false
+	}
+	p.thinWorkTokens--
+	return true
 }
 
 func (t *peerRelayTelemetry) noteEnqueue(depth queueDepthSnapshot) {

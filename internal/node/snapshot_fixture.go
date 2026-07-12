@@ -13,7 +13,7 @@ import (
 	"bitcoin-pure/internal/utxochecksum"
 )
 
-const UTXOSnapshotFixtureVersion = 2
+const UTXOSnapshotFixtureVersion = 3
 
 type UTXOSnapshotFixture struct {
 	Version               uint32                     `json:"version"`
@@ -29,10 +29,12 @@ type UTXOSnapshotFixture struct {
 }
 
 type UTXOSnapshotFixtureEntry struct {
-	TxIDHex    string `json:"txid_hex"`
-	Vout       uint32 `json:"vout"`
-	ValueAtoms uint64 `json:"value_atoms"`
-	PubKeyHex  string `json:"pubkey_hex"`
+	TxIDHex       string `json:"txid_hex"`
+	Vout          uint32 `json:"vout"`
+	ValueAtoms    uint64 `json:"value_atoms"`
+	PubKeyHex     string `json:"pubkey_hex"`
+	CreatedHeight uint64 `json:"created_height"`
+	Coinbase      bool   `json:"coinbase"`
 }
 
 type LoadedUTXOSnapshotFixture struct {
@@ -190,7 +192,7 @@ func decodeSnapshotUTXOs(entries []UTXOSnapshotFixtureEntry) (consensus.UtxoSet,
 		}
 		hasPrev = true
 		prev = outPoint
-		utxos[outPoint] = consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(entry.ValueAtoms, pubKey))
+		utxos[outPoint] = consensus.UtxoEntryFromOutputAtHeight(types.NewXOnlyOutput(entry.ValueAtoms, pubKey), entry.CreatedHeight, entry.Coinbase)
 	}
 	return utxos, nil
 }

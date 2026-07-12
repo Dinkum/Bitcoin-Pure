@@ -204,7 +204,7 @@ func nextCoinbaseBlock(prevHeight uint64, prev types.BlockHeader, currentUTXOs c
 	txids := [][32]byte{consensus.TxID(&coinbase)}
 	authids := [][32]byte{consensus.AuthID(&coinbase)}
 	nextUTXOs := cloneUtxos(currentUTXOs)
-	nextUTXOs[types.OutPoint{TxID: txids[0], Vout: 0}] = consensus.UtxoEntry{ValueAtoms: 1, PubKey: pubKey}
+	nextUTXOs[types.OutPoint{TxID: txids[0], Vout: 0}] = consensus.UtxoEntryFromOutputAtHeight(coinbase.Base.Outputs[0], prevHeight+1, true)
 	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: prevHeight, Header: prev}, params)
 	if err != nil {
 		panic(err)
@@ -247,7 +247,10 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 			}
 			claimedInputs[input.PrevOut] = struct{}{}
 		}
-		summary, err := consensus.ValidateTxWithParams(tx, currentUTXOs, consensus.RegtestParams(), consensus.DefaultConsensusRules())
+		summary, err := consensus.ValidateTx(tx, currentUTXOs, consensus.TxValidationContext{
+			Params:      consensus.RegtestParams(),
+			SpendHeight: prevHeight + 1,
+		}, consensus.DefaultConsensusRules())
 		if err != nil {
 			t.Fatalf("validate tx %d: %v", i, err)
 		}
@@ -260,7 +263,7 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 		tx := &blockTxs[i]
 		txid := consensus.TxID(tx)
 		for vout, output := range tx.Base.Outputs {
-			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
+			tempUtxos[types.OutPoint{TxID: txid, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutputAtHeight(output, prevHeight+1, false)
 		}
 	}
 
@@ -272,7 +275,7 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 	blockTxs[0] = coinbase
 	coinbaseTxID := consensus.TxID(&blockTxs[0])
 	for vout, output := range blockTxs[0].Base.Outputs {
-		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutput(output)
+		tempUtxos[types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}] = consensus.UtxoEntryFromOutputAtHeight(output, prevHeight+1, true)
 	}
 
 	txids := make([][32]byte, 0, len(blockTxs))
@@ -298,6 +301,73 @@ func blockWithTxsForNodeTest(t *testing.T, prevHeight uint64, prev types.BlockHe
 		Header: mineHeaderForNodeTest(header),
 		Txs:    blockTxs,
 	}
+}
+
+func matureGenesisForNodeTest(t *testing.T, svc *Service) {
+	t.Helper()
+	params := consensus.ParamsForProfile(svc.cfg.Profile)
+	for {
+		tip := svc.chainState.ChainState().TipHeight()
+		if tip == nil {
+			t.Fatal("missing test chain tip")
+		}
+		if *tip+1 >= params.CoinbaseMaturity {
+			return
+		}
+		state := svc.chainState.ChainState()
+		block := nextCoinbaseBlock(*tip, *state.TipHeader(), state.UTXOs(), byte((*tip%200)+20), state.TipHeader().Timestamp+600)
+		if _, _, err := svc.chainState.ApplyBlockWithTransition(&block); err != nil {
+			t.Fatalf("mature genesis coinbase: %v", err)
+		}
+		if err := svc.headerChain.ApplyHeader(&block.Header); err != nil {
+			t.Fatalf("mature genesis header: %v", err)
+		}
+		stored, err := svc.headerChain.StoredState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.chainState.Store().WriteHeaderState(stored); err != nil {
+			t.Fatal(err)
+		}
+		hash := consensus.HeaderHash(&block.Header)
+		if err := svc.chainState.Store().SetHeaderHashByHeight(*tip+1, hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func maturePersistentGenesisForNodeTest(t *testing.T, persistent *PersistentChainState) {
+	t.Helper()
+	params := consensus.ParamsForProfile(persistent.ChainState().Profile())
+	for {
+		state := persistent.ChainState()
+		tip := state.TipHeight()
+		header := state.TipHeader()
+		if tip == nil || header == nil {
+			t.Fatal("missing persistent test chain tip")
+		}
+		if *tip+1 >= params.CoinbaseMaturity {
+			return
+		}
+		block := nextCoinbaseBlock(*tip, *header, state.UTXOs(), byte((*tip%200)+20), header.Timestamp+600)
+		if _, err := persistent.ApplyBlock(&block); err != nil {
+			t.Fatalf("mature persistent genesis coinbase: %v", err)
+		}
+	}
+}
+
+func detachedChainStateForNodeTest(t *testing.T, source *ChainState) *ChainState {
+	t.Helper()
+	height := source.TipHeight()
+	header := source.TipHeader()
+	if height == nil || header == nil {
+		t.Fatal("missing source chain tip")
+	}
+	detached := NewChainState(source.Profile())
+	if err := detached.InitializeTip(*height, *header, source.BlockSizeState(), source.UTXOs()); err != nil {
+		t.Fatalf("initialize detached chain state: %v", err)
+	}
+	return detached
 }
 
 func encodePackedTransactionsForNodeTest(txs []types.Transaction) string {

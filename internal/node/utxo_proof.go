@@ -65,12 +65,25 @@ type RPCCompactStatePackage struct {
 }
 
 type RPCOutPointProof struct {
+	Version    uint8          `json:"version"`
 	TxID       string         `json:"txid"`
 	Vout       uint32         `json:"vout"`
 	Exists     bool           `json:"exists"`
+	Type       uint64         `json:"type,omitempty"`
 	ValueAtoms uint64         `json:"value_atoms,omitempty"`
+	Payload32  string         `json:"payload32,omitempty"`
 	PubKey     string         `json:"pubkey,omitempty"`
 	Steps      []RPCProofStep `json:"steps"`
+	Terminal   *RPCProofLeaf  `json:"terminal,omitempty"`
+}
+
+type RPCProofLeaf struct {
+	TxID       string `json:"txid"`
+	Vout       uint32 `json:"vout"`
+	Type       uint64 `json:"type"`
+	ValueAtoms uint64 `json:"value_atoms"`
+	Payload32  string `json:"payload32"`
+	PubKey     string `json:"pubkey,omitempty"`
 }
 
 type RPCProofStep struct {
@@ -206,30 +219,12 @@ func (s *Service) VerifyCompactStatePackage(pkg CompactStatePackage) (UTXOProofB
 }
 
 func EncodeRPCUTXOProof(proof AnchoredUTXOProof) RPCAnchoredUTXOProof {
-	steps := make([]RPCProofStep, 0, len(proof.Proof.Steps))
-	for _, step := range proof.Proof.Steps {
-		item := RPCProofStep{HasSibling: step.HasSibling}
-		if step.HasSibling {
-			item.SiblingHash = hex.EncodeToString(step.SiblingHash[:])
-		}
-		steps = append(steps, item)
-	}
-	out := RPCAnchoredUTXOProof{
+	return RPCAnchoredUTXOProof{
 		Height:     proof.Height,
 		HeaderHash: hex.EncodeToString(proof.HeaderHash[:]),
 		UTXORoot:   hex.EncodeToString(proof.UTXORoot[:]),
-		Proof: RPCOutPointProof{
-			TxID:   hex.EncodeToString(proof.Proof.OutPoint.TxID[:]),
-			Vout:   proof.Proof.OutPoint.Vout,
-			Exists: proof.Proof.Exists,
-			Steps:  steps,
-		},
+		Proof:      encodeRPCOutPointProof(proof.Proof),
 	}
-	if proof.Proof.Exists {
-		out.Proof.ValueAtoms = proof.Proof.ValueAtoms
-		out.Proof.PubKey = hex.EncodeToString(proof.Proof.PubKey[:])
-	}
-	return out
 }
 
 func EncodeRPCUTXOProofBatch(batch AnchoredUTXOProofBatch) RPCAnchoredUTXOProofBatch {
@@ -268,44 +263,16 @@ func DecodeRPCUTXOProof(raw RPCAnchoredUTXOProof) (AnchoredUTXOProof, error) {
 	if err != nil {
 		return AnchoredUTXOProof{}, err
 	}
-	txid, err := decodeProofHex32(raw.Proof.TxID, "proof.txid")
+	proof, err := decodeRPCOutPointProof(raw.Proof, "proof")
 	if err != nil {
 		return AnchoredUTXOProof{}, err
 	}
-	steps := make([]utreexo.ProofStep, 0, len(raw.Proof.Steps))
-	for i, step := range raw.Proof.Steps {
-		item := utreexo.ProofStep{HasSibling: step.HasSibling}
-		if step.HasSibling {
-			hash, err := decodeProofHex32(step.SiblingHash, fmt.Sprintf("proof.steps[%d].sibling_hash", i))
-			if err != nil {
-				return AnchoredUTXOProof{}, err
-			}
-			item.SiblingHash = hash
-		}
-		steps = append(steps, item)
-	}
-	out := AnchoredUTXOProof{
+	return AnchoredUTXOProof{
 		Height:     raw.Height,
 		HeaderHash: headerHash,
 		UTXORoot:   utxoRoot,
-		Proof: utreexo.OutPointProof{
-			OutPoint: types.OutPoint{
-				TxID: txid,
-				Vout: raw.Proof.Vout,
-			},
-			Exists: raw.Proof.Exists,
-			Steps:  steps,
-		},
-	}
-	if raw.Proof.Exists {
-		pubKey, err := decodeProofHex32(raw.Proof.PubKey, "proof.pubkey")
-		if err != nil {
-			return AnchoredUTXOProof{}, err
-		}
-		out.Proof.ValueAtoms = raw.Proof.ValueAtoms
-		out.Proof.PubKey = pubKey
-	}
-	return out, nil
+		Proof:      proof,
+	}, nil
 }
 
 func DecodeRPCUTXOProofBatch(raw RPCAnchoredUTXOProofBatch) (AnchoredUTXOProofBatch, error) {
@@ -369,14 +336,19 @@ func encodeRPCOutPointProof(proof utreexo.OutPointProof) RPCOutPointProof {
 		steps = append(steps, item)
 	}
 	out := RPCOutPointProof{
-		TxID:   hex.EncodeToString(proof.OutPoint.TxID[:]),
-		Vout:   proof.OutPoint.Vout,
-		Exists: proof.Exists,
-		Steps:  steps,
+		Version: proof.Version,
+		TxID:    hex.EncodeToString(proof.OutPoint.TxID[:]),
+		Vout:    proof.OutPoint.Vout,
+		Exists:  proof.Exists,
+		Steps:   steps,
 	}
 	if proof.Exists {
+		out.Type = proof.Type
 		out.ValueAtoms = proof.ValueAtoms
+		out.Payload32 = hex.EncodeToString(proof.Payload32[:])
 		out.PubKey = hex.EncodeToString(proof.PubKey[:])
+	} else if proof.Terminal != nil {
+		out.Terminal = encodeRPCProofLeaf(*proof.Terminal)
 	}
 	return out
 }
@@ -399,6 +371,7 @@ func decodeRPCOutPointProof(raw RPCOutPointProof, field string) (utreexo.OutPoin
 		steps = append(steps, item)
 	}
 	proof := utreexo.OutPointProof{
+		Version: raw.Version,
 		OutPoint: types.OutPoint{
 			TxID: txid,
 			Vout: raw.Vout,
@@ -407,14 +380,59 @@ func decodeRPCOutPointProof(raw RPCOutPointProof, field string) (utreexo.OutPoin
 		Steps:  steps,
 	}
 	if raw.Exists {
+		payload32, err := decodeProofHex32(raw.Payload32, field+".payload32")
+		if err != nil {
+			return utreexo.OutPointProof{}, err
+		}
 		pubKey, err := decodeProofHex32(raw.PubKey, field+".pubkey")
 		if err != nil {
 			return utreexo.OutPointProof{}, err
 		}
+		proof.Type = raw.Type
 		proof.ValueAtoms = raw.ValueAtoms
+		proof.Payload32 = payload32
 		proof.PubKey = pubKey
+	} else if raw.Terminal != nil {
+		terminal, err := decodeRPCProofLeaf(*raw.Terminal, field+".terminal")
+		if err != nil {
+			return utreexo.OutPointProof{}, err
+		}
+		proof.Terminal = &terminal
 	}
 	return proof, nil
+}
+
+func encodeRPCProofLeaf(leaf utreexo.UtxoLeaf) *RPCProofLeaf {
+	return &RPCProofLeaf{
+		TxID:       hex.EncodeToString(leaf.OutPoint.TxID[:]),
+		Vout:       leaf.OutPoint.Vout,
+		Type:       leaf.Type,
+		ValueAtoms: leaf.ValueAtoms,
+		Payload32:  hex.EncodeToString(leaf.Payload32[:]),
+		PubKey:     hex.EncodeToString(leaf.PubKey[:]),
+	}
+}
+
+func decodeRPCProofLeaf(raw RPCProofLeaf, field string) (utreexo.UtxoLeaf, error) {
+	txid, err := decodeProofHex32(raw.TxID, field+".txid")
+	if err != nil {
+		return utreexo.UtxoLeaf{}, err
+	}
+	payload32, err := decodeProofHex32(raw.Payload32, field+".payload32")
+	if err != nil {
+		return utreexo.UtxoLeaf{}, err
+	}
+	pubKey, err := decodeProofHex32(raw.PubKey, field+".pubkey")
+	if err != nil {
+		return utreexo.UtxoLeaf{}, err
+	}
+	return utreexo.UtxoLeaf{
+		OutPoint:   types.OutPoint{TxID: txid, Vout: raw.Vout},
+		Type:       raw.Type,
+		ValueAtoms: raw.ValueAtoms,
+		Payload32:  payload32,
+		PubKey:     pubKey,
+	}, nil
 }
 
 func decodeProofHex32(raw, field string) ([32]byte, error) {

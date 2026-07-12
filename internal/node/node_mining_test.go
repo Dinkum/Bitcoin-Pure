@@ -381,6 +381,7 @@ func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	before, err := svc.BuildBlockTemplate()
 	if err != nil {
@@ -417,7 +418,17 @@ func TestBuildBlockTemplateRefreshesAfterTxAdmission(t *testing.T) {
 func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
 	minerKey := nodeSignerPubKey(9)
 	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	genesis.Txs[0].Base.Outputs = []types.TxOutput{
+		{ValueAtoms: 50, PubKey: nodeSignerPubKey(7)},
+		{ValueAtoms: 50, PubKey: nodeSignerPubKey(9)},
+	}
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
+	genesis.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{genesisTxID})
+	genesis.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{consensus.AuthID(&genesis.Txs[0])})
+	genesis.Header.UTXORoot = consensus.ComputedUTXORoot(consensus.UtxoSet{
+		{TxID: genesisTxID, Vout: 0}: consensus.UtxoEntryFromOutput(genesis.Txs[0].Base.Outputs[0]),
+		{TxID: genesisTxID, Vout: 1}: consensus.UtxoEntryFromOutput(genesis.Txs[0].Base.Outputs[1]),
+	})
 	svc, err := OpenService(ServiceConfig{
 		Profile:     types.Regtest,
 		DBPath:      t.TempDir(),
@@ -427,30 +438,10 @@ func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
-
-	if _, err := svc.MineBlocks(1); err != nil {
-		t.Fatalf("MineBlocks: %v", err)
-	}
-	firstBlockHashPtr, err := svc.chainState.Store().GetBlockHashByHeight(1)
-	if err != nil {
-		t.Fatalf("BlockHashByHeight: %v", err)
-	}
-	if firstBlockHashPtr == nil {
-		t.Fatal("expected block hash at height 1")
-	}
-	firstBlockHashArr := *firstBlockHashPtr
-	firstBlock, err := svc.chainState.Store().GetBlock(&firstBlockHashArr)
-	if err != nil {
-		t.Fatalf("GetBlock: %v", err)
-	}
-	if firstBlock == nil {
-		t.Fatal("expected mined block at height 1")
-	}
-	firstCoinbaseTxID := consensus.TxID(&firstBlock.Txs[0])
-	firstCoinbaseValue := firstBlock.Txs[0].Base.Outputs[0].ValueAtoms
+	matureGenesisForNodeTest(t, svc)
 
 	genesisOut := types.OutPoint{TxID: genesisTxID, Vout: 0}
-	firstCoinbaseOut := types.OutPoint{TxID: firstCoinbaseTxID, Vout: 0}
+	secondGenesisOut := types.OutPoint{TxID: genesisTxID, Vout: 1}
 
 	var firstTx types.Transaction
 	var secondTx types.Transaction
@@ -459,7 +450,7 @@ func TestBuildBlockTemplateMaintainsLTORAcrossIncrementalAppend(t *testing.T) {
 		candidateFirst := spendTxForNodeTest(t, 7, genesisOut, 50, firstSeed, 1)
 		firstTxID := consensus.TxID(&candidateFirst)
 		for secondSeed := byte(96); secondSeed < 160; secondSeed++ {
-			candidateSecond := spendTxForNodeTest(t, 9, firstCoinbaseOut, firstCoinbaseValue, secondSeed, 1)
+			candidateSecond := spendTxForNodeTest(t, 9, secondGenesisOut, 50, secondSeed, 1)
 			secondTxID := consensus.TxID(&candidateSecond)
 			if bytes.Compare(secondTxID[:], firstTxID[:]) < 0 {
 				firstTx = candidateFirst
@@ -521,6 +512,7 @@ func TestBuildBlockTemplateUsesAtomicLTORAccumulatorDelta(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	var parent types.Transaction
 	var child types.Transaction
@@ -571,8 +563,8 @@ func TestBuildBlockTemplateUsesAtomicLTORAccumulatorDelta(t *testing.T) {
 	state := svc.chainState.ChainState()
 	applied := state.UTXOs()
 	summary, overlay, _, err := consensus.ValidateAndApplyBlockOverlayWithLookup(&template, consensus.PrevBlockContext{
-		Height: 0,
-		Header: genesis.Header,
+		Height: *state.TipHeight(),
+		Header: *state.TipHeader(),
 	}, state.BlockSizeState(), applied, consensus.LookupWithErrFromSet(applied), nil, consensus.RegtestParams(), rules)
 	if err != nil {
 		t.Fatalf("template failed consensus validation: %v", err)
@@ -661,6 +653,7 @@ func TestMineOneBlockRefreshesInterruptedTemplate(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	tx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
 	var calls int

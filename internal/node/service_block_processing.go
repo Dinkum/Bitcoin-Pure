@@ -18,10 +18,30 @@ import (
 )
 
 type pendingThinBlock struct {
-	hash   [32]byte
-	header types.BlockHeader
-	txs    []types.Transaction
-	filled []bool
+	hash          [32]byte
+	header        types.BlockHeader
+	txs           []types.Transaction
+	filled        []bool
+	expiresAt     time.Time
+	retainedBytes uint64
+	releaseBudget func()
+}
+
+func pendingThinRetainedBytes(state *pendingThinBlock) uint64 {
+	if state == nil {
+		return 0
+	}
+	// EncodedLen covers nested auth/output byte slices; the fixed allowance
+	// covers the transaction structs, fill bitmap, and slice backing arrays.
+	bytes := uint64(len(state.filled))
+	for i := range state.txs {
+		encoded := state.txs[i].EncodedLen()
+		if encoded < 0 || bytes > ^uint64(0)-uint64(encoded)-128 {
+			return ^uint64(0)
+		}
+		bytes += uint64(encoded) + 128
+	}
+	return bytes
 }
 
 func buildXThinBlockMessage(block types.Block) p2p.Message {

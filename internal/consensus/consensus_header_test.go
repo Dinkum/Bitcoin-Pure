@@ -6,22 +6,25 @@ import (
 	"testing"
 )
 
-func TestSubsidyAtomsMatchesSpecSchedule(t *testing.T) {
+func TestSubsidyAtomsMatchesDecadeHalvingSchedule(t *testing.T) {
 	params := MainnetParams()
-	if got := SubsidyAtoms(0, params); got != 1_000_000_000_000 {
-		t.Fatalf("genesis subsidy = %d, want %d", got, uint64(1_000_000_000_000))
+	if params.HalvingInterval != 525_600 {
+		t.Fatalf("halving interval = %d, want 525600", params.HalvingInterval)
 	}
-	if got := SubsidyAtoms(params.HalvingInterval, params); got != 500_000_000_000 {
-		t.Fatalf("first halving subsidy = %d, want %d", got, uint64(500_000_000_000))
+	if got := SubsidyAtoms(0, params); got != 5_000*atomsPerBPU {
+		t.Fatalf("genesis subsidy = %d, want %d", got, uint64(5_000*atomsPerBPU))
 	}
-	if got := SubsidyAtoms(params.HalvingInterval*39, params); got != 1 {
-		t.Fatalf("39th halving subsidy = %d, want 1", got)
+	if got := SubsidyAtoms(params.HalvingInterval, params); got != 2_500*atomsPerBPU {
+		t.Fatalf("first halving subsidy = %d, want %d", got, uint64(2_500*atomsPerBPU))
 	}
-	if got := SubsidyAtoms(params.HalvingInterval*40, params); got != 1 {
-		t.Fatalf("tail-emission subsidy = %d, want 1", got)
+	if got := SubsidyAtoms(params.HalvingInterval*12, params); got != 1_220_703_125 {
+		t.Fatalf("twelfth halving subsidy = %d, want 1220703125", got)
 	}
-	if got := SubsidyAtoms(params.HalvingInterval*80, params); got != 1 {
-		t.Fatalf("far-future subsidy = %d, want 1", got)
+	if got := SubsidyAtoms(params.HalvingInterval*13, params); got != atomsPerBPU {
+		t.Fatalf("tail-emission subsidy = %d, want %d", got, uint64(atomsPerBPU))
+	}
+	if got := SubsidyAtoms(params.HalvingInterval*80, params); got != atomsPerBPU {
+		t.Fatalf("far-future subsidy = %d, want %d", got, uint64(atomsPerBPU))
 	}
 }
 

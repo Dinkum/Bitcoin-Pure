@@ -149,6 +149,7 @@ func TestSubmitTxTracksAndRebroadcastsLocalOriginTransactions(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	peer := newPeerConnForTests("127.0.0.1:18444")
 	svc.peerMu.Lock()
@@ -208,6 +209,7 @@ func TestSubmitTxUsesSingleStemPeerBeforeFluff(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	stemPeer := newPeerConnForTests("127.0.0.1:18444")
 	stemPeer.outbound = true
@@ -254,6 +256,7 @@ func TestPeerOriginTxUsesStemRelayBeforeFluff(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	stemPeer := newPeerConnForTests("127.0.0.1:18445")
 	stemPeer.outbound = true
@@ -293,6 +296,7 @@ func TestSubmitTxDefaultsToImmediateNormalRelayWhenDandelionDisabled(t *testing.
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	peerA := newPeerConnForTests("127.0.0.1:18444")
 	peerA.outbound = true
@@ -330,6 +334,7 @@ func TestSubmitTxLocalRelayWaitsForSendQueueSpace(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	peer := newPeerConnForTests("127.0.0.1:18444")
 	peer.outbound = true
@@ -374,6 +379,7 @@ func TestRebroadcastLocalTxsRetriesPeersMarkedKnown(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	peer := newPeerConnForTests("127.0.0.1:18444")
 	svc.peerMu.Lock()
@@ -435,6 +441,7 @@ func TestPeerOriginTransactionsAreNotTrackedForLocalRebroadcast(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
 	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
@@ -464,6 +471,7 @@ func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	prevOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
 	tx := spendTxForNodeTest(t, 7, prevOut, 50, 8, 1)
@@ -472,36 +480,10 @@ func TestApplyPeerBlockRemovesConfirmedLocalRebroadcastTransactions(t *testing.T
 		t.Fatalf("SubmitTx: %v", err)
 	}
 
-	state := NewChainState(types.Regtest)
-	if _, err := state.InitializeFromGenesisBlock(&genesis); err != nil {
-		t.Fatal(err)
-	}
-	block := nextCoinbaseBlock(0, genesis.Header, state.UTXOs(), 9, genesis.Header.Timestamp+600)
-	block.Txs = append(block.Txs, tx)
-	block.Header.MerkleTxIDRoot = merkleRootForNodeTest([][32]byte{
-		consensus.TxID(&block.Txs[0]),
-		txid,
-	})
-	block.Header.MerkleAuthRoot = merkleRootForNodeTest([][32]byte{
-		consensus.AuthID(&block.Txs[0]),
-		consensus.AuthID(&tx),
-	})
-	utxos := make(consensus.UtxoSet, len(state.UTXOs()))
-	for outPoint, entry := range state.UTXOs() {
-		utxos[outPoint] = entry
-	}
-	delete(utxos, prevOut)
-	utxos[types.OutPoint{TxID: txid, Vout: 0}] = consensus.UtxoEntry{
-		ValueAtoms: tx.Base.Outputs[0].ValueAtoms,
-		PubKey:     tx.Base.Outputs[0].PubKey,
-	}
-	coinbaseTxID := consensus.TxID(&block.Txs[0])
-	utxos[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = consensus.UtxoEntry{
-		ValueAtoms: block.Txs[0].Base.Outputs[0].ValueAtoms,
-		PubKey:     block.Txs[0].Base.Outputs[0].PubKey,
-	}
-	block.Header.UTXORoot = consensus.ComputedUTXORoot(utxos)
-	block.Header = mineHeaderForNodeTest(block.Header)
+	prevHeight := *svc.chainState.ChainState().TipHeight()
+	prevHeader := *svc.chainState.ChainState().TipHeader()
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
+	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, tx}, prevHeader.Timestamp+600)
 
 	if _, err := svc.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
 		t.Fatalf("applyPeerHeaders: %v", err)

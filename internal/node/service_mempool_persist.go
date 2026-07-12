@@ -126,7 +126,7 @@ func (s *Service) buildPersistableMempoolSnapshot() (livePersistedMempoolSnapsho
 		State: persistedMempoolState{
 			Valid: true,
 			Meta: storage.StoredMempoolStateMeta{
-				Version:   2,
+				Version:   3,
 				Profile:   s.cfg.Profile,
 				TipHeight: tip.Height,
 				TipHash:   tip.TipHash,
@@ -226,6 +226,10 @@ func (s *Service) reloadPersistedMempool() error {
 	}
 	if stored == nil {
 		return nil
+	}
+	if stored.Version != 3 {
+		s.logger.Warn("discarding persisted mempool from pre-maturity schema", slog.Uint64("stored_version", uint64(stored.Version)))
+		return s.chainState.Store().ClearMempoolState()
 	}
 	if stored.Profile != s.cfg.Profile {
 		s.logger.Warn("discarding persisted mempool for different profile",

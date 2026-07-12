@@ -108,7 +108,8 @@ func (s *Service) submitSingleDecodedTxFrom(tx types.Transaction, source *peerCo
 
 	rules := consensus.DefaultConsensusRules()
 	params := consensus.ParamsForProfile(s.cfg.Profile)
-	admission, err = s.pool.AcceptTxWithLookupAndParams(tx, s.chainUtxoSnapshot(), params, rules)
+	_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
+	admission, err = s.pool.AcceptTxWithLookupAndParamsAtHeight(tx, chainLookup, params, spendHeight, rules)
 	orphanCount = s.pool.OrphanCount()
 	mempoolSize = s.pool.Count()
 	if err != nil {
@@ -359,9 +360,12 @@ func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, u
 	if block == nil {
 		return nil, nil
 	}
+	resolvedInputs, err := consensus.ResolveBlockInputEntries(block, undo)
+	if err != nil {
+		return nil, fmt.Errorf("resolve wallet activity block %x inputs: %w", hash, err)
+	}
 	timestamp := time.Unix(int64(block.Header.Timestamp), 0).UTC()
 	out := make([]WalletActivity, 0, len(block.Txs))
-	undoIndex := 0
 	for i, tx := range block.Txs {
 		received := uint64(0)
 		for _, output := range tx.Base.Outputs {
@@ -373,14 +377,13 @@ func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, u
 		inputSum := uint64(0)
 		if i > 0 {
 			for _, input := range tx.Base.Inputs {
-				if undoIndex >= len(undo) {
-					return nil, fmt.Errorf("missing undo entry for wallet activity block %x input %v", hash, input.PrevOut)
+				entry, ok := resolvedInputs[input.PrevOut]
+				if !ok {
+					return nil, fmt.Errorf("missing resolved wallet activity input for block %x: %v", hash, input.PrevOut)
 				}
-				entry := undo[undoIndex]
-				undoIndex++
-				inputSum += entry.Entry.ValueAtoms
-				if _, ok := wanted[compactFilterItemForUTXO(entry.Entry)]; ok {
-					sent += entry.Entry.ValueAtoms
+				inputSum += entry.ValueAtoms
+				if _, ok := wanted[compactFilterItemForUTXO(entry)]; ok {
+					sent += entry.ValueAtoms
 				}
 			}
 		}
@@ -531,7 +534,8 @@ func (s *Service) submitFreshDecodedTxsFrom(txs []types.Transaction, source *pee
 			mempoolSize := s.pool.Count()
 			return admissions, errs, orphanCount, mempoolSize
 		}
-		admission, err := s.pool.AcceptTxWithLookupAndParams(txs[0], s.chainUtxoSnapshot(), params, rules)
+		_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
+		admission, err := s.pool.AcceptTxWithLookupAndParamsAtHeight(txs[0], chainLookup, params, spendHeight, rules)
 		if err != nil {
 			errs[0] = err
 		} else {
@@ -570,9 +574,9 @@ func (s *Service) submitFreshDecodedTxsFrom(txs []types.Transaction, source *pee
 		}
 		return admissions, errs, orphanCount, mempoolSize
 	}
-	tipHash, chainUtxos := s.chainUtxoSnapshotWithTip()
+	tipHash, spendHeight, chainUtxos := s.chainUtxoSnapshotWithTip()
 	view := s.pool.AcquireSharedAdmissionView()
-	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, tipHash, rules)
+	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, tipHash, spendHeight, rules)
 	view.Release()
 	for i := range txs {
 		if prepareErrs[i] != nil {
@@ -586,7 +590,7 @@ func (s *Service) submitFreshDecodedTxsFrom(txs []types.Transaction, source *pee
 			accepted = append(accepted, retryAccepted...)
 			break
 		}
-		admission, err := s.pool.CommitPreparedWithLookupAndParams(prepared[i], chainUtxos, tipHash, params, rules)
+		admission, err := s.pool.CommitPreparedWithLookupAndParamsAtHeight(prepared[i], chainUtxos, tipHash, params, spendHeight, rules)
 		if err != nil {
 			errs[i] = err
 			continue
@@ -693,10 +697,11 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 	admissions := make([]mempool.Admission, len(txs))
 	errs := make([]error, len(txs))
 	accepted := make([]mempool.AcceptedTx, 0, len(txs))
-	tipHash, chainUtxos := s.chainUtxoSnapshotWithTip()
+	tipHash, spendHeight, chainUtxos := s.chainUtxoSnapshotWithTip()
 	snapshot := s.pool.AdmissionSnapshot()
 	retried := false
 	var fallbackTipHash [32]byte
+	var fallbackSpendHeight uint64
 	var fallbackChainUtxos consensus.UtxoLookup
 
 	for i, tx := range txs {
@@ -707,9 +712,9 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 		if currentTip := s.chainTipHash(); currentTip != tipHash {
 			if retried {
 				if fallbackTipHash != currentTip {
-					fallbackTipHash, fallbackChainUtxos = s.chainUtxoSnapshotWithTip()
+					fallbackTipHash, fallbackSpendHeight, fallbackChainUtxos = s.chainUtxoSnapshotWithTip()
 				}
-				admission, err := s.pool.AcceptTxWithLookupAndParams(tx, fallbackChainUtxos, consensus.ParamsForProfile(s.cfg.Profile), rules)
+				admission, err := s.pool.AcceptTxWithLookupAndParamsAtHeight(tx, fallbackChainUtxos, consensus.ParamsForProfile(s.cfg.Profile), fallbackSpendHeight, rules)
 				if err != nil {
 					errs[i] = err
 					continue
@@ -718,18 +723,18 @@ func (s *Service) submitDependentDecodedTxs(txs []types.Transaction, rules conse
 				accepted = append(accepted, admission.Accepted...)
 				continue
 			}
-			tipHash, chainUtxos = s.chainUtxoSnapshotWithTip()
+			tipHash, spendHeight, chainUtxos = s.chainUtxoSnapshotWithTip()
 			snapshot = s.pool.AdmissionSnapshot()
 			retried = true
 		}
-		prepared, err := s.pool.PrepareAdmissionWithLookupAndParams(tx, snapshot, chainUtxos, consensus.ParamsForProfile(s.cfg.Profile), rules)
+		prepared, err := s.pool.PrepareAdmissionWithLookupAndParamsAtHeight(tx, snapshot, chainUtxos, consensus.ParamsForProfile(s.cfg.Profile), spendHeight, rules)
 		if err != nil {
 			errs[i] = err
 			continue
 		}
 		prepared.PreparedTip = tipHash
 		prepared.HasPreparedTip = true
-		admission, err := s.pool.CommitPreparedWithLookupAndParams(prepared, chainUtxos, tipHash, consensus.ParamsForProfile(s.cfg.Profile), rules)
+		admission, err := s.pool.CommitPreparedWithLookupAndParamsAtHeight(prepared, chainUtxos, tipHash, consensus.ParamsForProfile(s.cfg.Profile), spendHeight, rules)
 		if err != nil {
 			errs[i] = err
 			continue
@@ -772,11 +777,12 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 	if len(txs) == 0 {
 		return admissions, errs, accepted
 	}
-	tipHash, chainUtxos := s.chainUtxoSnapshotWithTip()
+	tipHash, spendHeight, chainUtxos := s.chainUtxoSnapshotWithTip()
 	view := s.pool.AcquireSharedAdmissionView()
-	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, tipHash, rules)
+	prepared, prepareErrs := s.prepareAdmissionsParallel(txs, view, chainUtxos, tipHash, spendHeight, rules)
 	view.Release()
 	var fallbackTipHash [32]byte
+	var fallbackSpendHeight uint64
 	var fallbackChainUtxos consensus.UtxoLookup
 	for i, tx := range txs {
 		if err := s.avalancheManager().rejectionError(tx); err != nil {
@@ -789,9 +795,9 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 		}
 		if currentTip := s.chainTipHash(); currentTip != tipHash {
 			if fallbackTipHash != currentTip {
-				fallbackTipHash, fallbackChainUtxos = s.chainUtxoSnapshotWithTip()
+				fallbackTipHash, fallbackSpendHeight, fallbackChainUtxos = s.chainUtxoSnapshotWithTip()
 			}
-			admission, err := s.pool.AcceptTxWithLookupAndParams(tx, fallbackChainUtxos, consensus.ParamsForProfile(s.cfg.Profile), rules)
+			admission, err := s.pool.AcceptTxWithLookupAndParamsAtHeight(tx, fallbackChainUtxos, consensus.ParamsForProfile(s.cfg.Profile), fallbackSpendHeight, rules)
 			if err != nil {
 				errs[i] = err
 				continue
@@ -800,7 +806,7 @@ func (s *Service) retryDecodedTxSuffix(txs []types.Transaction, rules consensus.
 			accepted = append(accepted, admission.Accepted...)
 			continue
 		}
-		admission, err := s.pool.CommitPreparedWithLookupAndParams(prepared[i], chainUtxos, tipHash, consensus.ParamsForProfile(s.cfg.Profile), rules)
+		admission, err := s.pool.CommitPreparedWithLookupAndParamsAtHeight(prepared[i], chainUtxos, tipHash, consensus.ParamsForProfile(s.cfg.Profile), spendHeight, rules)
 		if err != nil {
 			errs[i] = err
 			continue
@@ -843,7 +849,7 @@ func decodePackedTransactions(encoded string) ([]types.Transaction, error) {
 	return txs, nil
 }
 
-func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempool.SharedAdmissionView, chainUtxos consensus.UtxoLookup, tipHash [32]byte, rules consensus.ConsensusRules) ([]mempool.PreparedAdmission, []error) {
+func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempool.SharedAdmissionView, chainUtxos consensus.UtxoLookup, tipHash [32]byte, spendHeight uint64, rules consensus.ConsensusRules) ([]mempool.PreparedAdmission, []error) {
 	prepared := make([]mempool.PreparedAdmission, len(txs))
 	errs := make([]error, len(txs))
 	if len(txs) == 0 {
@@ -867,7 +873,7 @@ func (s *Service) prepareAdmissionsParallel(txs []types.Transaction, view mempoo
 					errs[idx] = err
 					continue
 				}
-				item, err := s.pool.PrepareAdmissionSharedWithLookupAndParams(txs[idx], view, chainUtxos, consensus.ParamsForProfile(s.cfg.Profile), rules)
+				item, err := s.pool.PrepareAdmissionSharedWithLookupAndParamsAtHeight(txs[idx], view, chainUtxos, consensus.ParamsForProfile(s.cfg.Profile), spendHeight, rules)
 				if err != nil {
 					errs[idx] = err
 					continue

@@ -56,6 +56,7 @@ type accNode struct {
 }
 
 type OutPointProof struct {
+	Version    uint8
 	OutPoint   types.OutPoint
 	Exists     bool
 	Type       uint64
@@ -63,7 +64,10 @@ type OutPointProof struct {
 	Payload32  [32]byte
 	PubKey     [32]byte
 	Steps      []ProofStep
+	Terminal   *UtxoLeaf
 }
+
+const ProofVersion uint8 = 2
 
 type ProofStep struct {
 	HasSibling  bool
@@ -291,10 +295,10 @@ func OutPointFromKey(key [OutPointKeyBytes]byte) types.OutPoint {
 }
 
 // Prove returns a single-outpoint Merklix proof over the current accumulator
-// root. Exclusion proofs terminate at the first missing branch on the queried
-// path; membership proofs carry the committed leaf payload.
+// root. Membership proofs carry the queried leaf; exclusion proofs carry a
+// committed terminal leaf whose full path proves the query branch is absent.
 func (a *Accumulator) Prove(outPoint types.OutPoint) (OutPointProof, error) {
-	proof := OutPointProof{OutPoint: outPoint}
+	proof := OutPointProof{Version: ProofVersion, OutPoint: outPoint}
 	if a == nil || a.root == nil {
 		return proof, nil
 	}
@@ -321,7 +325,17 @@ func (a *Accumulator) Prove(outPoint types.OutPoint) (OutPointProof, error) {
 		}
 		steps = append(steps, step)
 		if next == nil {
-			proof.Steps = steps
+			terminal := firstAccumulatorLeaf(sibling)
+			if terminal == nil {
+				return OutPointProof{}, fmt.Errorf("missing exclusion witness for %x:%d", outPoint.TxID, outPoint.Vout)
+			}
+			membership, err := a.Prove(terminal.utxo.OutPoint)
+			if err != nil {
+				return OutPointProof{}, err
+			}
+			terminalCopy := terminal.utxo
+			proof.Terminal = &terminalCopy
+			proof.Steps = membership.Steps
 			return proof, nil
 		}
 		node = next
@@ -338,34 +352,65 @@ func (a *Accumulator) Prove(outPoint types.OutPoint) (OutPointProof, error) {
 	return proof, nil
 }
 
+func firstAccumulatorLeaf(node *accNode) *keyedLeaf {
+	for node != nil {
+		if node.leaf != nil {
+			return node.leaf
+		}
+		if node.left != nil {
+			node = node.left
+		} else {
+			node = node.right
+		}
+	}
+	return nil
+}
+
 // VerifyProof checks a membership or exclusion proof against a committed
 // `utxo_root` without requiring access to the full UTXO set.
 func VerifyProof(root [32]byte, proof OutPointProof) bool {
-	if len(proof.Steps) == 0 {
-		return !proof.Exists && root == crypto.TaggedHash(UTXORootTag, nil)
+	if proof.Version != ProofVersion || len(proof.Steps) > keyBits {
+		return false
 	}
-	key := leafKey(proof.OutPoint)
-	last := len(proof.Steps) - 1
-	var current [32]byte
+	if len(proof.Steps) == 0 {
+		return !proof.Exists && proof.Terminal == nil && root == crypto.TaggedHash(UTXORootTag, nil)
+	}
 	if proof.Exists {
-		current = LeafHash(UtxoLeaf{
+		if proof.Terminal != nil {
+			return false
+		}
+		return verifyMembershipProof(root, UtxoLeaf{
 			OutPoint:   proof.OutPoint,
 			Type:       proof.Type,
 			ValueAtoms: proof.ValueAtoms,
 			Payload32:  proof.Payload32,
 			PubKey:     proof.PubKey,
-		})
-	} else {
-		bottom := proof.Steps[last]
-		if !bottom.HasSibling {
-			return false
-		}
-		current = bottom.SiblingHash
-		last--
+		}, proof.Steps)
 	}
-	for bitIndex := last; bitIndex >= 0; bitIndex-- {
-		step := proof.Steps[bitIndex]
+	if proof.Terminal == nil || proof.Terminal.OutPoint == proof.OutPoint || len(proof.Steps) != keyBits {
+		return false
+	}
+	queryKey := leafKey(proof.OutPoint)
+	terminalKey := leafKey(proof.Terminal.OutPoint)
+	divergence := firstDifferentBit(queryKey, terminalKey)
+	if divergence < 0 || proof.Steps[divergence].HasSibling {
+		return false
+	}
+	return verifyMembershipProof(root, *proof.Terminal, proof.Steps)
+}
+
+func verifyMembershipProof(root [32]byte, leaf UtxoLeaf, steps []ProofStep) bool {
+	if len(steps) != keyBits {
+		return false
+	}
+	key := leafKey(leaf.OutPoint)
+	current := LeafHash(leaf)
+	for bitIndex := len(steps) - 1; bitIndex >= 0; bitIndex-- {
+		step := steps[bitIndex]
 		if !step.HasSibling {
+			if step.SiblingHash != ([32]byte{}) {
+				return false
+			}
 			continue
 		}
 		if bitSet(key, bitIndex) {
@@ -375,6 +420,15 @@ func VerifyProof(root [32]byte, proof OutPointProof) bool {
 		}
 	}
 	return root == crypto.TaggedHash(UTXORootTag, current[:])
+}
+
+func firstDifferentBit(left, right [outPointBytes]byte) int {
+	for bitIndex := 0; bitIndex < keyBits; bitIndex++ {
+		if bitSet(left, bitIndex) != bitSet(right, bitIndex) {
+			return bitIndex
+		}
+	}
+	return -1
 }
 
 func rebuildNodeFromRecords(records map[AccumulatorNodePath]AccumulatorNodeRecord, path AccumulatorNodePath, depth int) (*accNode, error) {

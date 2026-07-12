@@ -327,3 +327,25 @@ func TestAccumulatorProofRejectsTampering(t *testing.T) {
 		t.Fatal("expected tampered proof to fail")
 	}
 }
+
+func TestExclusionProofCannotReuseExistingLeafHash(t *testing.T) {
+	leaf := UtxoLeaf{
+		OutPoint:   types.OutPoint{TxID: [32]byte{42}, Vout: 7},
+		Type:       types.OutputXOnlyP2PK,
+		ValueAtoms: 50,
+		Payload32:  [32]byte{9},
+	}
+	acc, err := NewAccumulatorFromLeaves([]UtxoLeaf{leaf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := OutPointProof{
+		Version:  ProofVersion,
+		OutPoint: leaf.OutPoint,
+		Steps:    make([]ProofStep, keyBits),
+		Terminal: &leaf,
+	}
+	if VerifyProof(acc.Root(), forged) {
+		t.Fatal("forged exclusion proof for an existing outpoint verified")
+	}
+}

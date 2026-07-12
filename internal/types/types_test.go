@@ -118,6 +118,27 @@ func TestBlockRoundtrip(t *testing.T) {
 	}
 }
 
+func TestDecodeBlockDoesNotImposeIndependentOutputCountLimit(t *testing.T) {
+	outputs := make([]TxOutput, 100_001)
+	for i := range outputs {
+		outputs[i] = NewXOnlyOutput(1, [32]byte{byte(i)})
+	}
+	block := Block{Txs: []Transaction{{Base: TxBase{
+		Version:            1,
+		CoinbaseHeight:     testCoinbaseHeight(1),
+		CoinbaseExtraNonce: testCoinbaseExtraNonce(1),
+		Outputs:            outputs,
+	}}}}
+	encoded := block.Encode()
+	decoded, err := DecodeBlockWithBudget(encoded, uint64(len(encoded)))
+	if err != nil {
+		t.Fatalf("decode 100001-output block: %v", err)
+	}
+	if got := len(decoded.Txs[0].Base.Outputs); got != len(outputs) {
+		t.Fatalf("decoded outputs = %d, want %d", got, len(outputs))
+	}
+}
+
 func TestDecodeBlockRejectsOversizeBeforeDecode(t *testing.T) {
 	block := Block{
 		Header: BlockHeader{Version: 1},

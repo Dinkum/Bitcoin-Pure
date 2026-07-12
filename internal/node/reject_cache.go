@@ -205,6 +205,7 @@ func classifyTxReject(err error) txRejectClass {
 		errors.Is(err, mempool.ErrTooManyAncestors),
 		errors.Is(err, mempool.ErrTooManyDescendants),
 		errors.Is(err, mempool.ErrInputAlreadySpent),
+		errors.Is(err, consensus.ErrImmatureCoinbase),
 		errors.Is(err, ErrAvalancheFinalConflict):
 		return txRejectClassTemporary
 	case errors.Is(err, mempool.ErrTxAlreadyExists):

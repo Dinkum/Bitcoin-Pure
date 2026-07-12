@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,8 +56,15 @@ type peerConn struct {
 	localRelayTxs   map[[32]byte]localRelayFallbackState
 	thinMu          sync.Mutex
 	pendingThin     map[[32]byte]*pendingThinBlock
+	thinWorkTokens  float64
+	thinWorkRefill  time.Time
 	blockRelayMu    sync.Mutex
 	blockRelay      peerBlockRelayState
+	blockServeMu    sync.Mutex
+	blockServeBytes float64
+	blockServeAt    time.Time
+	blockTransferMu sync.Mutex
+	blockTransfers  map[[32]byte]*incomingBlockTransfer
 	erlayMu         sync.Mutex
 	erlayState      peerErlayState
 	telemetry       peerRelayTelemetry
@@ -63,6 +72,37 @@ type peerConn struct {
 	syncState       peerSyncState
 	avaMu           sync.Mutex
 	avaState        peerAvalancheState
+}
+
+type incomingBlockTransfer struct {
+	header   types.BlockHeader
+	total    uint64
+	next     uint64
+	checksum [32]byte
+	file     *os.File
+}
+
+func (p *peerConn) allowBlockServeBytes(size int, now time.Time, maxMessageBytes int) bool {
+	if p == nil || size < 0 || maxMessageBytes <= 0 {
+		return false
+	}
+	burst := float64(maxMessageBytes * 2)
+	refillPerSecond := float64(maxMessageBytes) / 8
+	p.blockServeMu.Lock()
+	defer p.blockServeMu.Unlock()
+	if p.blockServeAt.IsZero() {
+		p.blockServeBytes = burst
+		p.blockServeAt = now
+	}
+	if elapsed := now.Sub(p.blockServeAt).Seconds(); elapsed > 0 {
+		p.blockServeBytes = math.Min(burst, p.blockServeBytes+elapsed*refillPerSecond)
+		p.blockServeAt = now
+	}
+	if p.blockServeBytes < float64(size) {
+		return false
+	}
+	p.blockServeBytes -= float64(size)
+	return true
 }
 
 type peerAvalancheState struct {
@@ -105,10 +145,42 @@ const peerKnownTxLimit = 65536
 
 type outboundMessage struct {
 	msg        p2p.Message
+	blockRef   *outboundBlockReference
 	enqueuedAt time.Time
 	lane       relayQueueLane
 	class      relayMessageClass
 	invItems   []p2p.InvVector
+}
+
+type outboundBlockReference struct {
+	item  p2p.InvVector
+	batch *blockServeBatch
+}
+
+type blockServeBatch struct {
+	mu        sync.Mutex
+	remaining int64
+}
+
+func newBlockServeBatch(limit int64) *blockServeBatch {
+	if limit < 0 {
+		limit = 0
+	}
+	return &blockServeBatch{remaining: limit}
+}
+
+func (b *blockServeBatch) tryCharge(size int) bool {
+	if b == nil || size < 0 {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	charge := int64(size)
+	if charge > b.remaining {
+		return false
+	}
+	b.remaining -= charge
+	return true
 }
 
 type relayQueueLane uint8
@@ -311,6 +383,31 @@ func (p *peerConn) send(msg p2p.Message) error {
 		class:      classifyRelayMessage(msg),
 	}
 	return p.enqueueDirectMessage(envelope)
+}
+
+func (p *peerConn) enqueueBlockReference(item p2p.InvVector, batch *blockServeBatch) error {
+	envelope := outboundMessage{
+		blockRef:   &outboundBlockReference{item: item, batch: batch},
+		enqueuedAt: time.Now(),
+		lane:       relayQueueLanePriority,
+		class:      relayMessageClass{blockSendItems: 1},
+	}
+	q := p.sendQ
+	if p.relayPriorityQ != nil {
+		q = p.relayPriorityQ
+	} else {
+		envelope.lane = relayQueueLaneSend
+	}
+	select {
+	case <-p.closed:
+		return io.EOF
+	case q <- envelope:
+		p.telemetry.noteEnqueue(p.queueDepths())
+		return nil
+	default:
+		p.logRelayQueuePressure(slog.LevelWarn, "dropped requested block due to saturated relay queue", envelope.lane, envelope.class, 1)
+		return errors.New("peer block response queue saturated")
+	}
 }
 
 const (
@@ -612,7 +709,21 @@ func (p *peerConn) close() {
 		p.drainPriorityRelayQueue()
 		p.drainSendQueue()
 		p.clearRelayState()
+		p.clearIncomingBlockTransfers()
 	})
+}
+
+func (p *peerConn) clearIncomingBlockTransfers() {
+	p.blockTransferMu.Lock()
+	defer p.blockTransferMu.Unlock()
+	for hash, transfer := range p.blockTransfers {
+		if transfer.file != nil {
+			name := transfer.file.Name()
+			_ = transfer.file.Close()
+			_ = os.Remove(name)
+		}
+		delete(p.blockTransfers, hash)
+	}
 }
 
 func (p *peerConn) drainControlQueue() {
@@ -728,11 +839,37 @@ func (p *peerConn) clearRelayState() {
 	p.txMu.Unlock()
 
 	p.thinMu.Lock()
+	for _, state := range p.pendingThin {
+		if state != nil && state.releaseBudget != nil {
+			state.releaseBudget()
+		}
+	}
 	p.pendingThin = make(map[[32]byte]*pendingThinBlock)
 	p.thinMu.Unlock()
 }
 
 func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bool {
+	var releaseBlockBudget func()
+	if envelope.blockRef != nil {
+		// Reserve the maximum source-block footprint before touching Pebble or the
+		// recent-block cache. This keeps concurrent lazy loads globally bounded.
+		release, ok := s.blockServeBudget.TryAcquire(s.blockServingLimit())
+		if !ok {
+			envelope.msg = p2p.NotFoundMessage{Items: []p2p.InvVector{envelope.blockRef.item}}
+		} else {
+			releaseBlockBudget = release
+			msg, err := s.resolveQueuedBlockReference(peer, envelope.blockRef)
+			if err != nil {
+				releaseBlockBudget()
+				s.logPeerWriteFailure(peer, envelope, err, "lazy block response resolution failed")
+				return false
+			}
+			envelope.msg = msg
+		}
+	}
+	if releaseBlockBudget != nil {
+		defer releaseBlockBudget()
+	}
 	if s.cfg.StallTimeout > 0 {
 		if err := peer.wire.SetWriteDeadline(time.Now().Add(s.cfg.StallTimeout)); err != nil {
 			s.logPeerWriteFailure(peer, envelope, err, "peer write deadline setup failed")

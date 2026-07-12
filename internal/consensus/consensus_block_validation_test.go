@@ -99,6 +99,117 @@ func TestUTXORootMismatchRejects(t *testing.T) {
 	}
 }
 
+func TestValidateTxRejectsZeroValueOutputs(t *testing.T) {
+	prevOut := types.OutPoint{TxID: [32]byte{11}, Vout: 0}
+	utxos := UtxoSet{
+		prevOut: {ValueAtoms: 50, PubKey: consensusTestPubKey(1)},
+	}
+	pqLock := [32]byte{0xaa}
+	tests := []struct {
+		name    string
+		outputs []types.TxOutput
+	}{
+		{
+			name:    "xonly zero output",
+			outputs: []types.TxOutput{types.NewXOnlyOutput(0, consensusTestPubKey(2))},
+		},
+		{
+			name:    "pq zero output",
+			outputs: []types.TxOutput{types.NewPQLockOutput(0, pqLock)},
+		},
+		{
+			name: "mixed outputs with one zero",
+			outputs: []types.TxOutput{
+				types.NewXOnlyOutput(25, consensusTestPubKey(3)),
+				types.NewPQLockOutput(0, pqLock),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := signedSpendTxToOutputsForConsensusTest(t, 1, prevOut, 50, tt.outputs)
+			_, err := ValidateTxWithParams(&tx, utxos, RegtestParams(), DefaultConsensusRules())
+			if !errors.Is(err, ErrZeroOutputValue) {
+				t.Fatalf("expected zero output value error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateTxEnforcesCoinbaseMaturityBoundary(t *testing.T) {
+	params := RegtestParams()
+	createdHeight := uint64(7)
+	prevOut := types.OutPoint{TxID: [32]byte{0x44}, Vout: 0}
+	coin := UtxoEntryFromOutputAtHeight(types.NewXOnlyOutput(50, consensusTestPubKey(1)), createdHeight, true)
+	utxos := UtxoSet{prevOut: coin}
+	tx := signedSpendTxForConsensusTest(t, 1, prevOut, 50, 2, 1)
+
+	_, err := ValidateTx(&tx, utxos, TxValidationContext{
+		Params:      params,
+		SpendHeight: createdHeight + params.CoinbaseMaturity - 1,
+	}, DefaultConsensusRules())
+	if !errors.Is(err, ErrImmatureCoinbase) {
+		t.Fatalf("height H+99 error = %v, want ErrImmatureCoinbase", err)
+	}
+	if _, err := ValidateTx(&tx, utxos, TxValidationContext{
+		Params:      params,
+		SpendHeight: createdHeight + params.CoinbaseMaturity,
+	}, DefaultConsensusRules()); err != nil {
+		t.Fatalf("height H+100 rejected: %v", err)
+	}
+}
+
+func TestValidateAndApplyBlockRejectsZeroValueCoinbaseOutputs(t *testing.T) {
+	params := RegtestParams()
+	prevHeader := types.BlockHeader{
+		Version:   1,
+		Timestamp: params.GenesisTimestamp,
+		NBits:     params.GenesisBits,
+	}
+	prev := PrevBlockContext{Height: 0, Header: prevHeader}
+	nbits, err := NextWorkRequired(prev, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		output types.TxOutput
+	}{
+		{
+			name:   "xonly coinbase output",
+			output: types.NewXOnlyOutput(0, consensusTestPubKey(4)),
+		},
+		{
+			name:   "pq coinbase output",
+			output: types.NewPQLockOutput(0, [32]byte{0xbb}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{tt.output})
+			coinbaseTxID := TxID(&coinbase)
+			block := types.Block{
+				Header: types.BlockHeader{
+					Version:        1,
+					PrevBlockHash:  HeaderHash(&prevHeader),
+					MerkleTxIDRoot: specMerkleRootForTest([][32]byte{coinbaseTxID}),
+					MerkleAuthRoot: specMerkleRootForTest([][32]byte{AuthID(&coinbase)}),
+					UTXORoot:       ComputedUTXORoot(UtxoSet{}),
+					Timestamp:      prevHeader.Timestamp + 600,
+					NBits:          nbits,
+				},
+				Txs: []types.Transaction{coinbase},
+			}
+			block.Header = mineHeaderForTest(block.Header)
+
+			_, err := validateAndApplyBlockForTest(t, &block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
+			if !errors.Is(err, ErrZeroOutputValue) {
+				t.Fatalf("expected zero output value error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateAndApplyBlockRejectsMerkleTxIDMismatch(t *testing.T) {
 	params := RegtestParams()
 	prevHeader := types.BlockHeader{
@@ -320,9 +431,9 @@ func TestValidateAndApplyBlockAcceptsSameBlockSpend(t *testing.T) {
 	delete(nextUTXOs, prevOut)
 	delete(nextUTXOs, types.OutPoint{TxID: parentTxID, Vout: 0})
 	childTxID := txids[2]
-	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntryFromOutput(child.Base.Outputs[0])
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntryFromOutputAtHeight(child.Base.Outputs[0], 1, false)
 	coinbaseTxID := txids[0]
-	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntryFromOutput(coinbase.Base.Outputs[0])
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntryFromOutputAtHeight(coinbase.Base.Outputs[0], 1, true)
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
 		t.Fatal(err)
@@ -401,9 +512,9 @@ func TestValidateAndApplyBlockAcceptsAtomicLTORSameBlockSpendWithChildBeforePare
 	nextUTXOs := cloneUtxos(utxos)
 	delete(nextUTXOs, prevOut)
 	childTxID := txids[1]
-	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntryFromOutput(child.Base.Outputs[0])
+	nextUTXOs[types.OutPoint{TxID: childTxID, Vout: 0}] = UtxoEntryFromOutputAtHeight(child.Base.Outputs[0], 1, false)
 	coinbaseTxID := txids[0]
-	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntryFromOutput(coinbase.Base.Outputs[0])
+	nextUTXOs[types.OutPoint{TxID: coinbaseTxID, Vout: 0}] = UtxoEntryFromOutputAtHeight(coinbase.Base.Outputs[0], 1, true)
 	nbits, err := NextWorkRequired(prev, params)
 	if err != nil {
 		t.Fatal(err)
@@ -448,6 +559,29 @@ func TestValidateAndApplyBlockAcceptsAtomicLTORSameBlockSpendWithChildBeforePare
 	}
 	if nextAcc.Root() != block.Header.UTXORoot {
 		t.Fatalf("next accumulator root = %x, want %x", nextAcc.Root(), block.Header.UTXORoot)
+	}
+	delta, err := ValidateAndApplyBlockDeltaWithLookup(
+		&block,
+		prev,
+		NewBlockSizeState(params),
+		utxos,
+		LookupWithErrFromSet(utxos),
+		acc,
+		params,
+		DefaultConsensusRules(),
+	)
+	if err != nil {
+		t.Fatalf("validate detailed block delta: %v", err)
+	}
+	if len(delta.SpentPreBlock) != 1 || delta.SpentPreBlock[0].OutPoint != prevOut {
+		t.Fatalf("pre-block spends = %+v, want only %v", delta.SpentPreBlock, prevOut)
+	}
+	resolved, err := ResolveBlockInputEntries(&block, delta.SpentPreBlock)
+	if err != nil {
+		t.Fatalf("resolve block inputs: %v", err)
+	}
+	if _, ok := resolved[types.OutPoint{TxID: parentTxID, Vout: 0}]; !ok {
+		t.Fatal("same-block parent output was not resolved for child-before-parent LTOR")
 	}
 }
 
@@ -639,7 +773,7 @@ func TestValidateTxRejectsDuplicateInputs(t *testing.T) {
 	}
 	_, err := ValidateTx(&tx, UtxoSet{
 		prevOut: {ValueAtoms: 20, PubKey: consensusTestPubKey(7)},
-	}, DefaultConsensusRules())
+	}, TxValidationContext{Params: MainnetParams()}, DefaultConsensusRules())
 	if !errors.Is(err, ErrDuplicateInput) {
 		t.Fatalf("expected duplicate input error, got %v", err)
 	}

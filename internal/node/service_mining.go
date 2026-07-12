@@ -83,6 +83,20 @@ func (s *Service) handleCommittedBranchTransition(transition committedBranchTran
 		s.promoteReadyOrphansAfterBlock(&transition.Connected[i])
 		s.removeLocalRebroadcastForBlock(&transition.Connected[i])
 	}
+	_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
+	rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{
+		Params:      consensus.ParamsForProfile(s.cfg.Profile),
+		SpendHeight: spendHeight,
+	})
+	if len(rejected) > 0 {
+		txs := make([]types.Transaction, 0, len(rejected))
+		errs := make([]error, 0, len(rejected))
+		for _, reject := range rejected {
+			txs = append(txs, reject.Tx)
+			errs = append(errs, reject.Err)
+		}
+		s.noteRejectedTransactions(txs, errs)
+	}
 	if txs := transition.DisconnectedTxs; len(txs) > 0 {
 		s.reprocessTransactions(txs, "reorg_reprocess", relay)
 	}
@@ -415,12 +429,16 @@ func blockCreatedLeaves(txs []types.Transaction) []utreexo.UtxoLeaf {
 	return created
 }
 
-func (s *Service) chainUtxoSnapshotWithTip() ([32]byte, consensus.UtxoLookup) {
+func (s *Service) chainUtxoSnapshotWithTip() ([32]byte, uint64, consensus.UtxoLookup) {
 	tip, ok := s.chainState.tipSnapshot()
 	if !ok {
-		return [32]byte{}, s.chainState.Store().UTXOLookupFunc()
+		return [32]byte{}, 0, s.chainState.Store().UTXOLookupFunc()
 	}
-	return tip.TipHash, s.chainState.Store().UTXOLookupFunc()
+	spendHeight := tip.Height
+	if spendHeight != ^uint64(0) {
+		spendHeight++
+	}
+	return tip.TipHash, spendHeight, s.chainState.Store().UTXOLookupFunc()
 }
 
 func (s *Service) chainTipHash() [32]byte {

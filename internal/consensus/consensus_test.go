@@ -136,6 +136,24 @@ func signedSpendTxForConsensusTest(t *testing.T, spenderSeed byte, prevOut types
 	return tx
 }
 
+func signedSpendTxToOutputsForConsensusTest(t *testing.T, spenderSeed byte, prevOut types.OutPoint, value uint64, outputs []types.TxOutput) types.Transaction {
+	t.Helper()
+	tx := types.Transaction{
+		Base: types.TxBase{
+			Version: 1,
+			Inputs:  []types.TxInput{{PrevOut: prevOut}},
+			Outputs: outputs,
+		},
+	}
+	msg, err := SighashWithParams(&tx, 0, []UtxoEntry{{ValueAtoms: value, PubKey: consensusTestPubKey(spenderSeed)}}, RegtestParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sig := crypto.SignSchnorrForTest([32]byte{spenderSeed}, &msg)
+	tx.Auth = types.TxAuth{Entries: []types.TxAuthEntry{{Signature: sig}}}
+	return tx
+}
+
 func specSighashForTest(tx *types.Transaction, inputIndex int, spentCoins []UtxoEntry, params ChainParams) ([32]byte, error) {
 	if inputIndex < 0 || inputIndex >= len(tx.Base.Inputs) {
 		return [32]byte{}, errors.New("input index out of range")

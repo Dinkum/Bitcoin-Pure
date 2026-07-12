@@ -422,10 +422,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 	}
 	traffic := &peerTrafficMeter{}
 	limits := types.DefaultCodecLimits()
-	if m.svc.cfg.MaxMessageBytes > 0 {
-		limits.MaxBlockBytes = m.svc.cfg.MaxMessageBytes
-	}
-	wire := p2p.NewConnWithLimits(&meteredNetConn{Conn: conn, meter: traffic}, p2p.MagicForProfile(m.svc.cfg.Profile), m.svc.cfg.MaxMessageBytes, limits)
+	wire := p2p.NewConnWithLimitsAndBudget(&meteredNetConn{Conn: conn, meter: traffic}, p2p.MagicForProfile(m.svc.cfg.Profile), m.svc.cfg.MaxMessageBytes, limits, m.svc.payloadBudget)
 	remoteVersion, err := p2p.Handshake(wire, m.svc.localVersion(), m.svc.cfg.HandshakeTimeout)
 	if err != nil {
 		if outbound {
@@ -462,6 +459,7 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		knownTx:        make(map[[32]byte]struct{}),
 		localRelayTxs:  make(map[[32]byte]localRelayFallbackState),
 		pendingThin:    make(map[[32]byte]*pendingThinBlock),
+		blockTransfers: make(map[[32]byte]*incomingBlockTransfer),
 	}
 	peer.noteProgress(time.Now())
 	peer.noteHeight(remoteVersion.Height)

@@ -20,11 +20,14 @@ func TestGetBlockFilterRPCIncludesCreatedAndSpentPubKeys(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
 
 	genesisTxID := consensus.TxID(&genesis.Txs[0])
 	spend := spendTxForNodeTest(t, 7, types.OutPoint{TxID: genesisTxID, Vout: 0}, 50, 8, 1)
-	coinbase := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
-	block := blockWithTxsForNodeTest(t, 0, genesis.Header, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, spend}, genesis.Header.Timestamp+600)
+	prevHeight := *svc.chainState.ChainState().TipHeight()
+	prevHeader := *svc.chainState.ChainState().TipHeader()
+	coinbase := coinbaseTxForHeight(prevHeight+1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
+	block := blockWithTxsForNodeTest(t, prevHeight, prevHeader, svc.chainState.ChainState().UTXOs(), []types.Transaction{coinbase, spend}, prevHeader.Timestamp+600)
 	if _, _, err := svc.acceptMinedBlock(block); err != nil {
 		t.Fatalf("acceptMinedBlock: %v", err)
 	}

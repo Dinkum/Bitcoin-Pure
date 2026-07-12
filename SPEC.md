@@ -15,7 +15,7 @@ Bitcoin Pure is a minimalist, payments-only proof-of-work chain. The goal is to 
 - No scripts, no smart contracts, no timelocks, no OP_RETURN.
 - 10-minute blocks, SHA256d PoW, ASERT difficulty with a 1-day half-life.
 - Dynamic block size cap with a 32 MB floor, growing slowly with real usage.
-- Long-tail halving schedule: ~1 BPU/block around year ~500, subsidy → 0 around ~2235. Permanent 1-atom tail emission continues forever thereafter.
+- Long-tail decade halving schedule: 5,000 BPU/block at launch, 50% cuts every ~10 years, and a permanent 1 BPU/block tail floor thereafter.
 - Canonical transaction ordering (LTOR) in consensus.
 - Canonical Merkle transaction commitments in block headers.
 - Header-committed Merklix-style canonical UTXO state root for snapshots, fast sync, and proof anchoring.
@@ -314,35 +314,34 @@ Normative requirements:
 - All fully-valid nodes must derive identical `epsilon(h)`, `beta(h)`, and `L(h)` values at every height.
 - Any block whose serialized size exceeds `L(h)` is invalid.
 
-### Monetary Policy — Long Tail Emission
+### Monetary Policy — Decade Halving With Tail Emission
 ---------------------------------------
 Units:
 - Consensus amounts in atoms.
 - Display unit: 1 BPU = 1,000,000,000 atoms.
 
 Parameters:
-- Halving interval: 2,500,000 blocks (~47.6 years).
-- Initial block subsidy: 1,000 BPU per block = 1,000,000,000,000 atoms.
-- Permanent subsidy floor: 1 atom per block.
+- Halving interval: 525,600 blocks (~10 years at 600 seconds per block).
+- Initial block subsidy: 5,000 BPU per block = 5,000,000,000,000 atoms.
+- Permanent subsidy floor: 1 BPU per block = 1,000,000,000 atoms.
 
 Rule:
-- Let k be the number of full 2,500,000-block intervals that have passed.
+- Let k be the number of full 525,600-block intervals that have passed.
 - Define the main schedule:
-  - main_subsidy_atoms(h) = floor(1,000,000,000,000 atoms / 2^k).
+  - main_subsidy_atoms(h) = floor(5,000,000,000,000 atoms / 2^k).
 - Block subsidy at height h:
-  - subsidy_atoms(h) = max(1, main_subsidy_atoms(h)).
-- Therefore, once the main schedule falls below 1 atom, the subsidy remains fixed at 1 atom per block forever.
+  - subsidy_atoms(h) = max(1,000,000,000 atoms, main_subsidy_atoms(h)).
+- Therefore, once the main schedule falls below 1 BPU, the subsidy remains fixed at 1 BPU per block forever.
 
 Approximate behavior:
-- Year 0: 1,000 BPU/block.
-- ~48 years: 500 BPU/block.
-- ~96 years: 250 BPU/block.
+- Year 0: 5,000 BPU/block.
+- ~10 years: 2,500 BPU/block.
+- ~20 years: 1,250 BPU/block.
 - …
-- ~10 halvings (~480 years): ≈ 0.9765625 BPU/block (~1 BPU/block).
-- ~20 halvings (~950 years): ≈ 0.00095367431 BPU/block.
-- The main halving schedule falls below 1 atom after roughly 47 halvings (~2235 years).
-- Because `subsidy_atoms(h) = max(1, main_subsidy_atoms(h))`, subsidy never reaches 0 and instead remains fixed at 1 atom per block forever.
-- At 1 atom per block, annual tail issuance is ~52,560 atoms/year = 0.00005256 BPU/year.
+- ~120 years: ≈ 1.220703125 BPU/block.
+- ~130 years and thereafter: 1 BPU/block tail floor.
+- Because `subsidy_atoms(h) = max(1,000,000,000 atoms, main_subsidy_atoms(h))`, subsidy never reaches 0 and instead remains fixed at 1 BPU per block forever.
+- At 1 BPU per block, annual tail issuance is ~52,560 BPU/year.
 
 Coinbase constraint:
 - For block at height h:
