@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -493,11 +494,14 @@ func (c *Conn) WriteMessage(msg Message) error {
 }
 
 func (c *Conn) writeChunkedBlock(block types.Block) error {
-	encoded := block.Encode()
-	checksum := crypto.Sha256d(encoded)
+	checksum, err := streamedBlockChecksum(block)
+	if err != nil {
+		return err
+	}
+	totalSize := block.EncodedLen()
 	if err := c.WriteMessage(BlockStartMessage{
 		Header:    block.Header,
-		TotalSize: uint64(len(encoded)),
+		TotalSize: uint64(totalSize),
 		Checksum:  checksum,
 	}); err != nil {
 		return err
@@ -508,14 +512,108 @@ func (c *Conn) writeChunkedBlock(block types.Block) error {
 		return ErrPayloadTooLarge
 	}
 	blockHash := crypto.Sha256d(block.Header.Encode())
-	for offset := 0; offset < len(encoded); offset += chunkBytes {
-		end := minInt(offset+chunkBytes, len(encoded))
-		if err := c.WriteMessage(BlockChunkMessage{
-			BlockHash: blockHash,
-			Offset:    uint64(offset),
-			Data:      encoded[offset:end],
-		}); err != nil {
-			return err
+	stream := blockChunkStream{
+		conn:      c,
+		blockHash: blockHash,
+		buf:       make([]byte, chunkBytes),
+	}
+	written, err := block.WriteTo(&stream)
+	if err != nil {
+		return err
+	}
+	if written != int64(totalSize) {
+		return fmt.Errorf("streamed block size mismatch: wrote=%d expected=%d", written, totalSize)
+	}
+	return stream.flush()
+}
+
+func streamedBlockChecksum(block types.Block) ([32]byte, error) {
+	firstHasher := sha256.New()
+	written, err := block.WriteTo(firstHasher)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	if written != int64(block.EncodedLen()) {
+		return [32]byte{}, fmt.Errorf("streamed block checksum size mismatch: wrote=%d expected=%d", written, block.EncodedLen())
+	}
+	var first [32]byte
+	firstHasher.Sum(first[:0])
+	return sha256.Sum256(first[:]), nil
+}
+
+type blockChunkStream struct {
+	conn      *Conn
+	blockHash [32]byte
+	buf       []byte
+	used      int
+	offset    uint64
+}
+
+func (w *blockChunkStream) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		if w.used == 0 && len(p) >= len(w.buf) {
+			if err := w.conn.writeBlockChunkFrame(w.blockHash, w.offset, p[:len(w.buf)]); err != nil {
+				return written, err
+			}
+			w.offset += uint64(len(w.buf))
+			written += len(w.buf)
+			p = p[len(w.buf):]
+			continue
+		}
+		copied := copy(w.buf[w.used:], p)
+		w.used += copied
+		written += copied
+		p = p[copied:]
+		if w.used == len(w.buf) {
+			if err := w.flush(); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, nil
+}
+
+func (w *blockChunkStream) flush() error {
+	if w.used == 0 {
+		return nil
+	}
+	if err := w.conn.writeBlockChunkFrame(w.blockHash, w.offset, w.buf[:w.used]); err != nil {
+		return err
+	}
+	w.offset += uint64(w.used)
+	w.used = 0
+	return nil
+}
+
+func (c *Conn) writeBlockChunkFrame(blockHash [32]byte, offset uint64, data []byte) error {
+	var offsetBytes [8]byte
+	binary.LittleEndian.PutUint64(offsetBytes[:], offset)
+	var lengthBytes [4]byte
+	binary.LittleEndian.PutUint32(lengthBytes[:], uint32(len(data)))
+	payloadLen := len(blockHash) + len(offsetBytes) + len(lengthBytes) + len(data)
+	maxPayload, ok := maxPayloadForCommand(CmdBlockChunk, c.maxPayload)
+	if !ok || payloadLen > maxPayload {
+		return ErrPayloadTooLarge
+	}
+
+	firstHasher := sha256.New()
+	_, _ = firstHasher.Write(blockHash[:])
+	_, _ = firstHasher.Write(offsetBytes[:])
+	_, _ = firstHasher.Write(lengthBytes[:])
+	_, _ = firstHasher.Write(data)
+	var first [32]byte
+	firstHasher.Sum(first[:0])
+	checksum := sha256.Sum256(first[:])
+
+	var header [headerSize]byte
+	binary.LittleEndian.PutUint32(header[:4], c.magic)
+	header[4] = byte(CmdBlockChunk)
+	binary.LittleEndian.PutUint32(header[8:12], uint32(payloadLen))
+	copy(header[12:16], checksum[:4])
+	for _, part := range [][]byte{header[:], blockHash[:], offsetBytes[:], lengthBytes[:], data} {
+		if err := writeFull(c.Conn, part); err != nil {
+			return fmt.Errorf("write command %d payload: %w", CmdBlockChunk, err)
 		}
 	}
 	return nil
@@ -771,7 +869,7 @@ func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (
 		// Full block validity is bounded by the candidate's parent-derived ABLA
 		// state in the node. The wire codec must not impose an independent count
 		// or block-size consensus rule after the frame itself was admitted.
-		block, err := types.DecodeBlockWithBudget(blockBytes, uint64(len(blockBytes)))
+		block, err := types.DecodeBlockOwnedBuffer(blockBytes, uint64(len(blockBytes)))
 		if err != nil {
 			return nil, err
 		}

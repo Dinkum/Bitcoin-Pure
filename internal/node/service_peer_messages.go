@@ -228,7 +228,7 @@ func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage)
 	if uint64(len(raw)) != transfer.total || crypto.Sha256d(raw) != transfer.checksum {
 		return errors.New("chunked block transfer checksum mismatch")
 	}
-	block, err := types.DecodeBlockWithBudget(raw, transfer.total)
+	block, err := types.DecodeBlockOwnedBuffer(raw, transfer.total)
 	if err != nil {
 		return err
 	}

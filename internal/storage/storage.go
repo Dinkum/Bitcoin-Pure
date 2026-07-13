@@ -3,10 +3,12 @@ package storage
 import (
 	"bytes"
 	"container/heap"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"path/filepath"
@@ -2344,7 +2346,7 @@ func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
 		}
 		maxBytes = consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(profile))
 	}
-	block, err := types.DecodeBlockWithBudget(buf, maxBytes)
+	block, err := types.DecodeBlockOwnedBuffer(buf, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -3362,24 +3364,90 @@ func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
 
 func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry, active bool) error {
 	blockHash := consensus.HeaderHash(&block.Header)
-	encoded := block.Encode()
-	chunkCount64 := (uint64(len(encoded)) + storedBlockChunkBytes - 1) / storedBlockChunkBytes
+	totalSize := block.EncodedLen()
+	chunkCount64 := (uint64(totalSize) + storedBlockChunkBytes - 1) / storedBlockChunkBytes
 	if chunkCount64 > math.MaxUint32 {
 		return errors.New("encoded block requires too many storage chunks")
 	}
 	chunkCount := uint32(chunkCount64)
-	manifest := encodeStoredBlockManifest(uint64(len(encoded)), chunkCount, crypto.Sha256d(encoded))
+	chunkWriter := blockBatchChunkWriter{
+		batch:     batch,
+		blockHash: blockHash,
+		buf:       make([]byte, storedBlockChunkBytes),
+	}
+	firstHasher := sha256.New()
+	written, err := block.WriteTo(io.MultiWriter(firstHasher, &chunkWriter))
+	if err != nil {
+		return err
+	}
+	if err := chunkWriter.flush(); err != nil {
+		return err
+	}
+	if written != int64(totalSize) || chunkWriter.written != uint64(totalSize) || chunkWriter.index != chunkCount {
+		return fmt.Errorf("streamed stored block size mismatch: encoded=%d chunks=%d expected_bytes=%d expected_chunks=%d", chunkWriter.written, chunkWriter.index, totalSize, chunkCount)
+	}
+	var first [32]byte
+	firstHasher.Sum(first[:0])
+	checksum := sha256.Sum256(first[:])
+	manifest := encodeStoredBlockManifest(uint64(totalSize), chunkCount, checksum)
 	if err := batch.Set(blockKey(blockHash), manifest, nil); err != nil {
 		return err
 	}
-	for chunkIndex := uint32(0); chunkIndex < chunkCount; chunkIndex++ {
-		start := int(chunkIndex) * storedBlockChunkBytes
-		end := min(start+storedBlockChunkBytes, len(encoded))
-		if err := batch.Set(blockChunkKey(blockHash, chunkIndex), encoded[start:end], nil); err != nil {
-			return err
+	return putHeaderBatch(batch, entry, active)
+}
+
+type blockBatchChunkWriter struct {
+	batch     *pebble.Batch
+	blockHash [32]byte
+	buf       []byte
+	used      int
+	index     uint32
+	written   uint64
+}
+
+func (w *blockBatchChunkWriter) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		if w.used == 0 && len(p) >= len(w.buf) {
+			if err := w.writeChunk(p[:len(w.buf)]); err != nil {
+				return written, err
+			}
+			w.written += uint64(len(w.buf))
+			written += len(w.buf)
+			p = p[len(w.buf):]
+			continue
+		}
+		copied := copy(w.buf[w.used:], p)
+		w.used += copied
+		w.written += uint64(copied)
+		written += copied
+		p = p[copied:]
+		if w.used == len(w.buf) {
+			if err := w.flush(); err != nil {
+				return written, err
+			}
 		}
 	}
-	return putHeaderBatch(batch, entry, active)
+	return written, nil
+}
+
+func (w *blockBatchChunkWriter) flush() error {
+	if w.used == 0 {
+		return nil
+	}
+	if err := w.writeChunk(w.buf[:w.used]); err != nil {
+		return err
+	}
+	w.used = 0
+	return nil
+}
+
+func (w *blockBatchChunkWriter) writeChunk(chunk []byte) error {
+	if err := w.batch.Set(blockChunkKey(w.blockHash, w.index), chunk, nil); err != nil {
+		return err
+	}
+	w.index++
+	return nil
 }
 
 func journalPairsFromEntries(entries []BlockIndexEntry) []chainJournalHeightHash {

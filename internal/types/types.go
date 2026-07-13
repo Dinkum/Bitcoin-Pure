@@ -1,9 +1,11 @@
 package types
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 )
 
@@ -148,12 +150,17 @@ func (e InvalidFormatError) Error() string {
 }
 
 type reader struct {
-	buf []byte
-	pos int
+	buf            []byte
+	pos            int
+	borrowPayloads bool
 }
 
 func newReader(buf []byte) *reader {
 	return &reader{buf: buf}
+}
+
+func newBorrowingReader(buf []byte) *reader {
+	return &reader{buf: buf, borrowPayloads: true}
 }
 
 func (r *reader) take(n int) ([]byte, error) {
@@ -465,8 +472,14 @@ func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
 			// A zero-filled 64-byte payload is still a present payload. Without
 			// this preservation, compatibility encoding would collapse it to a
 			// zero-length auth entry.
-			entry.AuthPayload = append([]byte(nil), authPayload...)
+			if r.borrowPayloads {
+				entry.AuthPayload = authPayload
+			} else {
+				entry.AuthPayload = append([]byte(nil), authPayload...)
+			}
 		}
+	} else if r.borrowPayloads {
+		entry.AuthPayload = authPayload
 	} else {
 		entry.AuthPayload = append([]byte(nil), authPayload...)
 	}
@@ -780,6 +793,101 @@ func (b Block) AppendEncode(out []byte) []byte {
 	return out
 }
 
+// WriteTo streams the canonical block encoding without materializing a second
+// block-sized byte slice. It is byte-for-byte equivalent to Encode and is used
+// by storage and P2P paths whose resource ceiling must be independent of the
+// full block size.
+func (b Block) WriteTo(dst io.Writer) (int64, error) {
+	w := canonicalBlockWriter{dst: dst}
+	w.writeU32(b.Header.Version)
+	w.write(b.Header.PrevBlockHash[:])
+	w.write(b.Header.MerkleTxIDRoot[:])
+	w.write(b.Header.MerkleAuthRoot[:])
+	w.write(b.Header.UTXORoot[:])
+	w.writeU64(b.Header.Timestamp)
+	w.writeU32(b.Header.NBits)
+	w.writeU64(b.Header.Nonce)
+	w.writeVarInt(uint64(len(b.Txs)))
+	for i := range b.Txs {
+		w.writeTransaction(&b.Txs[i])
+	}
+	return w.written, w.err
+}
+
+type canonicalBlockWriter struct {
+	dst     io.Writer
+	written int64
+	err     error
+	scratch [9]byte
+}
+
+func (w *canonicalBlockWriter) write(buf []byte) {
+	for len(buf) > 0 && w.err == nil {
+		n, err := w.dst.Write(buf)
+		if n > 0 {
+			w.written += int64(n)
+			buf = buf[n:]
+		}
+		if err != nil {
+			w.err = err
+			return
+		}
+		if n == 0 {
+			w.err = io.ErrShortWrite
+		}
+	}
+}
+
+func (w *canonicalBlockWriter) writeU32(value uint32) {
+	binary.LittleEndian.PutUint32(w.scratch[:4], value)
+	w.write(w.scratch[:4])
+}
+
+func (w *canonicalBlockWriter) writeU64(value uint64) {
+	binary.LittleEndian.PutUint64(w.scratch[:8], value)
+	w.write(w.scratch[:8])
+}
+
+func (w *canonicalBlockWriter) writeVarInt(value uint64) {
+	buf := AppendCanonicalVarInt(w.scratch[:0], value)
+	w.write(buf)
+}
+
+func (w *canonicalBlockWriter) writeTransaction(tx *Transaction) {
+	w.writeU32(tx.Base.Version)
+	w.writeVarInt(uint64(len(tx.Base.Inputs)))
+	if len(tx.Base.Inputs) == 0 {
+		if tx.Base.CoinbaseHeight == nil || tx.Base.CoinbaseExtraNonce == nil {
+			w.err = InvalidFormatError{Reason: "coinbase tx is missing canonical metadata"}
+			return
+		}
+		w.writeVarInt(*tx.Base.CoinbaseHeight)
+		w.write(tx.Base.CoinbaseExtraNonce[:])
+	}
+	for i := range tx.Base.Inputs {
+		w.write(tx.Base.Inputs[i].PrevOut.TxID[:])
+		w.writeU32(tx.Base.Inputs[i].PrevOut.Vout)
+	}
+	w.writeVarInt(uint64(len(tx.Base.Outputs)))
+	for i := range tx.Base.Outputs {
+		output := &tx.Base.Outputs[i]
+		w.writeVarInt(output.Type)
+		w.writeU64(output.ValueAtoms)
+		payload := output.CanonicalPayload32()
+		w.write(payload[:])
+	}
+	w.writeVarInt(uint64(len(tx.Auth.Entries)))
+	for i := range tx.Auth.Entries {
+		entry := &tx.Auth.Entries[i]
+		payload := entry.AuthPayload
+		if len(payload) == 0 && entry.Signature != ([64]byte{}) {
+			payload = entry.Signature[:]
+		}
+		w.writeVarInt(uint64(len(payload)))
+		w.write(payload)
+	}
+}
+
 func (b Block) EncodedLen() int {
 	size := BlockHeaderEncodedLen + varIntEncodedLen(uint64(len(b.Txs)))
 	for _, tx := range b.Txs {
@@ -797,10 +905,24 @@ func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
 // allocation; no independent count constant can reject an otherwise valid
 // block.
 func DecodeBlockWithBudget(buf []byte, maxBytes uint64) (Block, error) {
+	return decodeBlockWithReader(buf, maxBytes, false)
+}
+
+// DecodeBlockOwnedBuffer decodes a block while allowing variable-sized
+// authorization payloads to reference buf directly. The caller transfers
+// ownership of buf and must not mutate it while the returned block is in use.
+func DecodeBlockOwnedBuffer(buf []byte, maxBytes uint64) (Block, error) {
+	return decodeBlockWithReader(buf, maxBytes, true)
+}
+
+func decodeBlockWithReader(buf []byte, maxBytes uint64, borrowPayloads bool) (Block, error) {
 	if maxBytes > 0 && uint64(len(buf)) > maxBytes {
 		return Block{}, LimitExceededError{Field: "block.bytes"}
 	}
 	r := newReader(buf)
+	if borrowPayloads {
+		r = newBorrowingReader(buf)
+	}
 	header, err := decodeBlockHeader(r)
 	if err != nil {
 		return Block{}, err
