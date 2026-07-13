@@ -9,6 +9,15 @@ import (
 	"testing"
 )
 
+func TestMempoolContextRecheckIsReorgOnly(t *testing.T) {
+	if transitionRequiresMempoolContextRecheck(committedBranchTransition{Connected: []types.Block{{}}}) {
+		t.Fatal("tip extension unexpectedly requires a full maturity rescan")
+	}
+	if !transitionRequiresMempoolContextRecheck(committedBranchTransition{Connected: []types.Block{{}}, DisconnectedTxs: []types.Transaction{{}}}) {
+		t.Fatal("reorg did not require a maturity rescan")
+	}
+}
+
 func TestApplyPeerBlockPromotesReadyOrphans(t *testing.T) {
 	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
 	svc, err := OpenService(ServiceConfig{
@@ -188,6 +197,56 @@ func TestServiceReloadsPersistedMempoolOnSameTip(t *testing.T) {
 	}
 }
 
+func TestServiceMempoolPersistenceUsesJournalAfterFullCheckpoint(t *testing.T) {
+	genesis := genesisBlockForPubKey(nodeSignerPubKey(7))
+	svc, err := OpenService(ServiceConfig{Profile: types.Regtest, DBPath: t.TempDir()}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+	matureGenesisForNodeTest(t, svc)
+
+	genesisOut := types.OutPoint{TxID: consensus.TxID(&genesis.Txs[0]), Vout: 0}
+	parent := spendTxForNodeTest(t, 7, genesisOut, 50, 8, 1)
+	parentAdmission, err := svc.SubmitTx(parent)
+	if err != nil {
+		t.Fatalf("SubmitTx(parent): %v", err)
+	}
+	if err := svc.flushMempoolPersistence(); err != nil {
+		t.Fatalf("initial full flush: %v", err)
+	}
+	fullEpoch := svc.mempoolPersistEpoch
+	if svc.mempoolFastFlushes != 0 {
+		t.Fatalf("fast flush count after full checkpoint = %d, want 0", svc.mempoolFastFlushes)
+	}
+
+	child := spendTxForNodeTest(t, 8, types.OutPoint{TxID: parentAdmission.TxID, Vout: 0}, 49, 9, 1)
+	if _, err := svc.SubmitTx(child); err != nil {
+		t.Fatalf("SubmitTx(child): %v", err)
+	}
+	if err := svc.flushMempoolPersistence(); err != nil {
+		t.Fatalf("journal flush: %v", err)
+	}
+	if svc.mempoolPersistEpoch <= fullEpoch || svc.mempoolFastFlushes != 1 {
+		t.Fatalf("journal checkpoint epoch=%d fast_flushes=%d, want epoch>%d and one fast flush", svc.mempoolPersistEpoch, svc.mempoolFastFlushes, fullEpoch)
+	}
+	stored, err := svc.chainState.Store().LoadMempoolState()
+	if err != nil {
+		t.Fatalf("LoadMempoolState: %v", err)
+	}
+	if stored == nil || len(stored.Entries) != 2 {
+		t.Fatalf("stored mempool entries = %v, want 2", stored)
+	}
+
+	svc.mempoolFastFlushes = mempoolFullReconcileInterval
+	if err := svc.flushMempoolPersistence(); err != nil {
+		t.Fatalf("periodic full reconciliation: %v", err)
+	}
+	if svc.mempoolFastFlushes != 0 {
+		t.Fatalf("fast flush count after periodic reconciliation = %d, want 0", svc.mempoolFastFlushes)
+	}
+}
+
 func TestBuildStoredMempoolDeltaOnlyTouchesChangedRecords(t *testing.T) {
 	entryTx := spendTxForNodeTest(t, 7, types.OutPoint{TxID: [32]byte{1}, Vout: 0}, 50, 8, 1)
 	entryTxID := consensus.TxID(&entryTx)
@@ -281,6 +340,47 @@ func TestBuildStoredMempoolDeltaOnlyTouchesChangedRecords(t *testing.T) {
 	}
 	if len(delta.OrphanDeletes) != 1 || delta.OrphanDeletes[0] != orphanTxID {
 		t.Fatalf("orphan deletes = %+v, want only old orphan", delta.OrphanDeletes)
+	}
+}
+
+func TestBuildStoredMempoolJournalDeltaMatchesCurrentRecords(t *testing.T) {
+	meta := storage.StoredMempoolStateMeta{Version: 3, Profile: types.Regtest, TipHeight: 8, TipHash: [32]byte{8}}
+	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 10, PubKey: nodeSignerPubKey(1)}})
+	txid := consensus.TxID(&tx)
+	authid := consensus.AuthID(&tx)
+	previous := persistedMempoolState{
+		Valid:   true,
+		Meta:    meta,
+		Entries: map[[32]byte]persistedMempoolEntryFingerprint{},
+		Orphans: map[[32]byte]persistedMempoolOrphanFingerprint{{9}: {AuthID: [32]byte{10}, AddedAt: 1}},
+	}
+	changes := mempool.PersistenceChanges{
+		Epoch:       7,
+		EntryCount:  1,
+		OrphanCount: 0,
+		EntryUpserts: []mempool.PersistedEntry{{
+			TxID: txid, AuthID: authid, Tx: tx, Summary: consensus.TxValidationSummary{Fee: 2}, AddedAt: 3,
+		}},
+		OrphanDeletes: [][32]byte{{9}},
+	}
+	delta, changed := buildStoredMempoolJournalDelta(changes, previous, meta)
+	if !changed || len(delta.EntryUpserts) != 1 || delta.EntryUpserts[0].TxID != txid {
+		t.Fatalf("journal entry upserts = %+v, changed=%v", delta.EntryUpserts, changed)
+	}
+	if len(delta.OrphanDeletes) != 1 || delta.OrphanDeletes[0] != ([32]byte{9}) {
+		t.Fatalf("journal orphan deletes = %+v", delta.OrphanDeletes)
+	}
+	applyMempoolJournalChanges(&previous, changes, meta)
+	if fingerprint, ok := previous.Entries[txid]; !ok || fingerprint.AuthID != authid || fingerprint.AddedAt != 3 {
+		t.Fatalf("applied entry fingerprint = %+v, present=%v", fingerprint, ok)
+	}
+	if _, ok := previous.Orphans[[32]byte{9}]; ok {
+		t.Fatal("applied journal retained deleted orphan")
+	}
+
+	noChanges, changed := buildStoredMempoolJournalDelta(mempool.PersistenceChanges{Epoch: 8, EntryCount: 1}, previous, meta)
+	if changed || len(noChanges.EntryUpserts) != 0 || len(noChanges.EntryDeletes) != 0 {
+		t.Fatalf("unchanged journal produced delta %+v", noChanges)
 	}
 }
 

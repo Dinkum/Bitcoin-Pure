@@ -188,6 +188,40 @@ type PersistedOrphan struct {
 	Missing []types.OutPoint
 }
 
+// PersistenceSnapshot is one lock-consistent view of restart-only mempool
+// records. Epoch identifies the exact mutation boundary represented by it.
+type PersistenceSnapshot struct {
+	Epoch   uint64
+	Entries []PersistedEntry
+	Orphans []PersistedOrphan
+}
+
+// PersistenceChanges is a coalesced view of records touched after an earlier
+// snapshot. A txid appears as its current record or as a delete, never both.
+type PersistenceChanges struct {
+	Epoch         uint64
+	EntryCount    int
+	OrphanCount   int
+	EntryUpserts  []PersistedEntry
+	EntryDeletes  [][32]byte
+	OrphanUpserts []PersistedOrphan
+	OrphanDeletes [][32]byte
+}
+
+type persistenceMutationKind uint8
+
+const (
+	persistenceEntryMutation persistenceMutationKind = iota + 1
+	persistenceOrphanMutation
+	persistenceJournalLimit = 65_536
+)
+
+type persistenceMutation struct {
+	Seq  uint64
+	Kind persistenceMutationKind
+	TxID [32]byte
+}
+
 type Pool struct {
 	mu          sync.RWMutex
 	cfg         PoolConfig
@@ -204,6 +238,11 @@ type Pool struct {
 	topByFee    []SnapshotEntry
 	topDirty    bool
 	snapshot    []SnapshotEntry
+	// The bounded mutation journal lets restart persistence scale with changed
+	// records. persistenceFloor forces a full reconciliation after overflow.
+	persistenceSeq   uint64
+	persistenceFloor uint64
+	persistenceLog   []persistenceMutation
 }
 
 type orphanEntry struct {
@@ -500,6 +539,134 @@ func (p *Pool) PersistedOrphans() []PersistedOrphan {
 	return out
 }
 
+// PersistenceSnapshot captures accepted and orphan records under one read lock
+// so a durable checkpoint can be tied to an exact mutation epoch.
+func (p *Pool) PersistenceSnapshot() PersistenceSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	snapshot := PersistenceSnapshot{
+		Epoch:   p.persistenceSeq,
+		Entries: make([]PersistedEntry, 0, len(p.entries)),
+		Orphans: make([]PersistedOrphan, 0, len(p.orphans)),
+	}
+	for _, entry := range p.entries {
+		snapshot.Entries = append(snapshot.Entries, persistedEntryForEntry(entry))
+	}
+	for _, orphan := range p.orphans {
+		snapshot.Orphans = append(snapshot.Orphans, persistedOrphanForOrphan(orphan))
+	}
+	sort.Slice(snapshot.Entries, func(i, j int) bool {
+		return bytes.Compare(snapshot.Entries[i].TxID[:], snapshot.Entries[j].TxID[:]) < 0
+	})
+	sort.Slice(snapshot.Orphans, func(i, j int) bool {
+		return bytes.Compare(snapshot.Orphans[i].TxID[:], snapshot.Orphans[j].TxID[:]) < 0
+	})
+	return snapshot
+}
+
+// PersistenceChangesSince returns only records touched after epoch. The false
+// result means the bounded journal no longer covers that epoch and the caller
+// must use PersistenceSnapshot instead.
+func (p *Pool) PersistenceChangesSince(epoch uint64) (PersistenceChanges, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	changes := PersistenceChanges{
+		Epoch:       p.persistenceSeq,
+		EntryCount:  len(p.entries),
+		OrphanCount: len(p.orphans),
+	}
+	if epoch > p.persistenceSeq || epoch < p.persistenceFloor {
+		return changes, false
+	}
+	dirtyEntries := make(map[[32]byte]struct{})
+	dirtyOrphans := make(map[[32]byte]struct{})
+	for _, mutation := range p.persistenceLog {
+		if mutation.Seq <= epoch {
+			continue
+		}
+		switch mutation.Kind {
+		case persistenceEntryMutation:
+			dirtyEntries[mutation.TxID] = struct{}{}
+		case persistenceOrphanMutation:
+			dirtyOrphans[mutation.TxID] = struct{}{}
+		}
+	}
+	entryIDs := txidSetKeys(dirtyEntries)
+	orphanIDs := txidSetKeys(dirtyOrphans)
+	sortTxIDs(entryIDs)
+	sortTxIDs(orphanIDs)
+	for _, txid := range entryIDs {
+		if entry := p.entries[txid]; entry != nil {
+			changes.EntryUpserts = append(changes.EntryUpserts, persistedEntryForEntry(entry))
+		} else {
+			changes.EntryDeletes = append(changes.EntryDeletes, txid)
+		}
+	}
+	for _, txid := range orphanIDs {
+		if orphan := p.orphans[txid]; orphan != nil {
+			changes.OrphanUpserts = append(changes.OrphanUpserts, persistedOrphanForOrphan(orphan))
+		} else {
+			changes.OrphanDeletes = append(changes.OrphanDeletes, txid)
+		}
+	}
+	return changes, true
+}
+
+// AcknowledgePersistence releases journal entries at or below an epoch that a
+// caller has durably committed. Mutations that raced after the snapshot remain
+// available for the next flush.
+func (p *Pool) AcknowledgePersistence(epoch uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if epoch > p.persistenceSeq || epoch < p.persistenceFloor {
+		return
+	}
+	firstPending := 0
+	for firstPending < len(p.persistenceLog) && p.persistenceLog[firstPending].Seq <= epoch {
+		firstPending++
+	}
+	copy(p.persistenceLog, p.persistenceLog[firstPending:])
+	p.persistenceLog = p.persistenceLog[:len(p.persistenceLog)-firstPending]
+	p.persistenceFloor = epoch
+}
+
+func persistedEntryForEntry(entry *Entry) PersistedEntry {
+	return PersistedEntry{
+		TxID:    entry.TxID,
+		AuthID:  entry.AuthID,
+		Tx:      entry.Tx,
+		Summary: entry.Summary,
+		AddedAt: entry.AddedAt,
+	}
+}
+
+func persistedOrphanForOrphan(orphan *orphanEntry) PersistedOrphan {
+	return PersistedOrphan{
+		TxID:    orphan.TxID,
+		AuthID:  consensus.AuthID(&orphan.Tx),
+		Tx:      orphan.Tx,
+		AddedAt: orphan.AddedAt,
+		Missing: outPointSetKeys(orphan.Missing),
+	}
+}
+
+func (p *Pool) notePersistenceMutationLocked(kind persistenceMutationKind, txid [32]byte) {
+	p.persistenceSeq++
+	if len(p.persistenceLog) >= persistenceJournalLimit {
+		// Dropping the covered prefix is safe because readers behind this floor
+		// receive false and rebuild one full, authoritative snapshot.
+		p.persistenceLog = p.persistenceLog[:0]
+		p.persistenceFloor = p.persistenceSeq - 1
+	}
+	p.persistenceLog = append(p.persistenceLog, persistenceMutation{Seq: p.persistenceSeq, Kind: kind, TxID: txid})
+}
+
+func (p *Pool) resetPersistenceJournalLocked() {
+	p.persistenceSeq++
+	p.persistenceFloor = p.persistenceSeq
+	p.persistenceLog = p.persistenceLog[:0]
+}
+
 func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []PersistedOrphan) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -633,6 +800,7 @@ func (p *Pool) RestorePersistedState(entries []PersistedEntry, orphans []Persist
 	p.topDirty = true
 	p.snapshot = nil
 	p.statsDirty = true
+	p.resetPersistenceJournalLocked()
 	return nil
 }
 
@@ -1288,15 +1456,16 @@ func (p *Pool) RemoveConfirmed(block *types.Block) {
 			confirmedSpends[input.PrevOut] = struct{}{}
 		}
 	}
-	for txid, entry := range p.entries {
-		if _, ok := confirmed[txid]; ok {
+	// p.spent is the authoritative one-spender index. Looking up the block's
+	// inputs directly keeps confirmation cleanup proportional to block work
+	// instead of scanning the entire mempool after every accepted block.
+	for outPoint := range confirmedSpends {
+		spender, ok := p.spent[outPoint]
+		if !ok {
 			continue
 		}
-		for _, input := range entry.Tx.Base.Inputs {
-			if _, ok := confirmedSpends[input.PrevOut]; ok {
-				conflicts[txid] = struct{}{}
-				break
-			}
+		if _, isConfirmed := confirmed[spender]; !isConfirmed {
+			conflicts[spender] = struct{}{}
 		}
 	}
 	remove := p.collectRecursive(conflicts)
@@ -1468,6 +1637,7 @@ func (p *Pool) insertValidatedLocked(tx types.Transaction, txid [32]byte, size i
 		DescendantFees:  summary.Fee,
 	}
 	p.entries[txid] = entry
+	p.notePersistenceMutationLocked(persistenceEntryMutation, txid)
 	p.noteEntryAddedLocked(entry)
 	for _, input := range tx.Base.Inputs {
 		p.spent[input.PrevOut] = txid
@@ -1554,6 +1724,7 @@ func (p *Pool) enqueueReadyOrphansForOutputs(ready [][32]byte, outputs []types.O
 			}
 			delete(orphan.Missing, out)
 			orphan.MissingCount--
+			p.notePersistenceMutationLocked(persistenceOrphanMutation, txid)
 			if orphan.MissingCount == 0 {
 				ready = append(ready, txid)
 			}
@@ -1699,6 +1870,7 @@ func (p *Pool) storeOrphan(tx types.Transaction, txid [32]byte, size int, missin
 		Missing:      copyOutPointSet(missing),
 		MissingCount: len(missing),
 	}
+	p.notePersistenceMutationLocked(persistenceOrphanMutation, txid)
 	for out := range missing {
 		p.orphanDeps[out] = append(p.orphanDeps[out], txid)
 	}
@@ -1733,6 +1905,7 @@ func (p *Pool) deleteOrphan(txid [32]byte) {
 	orphan := p.orphans[txid]
 	if orphan != nil {
 		p.removeOrphanDeps(txid, orphan.Missing)
+		p.notePersistenceMutationLocked(persistenceOrphanMutation, txid)
 	}
 	delete(p.orphans, txid)
 }
@@ -1748,6 +1921,7 @@ func (p *Pool) updateOrphanMissing(txid [32]byte, missing map[types.OutPoint]str
 	for out := range orphan.Missing {
 		p.orphanDeps[out] = append(p.orphanDeps[out], txid)
 	}
+	p.notePersistenceMutationLocked(persistenceOrphanMutation, txid)
 }
 
 func (p *Pool) removeOrphanDeps(txid [32]byte, missing map[types.OutPoint]struct{}) {
@@ -1840,6 +2014,7 @@ func (p *Pool) removeEntriesLocked(remove map[[32]byte]struct{}) {
 	for txid := range remove {
 		if entry := p.entries[txid]; entry != nil {
 			p.noteEntryRemovedLocked(entry)
+			p.notePersistenceMutationLocked(persistenceEntryMutation, txid)
 		}
 		delete(p.entries, txid)
 	}

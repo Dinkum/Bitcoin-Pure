@@ -18,10 +18,13 @@ type persistedMempoolState struct {
 }
 
 type livePersistedMempoolSnapshot struct {
+	Epoch   uint64
 	State   persistedMempoolState
 	Entries map[[32]byte]mempool.PersistedEntry
 	Orphans map[[32]byte]mempool.PersistedOrphan
 }
+
+const mempoolFullReconcileInterval = 256
 
 type persistedMempoolEntryFingerprint struct {
 	AuthID  [32]byte
@@ -86,26 +89,74 @@ func (s *Service) flushMempoolPersistence() error {
 	}
 	s.mempoolPersistMu.Lock()
 	defer s.mempoolPersistMu.Unlock()
+	if !s.mempoolPersistState.Valid || s.mempoolFastFlushes >= mempoolFullReconcileInterval {
+		return s.flushMempoolPersistenceFullLocked()
+	}
+	tip, ok := s.chainState.tipSnapshot()
+	if !ok {
+		return s.flushMempoolPersistenceFullLocked()
+	}
+	changes, complete := s.pool.PersistenceChangesSince(s.mempoolPersistEpoch)
+	if !complete {
+		return s.flushMempoolPersistenceFullLocked()
+	}
+	if changes.EntryCount == 0 && changes.OrphanCount == 0 {
+		if err := s.chainState.Store().ClearMempoolState(); err != nil {
+			return err
+		}
+		s.mempoolPersistState = persistedMempoolState{}
+		s.mempoolPersistEpoch = changes.Epoch
+		s.mempoolFastFlushes = 0
+		s.pool.AcknowledgePersistence(changes.Epoch)
+		return nil
+	}
+	meta := storage.StoredMempoolStateMeta{
+		Version:   3,
+		Profile:   s.cfg.Profile,
+		TipHeight: tip.Height,
+		TipHash:   tip.TipHash,
+	}
+	delta, changed := buildStoredMempoolJournalDelta(changes, s.mempoolPersistState, meta)
+	if changed {
+		if err := s.chainState.Store().ApplyMempoolStateDelta(delta); err != nil {
+			return err
+		}
+	}
+	applyMempoolJournalChanges(&s.mempoolPersistState, changes, meta)
+	s.mempoolPersistEpoch = changes.Epoch
+	s.mempoolFastFlushes++
+	s.pool.AcknowledgePersistence(changes.Epoch)
+	return nil
+}
 
+func (s *Service) flushMempoolPersistenceFullLocked() error {
 	snapshot, ok := s.buildPersistableMempoolSnapshot()
 	if !ok {
 		if !s.mempoolPersistState.Valid {
+			s.mempoolPersistEpoch = snapshot.Epoch
+			s.mempoolFastFlushes = 0
+			s.pool.AcknowledgePersistence(snapshot.Epoch)
 			return nil
 		}
 		if err := s.chainState.Store().ClearMempoolState(); err != nil {
 			return err
 		}
 		s.mempoolPersistState = persistedMempoolState{}
+		s.mempoolPersistEpoch = snapshot.Epoch
+		s.mempoolFastFlushes = 0
+		s.pool.AcknowledgePersistence(snapshot.Epoch)
 		return nil
 	}
 	delta, changed := buildStoredMempoolDelta(snapshot, s.mempoolPersistState)
-	if !changed {
-		return nil
-	}
-	if err := s.chainState.Store().ApplyMempoolStateDelta(delta); err != nil {
-		return err
+	if changed {
+		if err := s.chainState.Store().ApplyMempoolStateDelta(delta); err != nil {
+			return err
+		}
 	}
 	s.mempoolPersistState = snapshot.State
+	s.mempoolPersistEpoch = snapshot.Epoch
+	s.mempoolFastFlushes = 0
+	s.pool.AcknowledgePersistence(snapshot.Epoch)
 	return nil
 }
 
@@ -117,12 +168,14 @@ func (s *Service) buildPersistableMempoolSnapshot() (livePersistedMempoolSnapsho
 	if !ok {
 		return livePersistedMempoolSnapshot{}, false
 	}
-	entries := s.pool.PersistedEntries()
-	orphans := s.pool.PersistedOrphans()
+	poolSnapshot := s.pool.PersistenceSnapshot()
+	entries := poolSnapshot.Entries
+	orphans := poolSnapshot.Orphans
 	if len(entries) == 0 && len(orphans) == 0 {
-		return livePersistedMempoolSnapshot{}, false
+		return livePersistedMempoolSnapshot{Epoch: poolSnapshot.Epoch}, false
 	}
 	snapshot := livePersistedMempoolSnapshot{
+		Epoch: poolSnapshot.Epoch,
 		State: persistedMempoolState{
 			Valid: true,
 			Meta: storage.StoredMempoolStateMeta{
@@ -207,6 +260,85 @@ func buildStoredMempoolDelta(current livePersistedMempoolSnapshot, previous pers
 	return delta, changed
 }
 
+func buildStoredMempoolJournalDelta(changes mempool.PersistenceChanges, previous persistedMempoolState, meta storage.StoredMempoolStateMeta) (storage.StoredMempoolStateDelta, bool) {
+	delta := storage.StoredMempoolStateDelta{Meta: meta}
+	changed := !previous.Valid || previous.Meta != meta
+	for _, entry := range changes.EntryUpserts {
+		if fingerprint, ok := previous.Entries[entry.TxID]; ok && samePersistedEntryFingerprint(fingerprint, entry) {
+			continue
+		}
+		delta.EntryUpserts = append(delta.EntryUpserts, storage.StoredMempoolDeltaEntry{
+			TxID: entry.TxID,
+			Entry: storage.StoredMempoolEntry{
+				Tx:      entry.Tx.Encode(),
+				Summary: entry.Summary,
+				AddedAt: entry.AddedAt,
+			},
+		})
+		changed = true
+	}
+	for _, txid := range changes.EntryDeletes {
+		if _, ok := previous.Entries[txid]; !ok {
+			continue
+		}
+		delta.EntryDeletes = append(delta.EntryDeletes, txid)
+		changed = true
+	}
+	for _, orphan := range changes.OrphanUpserts {
+		if fingerprint, ok := previous.Orphans[orphan.TxID]; ok && samePersistedOrphanFingerprint(fingerprint, orphan) {
+			continue
+		}
+		delta.OrphanUpserts = append(delta.OrphanUpserts, storage.StoredMempoolDeltaEntry{
+			TxID: orphan.TxID,
+			Entry: storage.StoredMempoolEntry{
+				Tx:      orphan.Tx.Encode(),
+				AddedAt: orphan.AddedAt,
+				Missing: append([]types.OutPoint(nil), orphan.Missing...),
+			},
+		})
+		changed = true
+	}
+	for _, txid := range changes.OrphanDeletes {
+		if _, ok := previous.Orphans[txid]; !ok {
+			continue
+		}
+		delta.OrphanDeletes = append(delta.OrphanDeletes, txid)
+		changed = true
+	}
+	return delta, changed
+}
+
+func applyMempoolJournalChanges(state *persistedMempoolState, changes mempool.PersistenceChanges, meta storage.StoredMempoolStateMeta) {
+	if state.Entries == nil {
+		state.Entries = make(map[[32]byte]persistedMempoolEntryFingerprint)
+	}
+	if state.Orphans == nil {
+		state.Orphans = make(map[[32]byte]persistedMempoolOrphanFingerprint)
+	}
+	for _, entry := range changes.EntryUpserts {
+		state.Entries[entry.TxID] = persistedMempoolEntryFingerprint{
+			AuthID:  entry.AuthID,
+			Summary: entry.Summary,
+			AddedAt: entry.AddedAt,
+		}
+	}
+	for _, txid := range changes.EntryDeletes {
+		delete(state.Entries, txid)
+	}
+	for _, orphan := range changes.OrphanUpserts {
+		state.Orphans[orphan.TxID] = persistedMempoolOrphanFingerprint{
+			AuthID:  orphan.AuthID,
+			AddedAt: orphan.AddedAt,
+			Missing: append([]types.OutPoint(nil), orphan.Missing...),
+		}
+	}
+	for _, txid := range changes.OrphanDeletes {
+		delete(state.Orphans, txid)
+	}
+	state.Valid = true
+	state.Meta = meta
+}
+
 func samePersistedEntryFingerprint(fingerprint persistedMempoolEntryFingerprint, entry mempool.PersistedEntry) bool {
 	return fingerprint.AuthID == entry.AuthID &&
 		fingerprint.Summary == entry.Summary &&
@@ -289,6 +421,11 @@ func (s *Service) reloadPersistedMempool() error {
 		if err := s.pool.RestorePersistedState(accepted, orphans); err != nil {
 			return err
 		}
+		poolSnapshot := s.pool.PersistenceSnapshot()
+		s.mempoolPersistMu.Lock()
+		s.mempoolPersistEpoch = poolSnapshot.Epoch
+		s.mempoolFastFlushes = 0
+		s.mempoolPersistMu.Unlock()
 		s.logger.Info("restored mempool from persisted state",
 			slog.Int("entries", len(accepted)),
 			slog.Int("orphans", len(orphans)),
@@ -296,6 +433,12 @@ func (s *Service) reloadPersistedMempool() error {
 		)
 		return s.flushMempoolPersistence()
 	}
+	// Reprocessing can reject records without ever inserting them into the live
+	// pool, so the mutation journal alone cannot describe deletion from the old
+	// checkpoint. Force the authoritative full reconciliation after replay.
+	s.mempoolPersistMu.Lock()
+	s.mempoolPersistEpoch = ^uint64(0)
+	s.mempoolPersistMu.Unlock()
 	reprocess := make([]types.Transaction, 0, len(accepted)+len(orphans))
 	for _, entry := range accepted {
 		reprocess = append(reprocess, entry.Tx)

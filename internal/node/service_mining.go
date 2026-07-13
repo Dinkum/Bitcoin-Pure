@@ -83,19 +83,23 @@ func (s *Service) handleCommittedBranchTransition(transition committedBranchTran
 		s.promoteReadyOrphansAfterBlock(&transition.Connected[i])
 		s.removeLocalRebroadcastForBlock(&transition.Connected[i])
 	}
-	_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
-	rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{
-		Params:      consensus.ParamsForProfile(s.cfg.Profile),
-		SpendHeight: spendHeight,
-	})
-	if len(rejected) > 0 {
-		txs := make([]types.Transaction, 0, len(rejected))
-		errs := make([]error, 0, len(rejected))
-		for _, reject := range rejected {
-			txs = append(txs, reject.Tx)
-			errs = append(errs, reject.Err)
+	// Coinbase maturity is monotonic on a tip extension. Only a reorg can move
+	// the spend height backwards and invalidate a previously mature spend.
+	if transitionRequiresMempoolContextRecheck(transition) {
+		_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
+		rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{
+			Params:      consensus.ParamsForProfile(s.cfg.Profile),
+			SpendHeight: spendHeight,
+		})
+		if len(rejected) > 0 {
+			txs := make([]types.Transaction, 0, len(rejected))
+			errs := make([]error, 0, len(rejected))
+			for _, reject := range rejected {
+				txs = append(txs, reject.Tx)
+				errs = append(errs, reject.Err)
+			}
+			s.noteRejectedTransactions(txs, errs)
 		}
-		s.noteRejectedTransactions(txs, errs)
 	}
 	if txs := transition.DisconnectedTxs; len(txs) > 0 {
 		s.reprocessTransactions(txs, "reorg_reprocess", relay)
@@ -104,6 +108,10 @@ func (s *Service) handleCommittedBranchTransition(transition committedBranchTran
 		s.scheduleMempoolPersistence()
 	}
 	return nil
+}
+
+func transitionRequiresMempoolContextRecheck(transition committedBranchTransition) bool {
+	return len(transition.DisconnectedTxs) > 0
 }
 
 func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) {

@@ -283,6 +283,8 @@ type Service struct {
 	mempoolPersistCh    chan struct{}
 	mempoolPersistMu    sync.Mutex
 	mempoolPersistState persistedMempoolState
+	mempoolPersistEpoch uint64
+	mempoolFastFlushes  uint32
 	peerMgr             *peerManager
 	syncMgr             *syncManager
 	relaySched          *relayScheduler
