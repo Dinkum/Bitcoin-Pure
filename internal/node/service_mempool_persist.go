@@ -62,18 +62,17 @@ func (s *Service) mempoolPersistLoop() {
 		case <-s.stopCh:
 			return
 		case <-s.mempoolPersistCh:
-			if timer == nil {
-				timer = time.NewTimer(persistDebounce)
-				timerCh = timer.C
+			// Coalesce from the first dirty notification: sustained arrivals must
+			// not keep postponing the checkpoint indefinitely.
+			if timerCh != nil {
 				continue
 			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
+			if timer == nil {
+				timer = time.NewTimer(persistDebounce)
+			} else {
+				timer.Reset(persistDebounce)
 			}
-			timer.Reset(persistDebounce)
+			timerCh = timer.C
 		case <-timerCh:
 			timerCh = nil
 			if err := s.flushMempoolPersistence(); err != nil && s.logger != nil {

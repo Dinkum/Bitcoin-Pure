@@ -64,9 +64,27 @@ func MatchWatchItem(blockHash [32]byte, encoded []byte, item WatchItem) (bool, e
 	if err != nil {
 		return false, err
 	}
-	target := fingerprintForWatchItem(blockHash, item)
+	return matchesFingerprint(fingerprints, fingerprintForWatchItem(blockHash, item)), nil
+}
+
+// MatchWatchItems validates and decodes a filter once for all requested watch
+// items. Results preserve request order, including duplicate items. Even an
+// empty request validates the complete filter before returning an empty result.
+func MatchWatchItems(blockHash [32]byte, encoded []byte, items []WatchItem) ([]bool, error) {
+	fingerprints, err := decodeFingerprints(encoded)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]bool, len(items))
+	for i, item := range items {
+		matches[i] = matchesFingerprint(fingerprints, fingerprintForWatchItem(blockHash, item))
+	}
+	return matches, nil
+}
+
+func matchesFingerprint(fingerprints []uint64, target uint64) bool {
 	index := sort.Search(len(fingerprints), func(i int) bool { return fingerprints[i] >= target })
-	return index < len(fingerprints) && fingerprints[index] == target, nil
+	return index < len(fingerprints) && fingerprints[index] == target
 }
 
 func WatchItemForOutput(output types.TxOutput) WatchItem {

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bitcoin-pure/internal/config"
@@ -67,6 +68,10 @@ func rpcClientTimeout(cfg config.Config) time.Duration {
 }
 
 func (c *cliRPCClient) Call(method string, params any, out any) error {
+	return c.callContext(context.Background(), method, params, out)
+}
+
+func (c *cliRPCClient) callContext(ctx context.Context, method string, params any, out any) error {
 	if c.addr == "" {
 		return errors.New("rpc address is required")
 	}
@@ -81,7 +86,7 @@ func (c *cliRPCClient) Call(method string, params any, out any) error {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = "http://" + endpoint
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -548,18 +553,35 @@ type cliNodeStatus struct {
 }
 
 func fetchNodeStatus(client *cliRPCClient) (cliNodeStatus, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var status cliNodeStatus
-	if err := client.Call("getinfo", nil, &status.Info); err != nil {
-		return cliNodeStatus{}, err
+	calls := []struct {
+		method string
+		out    any
+	}{{"getinfo", &status.Info}, {"getmempoolinfo", &status.Mempool}, {"getmininginfo", &status.Mining}, {"getpeerinfo", &status.Peers}}
+	// Each request owns one result field; cancel sibling requests on failure.
+	var wg sync.WaitGroup
+	errs := make([]error, len(calls))
+	for i, call := range calls {
+		wg.Go(func() {
+			errs[i] = client.callContext(ctx, call.method, nil, call.out)
+			if errs[i] != nil {
+				cancel()
+			}
+		})
 	}
-	if err := client.Call("getmempoolinfo", nil, &status.Mempool); err != nil {
-		return cliNodeStatus{}, err
+	wg.Wait()
+	// Report the original failure before any cancellation it caused.
+	for _, err := range errs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return cliNodeStatus{}, err
+		}
 	}
-	if err := client.Call("getmininginfo", nil, &status.Mining); err != nil {
-		return cliNodeStatus{}, err
-	}
-	if err := client.Call("getpeerinfo", nil, &status.Peers); err != nil {
-		return cliNodeStatus{}, err
+	for _, err := range errs {
+		if err != nil {
+			return cliNodeStatus{}, err
+		}
 	}
 	return status, nil
 }

@@ -170,22 +170,64 @@ func readLastLogLines(path string, count int) ([]string, error) {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	lines := make([]string, 0, count)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	start, err := logTailStart(file, info.Size(), count)
+	if err != nil {
+		return nil, err
+	}
+	// Read only the selected suffix from the opened file, preserving its identity
+	// if the configured path is rotated while the command is running.
+	scanner := bufio.NewScanner(io.NewSectionReader(file, start, info.Size()-start))
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLogLineBytes)
+	lines := make([]string, 0, min(count, 256))
 	for scanner.Scan() {
-		line := scanner.Text()
-		if len(lines) < count {
-			lines = append(lines, line)
-			continue
-		}
-		copy(lines, lines[1:])
-		lines[len(lines)-1] = line
+		lines = append(lines, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 	return lines, nil
+}
+
+const maxLogLineBytes = 16 * 1024 * 1024
+
+// Locate the requested suffix with a fixed buffer. Skip a final newline because
+// it terminates the last line rather than introducing another empty line.
+func logTailStart(reader io.ReaderAt, size int64, count int) (int64, error) {
+	var buffer [64 * 1024]byte
+	remaining, lineBytes := count, 0
+	for end := size; end > 0; {
+		start := max(int64(0), end-int64(len(buffer)))
+		chunk := buffer[:int(end-start)]
+		n, err := reader.ReadAt(chunk, start)
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		if n != len(chunk) {
+			return 0, fmt.Errorf("log changed while reading; retry: %w", io.ErrUnexpectedEOF)
+		}
+		for i := len(chunk) - 1; i >= 0; i-- {
+			if chunk[i] == '\n' {
+				if start+int64(i) != size-1 {
+					remaining--
+					if remaining == 0 {
+						return start + int64(i) + 1, nil
+					}
+				}
+				lineBytes = 0
+			} else {
+				lineBytes++
+				if lineBytes >= maxLogLineBytes {
+					return 0, errors.New("log line exceeds 16 MiB limit")
+				}
+			}
+		}
+		end = start
+	}
+	return 0, nil
 }
 
 func scanLogRecords(path string, visit func(line string, record logRecord) bool) error {

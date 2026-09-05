@@ -851,7 +851,7 @@ func (s *ChainStore) ForEachFastSyncSnapshotUTXO(fn func(types.OutPoint, consens
 }
 
 func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO, error) {
-	items := make([]LocalityIndexedUTXO, 0)
+	items := make(localitySelectionHeap, 0)
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: localitySeqPrefix,
 		UpperBound: localitySeqPrefixEnd,
@@ -894,7 +894,7 @@ func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO,
 			OutPoint: outPoint,
 			Entry:    entry,
 		}
-		items = keepLocalityItem(items, item, limit)
+		keepLocalityItem(&items, item, limit)
 	}
 	if err := iter.Error(); err != nil {
 		return nil, err
@@ -953,6 +953,11 @@ func (s *ChainStore) WalletActivityByWatchItems(items []WalletWatchItem, limit i
 	}
 	uniqueItems := uniqueWalletWatchItems(items)
 	cursors := make([]*walletActivityCursor, 0, len(uniqueItems))
+	defer func() {
+		for _, cursor := range cursors {
+			cursor.iter.Close()
+		}
+	}()
 	for _, item := range uniqueItems {
 		prefix := walletActivityItemWatchPrefix(item)
 		iter, err := s.db.NewIter(&pebble.IterOptions{
@@ -973,11 +978,6 @@ func (s *ChainStore) WalletActivityByWatchItems(items []WalletWatchItem, limit i
 			iter.Close()
 		}
 	}
-	defer func() {
-		for _, cursor := range cursors {
-			cursor.iter.Close()
-		}
-	}()
 
 	activityHeap := walletActivityHeap(cursors)
 	heap.Init(&activityHeap)
@@ -1121,20 +1121,33 @@ func (h *walletActivityHeap) Pop() any {
 	return item
 }
 
-func keepLocalityItem(items []LocalityIndexedUTXO, item LocalityIndexedUTXO, limit int) []LocalityIndexedUTXO {
-	if limit <= 0 || len(items) < limit {
-		return append(items, item)
+// Keep a max-heap so selecting the smallest numeric sequences costs O(log limit)
+// per retained row instead of rescanning every selected row for every input.
+func keepLocalityItem(items *localitySelectionHeap, item LocalityIndexedUTXO, limit int) {
+	if limit <= 0 {
+		*items = append(*items, item)
+		return
 	}
-	worst := 0
-	for i := 1; i < len(items); i++ {
-		if compareLocalityItems(items[worst], items[i]) < 0 {
-			worst = i
-		}
+	if len(*items) < limit {
+		heap.Push(items, item)
+	} else if compareLocalityItems(item, (*items)[0]) < 0 {
+		(*items)[0] = item
+		heap.Fix(items, 0)
 	}
-	if compareLocalityItems(item, items[worst]) < 0 {
-		items[worst] = item
-	}
-	return items
+}
+
+type localitySelectionHeap []LocalityIndexedUTXO
+
+func (h localitySelectionHeap) Len() int           { return len(h) }
+func (h localitySelectionHeap) Less(i, j int) bool { return compareLocalityItems(h[i], h[j]) > 0 }
+func (h localitySelectionHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *localitySelectionHeap) Push(x any)        { *h = append(*h, x.(LocalityIndexedUTXO)) }
+func (h *localitySelectionHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 func compareLocalityItems(a, b LocalityIndexedUTXO) int {

@@ -142,20 +142,29 @@ func (s *Service) submitSingleDecodedTxFrom(tx types.Transaction, source *peerCo
 	return admission, nil, orphanCount, mempoolSize
 }
 
+// Best-effort view for the diagnostic stress surface; RPC callers use the
+// error-returning query so an unavailable index cannot become a zero balance.
 func (s *Service) UTXOsByWatchItems(items []compactfilter.WatchItem) []PubKeyUTXO {
+	out, err := s.walletUTXOsByWatchItems(items)
+	if err != nil {
+		s.logger.Warn("load wallet utxos by watch item failed", slog.Any("error", err))
+	}
+	return out
+}
+
+func (s *Service) walletUTXOsByWatchItems(items []compactfilter.WatchItem) ([]PubKeyUTXO, error) {
 	if len(items) == 0 {
-		return nil
+		return nil, nil
 	}
 	indexed, err := s.chainState.Store().WalletUTXOsByWatchItems(storageWatchItems(items))
 	if err != nil {
-		s.logger.Warn("load wallet utxos by watch item failed", slog.Any("error", err))
-		return nil
+		return nil, err
 	}
 	s.stateMu.RLock()
 	view, ok := s.chainState.sharedCommittedView()
 	s.stateMu.RUnlock()
 	if !ok {
-		return nil
+		return nil, ErrNoTip
 	}
 	params := consensus.ParamsForProfile(s.cfg.Profile)
 	out := make([]PubKeyUTXO, 0, len(indexed))
@@ -196,7 +205,7 @@ func (s *Service) UTXOsByWatchItems(items []compactfilter.WatchItem) []PubKeyUTX
 			return 0
 		}
 	})
-	return out
+	return out, nil
 }
 
 func (s *Service) annotateWalletUTXOOrigins(utxos []PubKeyUTXO) error {

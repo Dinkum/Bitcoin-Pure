@@ -101,10 +101,14 @@ func (s *Service) CompactFilterHeaders(startHeight uint64, count uint64) (Compac
 			Count:       0,
 		}, nil
 	}
+	if startHeight > ^uint64(0)-(count-1) {
+		return CompactFilterHeadersInfo{}, fmt.Errorf("filter height range overflows")
+	}
 	stopHeight := startHeight + count - 1
 	var prevHeader [32]byte
+	var previous [32]byte
 	headers := make([]CompactFilterHeaderEntry, 0, count)
-	for height := uint64(0); height <= stopHeight; height++ {
+	for height := uint64(0); ; height++ {
 		hash, err := s.chainState.Store().GetBlockHashByHeight(height)
 		if err != nil {
 			return CompactFilterHeadersInfo{}, err
@@ -117,6 +121,9 @@ func (s *Service) CompactFilterHeaders(startHeight uint64, count uint64) (Compac
 			return CompactFilterHeadersInfo{}, err
 		}
 		header := compactfilter.Header(filter.Hash, prevHeader)
+		if height == startHeight {
+			previous = prevHeader
+		}
 		if height >= startHeight {
 			headers = append(headers, CompactFilterHeaderEntry{
 				Height:       height,
@@ -126,14 +133,9 @@ func (s *Service) CompactFilterHeaders(startHeight uint64, count uint64) (Compac
 			})
 		}
 		prevHeader = header
-	}
-	var previous [32]byte
-	if startHeight > 0 {
-		prev, err := s.compactFilterHeaderAtHeight(startHeight - 1)
-		if err != nil {
-			return CompactFilterHeadersInfo{}, err
+		if height == stopHeight {
+			break
 		}
-		previous = prev
 	}
 	return CompactFilterHeadersInfo{
 		FilterType:           compactfilter.Type(),
@@ -152,8 +154,10 @@ func (s *Service) CompactFilterCheckpoint(interval uint64) (CompactFilterCheckpo
 	if !ok {
 		return CompactFilterCheckpointInfo{FilterType: compactfilter.Type(), Interval: interval}, nil
 	}
+	// Build the header chain once and emit only the requested checkpoints.
 	headers := make([]CompactFilterCheckpointEntry, 0)
-	for height := uint64(0); height <= view.Height; height += interval {
+	var previous [32]byte
+	for height := uint64(0); ; height++ {
 		hash, err := s.chainState.Store().GetBlockHashByHeight(height)
 		if err != nil {
 			return CompactFilterCheckpointInfo{}, err
@@ -161,27 +165,22 @@ func (s *Service) CompactFilterCheckpoint(interval uint64) (CompactFilterCheckpo
 		if hash == nil {
 			return CompactFilterCheckpointInfo{}, fmt.Errorf("block height %d not found", height)
 		}
-		header, err := s.compactFilterHeaderAtHeight(height)
+		filter, err := s.compactFilterForHash(*hash)
 		if err != nil {
 			return CompactFilterCheckpointInfo{}, err
 		}
-		headers = append(headers, CompactFilterCheckpointEntry{
-			Height:       height,
-			BlockHash:    hex.EncodeToString(hash[:]),
-			FilterHeader: hex.EncodeToString(header[:]),
-		})
-	}
-	if view.Height%interval != 0 {
-		hash := view.TipHash
-		header, err := s.compactFilterHeaderAtHeight(view.Height)
-		if err != nil {
-			return CompactFilterCheckpointInfo{}, err
+		header := compactfilter.Header(filter.Hash, previous)
+		if height%interval == 0 || height == view.Height {
+			headers = append(headers, CompactFilterCheckpointEntry{
+				Height:       height,
+				BlockHash:    hex.EncodeToString(hash[:]),
+				FilterHeader: hex.EncodeToString(header[:]),
+			})
 		}
-		headers = append(headers, CompactFilterCheckpointEntry{
-			Height:       view.Height,
-			BlockHash:    hex.EncodeToString(hash[:]),
-			FilterHeader: hex.EncodeToString(header[:]),
-		})
+		previous = header
+		if height == view.Height {
+			break
+		}
 	}
 	return CompactFilterCheckpointInfo{
 		FilterType: compactfilter.Type(),
@@ -189,25 +188,6 @@ func (s *Service) CompactFilterCheckpoint(interval uint64) (CompactFilterCheckpo
 		TipHeight:  view.Height,
 		Headers:    headers,
 	}, nil
-}
-
-func (s *Service) compactFilterHeaderAtHeight(height uint64) ([32]byte, error) {
-	var prev [32]byte
-	for current := uint64(0); current <= height; current++ {
-		hash, err := s.chainState.Store().GetBlockHashByHeight(current)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		if hash == nil {
-			return [32]byte{}, fmt.Errorf("block height %d not found", current)
-		}
-		filter, err := s.compactFilterForHash(*hash)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		prev = compactfilter.Header(filter.Hash, prev)
-	}
-	return prev, nil
 }
 
 func (s *Service) compactFilterForHash(blockHash [32]byte) (compactfilter.Filter, error) {

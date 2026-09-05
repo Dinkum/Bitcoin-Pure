@@ -570,7 +570,7 @@ func (s *Service) rpcGetFilterCheckpoint(params rpcGetFilterCheckpointParams) (C
 }
 
 func (s *Service) rpcGetMempool() (rpcGetMempoolResult, error) {
-	entries := s.pool.Snapshot()
+	entries := s.pool.SnapshotShared()
 	out := make(rpcGetMempoolResult, 0, len(entries))
 	for _, entry := range entries {
 		out = append(out, hex.EncodeToString(entry.TxID[:]))
@@ -603,7 +603,14 @@ func (s *Service) rpcGetUTXOsByPubKeys(params rpcGetUTXOsByPubKeysParams) (rpcPu
 	if err != nil {
 		return rpcPubKeyUTXOResult{}, err
 	}
-	utxos := s.UTXOsByPubKeys(pubKeys)
+	items := make([]compactfilter.WatchItem, len(pubKeys))
+	for i, key := range pubKeys {
+		items[i] = compactfilter.WatchItem{Type: types.OutputXOnlyP2PK, Payload32: key}
+	}
+	utxos, err := s.walletUTXOsByWatchItems(items)
+	if err != nil {
+		return rpcPubKeyUTXOResult{}, err
+	}
 	out := make([]rpcPubKeyUTXO, 0, len(utxos))
 	for _, utxo := range utxos {
 		out = append(out, encodeRPCPubKeyUTXO(utxo))
@@ -616,7 +623,10 @@ func (s *Service) rpcGetUTXOsByWatchItems(params rpcGetUTXOsByWatchItemsParams) 
 	if err != nil {
 		return rpcWatchItemUTXOResult{}, err
 	}
-	utxos := s.UTXOsByWatchItems(items)
+	utxos, err := s.walletUTXOsByWatchItems(items)
+	if err != nil {
+		return rpcWatchItemUTXOResult{}, err
+	}
 	out := make([]rpcWatchItemUTXO, 0, len(utxos))
 	for _, utxo := range utxos {
 		out = append(out, encodeRPCWatchItemUTXO(utxo))
