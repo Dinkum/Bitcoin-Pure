@@ -281,7 +281,8 @@ func (s *Service) EstimateFeeRate(targetBlocks int) uint64 {
 	if minRelay == 0 {
 		minRelay = 1
 	}
-	entries := s.pool.Snapshot()
+	// The shared snapshot is immutable; only the separate rates slice is sorted.
+	entries := s.pool.SnapshotShared()
 	if len(entries) == 0 {
 		return minRelay
 	}

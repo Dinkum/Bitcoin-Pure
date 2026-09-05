@@ -12,6 +12,9 @@ import (
 
 func TestDefaultConfigDisablesMiningWithoutDestination(t *testing.T) {
 	cfg := Default()
+	if cfg.TxIndexEnabled {
+		t.Fatal("transaction index must be opt-in")
+	}
 	if cfg.MinerEnabled {
 		t.Fatal("default config should keep mining disabled until a miner pubkey is configured")
 	}
@@ -39,6 +42,7 @@ func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	cfg := Default()
 	cfg.MinerEnabled = true
 	cfg.DandelionEnabled = true
+	cfg.TxIndexEnabled = true
 	cfg.MinerPubKeyHex = "abcd"
 	cfg.MaxMempoolBytes = 123456
 	if err := Save(path, cfg); err != nil {
@@ -54,14 +58,19 @@ func TestSaveRoundTripPersistsConfig(t *testing.T) {
 	if !loaded.MinerEnabled {
 		t.Fatal("expected miner_enabled to round-trip")
 	}
+	if !loaded.TxIndexEnabled {
+		t.Fatal("expected tx_index_enabled to round-trip")
+	}
 	if !loaded.DandelionEnabled {
 		t.Fatal("expected dandelion_enabled to round-trip")
 	}
 	if loaded.MaxMempoolBytes != cfg.MaxMempoolBytes {
 		t.Fatalf("max mempool bytes = %d, want %d", loaded.MaxMempoolBytes, cfg.MaxMempoolBytes)
 	}
-	if _, err := Load(filepath.Join(filepath.Dir(path), "config.json")); err != nil {
+	if sidecar, err := Load(filepath.Join(filepath.Dir(path), "config.json")); err != nil {
 		t.Fatalf("Load sidecar json: %v", err)
+	} else if !sidecar.TxIndexEnabled {
+		t.Fatal("JSON sidecar lost tx_index_enabled")
 	}
 }
 
@@ -109,5 +118,15 @@ func TestLoadLegacyJSONConfig(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(filepath.Dir(path), "config.yaml")); err != nil {
 		t.Fatalf("Load canonical yaml: %v", err)
+	}
+}
+
+func TestExampleConfigKeepsTransactionIndexOptional(t *testing.T) {
+	cfg, err := Load("../../example.config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TxIndexEnabled {
+		t.Fatal("example config enables transaction index by default")
 	}
 }

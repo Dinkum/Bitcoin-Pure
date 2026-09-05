@@ -19,6 +19,7 @@ const (
 type Config struct {
 	Profile                     string   `json:"profile" yaml:"profile"`
 	DBPath                      string   `json:"db_path" yaml:"db_path"`
+	TxIndexEnabled              bool     `json:"tx_index_enabled" yaml:"tx_index_enabled"`
 	LogPath                     string   `json:"log_path" yaml:"log_path"`
 	LogLevel                    string   `json:"log_level" yaml:"log_level"`
 	LogFormat                   string   `json:"log_format" yaml:"log_format"`
@@ -298,9 +299,10 @@ func renderCommentedYAML(cfg Config) ([]byte, error) {
 			},
 		},
 		{
-			title:       "Storage Paths",
-			description: "On-disk locations for durable chain state.",
+			title:       "Storage",
+			description: "Chain database location and optional transaction indexing.",
 			fields: []yamlField{
+				{key: "tx_index_enabled", description: "Speeds up transaction-status lookups using extra disk space and background indexing; restart the node after changing this setting.", value: cfg.TxIndexEnabled, defaultValue: defaults.TxIndexEnabled},
 				{key: "db_path", description: "Sets the chain database directory.", value: cfg.DBPath, defaultValue: defaults.DBPath},
 			},
 		},

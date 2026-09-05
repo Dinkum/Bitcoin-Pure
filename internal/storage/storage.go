@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -257,12 +258,15 @@ type ChainStore struct {
 	db     *pebble.DB
 	logger *slog.Logger
 
-	walletIndexMu sync.Mutex
-	deriveNotify  chan struct{}
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
-	closeOnce     sync.Once
-	closeErr      error
+	txIndexEnabled bool
+	txIndexRebuild atomic.Bool
+	txIndexNotify  chan struct{}
+	walletIndexMu  sync.Mutex
+	deriveNotify   chan struct{}
+	stopCh         chan struct{}
+	wg             sync.WaitGroup
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 type chainJournalKind uint8
@@ -304,10 +308,11 @@ func (l pebbleLogger) Fatalf(format string, args ...interface{}) {
 	panic(msg)
 }
 
-// OpenOptions holds optional Pebble tuning for point-read-heavy workloads.
-// Zero values preserve Pebble defaults so existing callers keep their current
-// behavior unless they opt in.
+// OpenOptions controls optional derived indexes and Pebble tuning.
+// Zero values keep the transaction index disabled and preserve Pebble defaults.
 type OpenOptions struct {
+	// TxIndexEnabled builds an optional transaction lookup index in the background.
+	TxIndexEnabled        bool
 	PebbleCacheBytes      int64
 	BloomFilterBitsPerKey int
 }
@@ -356,6 +361,12 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		defer store.wg.Done()
 		store.derivedIndexLoop()
 	}()
+	if opts.TxIndexEnabled {
+		store.txIndexEnabled = true
+		store.txIndexNotify = make(chan struct{}, 1)
+		store.wg.Add(1)
+		go func() { defer store.wg.Done(); store.txIndexLoop() }()
+	}
 	store.notifyDerivedReplay()
 	return store, nil
 }
@@ -2295,7 +2306,11 @@ func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
 }
 
 func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
-	manifest, err := s.get(blockKey(*blockHash))
+	return getBlockFrom(s.db, blockHash)
+}
+
+func getBlockFrom(reader valueReader, blockHash *[32]byte) (*types.Block, error) {
+	manifest, err := readValue(reader, blockKey(*blockHash))
 	if err != nil {
 		return nil, err
 	}
@@ -2311,7 +2326,7 @@ func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
 	}
 	buf := make([]byte, 0, int(totalSize))
 	for chunkIndex := uint32(0); chunkIndex < chunkCount; chunkIndex++ {
-		chunk, err := s.get(blockChunkKey(*blockHash, chunkIndex))
+		chunk, err := readValue(reader, blockChunkKey(*blockHash, chunkIndex))
 		if err != nil {
 			return nil, err
 		}
@@ -2337,19 +2352,19 @@ func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
 		return nil, fmt.Errorf("stored block header hash mismatch: key=%x header=%x", *blockHash, got)
 	}
 	maxBytes := uint64(len(buf))
-	index, err := s.GetBlockIndex(blockHash)
+	index, err := getBlockIndexFrom(reader, blockHash)
 	if err != nil {
 		return nil, err
 	}
 	if index != nil && index.Height > 0 {
-		parent, err := s.GetBlockIndex(&header.PrevBlockHash)
+		parent, err := getBlockIndexFrom(reader, &header.PrevBlockHash)
 		if err != nil {
 			return nil, err
 		}
 		if parent == nil {
 			return nil, fmt.Errorf("missing parent block index for stored block %x", *blockHash)
 		}
-		profileBytes, err := s.get(metaProfileKey)
+		profileBytes, err := readValue(reader, metaProfileKey)
 		if err != nil {
 			return nil, err
 		}
@@ -2430,7 +2445,11 @@ func (s *ChainStore) GetCanonicalHeaderHashByHeight(height uint64) (*[32]byte, e
 }
 
 func (s *ChainStore) GetBlockIndex(blockHash *[32]byte) (*BlockIndexEntry, error) {
-	buf, err := s.get(blockIndexKey(*blockHash))
+	return getBlockIndexFrom(s.db, blockHash)
+}
+
+func getBlockIndexFrom(reader valueReader, blockHash *[32]byte) (*BlockIndexEntry, error) {
+	buf, err := readValue(reader, blockIndexKey(*blockHash))
 	if err != nil {
 		return nil, err
 	}
@@ -2462,8 +2481,16 @@ func (s *ChainStore) GetBlockByHeight(height uint64) (*types.Block, error) {
 	return s.GetBlock(hash)
 }
 
+type valueReader interface {
+	Get([]byte) ([]byte, io.Closer, error)
+}
+
 func (s *ChainStore) get(key []byte) ([]byte, error) {
-	value, closer, err := s.db.Get(key)
+	return readValue(s.db, key)
+}
+
+func readValue(reader valueReader, key []byte) ([]byte, error) {
+	value, closer, err := reader.Get(key)
 	if errors.Is(err, pebble.ErrNotFound) {
 		return nil, nil
 	}
@@ -2590,6 +2617,12 @@ func (s *ChainStore) derivedJournalSeq() (uint64, error) {
 }
 
 func (s *ChainStore) notifyDerivedReplay() {
+	if s != nil && s.txIndexNotify != nil {
+		select {
+		case s.txIndexNotify <- struct{}{}:
+		default:
+		}
+	}
 	if s == nil || s.deriveNotify == nil {
 		return
 	}

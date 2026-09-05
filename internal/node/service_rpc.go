@@ -16,7 +16,9 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1036,6 +1038,11 @@ func (s *Service) authorizeRPC(r *http.Request) bool {
 }
 
 func allowUnauthenticatedLoopbackRPC(r *http.Request) bool {
+	// Matching Origin to an arbitrary Host does not stop DNS rebinding. Only
+	// literal loopback addresses and localhost may use the token-free gate.
+	if !isLoopbackRPCHost(r.Host) {
+		return false
+	}
 	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		return false
 	}
@@ -1047,6 +1054,25 @@ func allowUnauthenticatedLoopbackRPC(r *http.Request) bool {
 		return true
 	}
 	return originMatchesRequestHost(origin, r)
+}
+
+func isLoopbackRPCHost(host string) bool {
+	parsed, err := url.Parse("//" + host)
+	if err != nil || host == "" || parsed.Host != host || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || strings.HasSuffix(host, ":") {
+		return false
+	}
+	if port := parsed.Port(); port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return false
+		}
+	}
+	name := parsed.Hostname()
+	if strings.EqualFold(strings.TrimSuffix(name, "."), "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(name)
+	return err == nil && addr.Zone() == "" && addr.Unmap().IsLoopback()
 }
 
 func isJSONContentType(raw string) bool {

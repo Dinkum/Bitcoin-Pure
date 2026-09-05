@@ -130,6 +130,7 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 		rules,
 		rootLogger,
 		storage.OpenOptions{
+			TxIndexEnabled:        cfg.TxIndexEnabled,
 			PebbleCacheBytes:      cfg.PebbleCacheBytes,
 			BloomFilterBitsPerKey: cfg.PebbleBloomBitsPerKey,
 		},

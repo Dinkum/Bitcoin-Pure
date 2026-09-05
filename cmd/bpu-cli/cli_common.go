@@ -51,7 +51,12 @@ func newRPCClient(addr string, token string, timeout time.Duration) *cliRPCClien
 	return &cliRPCClient{
 		addr:  strings.TrimSpace(addr),
 		token: strings.TrimSpace(token),
-		http:  &http.Client{Timeout: timeout},
+		http: &http.Client{
+			Timeout: timeout,
+			// RPC has one configured endpoint. Do not forward credentials or
+			// process an untrusted redirect as another authenticated request.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}
 }
 
@@ -100,12 +105,23 @@ func (c *cliRPCClient) callContext(ctx context.Context, method string, params an
 		return fmt.Errorf("rpc %s to %s failed after %s: %w", method, endpoint, time.Since(started).Round(time.Millisecond), err)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
+	limit := rpcResponseLimit(method)
+	if resp.StatusCode != http.StatusOK {
+		limit = rpcErrorBodyLimit
+	}
+	// LimitReader also bounds chunked, compressed, and dishonestly sized bodies.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return fmt.Errorf("rpc %s read response from %s after %s: %w", method, endpoint, time.Since(started).Round(time.Millisecond), err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		if int64(len(respBody)) > limit {
+			respBody = append(respBody[:limit], []byte(" [truncated]")...)
+		}
 		return fmt.Errorf("rpc %s returned %s: %s", method, resp.Status, strings.TrimSpace(string(respBody)))
+	}
+	if int64(len(respBody)) > limit {
+		return fmt.Errorf("rpc %s response exceeds %d-byte limit", method, limit)
 	}
 	var rpcResp cliRPCResponse
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
@@ -118,6 +134,20 @@ func (c *cliRPCClient) callContext(ctx context.Context, method string, params an
 		return nil
 	}
 	return json.Unmarshal(rpcResp.Result, out)
+}
+
+const rpcErrorBodyLimit int64 = 8 << 10
+
+func rpcResponseLimit(method string) int64 {
+	switch method {
+	case "getblock":
+		// Hex doubles the canonical block byte budget; leave room for JSON.
+		return 2*int64(types.DefaultCodecLimits().MaxBlockBytes) + (1 << 20)
+	case "getmempool", "getutxosbypubkeys", "getutxosbywatchitems", "getutxoproofbatch", "getcompactstatepackage", "getblockfilter", "getfilterheaders", "getfiltercheckpoint", "getwalletactivitybypubkeys", "getwalletactivitybywatchitems":
+		return 64 << 20
+	default:
+		return 8 << 20
+	}
 }
 
 func resolveCLIConfig(configPath string) (config.Config, string, error) {

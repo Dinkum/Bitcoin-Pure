@@ -56,6 +56,7 @@ var (
 )
 
 type ServiceConfig struct {
+	TxIndexEnabled            bool
 	Profile                   types.ChainProfile
 	DBPath                    string
 	ThroughputSummaryInterval time.Duration
@@ -100,19 +101,20 @@ type ServiceConfig struct {
 }
 
 type ServiceInfo struct {
-	Profile        string        `json:"profile"`
-	TipHeight      uint64        `json:"tip_height"`
-	HeaderHeight   uint64        `json:"header_height"`
-	TipHeaderHash  string        `json:"tip_header_hash"`
-	UTXORoot       string        `json:"utxo_root"`
-	MempoolSize    int           `json:"mempool_size"`
-	RPCAddr        string        `json:"rpc_addr"`
-	P2PAddr        string        `json:"p2p_addr"`
-	Peers          []string      `json:"peers"`
-	Avalanche      AvalancheInfo `json:"avalanche"`
-	MinerEnabled   bool          `json:"miner_enabled"`
-	MinerWorkers   int           `json:"miner_workers"`
-	GenesisFixture string        `json:"genesis_fixture"`
+	TxIndex        storage.TxIndexStatus `json:"tx_index"`
+	Profile        string                `json:"profile"`
+	TipHeight      uint64                `json:"tip_height"`
+	HeaderHeight   uint64                `json:"header_height"`
+	TipHeaderHash  string                `json:"tip_header_hash"`
+	UTXORoot       string                `json:"utxo_root"`
+	MempoolSize    int                   `json:"mempool_size"`
+	RPCAddr        string                `json:"rpc_addr"`
+	P2PAddr        string                `json:"p2p_addr"`
+	Peers          []string              `json:"peers"`
+	Avalanche      AvalancheInfo         `json:"avalanche"`
+	MinerEnabled   bool                  `json:"miner_enabled"`
+	MinerWorkers   int                   `json:"miner_workers"`
+	GenesisFixture string                `json:"genesis_fixture"`
 }
 
 type ChainStateInfo struct {

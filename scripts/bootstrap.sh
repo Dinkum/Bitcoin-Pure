@@ -313,8 +313,11 @@ install_candidate_file() {
 	mode="$3"
 	owner="${4:-}"
 	group="${5:-}"
-	tmp="${dst}.new"
-	install -D -m "${mode}" "${src}" "${tmp}"
+	# A fixed .new name could have been planted while an older installation
+	# allowed service writes to the config directory. Create a fresh file.
+	mkdir -p "$(dirname "${dst}")"
+	tmp="$(mktemp "${dst}.new.XXXXXX")"
+	install -m "${mode}" "${src}" "${tmp}"
 	if [[ -n "${owner}" || -n "${group}" ]]; then
 		chown "${owner:-root}:${group:-root}" "${tmp}"
 	fi
@@ -408,39 +411,13 @@ ensure_live_service() {
 	fi
 }
 
-chown_wallet_paths() {
-	local wallet_path wallet_file count=0
-	[[ -f "$1" ]] || return 0
-	while IFS= read -r wallet_path; do
-		[[ -n "${wallet_path}" ]] || continue
-		[[ "${wallet_path}" = /* ]] || fail "staged wallet path must be absolute: ${wallet_path}"
-		mkdir -p "${wallet_path}"
-		chown "${SERVICE_USER}:${SERVICE_GROUP}" "${wallet_path}"
-		wallet_file="${wallet_path}/wallets.json"
-		if [[ -e "${wallet_file}" ]]; then
-			chown "${SERVICE_USER}:${SERVICE_GROUP}" "${wallet_file}"
-		fi
-		count=$((count + 1))
-	done <"$1"
-	if (( count > 0 )); then
-		log "wallet storage ready (${count} path(s))"
-	fi
-}
-
-chown_runtime_paths() {
-	local runtime_path count=0
-	[[ -f "$1" ]] || return 0
+prepare_runtime_paths() {
 	log "preparing service runtime directories"
-	while IFS= read -r runtime_path; do
-		[[ -n "${runtime_path}" ]] || continue
-		[[ "${runtime_path}" = /* ]] || fail "staged runtime path must be absolute: ${runtime_path}"
-		# systemd requires ReadWritePaths targets to exist before it creates
-		# the service mount namespace.
-		mkdir -p "${runtime_path}"
-		chown "${SERVICE_USER}:${SERVICE_GROUP}" "${runtime_path}"
-		count=$((count + 1))
-	done <"$1"
-	log "service runtime directories ready (${count} path(s))"
+	python3 "${STAGE_DIR}/scripts/runtime_paths.py" prepare \
+		--config "${STAGE_DIR}/.artifacts/config.json" \
+		--data-root "${DATA_DIR}" --log-root "${LOG_DIR}" --config-root "${CONFIG_DIR}" \
+		--user "${SERVICE_USER}" --group "${SERVICE_GROUP}"
+	log "service runtime directories ready"
 }
 
 apply_release() {
@@ -452,10 +429,8 @@ apply_release() {
 	[[ -f "${artifacts_dir}/${SERVICE_NAME}.service" ]] || fail "staged release unit file is missing"
 	[[ -f "${artifacts_dir}/${SERVICE_NAME}.motd" ]] || fail "staged release motd helper is missing"
 
-	mkdir -p "${APP_ROOT}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
-	chown "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}" "${LOG_DIR}"
-	chown_runtime_paths "${artifacts_dir}/runtime-paths"
-	chown_wallet_paths "${artifacts_dir}/wallet-paths"
+	mkdir -p "${APP_ROOT}"
+	prepare_runtime_paths
 
 	if release_is_unchanged; then
 		log "staged release matches the live install; leaving binaries and config in place"

@@ -63,11 +63,11 @@ current_go_version() {
 
 go_tarball_sha256() {
 	case "$1" in
-	go1.26.0.linux-amd64.tar.gz)
-		echo "aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235"
+	go1.26.7.linux-amd64.tar.gz)
+		echo "ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca"
 		;;
-	go1.26.0.linux-arm64.tar.gz)
-		echo "bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd"
+	go1.26.7.linux-arm64.tar.gz)
+		echo "5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37"
 		;;
 	*)
 		fail "missing pinned Go checksum for $1"
@@ -128,7 +128,7 @@ install_go() {
 
 ensure_packages() {
 	local pkg
-	local -a required=(build-essential ca-certificates coreutils curl git python3 tar)
+	local -a required=(build-essential ca-certificates coreutils curl git python3 tar util-linux)
 	local -a missing=()
 	for pkg in "${required[@]}"; do
 		if ! package_installed "${pkg}"; then
@@ -308,52 +308,10 @@ normalize_config() {
 render_unit() {
 	local artifacts_dir read_write_paths
 	artifacts_dir="${STAGE_DIR}/.artifacts"
-	read_write_paths="$(python3 - "${artifacts_dir}/config.json" "${CONFIG_PATH}" <<'PY'
-import json
-import os
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    cfg = json.load(fh)
-
-paths = [
-    os.path.dirname(sys.argv[2]),
-    str(cfg.get("db_path", "")).strip(),
-]
-db_path = str(cfg.get("db_path", "")).strip()
-if db_path:
-    paths.append(os.path.join(os.path.dirname(db_path), "wallets"))
-log_path = str(cfg.get("log_path", "")).strip()
-if log_path:
-    paths.append(os.path.dirname(log_path))
-
-seen = set()
-out = []
-for path in paths:
-    if not path:
-        continue
-    clean = os.path.abspath(path)
-    if clean not in seen:
-        seen.add(clean)
-        out.append(clean)
-print(" ".join(out))
-PY
-)"
-	printf '%s\n' "${read_write_paths}" | tr ' ' '\n' >"${artifacts_dir}/runtime-paths"
-	python3 - "${artifacts_dir}/config.json" >"${artifacts_dir}/wallet-paths" <<'PY'
-import json
-import os
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    cfg = json.load(fh)
-
-db_path = str(cfg.get("db_path", "")).strip()
-if db_path:
-    if not os.path.isabs(db_path):
-        raise SystemExit(f"configured db_path must be absolute for installed nodes: {db_path}")
-    print(os.path.join(os.path.dirname(db_path), "wallets"))
-PY
+	python3 "${STAGE_DIR}/scripts/runtime_paths.py" list \
+		--config "${artifacts_dir}/config.json" --data-root "${DATA_DIR}" --log-root "${LOG_DIR}" \
+		>"${artifacts_dir}/runtime-paths"
+	read_write_paths="$(paste -sd ' ' "${artifacts_dir}/runtime-paths")"
 	cat >"${artifacts_dir}/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Bitcoin Pure Node
@@ -475,11 +433,14 @@ PY
 	if [[ -z "${wallet_dir}" ]]; then
 		wallet_dir="${DATA_DIR}/wallets"
 	fi
-	mkdir -p "${wallet_dir}"
+	# Wallet paths are writable by the service. Provision without root privileges
+	# so a racing path replacement cannot turn key creation into a root write.
+	chgrp bitcoin-pure "${staged_config}"
+	chmod 640 "${staged_config}"
 	log "provisioning miner wallet"
-	if ! wallet_output="$("${STAGE_DIR}/bin/bpu-cli" wallet create --config "${staged_config}" --wallet-dir "${wallet_dir}" miner 2>&1)"; then
+	if ! wallet_output="$(runuser -u bitcoin-pure -- "${STAGE_DIR}/bin/bpu-cli" wallet create --config "${staged_config}" --wallet-dir "${wallet_dir}" miner 2>&1)"; then
 		if [[ "${wallet_output}" == *"wallet already exists"* ]]; then
-			wallet_output="$("${STAGE_DIR}/bin/bpu-cli" wallet receive --config "${staged_config}" --wallet-dir "${wallet_dir}" miner 2>&1)" || fail "failed to extend existing miner wallet: ${wallet_output}"
+			wallet_output="$(runuser -u bitcoin-pure -- "${STAGE_DIR}/bin/bpu-cli" wallet receive --config "${staged_config}" --wallet-dir "${wallet_dir}" miner 2>&1)" || fail "failed to extend existing miner wallet: ${wallet_output}"
 		else
 			fail "failed to create miner wallet: ${wallet_output}"
 		fi
@@ -600,6 +561,10 @@ main() {
 	render_unit
 	render_motd
 	normalize_config
+	python3 "${STAGE_DIR}/scripts/runtime_paths.py" prepare \
+		--config "${STAGE_DIR}/.artifacts/config.json" \
+		--data-root "${DATA_DIR}" --log-root "${LOG_DIR}" --config-root "$(dirname "${CONFIG_PATH}")" \
+		--user bitcoin-pure --group bitcoin-pure
 	ensure_mining_wallet
 	render_metadata
 	log "stage prepared successfully"

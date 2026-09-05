@@ -1005,24 +1005,7 @@ func canonicalUtxoPayload32(entry UtxoEntry) [32]byte {
 }
 
 func validateOutputPayload(output types.TxOutput) error {
-	if output.ValueAtoms == 0 {
-		return ErrZeroOutputValue
-	}
-	switch output.Type {
-	case types.OutputXOnlyP2PK:
-		if output.Payload32 != ([32]byte{}) && output.PubKey != ([32]byte{}) && output.Payload32 != output.PubKey {
-			return ErrOutputPayloadMismatch
-		}
-		payload32 := canonicalOutputPayload32(output)
-		if !crypto.IsValidXOnlyPubKey(&payload32) {
-			return ErrInvalidOutputPubKey
-		}
-		return nil
-	case types.OutputPQLock32:
-		return nil
-	default:
-		return ErrUnsupportedOutputType
-	}
+	return validateOutputPayloadWithKeyCache(output, nil)
 }
 
 func parsePQAuthPayload(payload []byte) (pqAuthV1, error) {
@@ -1844,6 +1827,7 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		return BlockValidationSummary{}, nil, nil, err
 	}
 
+	var outputKeys outputKeyCache
 	coinbase := &block.Txs[0]
 	if len(coinbase.Base.Inputs) != 0 {
 		return BlockValidationSummary{}, nil, nil, ErrFirstTxNotCoinbase
@@ -1861,7 +1845,7 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseNoOutputs
 	}
 	for _, output := range coinbase.Base.Outputs {
-		if err := validateOutputPayload(output); err != nil {
+		if err := validateOutputPayloadWithKeyCache(output, &outputKeys); err != nil {
 			return BlockValidationSummary{}, nil, nil, err
 		}
 	}
@@ -1882,7 +1866,7 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 			claimedInputs[input.PrevOut] = struct{}{}
 		}
 		for vout, output := range tx.Base.Outputs {
-			if err := validateOutputPayload(output); err != nil {
+			if err := validateOutputPayloadWithKeyCache(output, &outputKeys); err != nil {
 				return BlockValidationSummary{}, nil, nil, err
 			}
 			outPoint := types.OutPoint{TxID: txids[i], Vout: uint32(vout)}

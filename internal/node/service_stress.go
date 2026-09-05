@@ -228,6 +228,9 @@ func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool)
 }
 
 func (s *Service) findActiveTxBlockHash(txid [32]byte) ([32]byte, bool, error) {
+	if s.cfg.TxIndexEnabled {
+		return s.chainState.Store().FindActiveTransaction(txid)
+	}
 	var zero [32]byte
 	s.stateMu.RLock()
 	tip := s.chainState.ChainState().TipHeight()

@@ -372,6 +372,12 @@ func (s *Store) BackupWithOptions(path string, overwrite bool) error {
 	if sameCleanPath(path, s.path) {
 		return errors.New("backup path cannot be the live wallet store")
 	}
+	// Atomic wallet publication lets a backup read one complete current snapshot.
+	latest, err := OpenWithProfile(s.path, s.profile)
+	if err != nil {
+		return err
+	}
+	s.wallets = latest.wallets
 	backup := BackupFile{
 		Version:   1,
 		Profile:   s.profile,
@@ -390,6 +396,24 @@ func (s *Store) RestoreBackup(path string) error {
 }
 
 func (s *Store) RestoreBackupWithOptions(path string, allowProfileMismatch bool) error {
+	expected, err := json.Marshal(s.wallets)
+	if err != nil {
+		return err
+	}
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := json.Marshal(s.wallets)
+	if err != nil {
+		return err
+	}
+	// Restore deliberately replaces the store. Reject a new concurrent write
+	// that wasn't included in the caller's preview or pre-restore safety backup.
+	if !bytes.Equal(expected, current) {
+		return errors.New("wallet changed before restore; retry with a current safety backup")
+	}
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return errors.New("backup path is required")
@@ -488,6 +512,11 @@ func (s *Store) ImportWallet(export ExportFile, nameOverride string) (Wallet, er
 }
 
 func (s *Store) ImportWalletWithOptions(export ExportFile, nameOverride string, allowProfileMismatch bool) (Wallet, error) {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return Wallet{}, err
+	}
+	defer unlock()
 	if export.Profile != "" && export.Profile != s.profile && !allowProfileMismatch {
 		return Wallet{}, fmt.Errorf("wallet export profile %q does not match current profile %q", export.Profile, s.profile)
 	}
@@ -599,6 +628,11 @@ func (s *Store) CreateWallet(name string) (Wallet, Address, error) {
 }
 
 func (s *Store) CreateWalletWithType(name string, outputType uint64) (Wallet, Address, error) {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return Wallet{}, Address{}, err
+	}
+	defer unlock()
 	name = normalizeWalletName(name)
 	if name == "" {
 		return Wallet{}, Address{}, errors.New("wallet name is required")
@@ -637,6 +671,11 @@ func (s *Store) NewReceiveAddress(name string) (Address, error) {
 }
 
 func (s *Store) NewReceiveAddressWithType(name string, outputType uint64) (Address, error) {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return Address{}, err
+	}
+	defer unlock()
 	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return Address{}, ErrWalletNotFound
@@ -655,6 +694,11 @@ func (s *Store) NewReceiveAddressWithType(name string, outputType uint64) (Addre
 }
 
 func (s *Store) ReconcilePending(name string, mempool map[[32]byte]struct{}) (int, error) {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return 0, ErrWalletNotFound
@@ -685,6 +729,11 @@ func (s *Store) ReconcilePending(name string, mempool map[[32]byte]struct{}) (in
 }
 
 func (s *Store) ReconcilePendingWithStatus(name string, mempool map[[32]byte]struct{}, utxos []SpendableUTXO, confirmed map[[32]byte]struct{}) (int, error) {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return 0, ErrWalletNotFound
@@ -931,6 +980,11 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 }
 
 func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, inputs []SelectedInput, changeAddress *Address) error {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	wallet, index, ok := s.findWallet(name)
 	if !ok {
 		return ErrWalletNotFound
@@ -938,7 +992,11 @@ func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, 
 	next := cloneWallets(s.wallets)
 	wallet = &next[index]
 	if changeAddress != nil && !walletHasAddress(*wallet, changeAddress.Address) {
-		wallet.Addresses = append(wallet.Addresses, *changeAddress)
+		address := *changeAddress
+		if next := nextAddressIndex(*wallet); address.Index < next {
+			address.Index = next
+		}
+		wallet.Addresses = append(wallet.Addresses, address)
 	}
 	entry := PendingTx{
 		TxID:      hex.EncodeToString(txid[:]),
@@ -953,9 +1011,18 @@ func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, 
 			Vout: outPoint.Vout,
 		})
 	}
+	reservedInputs := make(map[PendingOutPoint]struct{}, len(entry.Spent))
+	for _, input := range entry.Spent {
+		reservedInputs[input] = struct{}{}
+	}
 	for _, pending := range wallet.Pending {
 		if pending.TxID == entry.TxID {
 			return nil
+		}
+		for _, spent := range pending.Spent {
+			if _, reserved := reservedInputs[spent]; reserved {
+				return errors.New("transaction input is already reserved by another pending transaction")
+			}
 		}
 	}
 	wallet.Pending = append(wallet.Pending, entry)
@@ -967,6 +1034,11 @@ func (s *Store) MarkSubmitted(name string, txid [32]byte, tx types.Transaction, 
 }
 
 func (s *Store) RememberAddress(name string, addr Address) error {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	_, index, ok := s.findWallet(name)
 	if !ok {
 		return ErrWalletNotFound
@@ -975,6 +1047,9 @@ func (s *Store) RememberAddress(name string, addr Address) error {
 	wallet := &next[index]
 	if walletHasAddress(*wallet, addr.Address) {
 		return nil
+	}
+	if next := nextAddressIndex(*wallet); addr.Index < next {
+		addr.Index = next
 	}
 	wallet.Addresses = append(wallet.Addresses, addr)
 	if err := s.saveWallets(next); err != nil {
@@ -985,6 +1060,11 @@ func (s *Store) RememberAddress(name string, addr Address) error {
 }
 
 func (s *Store) ForgetPending(name string, txid [32]byte) error {
+	unlock, err := s.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	_, index, ok := s.findWallet(name)
 	if !ok {
 		return ErrWalletNotFound
@@ -1660,10 +1740,7 @@ func (s *Store) findWallet(name string) (*Wallet, int, bool) {
 	return nil, -1, false
 }
 
-func (s *Store) save() error {
-	return s.saveWallets(s.wallets)
-}
-
+// saveWallets requires the stable file lock held by beginMutation.
 func (s *Store) saveWallets(wallets []Wallet) error {
 	if s.path == "" {
 		return errors.New("wallet store path is required")
@@ -1698,19 +1775,27 @@ func writeFileAtomic(path string, buf []byte, mode os.FileMode, overwrite bool) 
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Chmod(tmp, mode); err != nil {
+	if err := tmpFile.Chmod(mode); err != nil {
+		tmpFile.Close()
 		_ = os.Remove(tmp)
 		return err
 	}
 	if hasOwner {
-		if err := os.Chown(tmp, uid, gid); err != nil && os.Geteuid() == 0 {
+		if err := tmpFile.Chown(uid, gid); err != nil && os.Geteuid() == 0 {
+			tmpFile.Close()
 			_ = os.Remove(tmp)
 			return err
 		}
+	}
+	// Publish only after key material and metadata have reached durable storage.
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	if !overwrite {
 		if err := os.Link(tmp, path); err != nil {
@@ -1720,9 +1805,19 @@ func writeFileAtomic(path string, buf []byte, mode os.FileMode, overwrite bool) 
 			}
 			return err
 		}
-		return os.Remove(tmp)
+		if err := os.Remove(tmp); err != nil {
+			return err
+		}
+	} else if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
-	return os.Rename(tmp, path)
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func existingFileOwner(path string) (int, int, bool) {

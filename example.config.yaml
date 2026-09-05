@@ -16,9 +16,14 @@ profile: regtest
 genesis_fixture: fixtures/genesis/regtest.json
 
 # ==============================================================================
-# STORAGE PATHS
+# STORAGE
 # ==============================================================================
-# On-disk locations for durable chain state.
+# Chain database location and optional transaction indexing.
+
+# Speeds up transaction-status lookups using extra disk space and background indexing.
+# Restart the node after changing this setting.
+# Default: false
+tx_index_enabled: false
 
 # Sets the chain database directory.
 # Default: data/chain

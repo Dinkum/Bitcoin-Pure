@@ -60,6 +60,7 @@ func (s *Service) Info() ServiceInfo {
 	s.stateMu.RUnlock()
 	peers := s.activePeerAddrs()
 	return ServiceInfo{
+		TxIndex:        s.chainState.Store().TxIndexStatus(),
 		Profile:        s.cfg.Profile.String(),
 		TipHeight:      tipHeight,
 		HeaderHeight:   headerHeight,

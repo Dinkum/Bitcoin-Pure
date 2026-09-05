@@ -261,6 +261,7 @@ func runServe(args []string) error {
 		return err
 	}
 	svc, err := node.OpenService(node.ServiceConfig{
+		TxIndexEnabled:            cfg.TxIndexEnabled,
 		Profile:                   profile,
 		DBPath:                    cfg.DBPath,
 		ThroughputSummaryInterval: time.Duration(cfg.ThroughputSummaryIntervalMS) * time.Millisecond,
