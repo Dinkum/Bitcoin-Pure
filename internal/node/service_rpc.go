@@ -28,7 +28,7 @@ type rpcRequest = rpcserver.Request
 type rpcResponse = rpcserver.Response
 
 func (s *Service) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && s.publicPage && s.isPublicDashboardPath(r.URL.Path) {
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && s.publicPage {
 		s.handlePublicDashboard(w, r)
 		return
 	}

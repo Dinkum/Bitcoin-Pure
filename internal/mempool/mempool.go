@@ -1476,36 +1476,61 @@ func (p *Pool) RemoveConfirmed(block *types.Block) {
 	p.bumpEpochLocked()
 }
 
-// RemoveContextuallyInvalid evicts transactions whose committed-chain inputs
-// are no longer valid at the proposed spending height, plus their descendants.
-// Reorgs can make a previously mature coinbase spend immature again.
+// RemoveContextuallyInvalid revalidates against chain and in-pool inputs.
+// Reinsert disconnected parents before calling this so valid packages survive.
 func (p *Pool) RemoveContextuallyInvalid(chainLookup consensus.UtxoLookup, context consensus.TxValidationContext) []RejectedTx {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	invalidRoots := make(map[[32]byte]struct{})
+	// Confirmation removes dependency links; a reaccepted parent can recreate
+	// them even though its child was already in the pool at insertion time.
+	p.reindex()
+	lookup := func(out types.OutPoint) (consensus.UtxoEntry, bool) {
+		if coin, ok := chainLookup(out); ok {
+			return coin, true
+		}
+		parent := p.entries[out.TxID]
+		if parent == nil || uint64(out.Vout) >= uint64(len(parent.Tx.Base.Outputs)) {
+			return consensus.UtxoEntry{}, false
+		}
+		return consensus.UtxoEntryFromOutput(parent.Tx.Base.Outputs[out.Vout]), true
+	}
+	reasons := make(map[[32]byte]error)
 	for txid, entry := range p.entries {
-		for _, input := range entry.Tx.Base.Inputs {
-			coin, ok := chainLookup(input.PrevOut)
-			if !ok || !coin.Coinbase {
-				continue
-			}
-			if context.SpendHeight < coin.CreatedHeight || context.SpendHeight-coin.CreatedHeight < context.Params.CoinbaseMaturity {
-				invalidRoots[txid] = struct{}{}
-				break
+		prepared, err := consensus.PrepareTxValidationWithLookup(&entry.Tx, lookup, context, consensus.DefaultConsensusRules())
+		if err == nil {
+			_, err = consensus.ValidatePreparedTxBatchOptimized(prepared)
+		}
+		if err != nil {
+			reasons[txid] = err
+		}
+	}
+	if len(reasons) == 0 {
+		p.selection = nil
+		p.bumpEpochLocked()
+		return nil
+	}
+	roots := make([][32]byte, 0, len(reasons))
+	for root := range reasons {
+		roots = append(roots, root)
+	}
+	remove := make(map[[32]byte]struct{})
+	for _, root := range roots {
+		reason := reasons[root]
+		for txid := range p.collectRecursive(map[[32]byte]struct{}{root: {}}) {
+			remove[txid] = struct{}{}
+			if _, ok := reasons[txid]; !ok {
+				reasons[txid] = reason
 			}
 		}
 	}
-	if len(invalidRoots) == 0 {
-		return nil
-	}
-	remove := p.collectRecursive(invalidRoots)
 	rejected := make([]RejectedTx, 0, len(remove))
 	for txid := range remove {
 		if entry := p.entries[txid]; entry != nil {
-			rejected = append(rejected, RejectedTx{Tx: entry.Tx, TxID: txid, Err: consensus.ErrImmatureCoinbase})
+			rejected = append(rejected, RejectedTx{Tx: entry.Tx, TxID: txid, Err: reasons[txid]})
 		}
 	}
 	p.removeEntriesLocked(remove)
+	p.selection = nil
 	p.bumpEpochLocked()
 	return rejected
 }

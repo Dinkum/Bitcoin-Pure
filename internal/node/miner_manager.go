@@ -61,6 +61,7 @@ type chainSelectionSnapshot struct {
 	tipHash        [32]byte
 	height         uint64
 	tipHeader      types.BlockHeader
+	medianTimePast uint64
 	blockSizeState consensus.BlockSizeState
 	utxoLookup     consensus.UtxoLookup
 	utxoAcc        *utreexo.Accumulator
@@ -70,6 +71,7 @@ type chainTemplateContext struct {
 	tipHash        [32]byte
 	height         uint64
 	tipHeader      types.BlockHeader
+	medianTimePast uint64
 	blockSizeState consensus.BlockSizeState
 }
 
@@ -118,6 +120,9 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 	}
 	mempoolEpoch := m.svc.pool.Epoch()
 	if cached, generation, ok := m.cachedBlockTemplate(ctx.tipHash, mempoolEpoch); ok {
+		if err := m.svc.refreshMiningTimestamp(&cached.Header, ctx.medianTimePast); err != nil {
+			return types.Block{}, 0, err
+		}
 		if m.stopping() {
 			return types.Block{}, 0, ErrServiceStopping
 		}
@@ -295,6 +300,7 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxT
 		tipHash:        snapshot.tipHash,
 		height:         snapshot.height,
 		tipHeader:      snapshot.tipHeader,
+		medianTimePast: snapshot.medianTimePast,
 		blockSizeState: snapshot.blockSizeState,
 	}, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, selectionAcc)
 	m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
@@ -315,9 +321,9 @@ func (m *minerManager) buildBlockCandidate(snapshot chainSelectionSnapshot, maxT
 
 func (m *minerManager) assembleBlockTemplate(ctx chainTemplateContext, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, selectionAcc *utreexo.Accumulator) (types.Block, error) {
 	params := consensus.ParamsForProfile(m.svc.cfg.Profile)
-	nextTimestamp := ctx.tipHeader.Timestamp + uint64(params.TargetSpacingSecs)
-	if nextTimestamp <= ctx.tipHeader.Timestamp {
-		nextTimestamp = ctx.tipHeader.Timestamp + 1
+	nextTimestamp, err := m.svc.nextMiningTimestamp(ctx.medianTimePast)
+	if err != nil {
+		return types.Block{}, err
 	}
 	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: ctx.height, Header: ctx.tipHeader}, params)
 	if err != nil {
@@ -368,6 +374,7 @@ func (m *minerManager) chainTemplateContext() (chainTemplateContext, error) {
 		tipHash:        view.TipHash,
 		height:         view.Height,
 		tipHeader:      view.TipHeader,
+		medianTimePast: view.MedianTimePast,
 		blockSizeState: view.BlockSizeState,
 	}, nil
 }
@@ -383,6 +390,7 @@ func (m *minerManager) chainSelectionSnapshot() (chainSelectionSnapshot, error) 
 		tipHash:        view.TipHash,
 		height:         view.Height,
 		tipHeader:      view.TipHeader,
+		medianTimePast: view.MedianTimePast,
 		blockSizeState: view.BlockSizeState,
 		utxoLookup:     m.svc.chainState.Store().UTXOLookupFunc(),
 		utxoAcc:        view.UTXOAcc,

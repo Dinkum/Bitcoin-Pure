@@ -60,7 +60,8 @@ func TestConnMessageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read message: %v", err)
 	}
-	headers, ok := msg.(HeadersMessage)
+	defer msg.Release()
+	headers, ok := msg.Message.(HeadersMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want HeadersMessage", msg)
 	}
@@ -101,7 +102,8 @@ func TestChunkedBlockTransferUsesBoundedFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read block start: %v", err)
 	}
-	start, ok := startMessage.(BlockStartMessage)
+	defer startMessage.Release()
+	start, ok := startMessage.Message.(BlockStartMessage)
 	if !ok {
 		t.Fatalf("first message type = %T, want BlockStartMessage", startMessage)
 	}
@@ -111,7 +113,8 @@ func TestChunkedBlockTransferUsesBoundedFrames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read block chunk: %v", err)
 		}
-		chunk, ok := message.(BlockChunkMessage)
+		defer message.Release()
+		chunk, ok := message.Message.(BlockChunkMessage)
 		if !ok {
 			t.Fatalf("chunk message type = %T", message)
 		}
@@ -222,7 +225,8 @@ func TestConnTxBatchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read message: %v", err)
 	}
-	batch, ok := received.(TxBatchMessage)
+	defer received.Release()
+	batch, ok := received.Message.(TxBatchMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want TxBatchMessage", received)
 	}
@@ -252,7 +256,8 @@ func TestConnTxReconRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read message: %v", err)
 	}
-	recon, ok := received.(TxReconMessage)
+	defer received.Release()
+	recon, ok := received.Message.(TxReconMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want TxReconMessage", received)
 	}
@@ -288,7 +293,8 @@ func TestConnAvalanchePollVoteRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read poll: %v", err)
 	}
-	gotPoll, ok := received.(AvaPollMessage)
+	defer received.Release()
+	gotPoll, ok := received.Message.(AvaPollMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want AvaPollMessage", received)
 	}
@@ -314,7 +320,8 @@ func TestConnAvalanchePollVoteRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read vote: %v", err)
 	}
-	gotVote, ok := received.(AvaVoteMessage)
+	defer received.Release()
+	gotVote, ok := received.Message.(AvaVoteMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want AvaVoteMessage", received)
 	}
@@ -349,7 +356,8 @@ func TestConnXThinRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read message: %v", err)
 	}
-	thin, ok := received.(XThinBlockMessage)
+	defer received.Release()
+	thin, ok := received.Message.(XThinBlockMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want XThinBlockMessage", received)
 	}
@@ -386,7 +394,8 @@ func TestConnXBlockTxRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read message: %v", err)
 	}
-	resp, ok := received.(XBlockTxMessage)
+	defer received.Release()
+	resp, ok := received.Message.(XBlockTxMessage)
 	if !ok {
 		t.Fatalf("message type = %T, want XBlockTxMessage", received)
 	}

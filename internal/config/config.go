@@ -60,6 +60,7 @@ type Config struct {
 
 func Default() Config {
 	return Config{
+		TxIndexEnabled:              true,
 		Profile:                     "regtest",
 		DBPath:                      "data/chain",
 		LogLevel:                    "info",

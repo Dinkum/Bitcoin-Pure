@@ -12,8 +12,8 @@ import (
 
 func TestDefaultConfigDisablesMiningWithoutDestination(t *testing.T) {
 	cfg := Default()
-	if cfg.TxIndexEnabled {
-		t.Fatal("transaction index must be opt-in")
+	if !cfg.TxIndexEnabled {
+		t.Fatal("transaction index should accelerate status queries by default")
 	}
 	if cfg.MinerEnabled {
 		t.Fatal("default config should keep mining disabled until a miner pubkey is configured")
@@ -121,12 +121,12 @@ func TestLoadLegacyJSONConfig(t *testing.T) {
 	}
 }
 
-func TestExampleConfigKeepsTransactionIndexOptional(t *testing.T) {
+func TestExampleConfigEnablesTransactionIndex(t *testing.T) {
 	cfg, err := Load("../../example.config.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TxIndexEnabled {
-		t.Fatal("example config enables transaction index by default")
+	if !cfg.TxIndexEnabled {
+		t.Fatal("example config should enable transaction indexing")
 	}
 }

@@ -603,7 +603,7 @@ func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
 		svc.peerWriteLoop(peer)
 	}()
 
-	msgCh := make(chan p2p.Message, 1)
+	msgCh := make(chan *p2p.ReceivedMessage, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		msg, err := remoteWire.ReadMessage()
@@ -620,7 +620,8 @@ func TestPeerWriteLoopPrefersPriorityRelayQueue(t *testing.T) {
 		<-done
 		t.Fatalf("read message: %v", err)
 	case msg := <-msgCh:
-		inv, ok := msg.(p2p.InvMessage)
+		defer msg.Release()
+		inv, ok := msg.Message.(p2p.InvMessage)
 		if !ok {
 			close(svc.stopCh)
 			<-done
@@ -697,7 +698,8 @@ func TestPeerWriteLoopPrefersControlThenPriorityThenSend(t *testing.T) {
 		<-done
 		t.Fatalf("read first message: %v", err)
 	}
-	if _, ok := msg1.(p2p.PingMessage); !ok {
+	defer msg1.Release()
+	if _, ok := msg1.Message.(p2p.PingMessage); !ok {
 		close(svc.stopCh)
 		<-done
 		t.Fatalf("first message type = %T, want PingMessage", msg1)
@@ -708,7 +710,8 @@ func TestPeerWriteLoopPrefersControlThenPriorityThenSend(t *testing.T) {
 		<-done
 		t.Fatalf("read second message: %v", err)
 	}
-	if _, ok := msg2.(p2p.InvMessage); !ok {
+	defer msg2.Release()
+	if _, ok := msg2.Message.(p2p.InvMessage); !ok {
 		close(svc.stopCh)
 		<-done
 		t.Fatalf("second message type = %T, want InvMessage", msg2)
@@ -719,7 +722,8 @@ func TestPeerWriteLoopPrefersControlThenPriorityThenSend(t *testing.T) {
 		<-done
 		t.Fatalf("read third message: %v", err)
 	}
-	if _, ok := msg3.(p2p.TxBatchMessage); !ok {
+	defer msg3.Release()
+	if _, ok := msg3.Message.(p2p.TxBatchMessage); !ok {
 		close(svc.stopCh)
 		<-done
 		t.Fatalf("third message type = %T, want TxBatchMessage", msg3)

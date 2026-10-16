@@ -8,7 +8,9 @@ import (
 	"bitcoin-pure/internal/types"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -221,14 +223,31 @@ func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage)
 		return err
 	}
 	defer os.Remove(name)
-	raw, err := os.ReadFile(name)
+	reservation := s.payloadBudget.NewReservation()
+	defer reservation.Release()
+	if transfer.total > uint64(math.MaxInt) {
+		return p2p.ErrPayloadBudget
+	}
+	if err := reservation.Reserve(int(transfer.total)); err != nil {
+		return err
+	}
+	file, err := os.Open(name)
 	if err != nil {
 		return err
+	}
+	raw := make([]byte, int(transfer.total))
+	_, readErr := io.ReadFull(file, raw)
+	closeErr := file.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	if uint64(len(raw)) != transfer.total || crypto.Sha256d(raw) != transfer.checksum {
 		return errors.New("chunked block transfer checksum mismatch")
 	}
-	block, err := types.DecodeBlockOwnedBuffer(raw, transfer.total)
+	block, err := types.DecodeBlockOwnedBufferWithAllocationBudget(raw, transfer.total, reservation.Reserve)
 	if err != nil {
 		return err
 	}
@@ -693,6 +712,11 @@ func (s *Service) onXThinBlockMessage(peer *peerConn, msg p2p.XThinBlockMessage)
 		peer.deletePendingThin(hash)
 		return nil
 	}
+	reservation, err := s.reserveBlockReconstruction(len(msg.ShortIDs) + 1)
+	if err != nil {
+		return err
+	}
+	defer reservation.Release()
 	matches := s.pool.ShortIDMatches(func(txid [32]byte) uint64 {
 		return thinBlockShortID(msg.Nonce, txid)
 	}, xThinShortIDSet(msg))
@@ -731,6 +755,11 @@ func (s *Service) onCompactBlockMessage(peer *peerConn, msg p2p.CompactBlockMess
 		peer.deletePendingThin(hash)
 		return nil
 	}
+	reservation, err := s.reserveBlockReconstruction(len(msg.Prefilled) + len(msg.ShortIDs))
+	if err != nil {
+		return err
+	}
+	defer reservation.Release()
 	matches := s.pool.ShortIDMatches(func(txid [32]byte) uint64 {
 		return thinBlockShortID(msg.Nonce, txid)
 	}, compactShortIDSet(msg))
@@ -868,25 +897,27 @@ func (s *Service) onGetBlockTxMessage(peer *peerConn, msg p2p.GetBlockTxMessage)
 }
 
 func (s *Service) onXBlockTxMessage(peer *peerConn, msg p2p.XBlockTxMessage) error {
-	state, ok := peer.pendingThinState(msg.BlockHash)
+	state, ok := peer.takePendingThinState(msg.BlockHash)
 	if !ok {
 		return nil
 	}
+	defer func() {
+		if state.releaseBudget != nil {
+			state.releaseBudget()
+		}
+	}()
+
 	if len(msg.Indexes) != len(msg.Txs) {
-		peer.deletePendingThin(msg.BlockHash)
 		return s.requestFullBlock(peer, msg.BlockHash)
 	}
 	for i, index := range msg.Indexes {
 		if !state.fill(index, msg.Txs[i]) {
-			peer.deletePendingThin(msg.BlockHash)
 			return s.requestFullBlock(peer, msg.BlockHash)
 		}
 	}
 	if !state.complete() {
-		peer.deletePendingThin(msg.BlockHash)
 		return s.requestFullBlock(peer, msg.BlockHash)
 	}
-	peer.deletePendingThin(msg.BlockHash)
 	if err := s.acceptThinBlock(peer, state.block()); err != nil {
 		peer.clearGrapheneRecoveryPending(msg.BlockHash)
 		return s.requestFullBlock(peer, msg.BlockHash)
@@ -898,31 +929,33 @@ func (s *Service) onXBlockTxMessage(peer *peerConn, msg p2p.XBlockTxMessage) err
 }
 
 func (s *Service) onBlockTxMessage(peer *peerConn, msg p2p.BlockTxMessage) error {
-	state, ok := peer.pendingThinState(msg.BlockHash)
+	state, ok := peer.takePendingThinState(msg.BlockHash)
 	if !ok {
 		return nil
 	}
+	defer func() {
+		if state.releaseBudget != nil {
+			state.releaseBudget()
+		}
+	}()
+
 	if len(msg.Indexes) != len(msg.Txs) {
-		peer.deletePendingThin(msg.BlockHash)
 		s.noteCompactBlockFallback()
 		s.noteGrapheneDecodeFailure()
 		return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 	}
 	for i, index := range msg.Indexes {
 		if !state.fill(index, msg.Txs[i]) {
-			peer.deletePendingThin(msg.BlockHash)
 			s.noteCompactBlockFallback()
 			s.noteGrapheneDecodeFailure()
 			return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 		}
 	}
 	if !state.complete() {
-		peer.deletePendingThin(msg.BlockHash)
 		s.noteCompactBlockFallback()
 		s.noteGrapheneDecodeFailure()
 		return s.requestGrapheneExtendedBlock(peer, msg.BlockHash)
 	}
-	peer.deletePendingThin(msg.BlockHash)
 	if err := s.acceptThinBlock(peer, state.block()); err != nil {
 		s.noteCompactBlockFallback()
 		s.noteGrapheneDecodeFailure()

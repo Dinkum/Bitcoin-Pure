@@ -22,6 +22,8 @@ func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
 		t.Fatalf("OpenService: %v", err)
 	}
 	defer svc.Close()
+	miningTime := genesis.Header.Timestamp + 3_600
+	svc.miningTimeFn = func() time.Time { return time.Unix(int64(miningTime), 0) }
 
 	outputs, err := svc.MineFundingOutputs([][32]byte{nodeSignerPubKey(7), nodeSignerPubKey(8), nodeSignerPubKey(9)})
 	if err != nil {
@@ -42,6 +44,16 @@ func TestMineFundingOutputsProducesSpendableLanes(t *testing.T) {
 		if entry.ValueAtoms != output.Value || entry.PubKey != output.PubKey {
 			t.Fatalf("funding output mismatch for %+v", output.OutPoint)
 		}
+	}
+	block, err := svc.chainState.Store().GetBlock(&outputs[0].BlockHash)
+	if err != nil {
+		t.Fatalf("GetBlock: %v", err)
+	}
+	if block == nil {
+		t.Fatal("funding block missing from store")
+	}
+	if block.Header.Timestamp != miningTime {
+		t.Fatalf("funding block timestamp = %d, want wall time %d", block.Header.Timestamp, miningTime)
 	}
 }
 
@@ -260,6 +272,7 @@ func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
 	}
 	block := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 9, view.TipHeader.Timestamp+600)
 	block.Header.Nonce = 0
+	svc.miningTimeFn = func() time.Time { return time.Unix(int64(block.Header.Timestamp), 0) }
 
 	originalTxID := consensus.TxID(&block.Txs[0])
 	originalTxRoot := block.Header.MerkleTxIDRoot
@@ -315,6 +328,71 @@ func TestMineBlockSearchSpaceRollsCoinbaseExtraNonce(t *testing.T) {
 	}
 }
 
+func TestMineBlockSearchSpaceRollsTimestampForward(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: nodeSignerPubKey(9),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	view, ok := svc.chainState.CommittedView()
+	if !ok {
+		t.Fatal("missing committed chain view")
+	}
+	block := nextCoinbaseBlock(view.Height, view.TipHeader, svc.chainState.ChainState().UTXOs(), 9, view.TipHeader.Timestamp+600)
+	originalHeader := block.Header
+	now := block.Header.Timestamp
+	svc.miningTimeFn = func() time.Time { return time.Unix(int64(now), 0) }
+
+	var calls int
+	svc.mineHeaderFn = func(header types.BlockHeader, params consensus.ChainParams, shouldContinue func(uint64) bool) (types.BlockHeader, bool, error) {
+		calls++
+		switch calls {
+		case 1:
+			now++
+			if shouldContinue(0) {
+				return types.BlockHeader{}, false, errors.New("mining should pause to roll the timestamp")
+			}
+			return types.BlockHeader{}, false, nil
+		case 2:
+			if header.Timestamp != originalHeader.Timestamp+1 {
+				return types.BlockHeader{}, false, errors.New("mining timestamp was not rolled forward")
+			}
+			if header.Nonce != 0 {
+				return types.BlockHeader{}, false, errors.New("nonce was not reset after timestamp roll")
+			}
+			if header.NBits != originalHeader.NBits ||
+				header.MerkleTxIDRoot != originalHeader.MerkleTxIDRoot ||
+				header.MerkleAuthRoot != originalHeader.MerkleAuthRoot ||
+				header.UTXORoot != originalHeader.UTXORoot {
+				return types.BlockHeader{}, false, errors.New("timestamp roll changed non-time header commitments")
+			}
+			return mineHeaderForNodeTest(header), true, nil
+		default:
+			return types.BlockHeader{}, false, errors.New("unexpected extra mining attempt")
+		}
+	}
+
+	mined, fresh, err := svc.mineBlockSearchSpace(block, consensus.RegtestParams(), view.UTXOAcc, nil)
+	if err != nil {
+		t.Fatalf("mineBlockSearchSpace: %v", err)
+	}
+	if !fresh {
+		t.Fatal("expected mining to continue after timestamp roll")
+	}
+	if calls != 2 {
+		t.Fatalf("mineHeaderFn calls = %d, want 2", calls)
+	}
+	if mined.Header.Timestamp != originalHeader.Timestamp+1 {
+		t.Fatalf("mined timestamp = %d, want %d", mined.Header.Timestamp, originalHeader.Timestamp+1)
+	}
+}
+
 func TestMineBlockSearchSpaceStopsOnServiceShutdown(t *testing.T) {
 	genesis := genesisBlock()
 	svc, err := OpenService(ServiceConfig{
@@ -365,6 +443,68 @@ func TestBuildBlockTemplateStopsOnServiceShutdown(t *testing.T) {
 	_, _, err = svc.minerManager().buildBlockTemplateWithGeneration()
 	if !errors.Is(err, ErrServiceStopping) {
 		t.Fatalf("expected ErrServiceStopping, got %v", err)
+	}
+}
+
+func TestBuildBlockTemplateUsesWallClockAndRefreshesCachedTimestamp(t *testing.T) {
+	genesis := genesisBlock()
+	svc, err := OpenService(ServiceConfig{
+		Profile:     types.Regtest,
+		DBPath:      t.TempDir(),
+		MinerPubKey: nodeSignerPubKey(9),
+	}, &genesis)
+	if err != nil {
+		t.Fatalf("OpenService: %v", err)
+	}
+	defer svc.Close()
+
+	now := genesis.Header.Timestamp + 3_600
+	svc.miningTimeFn = func() time.Time { return time.Unix(int64(now), 0) }
+	first, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate first: %v", err)
+	}
+	if first.Header.Timestamp != now {
+		t.Fatalf("first template timestamp = %d, want wall time %d", first.Header.Timestamp, now)
+	}
+	if first.Header.Timestamp == genesis.Header.Timestamp+uint64(consensus.RegtestParams().TargetSpacingSecs) {
+		t.Fatal("template retained synthetic parent-plus-spacing timestamp")
+	}
+
+	now += 15
+	second, err := svc.BuildBlockTemplate()
+	if err != nil {
+		t.Fatalf("BuildBlockTemplate cached: %v", err)
+	}
+	if second.Header.Timestamp != now {
+		t.Fatalf("cached template timestamp = %d, want refreshed wall time %d", second.Header.Timestamp, now)
+	}
+	if second.Header.MerkleTxIDRoot != first.Header.MerkleTxIDRoot ||
+		second.Header.MerkleAuthRoot != first.Header.MerkleAuthRoot ||
+		second.Header.UTXORoot != first.Header.UTXORoot ||
+		second.Header.NBits != first.Header.NBits {
+		t.Fatal("cached timestamp refresh changed transaction commitments or difficulty")
+	}
+	if svc.BlockTemplateStats().CacheHits == 0 {
+		t.Fatal("expected second template request to use the cache")
+	}
+}
+
+func TestNextMiningTimestampUsesMedianTimePastFloor(t *testing.T) {
+	now := uint64(1_700_000_000)
+	svc := &Service{miningTimeFn: func() time.Time { return time.Unix(int64(now), 0) }}
+
+	got, err := svc.nextMiningTimestamp(now + 10)
+	if err != nil {
+		t.Fatalf("nextMiningTimestamp: %v", err)
+	}
+	if want := now + 11; got != want {
+		t.Fatalf("timestamp = %d, want MTP floor %d", got, want)
+	}
+
+	_, err = svc.nextMiningTimestamp(now + consensus.MaxFutureBlockTimeSeconds)
+	if !errors.Is(err, consensus.ErrTimestampTooFarFuture) {
+		t.Fatalf("future MTP error = %v, want %v", err, consensus.ErrTimestampTooFarFuture)
 	}
 }
 

@@ -253,6 +253,7 @@ type Service struct {
 	pool        *mempool.Pool
 	genesis     *types.Block
 
+	blockApplyMu        sync.Mutex
 	stateMu             sync.RWMutex
 	stressMu            sync.Mutex
 	peerMu              sync.RWMutex
@@ -293,6 +294,7 @@ type Service struct {
 	minerMgr            *minerManager
 	avaMgr              *avalancheManager
 	mineHeaderFn        func(types.BlockHeader, consensus.ChainParams, func(uint64) bool) (types.BlockHeader, bool, error)
+	miningTimeFn        func() time.Time
 	thinExpectationFn   func(*peerConn, types.BlockHeader) error
 	nodeID              string
 	dashboard           dashboardCache

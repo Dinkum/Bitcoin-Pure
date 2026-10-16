@@ -22,8 +22,8 @@ genesis_fixture: fixtures/genesis/regtest.json
 
 # Speeds up transaction-status lookups using extra disk space and background indexing.
 # Restart the node after changing this setting.
-# Default: false
-tx_index_enabled: false
+# Default: true
+tx_index_enabled: true
 
 # Sets the chain database directory.
 # Default: data/chain

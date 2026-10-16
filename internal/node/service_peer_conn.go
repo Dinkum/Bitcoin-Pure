@@ -334,8 +334,11 @@ type recentHeaderCache struct {
 }
 
 type recentBlockCache struct {
-	order [][32]byte
-	items map[[32]byte]types.Block
+	sizes    map[[32]byte]uint64
+	bytes    uint64
+	maxBytes uint64
+	order    [][32]byte
+	items    map[[32]byte]types.Block
 }
 
 type peerTrafficMeter struct {

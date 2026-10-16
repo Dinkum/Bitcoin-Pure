@@ -65,3 +65,5 @@ target/
 /*.md
 !/README.md
 !/SPEC.md
+
+/.agents/

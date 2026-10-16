@@ -29,8 +29,9 @@ type branchStep struct {
 // block height from fork+1 upward so mempool reprocessing sees the same
 // dependency ordering as the previous storage-reread path.
 type committedBranchTransition struct {
-	Connected       []types.Block
-	DisconnectedTxs []types.Transaction
+	DisconnectedBlocks int
+	Connected          []types.Block
+	DisconnectedTxs    []types.Transaction
 }
 
 func (c *ChainState) Clone() *ChainState {
@@ -104,18 +105,22 @@ func (p *PersistentChainState) ApplyBlockWithTransition(block *types.Block) (con
 }
 
 func (p *PersistentChainState) ApplyBlockWithTiming(block *types.Block) (consensus.BlockValidationSummary, time.Duration, committedBranchTransition, error) {
-	if summary, wait, transition, committed, err := p.tryApplyActiveTipExtension(block); committed || err != nil {
+	return p.applyBlockWithHeaderUpdate(block, nil)
+}
+
+func (p *PersistentChainState) applyBlockWithHeaderUpdate(block *types.Block, headerUpdate *storage.HeaderChainUpdate) (consensus.BlockValidationSummary, time.Duration, committedBranchTransition, error) {
+	if summary, wait, transition, committed, err := p.tryApplyActiveTipExtension(block, headerUpdate); committed || err != nil {
 		return summary, wait, transition, err
 	}
 	waitStarted := time.Now()
 	p.mu.Lock()
 	wait := time.Since(waitStarted)
 	defer p.mu.Unlock()
-	summary, transition, err := p.applyBlockLocked(block)
+	summary, transition, err := p.applyBlockLocked(block, headerUpdate)
 	return summary, wait, transition, err
 }
 
-func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (consensus.BlockValidationSummary, time.Duration, committedBranchTransition, bool, error) {
+func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block, headerUpdate *storage.HeaderChainUpdate) (consensus.BlockValidationSummary, time.Duration, committedBranchTransition, bool, error) {
 	p.mu.RLock()
 	if p.state == nil || p.state.height == nil || p.state.tipHeader == nil {
 		p.mu.RUnlock()
@@ -194,7 +199,7 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	}
 	nextStateMeta.UTXOAccumulatorDelta = &detail.accumulatorDelta
 	nextStateMeta.UTXOAccumulator = nil
-	if err := p.store.AppendValidatedBlockMeta(nextStateMeta, block, &entry, undo, spent, created); err != nil {
+	if err := p.store.AppendValidatedBlockMetaWithHeaderUpdate(nextStateMeta, block, &entry, undo, spent, created, headerUpdate); err != nil {
 		return consensus.BlockValidationSummary{}, wait, committedBranchTransition{}, true, err
 	}
 	snapshot.bindCommittedUTXOBackend(p.store.UTXOLookupWithErr(), p.store.ForEachUTXO, snapshot.UTXOCount())
@@ -202,7 +207,7 @@ func (p *PersistentChainState) tryApplyActiveTipExtension(block *types.Block) (c
 	return detail.summary, wait, committedBranchTransition{Connected: []types.Block{*block}}, true, nil
 }
 
-func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.BlockValidationSummary, committedBranchTransition, error) {
+func (p *PersistentChainState) applyBlockLocked(block *types.Block, headerUpdate *storage.HeaderChainUpdate) (consensus.BlockValidationSummary, committedBranchTransition, error) {
 	if p.state.height == nil || p.state.tipHeader == nil {
 		return consensus.BlockValidationSummary{}, committedBranchTransition{}, ErrNoTip
 	}
@@ -257,7 +262,11 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 				return consensus.BlockValidationSummary{}, committedBranchTransition{}, fmt.Errorf("missing connected entry for block %x", hash)
 			}
 			entry := &connectedEntries[entryIndex]
-			if err := p.store.PutValidatedBlock(&step.block, entry, undoByHash[hash]); err != nil {
+			var update *storage.HeaderChainUpdate
+			if hash == blockHash {
+				update = headerUpdate
+			}
+			if err := p.store.PutValidatedBlockWithHeaderUpdate(&step.block, entry, undoByHash[hash], update); err != nil {
 				return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 			}
 		}
@@ -277,7 +286,7 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 	if isActiveTipExtension {
 		undo := undoByHash[blockHash]
 		spent, created := activeTipDelta(undo, createdByHash[blockHash])
-		if err := p.store.AppendValidatedBlockMeta(nextStateMeta, block, &newTipEntry, undo, spent, created); err != nil {
+		if err := p.store.AppendValidatedBlockMetaWithHeaderUpdate(nextStateMeta, block, &newTipEntry, undo, spent, created, headerUpdate); err != nil {
 			return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 		}
 	} else {
@@ -292,13 +301,14 @@ func (p *PersistentChainState) applyBlockLocked(block *types.Block) (consensus.B
 				return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 			}
 		}
-		if err := p.store.CommitReorgDelta(
+		if err := p.store.CommitReorgDeltaWithHeaderUpdate(
 			nextStateMeta,
 			reorgOverlay.SpentOutPoints(),
 			reorgOverlay.CreatedEntriesClone(),
 			forkHeight,
 			oldTipHeight,
 			connectedEntries,
+			headerUpdate,
 		); err != nil {
 			return consensus.BlockValidationSummary{}, committedBranchTransition{}, err
 		}
@@ -431,8 +441,9 @@ func (p *PersistentChainState) evaluateBranch(steps []branchStep, forkHeight uin
 		createdByHash[hash] = detail.createdUTXO
 	}
 	return tempState, reorgOverlay, entries, undoByHash, createdByHash, committedBranchTransition{
-		Connected:       connectedBlocks,
-		DisconnectedTxs: disconnectedBranchTransactions(disconnectedBlocks),
+		Connected:          connectedBlocks,
+		DisconnectedTxs:    disconnectedBranchTransactions(disconnectedBlocks),
+		DisconnectedBlocks: len(disconnectedBlocks),
 	}, summary, nil
 }
 

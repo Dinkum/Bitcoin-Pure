@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"time"
+	"unsafe"
 
 	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
@@ -364,9 +366,11 @@ func Handshake(conn *Conn, local VersionMessage, timeout time.Duration) (Version
 		return VersionMessage{}, err
 	}
 	if err := <-writeErr; err != nil {
+		msg.Release()
 		return VersionMessage{}, err
 	}
-	remote, ok := msg.(VersionMessage)
+	remote, ok := msg.Message.(VersionMessage)
+	msg.Release()
 	if !ok {
 		return VersionMessage{}, ErrBadHandshake
 	}
@@ -380,15 +384,32 @@ func Handshake(conn *Conn, local VersionMessage, timeout time.Duration) (Version
 		return VersionMessage{}, err
 	}
 	if err := <-writeErr; err != nil {
+		msg.Release()
 		return VersionMessage{}, err
 	}
-	if _, ok := msg.(VerAckMessage); !ok {
+	_, ok = msg.Message.(VerAckMessage)
+	msg.Release()
+	if !ok {
 		return VersionMessage{}, ErrBadHandshake
 	}
 	return remote, nil
 }
 
-func (c *Conn) ReadMessage() (Message, error) {
+type ReceivedMessage struct {
+	Message     Message
+	reservation *PayloadReservation
+}
+
+// Release ends ownership of the decoded message. Retaining handlers must first
+// transfer its backing data to their own bounded state budget.
+func (m *ReceivedMessage) Release() {
+	if m != nil {
+		m.reservation.Release()
+		m.Message = nil
+	}
+}
+
+func (c *Conn) ReadMessage() (*ReceivedMessage, error) {
 	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(c.Conn, header); err != nil {
 		return nil, err
@@ -405,11 +426,16 @@ func (c *Conn) ReadMessage() (Message, error) {
 	if payloadLen < 0 || payloadLen > maxPayload {
 		return nil, ErrPayloadTooLarge
 	}
-	release, ok := c.budget.TryAcquire(payloadLen)
-	if !ok {
-		return nil, ErrPayloadBudget
+	reservation := c.budget.NewReservation()
+	owned := false
+	defer func() {
+		if !owned {
+			reservation.Release()
+		}
+	}()
+	if err := reservation.Reserve(payloadLen); err != nil {
+		return nil, err
 	}
-	defer release()
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(c.Conn, payload); err != nil {
 		return nil, err
@@ -418,7 +444,12 @@ func (c *Conn) ReadMessage() (Message, error) {
 	if !bytes.Equal(checksum[:4], header[12:16]) {
 		return nil, ErrBadChecksum
 	}
-	return decodeMessage(cmd, payload, c.limits)
+	msg, err := decodeMessageWithAllocationBudget(cmd, payload, c.limits, reservation.Reserve)
+	if err != nil {
+		return nil, err
+	}
+	owned = true
+	return &ReceivedMessage{Message: msg, reservation: reservation}, nil
 }
 
 func maxPayloadForCommand(cmd Command, globalMax int) (int, bool) {
@@ -774,7 +805,12 @@ func encodePayload(msg Message) ([]byte, error) {
 }
 
 func decodeMessage(cmd Command, payload []byte, limits types.CodecLimits) (Message, error) {
+	return decodeMessageWithAllocationBudget(cmd, payload, limits, nil)
+}
+
+func decodeMessageWithAllocationBudget(cmd Command, payload []byte, limits types.CodecLimits, reserve func(int) error) (Message, error) {
 	r := newReader(payload)
+	r.reserve = reserve
 	msg, err := decodeMessageFromReader(cmd, r, limits)
 	if err != nil {
 		return nil, err
@@ -869,7 +905,7 @@ func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (
 		// Full block validity is bounded by the candidate's parent-derived ABLA
 		// state in the node. The wire codec must not impose an independent count
 		// or block-size consensus rule after the frame itself was admitted.
-		block, err := types.DecodeBlockOwnedBuffer(blockBytes, uint64(len(blockBytes)))
+		block, err := types.DecodeBlockOwnedBufferWithAllocationBudget(blockBytes, uint64(len(blockBytes)), r.reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -915,7 +951,7 @@ func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (
 		if err != nil {
 			return nil, err
 		}
-		tx, err := types.DecodeTransactionWithLimits(txBytes, limits)
+		tx, err := types.DecodeTransactionWithAllocationBudget(txBytes, limits, r.reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -1005,7 +1041,7 @@ func decodeMessageFromReader(cmd Command, r *reader, limits types.CodecLimits) (
 		if err != nil {
 			return nil, err
 		}
-		coinbase, err := types.DecodeTransactionWithLimits(coinbaseBytes, limits)
+		coinbase, err := types.DecodeTransactionWithAllocationBudget(coinbaseBytes, limits, r.reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -1275,8 +1311,9 @@ func growBytes(buf []byte, extra int) []byte {
 }
 
 type reader struct {
-	buf []byte
-	pos int
+	buf     []byte
+	pos     int
+	reserve func(int) error
 }
 
 func newReader(buf []byte) *reader {
@@ -1333,6 +1370,11 @@ func (r *reader) readString() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if r.reserve != nil {
+		if err := r.reserve(len(buf)); err != nil {
+			return "", err
+		}
+	}
 	return string(buf), nil
 }
 
@@ -1340,6 +1382,11 @@ func (r *reader) readStringWithLimit(limit int) (string, error) {
 	buf, err := r.readBytesWithLimit(limit)
 	if err != nil {
 		return "", err
+	}
+	if r.reserve != nil {
+		if err := r.reserve(len(buf)); err != nil {
+			return "", err
+		}
 	}
 	return string(buf), nil
 }
@@ -1351,6 +1398,9 @@ func (r *reader) readStrings(limit int, itemLimit int) ([]string, error) {
 	}
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
+	}
+	if err := reserveDecodedSlice[string](r, int(count)); err != nil {
+		return nil, err
 	}
 	out := make([]string, 0, count)
 	for i := uint32(0); i < count; i++ {
@@ -1370,6 +1420,9 @@ func (r *reader) readInvs() ([]InvVector, error) {
 	}
 	if count > maxInvPerMessage {
 		return nil, ErrPayloadTooLarge
+	}
+	if err := reserveDecodedSlice[InvVector](r, int(count)); err != nil {
+		return nil, err
 	}
 	items := make([]InvVector, 0, count)
 	for i := uint32(0); i < count; i++ {
@@ -1397,6 +1450,9 @@ func (r *reader) readOutPoints(limit int) ([]types.OutPoint, error) {
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[types.OutPoint](r, int(count)); err != nil {
+		return nil, err
+	}
 	out := make([]types.OutPoint, 0, count)
 	for i := uint32(0); i < count; i++ {
 		hash, err := r.take(32)
@@ -1421,6 +1477,9 @@ func (r *reader) readAvaVotes(limit int) ([]AvaVote, error) {
 	}
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
+	}
+	if err := reserveDecodedSlice[AvaVote](r, int(count)); err != nil {
+		return nil, err
 	}
 	out := make([]AvaVote, 0, count)
 	for i := uint32(0); i < count; i++ {
@@ -1453,6 +1512,9 @@ func (r *reader) readLocatorPayload() ([][32]byte, [32]byte, error) {
 	if count > maxHeadersPerMessage {
 		return nil, [32]byte{}, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[[32]byte](r, int(count)); err != nil {
+		return nil, [32]byte{}, err
+	}
 	locator := make([][32]byte, 0, count)
 	for i := uint32(0); i < count; i++ {
 		hash, err := r.take(32)
@@ -1480,6 +1542,9 @@ func (r *reader) readHeaders() ([]types.BlockHeader, error) {
 	if count > maxHeadersPerMessage {
 		return nil, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[types.BlockHeader](r, int(count)); err != nil {
+		return nil, err
+	}
 	headers := make([]types.BlockHeader, 0, count)
 	for i := uint32(0); i < count; i++ {
 		buf, err := r.take(types.BlockHeaderEncodedLen)
@@ -1503,13 +1568,16 @@ func (r *reader) readTxs(limit int, limits types.CodecLimits) ([]types.Transacti
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[types.Transaction](r, int(count)); err != nil {
+		return nil, err
+	}
 	txs := make([]types.Transaction, 0, count)
 	for i := uint32(0); i < count; i++ {
 		txBytes, err := r.readBytes()
 		if err != nil {
 			return nil, err
 		}
-		tx, err := types.DecodeTransactionWithLimits(txBytes, limits)
+		tx, err := types.DecodeTransactionWithAllocationBudget(txBytes, limits, r.reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -1526,6 +1594,9 @@ func (r *reader) readPrefilledTxs(limit int, limits types.CodecLimits) ([]Prefil
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[PrefilledTx](r, int(count)); err != nil {
+		return nil, err
+	}
 	items := make([]PrefilledTx, 0, count)
 	for i := uint32(0); i < count; i++ {
 		index, err := r.readU32()
@@ -1536,7 +1607,7 @@ func (r *reader) readPrefilledTxs(limit int, limits types.CodecLimits) ([]Prefil
 		if err != nil {
 			return nil, err
 		}
-		tx, err := types.DecodeTransactionWithLimits(txBytes, limits)
+		tx, err := types.DecodeTransactionWithAllocationBudget(txBytes, limits, r.reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -1552,6 +1623,9 @@ func (r *reader) readHashes(limit int) ([][32]byte, error) {
 	}
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
+	}
+	if err := reserveDecodedSlice[[32]byte](r, int(count)); err != nil {
+		return nil, err
 	}
 	hashes := make([][32]byte, 0, count)
 	for i := uint32(0); i < count; i++ {
@@ -1574,6 +1648,9 @@ func (r *reader) readU64s(limit int) ([]uint64, error) {
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[uint64](r, int(count)); err != nil {
+		return nil, err
+	}
 	values := make([]uint64, 0, count)
 	for i := uint32(0); i < count; i++ {
 		value, err := r.readU64()
@@ -1593,6 +1670,9 @@ func (r *reader) readU32s(limit int) ([]uint32, error) {
 	if int(count) > limit {
 		return nil, ErrPayloadTooLarge
 	}
+	if err := reserveDecodedSlice[uint32](r, int(count)); err != nil {
+		return nil, err
+	}
 	values := make([]uint32, 0, count)
 	for i := uint32(0); i < count; i++ {
 		value, err := r.readU32()
@@ -1602,4 +1682,16 @@ func (r *reader) readU32s(limit int) ([]uint32, error) {
 		values = append(values, value)
 	}
 	return values, nil
+}
+
+func reserveDecodedSlice[T any](r *reader, count int) error {
+	if r.reserve == nil {
+		return nil
+	}
+	var value T
+	size := int(unsafe.Sizeof(value))
+	if count < 0 || (size > 0 && count > math.MaxInt/size) {
+		return ErrPayloadBudget
+	}
+	return r.reserve(count * size)
 }

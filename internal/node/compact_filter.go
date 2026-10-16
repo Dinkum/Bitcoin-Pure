@@ -5,10 +5,11 @@ import (
 	"fmt"
 
 	"bitcoin-pure/internal/compactfilter"
+	"bitcoin-pure/internal/storage"
 )
 
 const (
-	maxFilterHeadersPerRPC  = 2000
+	maxFilterHeadersPerRPC  = storage.MaxCompactFilterHeaders
 	defaultFilterCheckpoint = 1000
 )
 
@@ -104,90 +105,30 @@ func (s *Service) CompactFilterHeaders(startHeight uint64, count uint64) (Compac
 	if startHeight > ^uint64(0)-(count-1) {
 		return CompactFilterHeadersInfo{}, fmt.Errorf("filter height range overflows")
 	}
-	stopHeight := startHeight + count - 1
-	var prevHeader [32]byte
-	var previous [32]byte
-	headers := make([]CompactFilterHeaderEntry, 0, count)
-	for height := uint64(0); ; height++ {
-		hash, err := s.chainState.Store().GetBlockHashByHeight(height)
-		if err != nil {
-			return CompactFilterHeadersInfo{}, err
-		}
-		if hash == nil {
-			return CompactFilterHeadersInfo{}, fmt.Errorf("block height %d not found", height)
-		}
-		filter, err := s.compactFilterForHash(*hash)
-		if err != nil {
-			return CompactFilterHeadersInfo{}, err
-		}
-		header := compactfilter.Header(filter.Hash, prevHeader)
-		if height == startHeight {
-			previous = prevHeader
-		}
-		if height >= startHeight {
-			headers = append(headers, CompactFilterHeaderEntry{
-				Height:       height,
-				BlockHash:    hex.EncodeToString(hash[:]),
-				FilterHash:   hex.EncodeToString(filter.Hash[:]),
-				FilterHeader: hex.EncodeToString(header[:]),
-			})
-		}
-		prevHeader = header
-		if height == stopHeight {
-			break
-		}
+	previous, rows, err := s.chainState.Store().CompactFilterHeaders(startHeight, count)
+	if err != nil {
+		return CompactFilterHeadersInfo{}, err
 	}
-	return CompactFilterHeadersInfo{
-		FilterType:           compactfilter.Type(),
-		StartHeight:          startHeight,
-		Count:                count,
-		PreviousFilterHeader: hex.EncodeToString(previous[:]),
-		Headers:              headers,
-	}, nil
+	headers := make([]CompactFilterHeaderEntry, 0, len(rows))
+	for _, row := range rows {
+		headers = append(headers, CompactFilterHeaderEntry{Height: row.Height, BlockHash: hex.EncodeToString(row.BlockHash[:]), FilterHash: hex.EncodeToString(row.FilterHash[:]), FilterHeader: hex.EncodeToString(row.Header[:])})
+	}
+	return CompactFilterHeadersInfo{FilterType: compactfilter.Type(), StartHeight: startHeight, Count: count, PreviousFilterHeader: hex.EncodeToString(previous[:]), Headers: headers}, nil
 }
 
 func (s *Service) CompactFilterCheckpoint(interval uint64) (CompactFilterCheckpointInfo, error) {
 	if interval == 0 {
 		interval = defaultFilterCheckpoint
 	}
-	view, ok := s.chainState.sharedCommittedView()
-	if !ok {
-		return CompactFilterCheckpointInfo{FilterType: compactfilter.Type(), Interval: interval}, nil
+	tip, rows, err := s.chainState.Store().CompactFilterCheckpoints(interval, maxFilterHeadersPerRPC)
+	if err != nil {
+		return CompactFilterCheckpointInfo{}, err
 	}
-	// Build the header chain once and emit only the requested checkpoints.
-	headers := make([]CompactFilterCheckpointEntry, 0)
-	var previous [32]byte
-	for height := uint64(0); ; height++ {
-		hash, err := s.chainState.Store().GetBlockHashByHeight(height)
-		if err != nil {
-			return CompactFilterCheckpointInfo{}, err
-		}
-		if hash == nil {
-			return CompactFilterCheckpointInfo{}, fmt.Errorf("block height %d not found", height)
-		}
-		filter, err := s.compactFilterForHash(*hash)
-		if err != nil {
-			return CompactFilterCheckpointInfo{}, err
-		}
-		header := compactfilter.Header(filter.Hash, previous)
-		if height%interval == 0 || height == view.Height {
-			headers = append(headers, CompactFilterCheckpointEntry{
-				Height:       height,
-				BlockHash:    hex.EncodeToString(hash[:]),
-				FilterHeader: hex.EncodeToString(header[:]),
-			})
-		}
-		previous = header
-		if height == view.Height {
-			break
-		}
+	headers := make([]CompactFilterCheckpointEntry, 0, len(rows))
+	for _, row := range rows {
+		headers = append(headers, CompactFilterCheckpointEntry{Height: row.Height, BlockHash: hex.EncodeToString(row.BlockHash[:]), FilterHeader: hex.EncodeToString(row.Header[:])})
 	}
-	return CompactFilterCheckpointInfo{
-		FilterType: compactfilter.Type(),
-		Interval:   interval,
-		TipHeight:  view.Height,
-		Headers:    headers,
-	}, nil
+	return CompactFilterCheckpointInfo{FilterType: compactfilter.Type(), Interval: interval, TipHeight: tip, Headers: headers}, nil
 }
 
 func (s *Service) compactFilterForHash(blockHash [32]byte) (compactfilter.Filter, error) {

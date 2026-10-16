@@ -114,7 +114,7 @@ func TestStorePendingPeerBlockEnforcesByteBudget(t *testing.T) {
 	first := pendingPeerBlockForTest(11, 4)
 	second := pendingPeerBlockForTest(12, 4)
 	third := pendingPeerBlockForTest(13, 4)
-	byteLimit := pendingPeerBlockEncodedSize(&first) + pendingPeerBlockEncodedSize(&second) + pendingPeerBlockEncodedSize(&third) - 1
+	byteLimit := pendingPeerBlockRetainedSize(&first) + pendingPeerBlockRetainedSize(&second) + pendingPeerBlockRetainedSize(&third) - 1
 	withPendingPeerBlockLimitsForTest(t, byteLimit, 8)
 	svc := &Service{
 		pendingBlocks:       make(map[[32]byte]pendingPeerBlock),

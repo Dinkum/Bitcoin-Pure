@@ -2,7 +2,7 @@ package p2p
 
 import "sync"
 
-// PayloadBudget bounds the aggregate payload buffers held by all connections
+// PayloadBudget bounds payload buffers and decoded storage held by connections
 // that share it. Admission is deliberately non-blocking: under pressure, a
 // peer is disconnected instead of reserving an unbounded queue of readers.
 type PayloadBudget struct {
@@ -25,33 +25,59 @@ func NewPayloadBudget(limit int64) *PayloadBudget {
 	return &PayloadBudget{limit: limit}
 }
 
-func (b *PayloadBudget) TryAcquire(size int) (func(), bool) {
-	if b == nil || size == 0 {
-		return func() {}, true
-	}
+// PayloadReservation follows a received message through decoding and handling.
+// Reserve must precede allocation; Release is safe on every error path.
+type PayloadReservation struct {
+	budget   *PayloadBudget
+	used     int64
+	released bool
+}
+
+func (b *PayloadBudget) NewReservation() *PayloadReservation { return &PayloadReservation{budget: b} }
+
+func (r *PayloadReservation) Reserve(size int) error {
 	if size < 0 {
-		return nil, false
+		return ErrPayloadBudget
 	}
-	requested := int64(size)
+	b := r.budget
+	if b == nil {
+		return nil
+	}
 	b.mu.Lock()
-	if b.limit > 0 && (requested > b.limit || b.used > b.limit-requested) {
-		b.mu.Unlock()
-		return nil, false
+	defer b.mu.Unlock()
+	requested := int64(size)
+	if r.released || (b.limit > 0 && (requested > b.limit || b.used > b.limit-requested)) {
+		return ErrPayloadBudget
 	}
 	b.used += requested
+	r.used += requested
 	if b.used > b.peak {
 		b.peak = b.used
 	}
-	b.mu.Unlock()
+	return nil
+}
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.used -= requested
-			b.mu.Unlock()
-		})
-	}, true
+func (r *PayloadReservation) Release() {
+	if r == nil || r.budget == nil {
+		return
+	}
+	b := r.budget
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r.released {
+		return
+	}
+	r.released = true
+	b.used -= r.used
+	r.used = 0
+}
+
+func (b *PayloadBudget) TryAcquire(size int) (func(), bool) {
+	r := b.NewReservation()
+	if err := r.Reserve(size); err != nil {
+		return nil, false
+	}
+	return r.Release, true
 }
 
 func (b *PayloadBudget) Stats() PayloadBudgetStats {

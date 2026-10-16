@@ -258,15 +258,19 @@ type ChainStore struct {
 	db     *pebble.DB
 	logger *slog.Logger
 
+	filterMu       sync.Mutex
+	filterNotify   chan struct{}
 	txIndexEnabled bool
 	txIndexRebuild atomic.Bool
 	txIndexNotify  chan struct{}
-	walletIndexMu  sync.Mutex
-	deriveNotify   chan struct{}
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
-	closeOnce      sync.Once
-	closeErr       error
+	// Lock order is node state, then mutationMu. Keep every dependent store
+	// read and its commit together; Pebble batches do not isolate readers.
+	mutationMu   sync.Mutex
+	deriveNotify chan struct{}
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 type chainJournalKind uint8
@@ -350,6 +354,7 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		logger:       logger,
 		db:           db,
 		deriveNotify: make(chan struct{}, 1),
+		filterNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 	}
 	if err := store.migrateUTXOAccumulatorIndex(); err != nil {
@@ -367,6 +372,8 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		store.wg.Add(1)
 		go func() { defer store.wg.Done(); store.txIndexLoop() }()
 	}
+	store.wg.Add(1)
+	go func() { defer store.wg.Done(); store.compactFilterIndexLoop() }()
 	store.notifyDerivedReplay()
 	return store, nil
 }
@@ -1543,14 +1550,14 @@ func (s *ChainStore) WriteKnownPeers(peers map[string]KnownPeerRecord) error {
 }
 
 func (s *ChainStore) WriteFullState(state *StoredChainState) error {
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	return s.writeFullStateLocked(state, nil, nil, nil)
 }
 
 func (s *ChainStore) WriteFullStateWithHeaderMetadata(state *StoredChainState, headerState *StoredHeaderState, activeEntries []BlockIndexEntry) error {
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	return s.writeFullStateLocked(state, nil, headerState, activeEntries)
 }
 
@@ -1558,8 +1565,8 @@ func (s *ChainStore) WriteFullStateWithFastSyncStateMetadata(state *StoredChainS
 	if fastSyncState == nil {
 		return errors.New("fast sync state is required")
 	}
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	return s.writeFullStateLocked(state, fastSyncState, headerState, activeEntries)
 }
 
@@ -1654,6 +1661,9 @@ func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState
 }
 
 func (s *ChainStore) WriteFastSyncState(state *FastSyncState, snapshot consensus.UtxoSet) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if state == nil {
 		return errors.New("fast sync state is required")
 	}
@@ -1701,6 +1711,9 @@ func (s *ChainStore) WriteFastSyncState(state *FastSyncState, snapshot consensus
 }
 
 func (s *ChainStore) WriteFastSyncStateMetadata(state *FastSyncState) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if state == nil {
 		return errors.New("fast sync state is required")
 	}
@@ -1740,6 +1753,9 @@ func (s *ChainStore) WriteFastSyncStateMetadata(state *FastSyncState) error {
 }
 
 func (s *ChainStore) UpdateFastSyncState(state *FastSyncState) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if state == nil {
 		return errors.New("fast sync state is required")
 	}
@@ -1751,6 +1767,9 @@ func (s *ChainStore) UpdateFastSyncState(state *FastSyncState) error {
 }
 
 func (s *ChainStore) ClearFastSyncState() error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := batch.Delete(metaFastSyncStateKey, nil); err != nil {
@@ -1793,6 +1812,9 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if previous == nil {
 		return s.WriteFullState(next)
 	}
+
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
@@ -1857,6 +1879,13 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 // delta, locality updates, and active-height journal rewrite. The validated
 // branch blocks themselves are expected to have been stored already.
 func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []BlockIndexEntry) error {
+	return s.CommitReorgDeltaWithHeaderUpdate(meta, spent, created, forkHeight, oldTipHeight, activeEntries, nil)
+}
+
+func (s *ChainStore) CommitReorgDeltaWithHeaderUpdate(meta *StoredChainStateMeta, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []BlockIndexEntry, headerUpdate *HeaderChainUpdate) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if meta == nil {
 		return errors.New("reorg chain metadata is required")
 	}
@@ -1864,12 +1893,13 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 		return err
 	}
 
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
-
-	batch := s.db.NewBatch()
+	batch := s.db.NewIndexedBatch()
 	defer batch.Close()
-	if err := writeMetaFromMeta(batch, meta); err != nil {
+	writeMeta := writeBlockMetaFromMeta
+	if headerUpdate == nil {
+		writeMeta = writeMetaFromMeta
+	}
+	if err := writeMeta(batch, meta); err != nil {
 		return err
 	}
 	for _, outPoint := range spent {
@@ -1908,13 +1938,14 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 			OldTipHeight: oldTipHeight,
 			Pairs:        pairs,
 		},
-		chainJournalEntry{
-			Kind:         journalRewriteHeaderHeights,
-			ForkHeight:   forkHeight,
-			OldTipHeight: oldTipHeight,
-			Pairs:        pairs,
-		},
 	); err != nil {
+		return err
+	}
+	if headerUpdate == nil {
+		if err := s.appendJournalEntryBatch(batch, chainJournalEntry{Kind: journalRewriteHeaderHeights, ForkHeight: forkHeight, OldTipHeight: oldTipHeight, Pairs: pairs}); err != nil {
+			return err
+		}
+	} else if err := s.applyHeaderUpdateBatch(batch, headerUpdate); err != nil {
 		return err
 	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
@@ -1931,6 +1962,9 @@ func (s *ChainStore) CommitReorgDelta(meta *StoredChainStateMeta, spent []types.
 }
 
 func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeHeaderMeta(batch, state); err != nil {
@@ -1952,6 +1986,9 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 }
 
 func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []HeaderBatchEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []HeaderBatchEntry) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := writeHeaderMeta(batch, state); err != nil {
@@ -1998,9 +2035,16 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 }
 
 func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	entry, err := s.buildLinearIndexEntry(height, &block.Header, false, consensus.BlockSizeState{})
+	if err != nil {
+		return err
+	}
+	entry, err = s.preserveValidatedBlockIndex(entry)
 	if err != nil {
 		return err
 	}
@@ -2026,6 +2070,9 @@ func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 }
 
 func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	entry, err := s.buildLinearIndexEntry(height, header, false, consensus.BlockSizeState{})
@@ -2084,18 +2131,26 @@ func (s *ChainStore) AppendValidatedBlock(state *StoredChainState, block *types.
 }
 
 func (s *ChainStore) AppendValidatedBlockMeta(state *StoredChainStateMeta, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
+	return s.AppendValidatedBlockMetaWithHeaderUpdate(state, block, entry, undo, spent, created, nil)
+}
+
+func (s *ChainStore) AppendValidatedBlockMetaWithHeaderUpdate(state *StoredChainStateMeta, block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, headerUpdate *HeaderChainUpdate) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if state == nil {
 		return errors.New("chain state metadata is required")
 	}
 	if err := s.populateAccumulatorDeltaFromUTXODelta(state, spent, created); err != nil {
 		return err
 	}
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
-
-	batch := s.db.NewBatch()
+	batch := s.db.NewIndexedBatch()
 	defer batch.Close()
-	if err := writeMetaFromMeta(batch, state); err != nil {
+	writeMeta := writeBlockMetaFromMeta
+	if headerUpdate == nil {
+		writeMeta = writeMetaFromMeta
+	}
+	if err := writeMeta(batch, state); err != nil {
 		return err
 	}
 	if err := putBlockBatch(batch, block, *entry, false); err != nil {
@@ -2133,16 +2188,18 @@ func (s *ChainStore) AppendValidatedBlockMeta(state *StoredChainStateMeta, block
 	if err != nil {
 		return err
 	}
-	if err := s.appendJournalEntriesBatch(batch,
-		chainJournalEntry{
-			Kind:  journalSetBlockHeight,
-			Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
-		},
-		chainJournalEntry{
-			Kind:  journalSetHeaderHeight,
-			Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
-		},
-	); err != nil {
+	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		Kind: journalSetBlockHeight, Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
+	}); err != nil {
+		return err
+	}
+	if headerUpdate == nil {
+		if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+			Kind: journalSetHeaderHeight, Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
+		}); err != nil {
+			return err
+		}
+	} else if err := s.applyHeaderUpdateBatch(batch, headerUpdate); err != nil {
 		return err
 	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
@@ -2159,10 +2216,14 @@ func (s *ChainStore) AppendValidatedBlockMeta(state *StoredChainStateMeta, block
 }
 
 func (s *ChainStore) PutValidatedBlock(block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry) error {
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
+	return s.PutValidatedBlockWithHeaderUpdate(block, entry, undo, nil)
+}
 
-	batch := s.db.NewBatch()
+func (s *ChainStore) PutValidatedBlockWithHeaderUpdate(block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry, headerUpdate *HeaderChainUpdate) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	batch := s.db.NewIndexedBatch()
 	defer batch.Close()
 	if err := putBlockBatch(batch, block, *entry, false); err != nil {
 		return err
@@ -2174,10 +2235,16 @@ func (s *ChainStore) PutValidatedBlock(block *types.Block, entry *BlockIndexEntr
 	if err := putWalletOriginsForBlockBatch(batch, entry.Height, hash, block); err != nil {
 		return err
 	}
+	if err := s.applyHeaderUpdateBatch(batch, headerUpdate); err != nil {
+		return err
+	}
 	return batch.Commit(consensusCriticalWriteOptions)
 }
 
 func (s *ChainStore) PutValidatedBlockWithoutWalletIndex(block *types.Block, entry *BlockIndexEntry, undo []BlockUndoEntry) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if block == nil || entry == nil {
 		return errors.New("block and index entry are required")
 	}
@@ -2194,6 +2261,9 @@ func (s *ChainStore) PutValidatedBlockWithoutWalletIndex(block *types.Block, ent
 }
 
 func (s *ChainStore) PutValidatedBlocksWithoutWalletIndex(blocks []types.Block, entries []BlockIndexEntry) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if len(blocks) != len(entries) {
 		return fmt.Errorf("block batch length mismatch: blocks=%d entries=%d", len(blocks), len(entries))
 	}
@@ -2203,15 +2273,15 @@ func (s *ChainStore) PutValidatedBlocksWithoutWalletIndex(blocks []types.Block, 
 		if err := putBlockBatch(batch, &blocks[i], entries[i], false); err != nil {
 			return err
 		}
-		hash := consensus.HeaderHash(&blocks[i].Header)
-		if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(nil), nil); err != nil {
-			return err
-		}
+
 	}
 	return batch.Commit(consensusCriticalWriteOptions)
 }
 
 func (s *ChainStore) PutValidatedBlockUndo(entry *BlockIndexEntry, undo []BlockUndoEntry) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	if entry == nil {
 		return errors.New("block index entry is required")
 	}
@@ -2224,7 +2294,11 @@ func (s *ChainStore) PutValidatedBlockUndo(entry *BlockIndexEntry, undo []BlockU
 	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
 		return err
 	}
-	return batch.Commit(consensusCriticalWriteOptions)
+	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
+		return err
+	}
+	s.notifyDerivedReplay()
+	return nil
 }
 
 func (s *ChainStore) preserveValidatedBlockIndex(entry BlockIndexEntry) (BlockIndexEntry, error) {
@@ -2244,6 +2318,9 @@ func (s *ChainStore) preserveValidatedBlockIndex(entry BlockIndexEntry) (BlockIn
 }
 
 func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	pairs := make([]chainJournalHeightHash, 0, len(entries))
@@ -2267,6 +2344,9 @@ func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64
 }
 
 func (s *ChainStore) RewriteActiveHeaderHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	pairs := make([]chainJournalHeightHash, 0, len(entries))
@@ -2290,6 +2370,9 @@ func (s *ChainStore) RewriteActiveHeaderHeights(forkHeight uint64, oldTipHeight 
 }
 
 func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
@@ -2565,11 +2648,25 @@ func (s *ChainStore) appendJournalEntriesBatch(batch *pebble.Batch, entries ...c
 		return nil
 	}
 	nextSeq, err := s.journalNextSeq()
+	if batch.Indexed() {
+		var raw []byte
+		raw, err = readValue(batch, metaJournalNextSeqKey)
+		if err == nil && raw != nil {
+			nextSeq, err = decodeU64(raw)
+		}
+	}
 	if err != nil {
 		return err
 	}
 	startSeq := nextSeq
 	derivedSeq, err := s.derivedJournalSeq()
+	if batch.Indexed() {
+		var raw []byte
+		raw, err = readValue(batch, metaDerivedJournalSeqKey)
+		if err == nil && raw != nil {
+			derivedSeq, err = decodeU64(raw)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -2617,6 +2714,12 @@ func (s *ChainStore) derivedJournalSeq() (uint64, error) {
 }
 
 func (s *ChainStore) notifyDerivedReplay() {
+	if s != nil && s.filterNotify != nil {
+		select {
+		case s.filterNotify <- struct{}{}:
+		default:
+		}
+	}
 	if s != nil && s.txIndexNotify != nil {
 		select {
 		case s.txIndexNotify <- struct{}{}:
@@ -2664,6 +2767,9 @@ func (s *ChainStore) replayDerivedIndexes() error {
 }
 
 func (s *ChainStore) applyNextJournalEntry() (bool, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
 	derivedSeq, err := s.derivedJournalSeq()
 	if err != nil {
 		return false, err
@@ -2827,14 +2933,14 @@ func (s *ChainStore) applyLocalityDeltaBatch(batch *pebble.Batch, spent []types.
 }
 
 func (s *ChainStore) RebuildWalletIndexes(tipHeight uint64) error {
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	return s.rebuildWalletIndexesLocked(tipHeight)
 }
 
 func (s *ChainStore) RebuildWalletIndexesAtCurrentTip() (uint64, error) {
-	s.walletIndexMu.Lock()
-	defer s.walletIndexMu.Unlock()
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	meta, err := s.LoadChainStateMeta()
 	if err != nil {
 		return 0, err
@@ -3374,6 +3480,13 @@ func writeMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
 		Height:    state.Height,
 		TipHeader: state.TipHeader,
 	}); err != nil {
+		return err
+	}
+	return writeBlockMetaFromMeta(batch, state)
+}
+
+func writeBlockMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) error {
+	if err := batch.Set(metaProfileKey, []byte(state.Profile.String()), nil); err != nil {
 		return err
 	}
 	if err := batch.Set(metaTipHeightKey, encodeU64(state.Height), nil); err != nil {

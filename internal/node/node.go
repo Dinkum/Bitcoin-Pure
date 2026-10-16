@@ -61,6 +61,7 @@ type sharedCommittedChainView struct {
 	Height         uint64
 	TipHeader      types.BlockHeader
 	TipHash        [32]byte
+	MedianTimePast uint64
 	BlockSizeState consensus.BlockSizeState
 	UTXOCount      int
 	UTXOAcc        *utreexo.Accumulator
@@ -483,6 +484,7 @@ func (c *ChainState) sharedCommittedView() (sharedCommittedChainView, bool) {
 		Height:         *c.height,
 		TipHeader:      *c.tipHeader,
 		TipHash:        consensus.HeaderHash(c.tipHeader),
+		MedianTimePast: consensus.MedianTimePast(c.recentTimes),
 		BlockSizeState: c.blockSizeState,
 		UTXOCount:      c.utxoCount,
 		UTXOAcc:        c.utxoAcc,

@@ -559,11 +559,12 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 			return established
 		}
 		peer.noteProgress(time.Now())
-		if err := m.svc.onPeerMessage(peer, msg); err != nil {
+		messageType := fmt.Sprintf("%T", msg.Message)
+		if err := func() error { defer msg.Release(); return m.svc.onPeerMessage(peer, msg.Message) }(); err != nil {
 			m.svc.logger.Warn("peer message handling failed",
 				slog.String("addr", addr),
 				slog.String("remote_addr", remoteAddr),
-				slog.String("type", fmt.Sprintf("%T", msg)),
+				slog.String("type", messageType),
 				slog.Any("error", err),
 				slog.Uint64("tip_height", m.svc.blockHeight()),
 				slog.Uint64("header_height", m.svc.headerHeight()),

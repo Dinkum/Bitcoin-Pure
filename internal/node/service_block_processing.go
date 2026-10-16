@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unsafe"
 )
 
 type pendingThinBlock struct {
@@ -31,15 +32,9 @@ func pendingThinRetainedBytes(state *pendingThinBlock) uint64 {
 	if state == nil {
 		return 0
 	}
-	// EncodedLen covers nested auth/output byte slices; the fixed allowance
-	// covers the transaction structs, fill bitmap, and slice backing arrays.
-	bytes := uint64(len(state.filled))
+	bytes := uint64(cap(state.filled)) + uint64(cap(state.txs))*uint64(unsafe.Sizeof(types.Transaction{}))
 	for i := range state.txs {
-		encoded := state.txs[i].EncodedLen()
-		if encoded < 0 || bytes > ^uint64(0)-uint64(encoded)-128 {
-			return ^uint64(0)
-		}
-		bytes += uint64(encoded) + 128
+		bytes += uint64(state.txs[i].EncodedLen()) + transactionArrayBytes(&state.txs[i])
 	}
 	return bytes
 }
@@ -289,6 +284,11 @@ func (s *Service) cacheRecentBlock(block types.Block) {
 	hash := consensus.HeaderHash(&block.Header)
 	s.recentMu.Lock()
 	defer s.recentMu.Unlock()
+	maxPayload := s.cfg.MaxMessageBytes
+	if maxPayload <= 0 {
+		maxPayload = defaultMaxMessageBytes
+	}
+	s.recentBlks.maxBytes = uint64(maxPayload) * defaultInflightPayloadMultiplier
 	cacheRecentBlockLocked(&s.recentBlks, hash, block)
 	cacheRecentHeaderLocked(&s.recentHdrs, hash, block.Header)
 }
@@ -309,10 +309,31 @@ func cacheRecentHeaderLocked(cache *recentHeaderCache, hash [32]byte, header typ
 }
 
 func cacheRecentBlockLocked(cache *recentBlockCache, hash [32]byte, block types.Block) {
+	if cache.maxBytes == 0 {
+		cache.maxBytes = defaultMaxMessageBytes * defaultInflightPayloadMultiplier
+	}
+	if cache.sizes == nil {
+		cache.sizes = make(map[[32]byte]uint64, len(cache.items))
+		for key, item := range cache.items {
+			size := blockRetainedBytes(&item)
+			cache.sizes[key] = size
+			cache.bytes += size
+		}
+	}
+	size := blockRetainedBytes(&block)
+	if size > cache.maxBytes {
+		return
+	}
+	if cache.items == nil {
+		cache.items = make(map[[32]byte]types.Block)
+	}
 	if _, ok := cache.items[hash]; !ok {
 		cache.order = append(cache.order, hash)
 	}
+	cache.bytes -= cache.sizes[hash]
 	cache.items[hash] = cloneBlock(block)
+	cache.sizes[hash] = size
+	cache.bytes += size
 	trimRecentBlockCacheLocked(cache)
 }
 
@@ -327,9 +348,11 @@ func trimRecentHeaderCacheLocked(cache *recentHeaderCache) {
 
 func trimRecentBlockCacheLocked(cache *recentBlockCache) {
 	const limit = 256
-	for len(cache.order) > limit {
+	for len(cache.order) > limit || cache.bytes > cache.maxBytes {
 		evict := cache.order[0]
 		cache.order = cache.order[1:]
+		cache.bytes -= cache.sizes[evict]
+		delete(cache.sizes, evict)
 		delete(cache.items, evict)
 	}
 }
@@ -547,6 +570,8 @@ func (s *Service) headerBranchEntriesLocked(tip storage.BlockIndexEntry, batchEn
 }
 
 func (s *Service) applyPeerBlock(block *types.Block) (bool, consensus.BlockValidationSummary, time.Duration, error) {
+	s.blockApplyMu.Lock()
+	defer s.blockApplyMu.Unlock()
 	startedAt := time.Now()
 	hash := consensus.HeaderHash(&block.Header)
 	entry, err := s.chainState.Store().GetBlockIndex(&hash)
@@ -556,7 +581,9 @@ func (s *Service) applyPeerBlock(block *types.Block) (bool, consensus.BlockValid
 	if entry == nil {
 		return false, consensus.BlockValidationSummary{}, 0, fmt.Errorf("%w: %x", ErrBlockHeaderNotIndexed, hash)
 	}
-	summary, lockWait, transition, err := s.chainState.ApplyBlockWithTiming(block)
+	// Peer blocks already have indexed headers. Their commit must preserve
+	// the independently selected best-header branch, including during sync.
+	summary, lockWait, transition, err := s.chainState.applyBlockWithHeaderUpdate(block, &storage.HeaderChainUpdate{})
 	if err != nil {
 		return false, consensus.BlockValidationSummary{}, 0, err
 	} else {
@@ -945,7 +972,7 @@ func (s *Service) storePendingPeerBlock(peerAddr string, block *types.Block) pen
 	hash := consensus.HeaderHash(&block.Header)
 	parent := block.Header.PrevBlockHash
 	now := time.Now()
-	blockBytes := pendingPeerBlockEncodedSize(block)
+	blockBytes := pendingPeerBlockRetainedSize(block)
 
 	s.downloadMu.Lock()
 	defer s.downloadMu.Unlock()
@@ -1144,12 +1171,7 @@ func (s *Service) deletePendingPeerBlockLocked(hash [32]byte) (pendingPeerBlock,
 	return entry, true
 }
 
-func pendingPeerBlockEncodedSize(block *types.Block) uint64 {
-	if block == nil {
-		return 0
-	}
-	return uint64(block.EncodedLen())
-}
+func pendingPeerBlockRetainedSize(block *types.Block) uint64 { return blockRetainedBytes(block) }
 
 func (s *Service) pendingPeerBlockChildren(parent [32]byte) []pendingPeerBlock {
 	s.downloadMu.Lock()

@@ -1152,6 +1152,17 @@ func (p *peerConn) pendingThinState(hash [32]byte) (*pendingThinBlock, bool) {
 	return state, ok
 }
 
+// The recovery handler takes the lease with the state so expiration or peer
+// teardown cannot release its reservation while block validation is using it.
+func (p *peerConn) takePendingThinState(hash [32]byte) (*pendingThinBlock, bool) {
+	p.thinMu.Lock()
+	defer p.thinMu.Unlock()
+	p.pruneExpiredPendingThinLocked(time.Now())
+	state, ok := p.pendingThin[hash]
+	delete(p.pendingThin, hash)
+	return state, ok
+}
+
 func (p *peerConn) deletePendingThin(hash [32]byte) {
 	p.thinMu.Lock()
 	defer p.thinMu.Unlock()

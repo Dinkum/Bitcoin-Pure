@@ -219,6 +219,7 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 		publicPage:          shouldServePublicDashboard(),
 		stopCh:              make(chan struct{}),
 		mineHeaderFn:        consensus.MineHeaderInterruptible,
+		miningTimeFn:        time.Now,
 	}
 	svc.peerMgr = &peerManager{svc: svc}
 	svc.syncMgr = &syncManager{svc: svc}

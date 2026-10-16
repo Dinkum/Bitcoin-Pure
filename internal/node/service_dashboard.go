@@ -252,13 +252,6 @@ type dashboardThroughputBlock struct {
 	BarWidth  int
 }
 
-func (s *Service) isPublicDashboardPath(path string) bool {
-	if path == "/" {
-		return true
-	}
-	return strings.HasPrefix(path, "/block/") || strings.HasPrefix(path, "/tx/")
-}
-
 func (s *Service) handlePublicDashboard(w http.ResponseWriter, r *http.Request) {
 	body, renderedAt, status, err := s.cachedDashboardHTML(r.URL.Path)
 	if err != nil {

@@ -2,11 +2,13 @@ package node
 
 import (
 	"bitcoin-pure/internal/consensus"
+	"bitcoin-pure/internal/mempool"
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/utreexo"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -80,30 +82,36 @@ func (s *Service) handleCommittedBranchTransition(transition committedBranchTran
 	for i := range transition.Connected {
 		s.pool.RemoveConfirmed(&transition.Connected[i])
 		s.avalancheManager().onBlockAccepted(&transition.Connected[i])
-		s.promoteReadyOrphansAfterBlock(&transition.Connected[i])
 		s.removeLocalRebroadcastForBlock(&transition.Connected[i])
 	}
-	// Coinbase maturity is monotonic on a tip extension. Only a reorg can move
-	// the spend height backwards and invalidate a previously mature spend.
+	var reaccepted []mempool.AcceptedTx
+	if txs := transition.DisconnectedTxs; len(txs) > 0 {
+		_, _, reaccepted = s.reprocessTransactions(txs, "reorg_reprocess", false)
+	}
 	if transitionRequiresMempoolContextRecheck(transition) {
 		_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
-		rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{
-			Params:      consensus.ParamsForProfile(s.cfg.Profile),
-			SpendHeight: spendHeight,
-		})
-		if len(rejected) > 0 {
-			txs := make([]types.Transaction, 0, len(rejected))
-			errs := make([]error, 0, len(rejected))
-			for _, reject := range rejected {
-				txs = append(txs, reject.Tx)
-				errs = append(errs, reject.Err)
-			}
-			s.noteRejectedTransactions(txs, errs)
+		rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{Params: consensus.ParamsForProfile(s.cfg.Profile), SpendHeight: spendHeight})
+		txs := make([]types.Transaction, 0, len(rejected))
+		errs := make([]error, 0, len(rejected))
+		for _, reject := range rejected {
+			txs = append(txs, reject.Tx)
+			errs = append(errs, reject.Err)
 		}
+		s.noteRejectedTransactions(txs, errs)
 	}
-	if txs := transition.DisconnectedTxs; len(txs) > 0 {
-		s.reprocessTransactions(txs, "reorg_reprocess", relay)
+	for i := range transition.Connected {
+		s.promoteReadyOrphansAfterBlock(&transition.Connected[i])
 	}
+	if relay && len(reaccepted) > 0 {
+		retained := reaccepted[:0]
+		for _, tx := range reaccepted {
+			if s.pool.Contains(tx.TxID) {
+				retained = append(retained, tx)
+			}
+		}
+		s.broadcastAcceptedTxsToPeers(s.peerSnapshot(), retained)
+	}
+
 	if len(transition.Connected) > 0 || len(transition.DisconnectedTxs) > 0 {
 		s.scheduleMempoolPersistence()
 	}
@@ -111,13 +119,15 @@ func (s *Service) handleCommittedBranchTransition(transition committedBranchTran
 }
 
 func transitionRequiresMempoolContextRecheck(transition committedBranchTransition) bool {
-	return len(transition.DisconnectedTxs) > 0
+	return transition.DisconnectedBlocks > 0 || len(transition.DisconnectedTxs) > 0
 }
 
 func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) {
 	startedAt := time.Now()
 	hash := consensus.HeaderHash(&block.Header)
 
+	s.blockApplyMu.Lock()
+	defer s.blockApplyMu.Unlock()
 	s.stateMu.Lock()
 	beforeTip, ok := s.chainState.tipSnapshot()
 	if !ok {
@@ -128,35 +138,12 @@ func (s *Service) acceptMinedBlock(block types.Block) ([32]byte, uint64, error) 
 		s.stateMu.Unlock()
 		return [32]byte{}, 0, errors.New("stale template")
 	}
-	summary, transition, err := s.chainState.ApplyBlockWithTransition(&block)
-	if err != nil {
-		s.stateMu.Unlock()
-		return [32]byte{}, 0, err
-	}
-	if err := s.headerChain.ApplyHeader(&block.Header); err != nil {
-		s.stateMu.Unlock()
-		return [32]byte{}, 0, err
-	}
-	stored, err := s.headerChain.StoredState()
-	if err != nil {
-		s.stateMu.Unlock()
-		return [32]byte{}, 0, err
-	}
-	if err := s.chainState.Store().WriteHeaderState(stored); err != nil {
-		s.stateMu.Unlock()
-		return [32]byte{}, 0, err
-	}
-	afterTip, ok := s.chainState.tipSnapshot()
-	if !ok {
-		s.stateMu.Unlock()
-		return [32]byte{}, 0, ErrNoTip
-	}
-	height := afterTip.Height
-	if err := s.chainState.Store().SetHeaderHashByHeight(height, hash); err != nil {
-		s.stateMu.Unlock()
-		return [32]byte{}, 0, err
-	}
+	summary, _, transition, err := s.applyBlockAndHeaderLocked(&block)
 	s.stateMu.Unlock()
+	if err != nil {
+		return [32]byte{}, 0, err
+	}
+	height := summary.Height
 
 	if err := s.handleCommittedBranchTransition(transition, true); err != nil {
 		return [32]byte{}, 0, err
@@ -242,9 +229,9 @@ func (s *Service) buildFundingBlock(keyHashes [][32]byte) (types.Block, []Fundin
 		return types.Block{}, nil, errors.New("at least one key hash is required")
 	}
 	params := consensus.ParamsForProfile(s.cfg.Profile)
-	nextTimestamp := ctx.tipHeader.Timestamp + uint64(params.TargetSpacingSecs)
-	if nextTimestamp <= ctx.tipHeader.Timestamp {
-		nextTimestamp = ctx.tipHeader.Timestamp + 1
+	nextTimestamp, err := s.nextMiningTimestamp(ctx.medianTimePast)
+	if err != nil {
+		return types.Block{}, nil, err
 	}
 	nbits, err := consensus.NextWorkRequired(consensus.PrevBlockContext{Height: ctx.height, Header: ctx.tipHeader}, params)
 	if err != nil {
@@ -345,15 +332,48 @@ func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.Chain
 	if len(block.Txs) == 0 || !block.Txs[0].IsCoinbase() {
 		return types.Block{}, false, errors.New("mining requires coinbase-first block")
 	}
-	continueMining := func(nonce uint64) bool {
-		select {
-		case <-s.stopCh:
-			return false
-		default:
-		}
-		return shouldContinue == nil || shouldContinue(nonce)
-	}
 	for {
+		var refreshTimestamp uint64
+		var clockErr error
+		continueMining := func(nonce uint64) bool {
+			select {
+			case <-s.stopCh:
+				return false
+			default:
+			}
+			if shouldContinue != nil && !shouldContinue(nonce) {
+				return false
+			}
+			now, err := s.miningUnixTime()
+			if err != nil {
+				clockErr = err
+				return false
+			}
+			if block.Header.Timestamp > now && block.Header.Timestamp-now > consensus.MaxFutureBlockTimeSeconds {
+				// Rebuild from the current MTP floor on the next attempt.
+				return false
+			}
+			if now > block.Header.Timestamp {
+				refreshTimestamp = now
+				return false
+			}
+			return true
+		}
+		rollTimestamp := func() bool {
+			if refreshTimestamp <= block.Header.Timestamp {
+				return false
+			}
+			oldTimestamp := block.Header.Timestamp
+			block.Header.Timestamp = refreshTimestamp
+			block.Header.Nonce = 0
+			// ASERT derives this candidate's work from its parent, so rolling
+			// time changes only the header search space and does not change nBits.
+			s.logger.Debug("mining rolled block timestamp",
+				slog.Uint64("old_timestamp", oldTimestamp),
+				slog.Uint64("timestamp", refreshTimestamp),
+			)
+			return true
+		}
 		minedHeader, ok, err := mineHeader(block.Header, params, continueMining)
 		if err == nil && ok {
 			block.Header = minedHeader
@@ -363,9 +383,21 @@ func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.Chain
 			return types.Block{}, false, err
 		}
 		if !ok && err == nil {
+			if clockErr != nil {
+				return types.Block{}, false, clockErr
+			}
+			if rollTimestamp() {
+				continue
+			}
 			return types.Block{}, false, nil
 		}
 		if !continueMining(0) {
+			if clockErr != nil {
+				return types.Block{}, false, clockErr
+			}
+			if rollTimestamp() {
+				continue
+			}
 			return types.Block{}, false, nil
 		}
 		nextExtraNonce, wrapped := incrementCoinbaseExtraNonce(*block.Txs[0].Base.CoinbaseExtraNonce)
@@ -382,6 +414,48 @@ func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.Chain
 			slog.Uint64("timestamp", block.Header.Timestamp),
 		)
 	}
+}
+
+func (s *Service) miningUnixTime() (uint64, error) {
+	nowFn := s.miningTimeFn
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn().Unix()
+	if now < 0 {
+		return 0, errors.New("mining clock is before the Unix epoch")
+	}
+	return uint64(now), nil
+}
+
+func (s *Service) nextMiningTimestamp(medianTimePast uint64) (uint64, error) {
+	now, err := s.miningUnixTime()
+	if err != nil {
+		return 0, err
+	}
+	if medianTimePast == ^uint64(0) {
+		return 0, errors.New("median time past cannot be incremented")
+	}
+	minimum := medianTimePast + 1
+	if minimum > now && minimum-now > consensus.MaxFutureBlockTimeSeconds {
+		return 0, fmt.Errorf("%w: minimum mining timestamp %d exceeds local time %d", consensus.ErrTimestampTooFarFuture, minimum, now)
+	}
+	if minimum > now {
+		return minimum, nil
+	}
+	return now, nil
+}
+
+func (s *Service) refreshMiningTimestamp(header *types.BlockHeader, medianTimePast uint64) error {
+	timestamp, err := s.nextMiningTimestamp(medianTimePast)
+	if err != nil {
+		return err
+	}
+	if timestamp != header.Timestamp {
+		header.Timestamp = timestamp
+		header.Nonce = 0
+	}
+	return nil
 }
 
 func rebuildCoinbaseSearchCommitments(block *types.Block, selectionAcc *utreexo.Accumulator) error {

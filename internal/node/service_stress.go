@@ -228,39 +228,7 @@ func (s *Service) createStressLaneBatch(keyHashes [][32]byte, reserveTopUp bool)
 }
 
 func (s *Service) findActiveTxBlockHash(txid [32]byte) ([32]byte, bool, error) {
-	if s.cfg.TxIndexEnabled {
-		return s.chainState.Store().FindActiveTransaction(txid)
-	}
-	var zero [32]byte
-	s.stateMu.RLock()
-	tip := s.chainState.ChainState().TipHeight()
-	s.stateMu.RUnlock()
-	if tip == nil {
-		return zero, false, nil
-	}
-	for height := *tip + 1; height > 0; height-- {
-		blockHeight := height - 1
-		hash, err := s.chainState.Store().GetBlockHashByHeight(blockHeight)
-		if err != nil {
-			return zero, false, err
-		}
-		if hash == nil {
-			continue
-		}
-		block, err := s.chainState.Store().GetBlock(hash)
-		if err != nil {
-			return zero, false, err
-		}
-		if block == nil {
-			continue
-		}
-		for _, tx := range block.Txs {
-			if consensus.TxID(&tx) == txid {
-				return *hash, true, nil
-			}
-		}
-	}
-	return zero, false, nil
+	return s.chainState.Store().FindActiveTransaction(txid)
 }
 
 func (s *Service) waitForStressLaneBatch(batch stressLaneBatch, timeout time.Duration) ([]FundingOutput, StressLaneInfo, error) {

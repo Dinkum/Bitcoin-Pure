@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"unsafe"
 )
 
 type OutPoint struct {
@@ -153,6 +154,7 @@ type reader struct {
 	buf            []byte
 	pos            int
 	borrowPayloads bool
+	reserve        func(int) error
 }
 
 func newReader(buf []byte) *reader {
@@ -475,12 +477,22 @@ func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
 			if r.borrowPayloads {
 				entry.AuthPayload = authPayload
 			} else {
+				if r.reserve != nil {
+					if err := r.reserve(len(authPayload)); err != nil {
+						return TxAuthEntry{}, err
+					}
+				}
 				entry.AuthPayload = append([]byte(nil), authPayload...)
 			}
 		}
 	} else if r.borrowPayloads {
 		entry.AuthPayload = authPayload
 	} else {
+		if r.reserve != nil {
+			if err := r.reserve(len(authPayload)); err != nil {
+				return TxAuthEntry{}, err
+			}
+		}
 		entry.AuthPayload = append([]byte(nil), authPayload...)
 	}
 	return entry, nil
@@ -539,6 +551,11 @@ func decodeTxBase(r *reader) (TxBase, error) {
 		if err != nil {
 			return TxBase{}, err
 		}
+		if r.reserve != nil {
+			if err := r.reserve(8 + CoinbaseExtraNonceLen); err != nil {
+				return TxBase{}, err
+			}
+		}
 		coinbaseHeight = new(uint64)
 		*coinbaseHeight = height
 		extraNonce, err := r.readArray16()
@@ -547,6 +564,9 @@ func decodeTxBase(r *reader) (TxBase, error) {
 		}
 		coinbaseExtraNonce = new([CoinbaseExtraNonceLen]byte)
 		*coinbaseExtraNonce = extraNonce
+	}
+	if err := reserveDecodedSlice[TxInput](r, inputCount); err != nil {
+		return TxBase{}, err
 	}
 	inputs := make([]TxInput, 0, inputCount)
 	for range inputCount {
@@ -559,6 +579,9 @@ func decodeTxBase(r *reader) (TxBase, error) {
 	const maxRepresentableOutputs = uint64(math.MaxUint32) + 1
 	outputCount, err := readCountBoundedByBytes(r, 41, maxRepresentableOutputs, "tx.outputs")
 	if err != nil {
+		return TxBase{}, err
+	}
+	if err := reserveDecodedSlice[TxOutput](r, outputCount); err != nil {
 		return TxBase{}, err
 	}
 	outputs := make([]TxOutput, 0, outputCount)
@@ -600,6 +623,9 @@ func decodeTxAuth(r *reader, expectedEntries int) (TxAuth, error) {
 	}
 	if count != expectedEntries {
 		return TxAuth{}, InvalidFormatError{Reason: "auth entry count must equal input count"}
+	}
+	if err := reserveDecodedSlice[TxAuthEntry](r, count); err != nil {
+		return TxAuth{}, err
 	}
 	entries := make([]TxAuthEntry, 0, count)
 	for range count {
@@ -677,11 +703,20 @@ func decodeTransactionFromReader(r *reader) (Transaction, error) {
 }
 
 func DecodeTransactionWithLimits(buf []byte, limits CodecLimits) (Transaction, error) {
+	return DecodeTransactionWithAllocationBudget(buf, limits, nil)
+}
+
+// DecodeTransactionWithAllocationBudget charges decoded storage before each
+// allocation. The caller separately accounts for buf and owns the reservation
+// until the returned transaction is released or transferred to bounded state.
+func DecodeTransactionWithAllocationBudget(buf []byte, limits CodecLimits, reserve func(int) error) (Transaction, error) {
+
 	maxBytes := limits.MaxBlockBytes
 	if maxBytes > 0 && len(buf) > maxBytes {
 		return Transaction{}, LimitExceededError{Field: "tx.bytes"}
 	}
 	r := newReader(buf)
+	r.reserve = reserve
 	tx, err := decodeTransactionFromReader(r)
 	if err != nil {
 		return Transaction{}, err
@@ -905,17 +940,23 @@ func DecodeBlockWithLimits(buf []byte, limits CodecLimits) (Block, error) {
 // allocation; no independent count constant can reject an otherwise valid
 // block.
 func DecodeBlockWithBudget(buf []byte, maxBytes uint64) (Block, error) {
-	return decodeBlockWithReader(buf, maxBytes, false)
+	return decodeBlockWithReader(buf, maxBytes, false, nil)
 }
 
 // DecodeBlockOwnedBuffer decodes a block while allowing variable-sized
 // authorization payloads to reference buf directly. The caller transfers
 // ownership of buf and must not mutate it while the returned block is in use.
 func DecodeBlockOwnedBuffer(buf []byte, maxBytes uint64) (Block, error) {
-	return decodeBlockWithReader(buf, maxBytes, true)
+	return decodeBlockWithReader(buf, maxBytes, true, nil)
 }
 
-func decodeBlockWithReader(buf []byte, maxBytes uint64, borrowPayloads bool) (Block, error) {
+// DecodeBlockOwnedBufferWithAllocationBudget charges decoded arrays before
+// allocation while borrowing auth payloads from the separately reserved buf.
+func DecodeBlockOwnedBufferWithAllocationBudget(buf []byte, maxBytes uint64, reserve func(int) error) (Block, error) {
+	return decodeBlockWithReader(buf, maxBytes, true, reserve)
+}
+
+func decodeBlockWithReader(buf []byte, maxBytes uint64, borrowPayloads bool, reserve func(int) error) (Block, error) {
 	if maxBytes > 0 && uint64(len(buf)) > maxBytes {
 		return Block{}, LimitExceededError{Field: "block.bytes"}
 	}
@@ -923,12 +964,16 @@ func decodeBlockWithReader(buf []byte, maxBytes uint64, borrowPayloads bool) (Bl
 	if borrowPayloads {
 		r = newBorrowingReader(buf)
 	}
+	r.reserve = reserve
 	header, err := decodeBlockHeader(r)
 	if err != nil {
 		return Block{}, err
 	}
 	txCount, err := readCountBoundedByBytes(r, 64, 0, "block.txs")
 	if err != nil {
+		return Block{}, err
+	}
+	if err := reserveDecodedSlice[Transaction](r, txCount); err != nil {
 		return Block{}, err
 	}
 	txs := make([]Transaction, 0, txCount)
@@ -1015,4 +1060,16 @@ func (e TxAuthEntry) XOnlySignature() ([64]byte, bool) {
 	}
 	copy(signature[:], e.AuthPayload)
 	return signature, true
+}
+
+func reserveDecodedSlice[T any](r *reader, count int) error {
+	if r.reserve == nil {
+		return nil
+	}
+	var value T
+	size := int(unsafe.Sizeof(value))
+	if count < 0 || (size > 0 && count > math.MaxInt/size) {
+		return LimitExceededError{Field: "decoded allocation"}
+	}
+	return r.reserve(count * size)
 }
