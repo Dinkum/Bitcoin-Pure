@@ -548,12 +548,12 @@ func TestPeerConnStagesWireMaxTxBatches(t *testing.T) {
 		txs = append(txs, coinbaseTxForHeight(uint64(i+1), []types.TxOutput{{ValueAtoms: uint64(i + 1), PubKey: nodeSignerPubKey(byte(i + 1))}}))
 	}
 
-	ready, armFlush := peer.stagePendingTxs(txs)
+	ready, armFlush := peer.stagePendingTxs(peer.filterQueuedTxs(txs))
 	if len(ready) != 1 {
 		t.Fatalf("ready tx batches = %d, want 1", len(ready))
 	}
-	if len(ready[0]) != txRelayBatchMaxItems {
-		t.Fatalf("ready tx batch size = %d, want %d", len(ready[0]), txRelayBatchMaxItems)
+	if len(ready[0].txs) != txRelayBatchMaxItems {
+		t.Fatalf("ready tx batch size = %d, want %d", len(ready[0].txs), txRelayBatchMaxItems)
 	}
 	if !armFlush {
 		t.Fatal("remaining tx should arm delayed flush")
@@ -571,7 +571,7 @@ func TestPeerConnPendingTxStoreMaterializesRelayBatchOnce(t *testing.T) {
 	first := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
 	second := coinbaseTxForHeight(2, []types.TxOutput{{ValueAtoms: 2, PubKey: nodeSignerPubKey(10)}})
 
-	ready, armFlush := peer.stagePendingTxs([]types.Transaction{first, second})
+	ready, armFlush := peer.stagePendingTxs(peer.filterQueuedTxs([]types.Transaction{first, second}))
 	if len(ready) != 0 {
 		t.Fatalf("ready batches = %d, want 0", len(ready))
 	}
@@ -586,10 +586,10 @@ func TestPeerConnPendingTxStoreMaterializesRelayBatchOnce(t *testing.T) {
 	if len(batches) != 1 {
 		t.Fatalf("batch count = %d, want 1", len(batches))
 	}
-	if len(batches[0]) != 2 {
-		t.Fatalf("batch tx count = %d, want 2", len(batches[0]))
+	if len(batches[0].txs) != 2 {
+		t.Fatalf("batch tx count = %d, want 2", len(batches[0].txs))
 	}
-	if consensus.TxID(&batches[0][0]) != consensus.TxID(&first) || consensus.TxID(&batches[0][1]) != consensus.TxID(&second) {
+	if consensus.TxID(&batches[0].txs[0]) != consensus.TxID(&first) || consensus.TxID(&batches[0].txs[1]) != consensus.TxID(&second) {
 		t.Fatal("materialized relay batch lost tx order")
 	}
 	if len(peer.pendingTxOrder) != 0 || len(peer.pendingTxByID) != 0 {

@@ -70,6 +70,7 @@ type peerConn struct {
 	telemetry       peerRelayTelemetry
 	syncMu          sync.Mutex
 	syncState       peerSyncState
+	lastAddrUpdate  time.Time
 	avaMu           sync.Mutex
 	avaState        peerAvalancheState
 }
@@ -81,6 +82,21 @@ type incomingBlockTransfer struct {
 	checksum [32]byte
 	file     *os.File
 	updated  time.Time
+	release  func()
+}
+
+func (t *incomingBlockTransfer) close() {
+	if t == nil {
+		return
+	}
+	if t.file != nil {
+		name := t.file.Name()
+		_ = t.file.Close()
+		_ = os.Remove(name)
+	}
+	if t.release != nil {
+		t.release()
+	}
 }
 
 func (p *peerConn) allowBlockServeBytes(size int, now time.Time, maxMessageBytes int) bool {
@@ -111,6 +127,7 @@ type peerAvalancheState struct {
 	pollsReceived int
 	votesSent     int
 	votesReceived int
+	lastPoll      time.Time
 }
 
 type peerBlockRelayState struct {
@@ -151,26 +168,30 @@ type outboundMessage struct {
 	lane       relayQueueLane
 	class      relayMessageClass
 	invItems   []p2p.InvVector
+	txids      [][32]byte
 }
 
 type outboundBlockReference struct {
-	item  p2p.InvVector
-	batch *blockServeBatch
+	item             p2p.InvVector
+	batch            *blockServeBatch
+	recoveryIndexes  []uint32
+	extendedRecovery bool
 }
 
 type blockServeBatch struct {
 	mu        sync.Mutex
 	remaining int64
+	limit     int64
 }
 
 func newBlockServeBatch(limit int64) *blockServeBatch {
 	if limit < 0 {
 		limit = 0
 	}
-	return &blockServeBatch{remaining: limit}
+	return &blockServeBatch{remaining: limit, limit: limit}
 }
 
-func (b *blockServeBatch) tryCharge(size int) bool {
+func (b *blockServeBatch) tryCharge(size int, chunked bool) bool {
 	if b == nil || size < 0 {
 		return false
 	}
@@ -178,7 +199,11 @@ func (b *blockServeBatch) tryCharge(size int) bool {
 	defer b.mu.Unlock()
 	charge := int64(size)
 	if charge > b.remaining {
-		return false
+		if !chunked || b.remaining != b.limit {
+			return false
+		}
+		b.remaining = 0
+		return true
 	}
 	b.remaining -= charge
 	return true
@@ -277,7 +302,8 @@ type peerRelayTelemetry struct {
 	priorityStarvation    int
 	sendStarvation        int
 	lastRelayActivityUnix int64
-	relaySamples          []float64
+	relaySamples          [256]float64
+	relayEvents           int
 }
 
 type queueDepthSnapshot struct {
@@ -367,6 +393,24 @@ func (c *meteredNetConn) Write(buf []byte) (int, error) {
 	return n, err
 }
 
+func (c *meteredNetConn) WriteBuffers(buffers *net.Buffers) (int64, error) {
+	n, err := buffers.WriteTo(c.Conn)
+	if n > 0 && c.meter != nil {
+		c.meter.txBytes.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (p *peerConn) allowAddrUpdate(now time.Time) bool {
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
+	if now.Sub(p.lastAddrUpdate) < time.Minute {
+		return false
+	}
+	p.lastAddrUpdate = now
+	return true
+}
+
 func (p *peerConn) send(msg p2p.Message) error {
 	if inv, ok := msg.(p2p.InvMessage); ok {
 		return p.enqueueInv(inv)
@@ -390,8 +434,12 @@ func (p *peerConn) send(msg p2p.Message) error {
 }
 
 func (p *peerConn) enqueueBlockReference(item p2p.InvVector, batch *blockServeBatch) error {
+	return p.enqueueBlockResponse(&outboundBlockReference{item: item, batch: batch})
+}
+
+func (p *peerConn) enqueueBlockResponse(ref *outboundBlockReference) error {
 	envelope := outboundMessage{
-		blockRef:   &outboundBlockReference{item: item, batch: batch},
+		blockRef:   ref,
 		enqueuedAt: time.Now(),
 		lane:       relayQueueLanePriority,
 		class:      relayMessageClass{blockSendItems: 1},
@@ -546,7 +594,7 @@ func (p *peerConn) enqueueInvItems(items []p2p.InvVector, priority bool) error {
 
 func (p *peerConn) enqueueTxBatch(msg p2p.TxBatchMessage) error {
 	filtered := p.filterQueuedTxs(msg.Txs)
-	if len(filtered) == 0 {
+	if len(filtered.txs) == 0 {
 		return nil
 	}
 	immediate, armFlush := p.stagePendingTxs(filtered)
@@ -567,19 +615,20 @@ func (p *peerConn) enqueueTxBatch(msg p2p.TxBatchMessage) error {
 
 func (p *peerConn) enqueueLocalTxBatch(msg p2p.TxBatchMessage) error {
 	filtered := p.filterQueuedTxs(msg.Txs)
-	if len(filtered) == 0 {
+	if len(filtered.txs) == 0 {
 		return nil
 	}
-	batch := p2p.TxBatchMessage{Txs: filtered}
+	batch := p2p.TxBatchMessage{Txs: filtered.txs}
 	envelope := outboundMessage{
 		msg:        batch,
+		txids:      filtered.txids,
 		enqueuedAt: time.Now(),
 		lane:       relayQueueLaneSend,
 		class:      classifyRelayMessage(batch),
 	}
 	select {
 	case <-p.closed:
-		p.releaseQueuedTxs(filtered)
+		p.releaseQueuedTxIDs(filtered.txids)
 		return io.EOF
 	case p.sendQ <- envelope:
 		p.telemetry.noteEnqueue(p.queueDepths())
@@ -591,15 +640,15 @@ func (p *peerConn) enqueueLocalTxBatch(msg p2p.TxBatchMessage) error {
 	defer timer.Stop()
 	select {
 	case <-p.closed:
-		p.releaseQueuedTxs(filtered)
+		p.releaseQueuedTxIDs(filtered.txids)
 		return io.EOF
 	case p.sendQ <- envelope:
 		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	case <-timer.C:
-		p.releaseQueuedTxs(filtered)
-		p.telemetry.noteDroppedTxs(len(filtered), envelope.lane)
-		p.logRelayQueuePressure(slog.LevelWarn, "dropped local tx batch after send queue backpressure timeout", envelope.lane, envelope.class, len(filtered))
+		p.releaseQueuedTxIDs(filtered.txids)
+		p.telemetry.noteDroppedTxs(len(filtered.txs), envelope.lane)
+		p.logRelayQueuePressure(slog.LevelWarn, "dropped local tx batch after send queue backpressure timeout", envelope.lane, envelope.class, len(filtered.txs))
 		return errors.New("peer send queue saturated")
 	}
 }
@@ -721,13 +770,23 @@ func (p *peerConn) clearIncomingBlockTransfers() {
 	p.blockTransferMu.Lock()
 	defer p.blockTransferMu.Unlock()
 	for hash, transfer := range p.blockTransfers {
-		if transfer.file != nil {
-			name := transfer.file.Name()
-			_ = transfer.file.Close()
-			_ = os.Remove(name)
-		}
+		transfer.close()
 		delete(p.blockTransfers, hash)
 	}
+}
+
+func (p *peerConn) finishRelayEnvelope(envelope outboundMessage, sent bool) {
+	if envelope.txids != nil {
+		if sent {
+			p.noteKnownTxIDs(envelope.txids)
+		}
+		p.releaseQueuedTxIDs(envelope.txids)
+		return
+	}
+	if sent {
+		p.noteKnownTxs(envelope.msg)
+	}
+	p.releaseRelayBatch(envelope.msg)
 }
 
 func (p *peerConn) drainControlQueue() {
@@ -738,7 +797,7 @@ func (p *peerConn) drainControlQueue() {
 		select {
 		case envelope := <-p.controlQ:
 			p.releaseQueuedInv(envelope.invItems)
-			p.releaseRelayBatch(envelope.msg)
+			p.finishRelayEnvelope(envelope, false)
 		default:
 			return
 		}
@@ -753,7 +812,7 @@ func (p *peerConn) drainPriorityRelayQueue() {
 		select {
 		case envelope := <-p.relayPriorityQ:
 			p.releaseQueuedInv(envelope.invItems)
-			p.releaseRelayBatch(envelope.msg)
+			p.finishRelayEnvelope(envelope, false)
 		default:
 			return
 		}
@@ -765,7 +824,7 @@ func (p *peerConn) drainSendQueue() {
 		select {
 		case envelope := <-p.sendQ:
 			p.releaseQueuedInv(envelope.invItems)
-			p.releaseRelayBatch(envelope.msg)
+			p.finishRelayEnvelope(envelope, false)
 		default:
 			return
 		}
@@ -855,17 +914,24 @@ func (p *peerConn) clearRelayState() {
 func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bool {
 	var releaseBlockBudget func()
 	if envelope.blockRef != nil {
-		// Reserve the maximum source-block footprint before touching Pebble or the
-		// recent-block cache. This keeps concurrent lazy loads globally bounded.
-		release, ok := s.blockServeBudget.TryAcquire(s.blockServingLimit())
+		size, checksum, err := s.chainState.Store().BlockManifest(&envelope.blockRef.item.Hash)
+		if err != nil {
+			s.logPeerWriteFailure(peer, envelope, err, "block manifest lookup failed")
+			peer.close()
+			_ = peer.wire.Close()
+			return false
+		}
+		release, ok := s.reserveBlockServing(size)
 		if !ok {
 			envelope.msg = p2p.NotFoundMessage{Items: []p2p.InvVector{envelope.blockRef.item}}
 		} else {
 			releaseBlockBudget = release
-			msg, err := s.resolveQueuedBlockReference(peer, envelope.blockRef)
+			msg, err := s.resolveQueuedBlockReference(peer, envelope.blockRef, int(size), checksum)
 			if err != nil {
 				releaseBlockBudget()
 				s.logPeerWriteFailure(peer, envelope, err, "lazy block response resolution failed")
+				peer.close()
+				_ = peer.wire.Close()
 				return false
 			}
 			envelope.msg = msg
@@ -878,7 +944,7 @@ func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bo
 		if err := peer.wire.SetWriteDeadline(time.Now().Add(s.cfg.StallTimeout)); err != nil {
 			s.logPeerWriteFailure(peer, envelope, err, "peer write deadline setup failed")
 			peer.releaseQueuedInv(envelope.invItems)
-			peer.releaseRelayBatch(envelope.msg)
+			peer.finishRelayEnvelope(envelope, false)
 			peer.close()
 			_ = peer.wire.Close()
 			return false
@@ -897,14 +963,13 @@ func (s *Service) writePeerEnvelope(peer *peerConn, envelope outboundMessage) bo
 	if err := peer.wire.WriteMessage(envelope.msg); err != nil {
 		s.logPeerWriteFailure(peer, envelope, err, "peer write failed")
 		peer.releaseQueuedInv(envelope.invItems)
-		peer.releaseRelayBatch(envelope.msg)
+		peer.finishRelayEnvelope(envelope, false)
 		peer.close()
 		_ = peer.wire.Close()
 		return false
 	}
-	peer.noteKnownTxs(envelope.msg)
 	peer.releaseQueuedInv(envelope.invItems)
-	peer.releaseRelayBatch(envelope.msg)
+	peer.finishRelayEnvelope(envelope, true)
 	peer.telemetry.noteSent(envelope, peer.queueDepth())
 	if budget := relayLaneBudget(envelope.lane); budget > 0 && time.Since(envelope.enqueuedAt) > budget {
 		peer.telemetry.noteWriterStarvation(envelope.lane)

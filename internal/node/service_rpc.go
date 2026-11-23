@@ -8,6 +8,7 @@ import (
 	"bitcoin-pure/internal/rpcserver"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,6 +29,11 @@ type rpcRequest = rpcserver.Request
 type rpcResponse = rpcserver.Response
 
 func (s *Service) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.beginServiceWork() {
+		http.Error(w, "node is stopping", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.wg.Done()
 	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && s.publicPage {
 		s.handlePublicDashboard(w, r)
 		return
@@ -70,31 +76,32 @@ func (s *Service) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	var req rpcRequest
 	decoder := json.NewDecoder(body)
-	if err := decoder.Decode(&req); err != nil {
-		s.logger.Warn("rpc decode failed",
-			slog.String("request_id", requestID),
-			slog.String("remote_addr", r.RemoteAddr),
-			slog.Int("status_code", http.StatusOK),
-			slog.Duration("duration", time.Since(started)),
-			slog.Any("error", err),
-		)
-		s.writeRPCResponse(w, requestID, r.RemoteAddr, "", started, rpcResponse{Error: err.Error()})
-		return
-	}
-	var extra json.RawMessage
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&req)
+	if err == nil {
+		var extra json.RawMessage
+		err = decoder.Decode(&extra)
 		if err == nil {
 			err = errors.New("trailing data after RPC request")
+		} else if errors.Is(err, io.EOF) {
+			err = nil
+		}
+	}
+	if err != nil {
+		status := http.StatusOK
+		var bodyLimit *http.MaxBytesError
+		if errors.As(err, &bodyLimit) {
+			status = http.StatusRequestEntityTooLarge
 		}
 		s.logger.Warn("rpc decode failed",
 			slog.String("request_id", requestID),
 			slog.String("remote_addr", r.RemoteAddr),
 			slog.String("method", req.Method),
-			slog.Int("status_code", http.StatusOK),
+			slog.Int("status_code", status),
 			slog.Duration("duration", time.Since(started)),
 			slog.Any("error", err),
 		)
-		s.writeRPCResponse(w, requestID, r.RemoteAddr, req.Method, started, rpcResponse{Error: err.Error()})
+		s.writeRPCResponse(w, status, requestID, r.RemoteAddr, req.Method, started, rpcResponse{Error: err.Error()})
 		return
 	}
 	s.logger.Debug("rpc request",
@@ -135,10 +142,12 @@ func (s *Service) handleRPC(w http.ResponseWriter, r *http.Request) {
 			slog.Duration("duration", time.Since(started)),
 		)
 	}
-	s.writeRPCResponse(w, requestID, r.RemoteAddr, req.Method, started, resp)
+	s.writeRPCResponse(w, http.StatusOK, requestID, r.RemoteAddr, req.Method, started, resp)
 }
 
-func (s *Service) writeRPCResponse(w http.ResponseWriter, requestID string, remoteAddr string, method string, started time.Time, resp rpcResponse) {
+func (s *Service) writeRPCResponse(w http.ResponseWriter, status int, requestID string, remoteAddr string, method string, started time.Time, resp rpcResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(resp); err != nil && s.logger != nil {
 		s.logger.Warn("rpc response write failed",
 			slog.String("request_id", requestID),
@@ -271,10 +280,11 @@ type rpcGetTxStatusParams struct {
 }
 
 type rpcGetTxStatusResult struct {
-	TxID      string `json:"txid"`
-	Confirmed bool   `json:"confirmed"`
-	Mempool   bool   `json:"mempool"`
-	BlockHash string `json:"block_hash,omitempty"`
+	TxID               string `json:"txid"`
+	Confirmed          bool   `json:"confirmed"`
+	Mempool            bool   `json:"mempool"`
+	BlockHash          string `json:"block_hash,omitempty"`
+	HistoryUnavailable bool   `json:"history_unavailable,omitempty"`
 }
 
 type rpcGetUTXOsByPubKeysParams struct {
@@ -586,13 +596,15 @@ func (s *Service) rpcGetTxStatus(params rpcGetTxStatusParams) (rpcGetTxStatusRes
 		return rpcGetTxStatusResult{}, err
 	}
 	blockHash, confirmed, err := s.findActiveTxBlockHash(txid)
-	if err != nil {
+	historyUnavailable := errors.Is(err, storage.ErrTransactionScanLimit)
+	if err != nil && !historyUnavailable {
 		return rpcGetTxStatusResult{}, err
 	}
 	result := rpcGetTxStatusResult{
-		TxID:      hex.EncodeToString(txid[:]),
-		Confirmed: confirmed,
-		Mempool:   s.pool.Contains(txid),
+		TxID:               hex.EncodeToString(txid[:]),
+		Confirmed:          confirmed,
+		Mempool:            s.pool.Contains(txid),
+		HistoryUnavailable: historyUnavailable,
 	}
 	if confirmed {
 		result.BlockHash = hex.EncodeToString(blockHash[:])
@@ -826,6 +838,10 @@ func (s *Service) submitRPCDecodedTxBatch(txs []types.Transaction, decodeDuratio
 }
 
 func (s *Service) rpcMine(params rpcMineParams) ([]string, error) {
+	const maxMineBlocks = 10_000
+	if params.Count > maxMineBlocks {
+		return nil, fmt.Errorf("count exceeds %d blocks", maxMineBlocks)
+	}
 	if params.Count <= 0 {
 		params.Count = 1
 	}
@@ -919,11 +935,13 @@ func (s *Service) rpcAddPeer(params rpcAddPeerParams) (rpcAddPeerResult, error) 
 	if params.Addr == "" {
 		return rpcAddPeerResult{}, errors.New("addr is required")
 	}
-	s.safeGoDetached("rpc-addpeer", func() {
+	if !s.safeGo("rpc-addpeer", func() {
 		if err := s.ConnectPeer(params.Addr); err != nil {
 			s.logger.Warn("rpc addpeer failed", slog.String("addr", params.Addr), slog.Any("error", err))
 		}
-	})
+	}) {
+		return rpcAddPeerResult{}, ErrServiceStopping
+	}
 	return rpcAddPeerResult{Addr: params.Addr}, nil
 }
 
@@ -946,7 +964,12 @@ func parseRPCPubKeys(raw []string) ([][32]byte, error) {
 	return pubKeys, nil
 }
 
+const MaxRPCWatchItems = 4096
+
 func decodeRPCWatchItems(raw []rpcWatchItemParam) ([]compactfilter.WatchItem, error) {
+	if len(raw) > MaxRPCWatchItems {
+		return nil, fmt.Errorf("watchitems exceeds %d items", MaxRPCWatchItems)
+	}
 	items := make([]compactfilter.WatchItem, 0, len(raw))
 	for i, item := range raw {
 		payload32, err := decodeProofHex32(item.Payload32, fmt.Sprintf("watchitems[%d].payload32", i))
@@ -959,6 +982,10 @@ func decodeRPCWatchItems(raw []rpcWatchItemParam) ([]compactfilter.WatchItem, er
 }
 
 func decodeRPCOutPointParams(raw []rpcOutPointParam, field string) ([]types.OutPoint, error) {
+	const maxOutPoints = 4096
+	if len(raw) > maxOutPoints {
+		return nil, fmt.Errorf("%s exceeds %d items", field, maxOutPoints)
+	}
 	outPoints := make([]types.OutPoint, 0, len(raw))
 	for i, item := range raw {
 		txid, err := decodeProofHex32(item.TxID, fmt.Sprintf("%s[%d].txid", field, i))
@@ -1030,11 +1057,12 @@ func (s *Service) authorizeRPC(r *http.Request) bool {
 		return allowUnauthenticatedLoopbackRPC(r)
 	}
 	const prefix = "Bearer "
-	header := r.Header.Get("Authorization")
-	if strings.HasPrefix(header, prefix) && strings.TrimPrefix(header, prefix) == s.cfg.RPCAuthToken {
-		return true
+	token := []byte(s.cfg.RPCAuthToken)
+	bearer, hasBearer := strings.CutPrefix(r.Header.Get("Authorization"), prefix)
+	if !hasBearer {
+		bearer = ""
 	}
-	return r.Header.Get("X-BPU-Auth") == s.cfg.RPCAuthToken
+	return subtle.ConstantTimeCompare([]byte(bearer), token)|subtle.ConstantTimeCompare([]byte(r.Header.Get("X-BPU-Auth")), token) == 1
 }
 
 func allowUnauthenticatedLoopbackRPC(r *http.Request) bool {

@@ -31,6 +31,9 @@ type dashboardCache struct {
 	renderedAt time.Time
 	view       *publicDashboardView
 	pages      map[string]string
+
+	blockMu sync.Mutex
+	blocks  map[[32]byte]dashboardBlockPage
 }
 
 type dashboardBlockWindow struct {
@@ -376,61 +379,58 @@ func (s *Service) dashboardBlockWindow(now time.Time, recentLimit int, previewLi
 		return out, nil
 	}
 	chartCutoff := now.Add(-time.Hour)
-	s.stateMu.RLock()
-	tip := s.chainState.ChainState().TipHeight()
-	s.stateMu.RUnlock()
-	if tip == nil {
+	tip, ok := s.chainState.tipSnapshot()
+	if !ok {
 		return out, nil
 	}
-	maxScan := chartLimit
-	if maxScan < recentLimit {
-		maxScan = recentLimit
-	}
+	maxScan := max(chartLimit, recentLimit)
 	out.recent = make([]dashboardBlockPage, 0, recentLimit)
-	out.chart = make([]dashboardBlockPage, 0, maxScan)
-	for height := *tip + 1; height > 0; {
-		height--
+	out.chart = make([]dashboardBlockPage, 0, chartLimit)
+	s.dashboard.blockMu.Lock()
+	defer s.dashboard.blockMu.Unlock()
+	nextCache := make(map[[32]byte]dashboardBlockPage, maxScan)
+	hash := tip.TipHash
+	for height := tip.Height; ; height-- {
 		pagePreviewLimit := 0
 		if len(out.recent) < recentLimit {
 			pagePreviewLimit = previewLimit
 		}
-		page, err := s.dashboardBlockPageAt(height, pagePreviewLimit)
-		if err != nil {
-			return dashboardBlockWindow{}, err
+		page, cached := s.dashboard.blocks[hash]
+		if !cached || len(page.PreviewTxs) < min(pagePreviewLimit, page.TxCount) {
+			var err error
+			page, err = s.dashboardBlockPage(height, hash, pagePreviewLimit)
+			if err != nil {
+				return dashboardBlockWindow{}, err
+			}
 		}
+		// The parent hash keeps this window on one chain through a concurrent reorg.
+		nextCache[hash] = page
+		hash = page.PrevHash
 		if len(out.recent) < recentLimit {
 			out.recent = append(out.recent, page)
 		}
 		if len(out.chart) < chartLimit {
+			page.PreviewTxs = nil
 			out.chart = append(out.chart, page)
 		}
 		chartSatisfied := len(out.chart) >= chartLimit || (page.Timestamp.Before(chartCutoff) && len(out.chart) != 0)
-		if len(out.recent) >= recentLimit && chartSatisfied {
-			break
-		}
-		if height == 0 {
+		if height == 0 || (len(out.recent) >= recentLimit && chartSatisfied) {
 			break
 		}
 	}
+	s.dashboard.blocks = nextCache
 	return out, nil
 }
 
-func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboardBlockPage, error) {
-	hash, err := s.chainState.Store().GetBlockHashByHeight(height)
-	if err != nil {
-		return dashboardBlockPage{}, err
-	}
-	if hash == nil {
-		return dashboardBlockPage{}, fmt.Errorf("missing block hash at height %d", height)
-	}
-	block, err := s.chainState.Store().GetBlock(hash)
+func (s *Service) dashboardBlockPage(height uint64, hash [32]byte, previewLimit int) (dashboardBlockPage, error) {
+	block, err := s.chainState.Store().GetBlock(&hash)
 	if err != nil {
 		return dashboardBlockPage{}, err
 	}
 	if block == nil {
 		return dashboardBlockPage{}, fmt.Errorf("missing block at height %d", height)
 	}
-	undo, err := s.chainState.Store().GetUndo(hash)
+	undo, err := s.chainState.Store().GetUndo(&hash)
 	if err != nil {
 		return dashboardBlockPage{}, err
 	}
@@ -440,7 +440,7 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 	}
 	page := dashboardBlockPage{
 		Height:      height,
-		Hash:        *hash,
+		Hash:        hash,
 		PrevHash:    block.Header.PrevBlockHash,
 		Timestamp:   time.Unix(int64(block.Header.Timestamp), 0).UTC(),
 		NBits:       block.Header.NBits,
@@ -454,39 +454,43 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 	fees := make([]uint64, 0, len(block.Txs))
 	feeRates := make([]uint64, 0, len(block.Txs))
 	for i, tx := range block.Txs {
-		txPage := dashboardTxPage{
-			BlockHeight: height,
-			BlockHash:   *hash,
-			Timestamp:   page.Timestamp,
-			TxID:        consensus.TxID(&tx),
-			Coinbase:    i == 0,
-			Size:        tx.EncodedLen(),
-			AuthCount:   len(tx.Auth.Entries),
+		preview := len(page.PreviewTxs) < previewLimit
+		txPage := dashboardTxPage{Coinbase: i == 0, Size: tx.EncodedLen()}
+		if preview {
+			txPage.BlockHeight = height
+			txPage.BlockHash = hash
+			txPage.Timestamp = page.Timestamp
+			txPage.TxID = consensus.TxID(&tx)
+			txPage.AuthCount = len(tx.Auth.Entries)
+			txPage.Outputs = make([]dashboardTxOutput, 0, len(tx.Base.Outputs))
 		}
-		for _, output := range tx.Base.Outputs {
-			txPage.OutputSum += output.ValueAtoms
-		}
-		txPage.Outputs = make([]dashboardTxOutput, 0, len(tx.Base.Outputs))
 		for idx, output := range tx.Base.Outputs {
-			txPage.Outputs = append(txPage.Outputs, dashboardTxOutput{
-				Index:  idx,
-				Amount: output.ValueAtoms,
-				PubKey: output.PubKey,
-			})
+			txPage.OutputSum += output.ValueAtoms
+			if preview {
+				txPage.Outputs = append(txPage.Outputs, dashboardTxOutput{
+					Index:  idx,
+					Amount: output.ValueAtoms,
+					PubKey: output.PubKey,
+				})
+			}
 		}
 		if !txPage.Coinbase {
 			page.TotalUserTxs++
-			txPage.Inputs = make([]dashboardTxInput, 0, len(tx.Base.Inputs))
+			if preview {
+				txPage.Inputs = make([]dashboardTxInput, 0, len(tx.Base.Inputs))
+			}
 			for _, input := range tx.Base.Inputs {
 				entry, ok := resolvedInputs[input.PrevOut]
 				if !ok {
-					return dashboardBlockPage{}, fmt.Errorf("missing resolved input %v for block %x", input.PrevOut, *hash)
+					return dashboardBlockPage{}, fmt.Errorf("missing resolved input %v for block %x", input.PrevOut, hash)
 				}
 				txPage.InputSum += entry.ValueAtoms
-				txPage.Inputs = append(txPage.Inputs, dashboardTxInput{
-					PrevOut: input.PrevOut,
-					Amount:  entry.ValueAtoms,
-				})
+				if preview {
+					txPage.Inputs = append(txPage.Inputs, dashboardTxInput{
+						PrevOut: input.PrevOut,
+						Amount:  entry.ValueAtoms,
+					})
+				}
 			}
 			txPage.Fee = txPage.InputSum - txPage.OutputSum
 			if txPage.Size > 0 {
@@ -501,7 +505,7 @@ func (s *Service) dashboardBlockPageAt(height uint64, previewLimit int) (dashboa
 				page.PaidTxs++
 			}
 		}
-		if len(page.PreviewTxs) < previewLimit {
+		if preview {
 			page.PreviewTxs = append(page.PreviewTxs, txPage)
 		}
 	}

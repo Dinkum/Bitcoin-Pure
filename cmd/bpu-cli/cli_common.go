@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -13,12 +14,14 @@ import (
 	"os"
 	osuser "os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"bitcoin-pure/internal/config"
+	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/node"
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/wallet"
@@ -191,25 +194,6 @@ func openWalletStore(walletDir string, cfg config.Config) (*wallet.Store, string
 	return store, path, nil
 }
 
-func samePath(left string, right string) bool {
-	left = strings.TrimSpace(left)
-	right = strings.TrimSpace(right)
-	if left == "" || right == "" {
-		return false
-	}
-	leftEval, leftEvalErr := filepath.EvalSymlinks(left)
-	rightEval, rightEvalErr := filepath.EvalSymlinks(right)
-	if leftEvalErr == nil && rightEvalErr == nil {
-		return leftEval == rightEval
-	}
-	leftAbs, leftErr := filepath.Abs(filepath.Clean(left))
-	rightAbs, rightErr := filepath.Abs(filepath.Clean(right))
-	if leftErr == nil && rightErr == nil {
-		return leftAbs == rightAbs
-	}
-	return filepath.Clean(left) == filepath.Clean(right)
-}
-
 func formatConfigFlag(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -336,6 +320,13 @@ func resolveRPCAuthToken(cfg config.Config, override string) string {
 	return cfg.RPCAuthToken
 }
 
+func walletSyncError(err error, name string, cfg config.Config, override string) error {
+	if errors.Is(err, wallet.ErrWalletNotFound) {
+		return walletCommandError(name, err)
+	}
+	return walletRPCError(err, cfg, override)
+}
+
 func walletRPCError(err error, cfg config.Config, override string) error {
 	if err == nil {
 		return nil
@@ -361,72 +352,108 @@ func walletCommandError(walletName string, err error) error {
 	}
 }
 
-func reconcileWalletPending(store *wallet.Store, client *cliRPCClient, walletName string, utxos []wallet.SpendableUTXO, confirmed map[[32]byte]struct{}) error {
-	var txids []string
-	if err := client.Call("getmempool", map[string]any{}, &txids); err != nil {
-		return err
-	}
-	mempool := make(map[[32]byte]struct{}, len(txids))
-	for _, raw := range txids {
-		txid, err := decodeHex32(raw)
-		if err != nil {
-			continue
-		}
-		mempool[txid] = struct{}{}
-	}
-	_, err := store.ReconcilePendingWithStatus(walletName, mempool, utxos, confirmed)
-	return err
-}
-
-func walletReconcileActivityLimit(store *wallet.Store, walletName string, fallback int) int {
+// historyLimit is zero for commands that need spendable coins, and positive
+// for wallet history, which needs coins only when it has pending spends.
+func syncWalletState(store *wallet.Store, client *cliRPCClient, walletName string, historyLimit int) ([]wallet.SpendableUTXO, []walletActivityRPCItem, error) {
 	entry, err := store.Wallet(walletName)
 	if err != nil {
-		return fallback
+		return nil, nil, err
 	}
-	return walletMinInt(walletActivityRPCLimitMax, walletMaxInt(fallback, len(entry.Pending)*2))
+	watchItems, err := store.SpendableWatchItems(walletName)
+	if err != nil {
+		return nil, nil, err
+	}
+	var utxos []wallet.SpendableUTXO
+	if historyLimit == 0 || len(entry.Pending) != 0 {
+		utxos, err = rpcUTXOsByWatchItems(client, watchItems)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	activityLimit := historyLimit
+	if len(entry.Pending) != 0 {
+		activityLimit = max(activityLimit, 20, 2*min(len(entry.Pending), walletActivityRPCLimitMax))
+		activityLimit = min(activityLimit, walletActivityRPCLimitMax)
+	}
+	var activity []walletActivityRPCItem
+	if activityLimit > 0 {
+		activity, err = rpcWalletActivityByWatchItems(client, watchItems, activityLimit)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if len(entry.Pending) == 0 {
+		return utxos, activity, nil
+	}
+
+	observed, err := walletPendingStatus(client, entry.Pending, activity)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := store.ReconcilePendingWithStatus(walletName, observed, utxos); err != nil {
+		return nil, nil, err
+	}
+	return utxos, activity, nil
 }
 
-func confirmedWalletTxIDs(client *cliRPCClient, store *wallet.Store, walletName string, activity []walletActivityRPCItem) (map[[32]byte]struct{}, error) {
-	out := make(map[[32]byte]struct{}, len(activity))
+func walletPendingStatus(client *cliRPCClient, pending []wallet.PendingTx, activity []walletActivityRPCItem) (map[string]wallet.PendingStatus, error) {
+	confirmed := make(map[[32]byte]struct{}, len(activity))
 	for _, item := range activity {
-		txid, err := decodeHex32(item.TxID)
-		if err != nil {
-			continue
+		if txid, err := decodeHex32(item.TxID); err == nil {
+			confirmed[txid] = struct{}{}
 		}
-		out[txid] = struct{}{}
 	}
-	entry, err := store.Wallet(walletName)
-	if err != nil {
-		return nil, err
+	statuses := make([]wallet.PendingStatus, len(pending))
+	errs := make([]error, len(pending))
+	workers := min(4, len(pending))
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Go(func() {
+			for i := worker; i < len(pending); i += workers {
+				status := &statuses[i]
+				status.CreatedAt = pending[i].CreatedAt
+				txid, err := decodeHex32(pending[i].TxID)
+				if err != nil {
+					continue
+				}
+				if _, ok := confirmed[txid]; ok {
+					status.Confirmed = true
+					continue
+				}
+				var result walletTxStatusRPCItem
+				errs[i] = client.Call("gettxstatus", map[string]string{"txid": pending[i].TxID}, &result)
+				status.Confirmed = result.Confirmed
+				status.InMempool = result.Mempool
+			}
+		})
 	}
-	for _, pending := range entry.Pending {
-		txid, err := decodeHex32(pending.TxID)
-		if err != nil {
-			continue
+	wg.Wait()
+	out := make(map[string]wallet.PendingStatus, len(pending))
+	for i, observation := range statuses {
+		if errs[i] != nil {
+			return nil, errs[i]
 		}
-		if _, ok := out[txid]; ok {
-			continue
-		}
-		status, err := rpcTxStatus(client, pending.TxID)
-		if err != nil {
-			return nil, err
-		}
-		if status.Confirmed {
-			out[txid] = struct{}{}
-		}
+		out[pending[i].TxID] = observation
 	}
 	return out, nil
 }
 
-func rpcUTXOsByPubKeys(client *cliRPCClient, pubKeys [][32]byte) ([]wallet.SpendableUTXO, error) {
-	items := make([]wallet.WatchItem, 0, len(pubKeys))
-	for _, pubKey := range pubKeys {
-		items = append(items, wallet.WatchItem{Type: types.OutputXOnlyP2PK, Payload32: pubKey})
+func rpcUTXOsByWatchItems(client *cliRPCClient, items []wallet.WatchItem) ([]wallet.SpendableUTXO, error) {
+	if len(items) <= node.MaxRPCWatchItems {
+		return rpcUTXOsByWatchItemBatch(client, items)
 	}
-	return rpcUTXOsByWatchItems(client, items)
+	var out []wallet.SpendableUTXO
+	for batch := range slices.Chunk(items, node.MaxRPCWatchItems) {
+		utxos, err := rpcUTXOsByWatchItemBatch(client, batch)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, utxos...)
+	}
+	return out, nil
 }
 
-func rpcUTXOsByWatchItems(client *cliRPCClient, items []wallet.WatchItem) ([]wallet.SpendableUTXO, error) {
+func rpcUTXOsByWatchItemBatch(client *cliRPCClient, items []wallet.WatchItem) ([]wallet.SpendableUTXO, error) {
 	params := struct {
 		WatchItems []struct {
 			Type      uint64 `json:"type"`
@@ -499,29 +526,54 @@ type walletActivityRPCItem struct {
 }
 
 type walletTxStatusRPCItem struct {
-	TxID      string `json:"txid"`
-	Confirmed bool   `json:"confirmed"`
-	Mempool   bool   `json:"mempool"`
-	BlockHash string `json:"block_hash"`
-}
-
-func rpcTxStatus(client *cliRPCClient, txid string) (walletTxStatusRPCItem, error) {
-	var result walletTxStatusRPCItem
-	if err := client.Call("gettxstatus", map[string]string{"txid": txid}, &result); err != nil {
-		return walletTxStatusRPCItem{}, err
-	}
-	return result, nil
-}
-
-func rpcWalletActivityByPubKeys(client *cliRPCClient, pubKeys [][32]byte, limit int) ([]walletActivityRPCItem, error) {
-	items := make([]wallet.WatchItem, 0, len(pubKeys))
-	for _, pubKey := range pubKeys {
-		items = append(items, wallet.WatchItem{Type: types.OutputXOnlyP2PK, Payload32: pubKey})
-	}
-	return rpcWalletActivityByWatchItems(client, items, limit)
+	Confirmed bool `json:"confirmed"`
+	Mempool   bool `json:"mempool"`
 }
 
 func rpcWalletActivityByWatchItems(client *cliRPCClient, items []wallet.WatchItem, limit int) ([]walletActivityRPCItem, error) {
+	if len(items) <= node.MaxRPCWatchItems {
+		return rpcWalletActivityByWatchItemBatch(client, items, limit)
+	}
+	type activityKey struct {
+		height          uint64
+		txid, blockHash string
+	}
+	merged := make(map[activityKey]walletActivityRPCItem)
+	for batch := range slices.Chunk(items, node.MaxRPCWatchItems) {
+		// A row in the global top limit also ranks within the top limit
+		// of every batch that contains that transaction.
+		rows, err := rpcWalletActivityByWatchItemBatch(client, batch, limit)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			key := activityKey{row.Height, row.TxID, row.BlockHash}
+			if existing, ok := merged[key]; ok {
+				row.Received += existing.Received
+				row.Sent += existing.Sent
+				row.Fee = max(row.Fee, existing.Fee)
+				row.Net = int64(row.Received) - int64(row.Sent)
+			}
+			merged[key] = row
+		}
+	}
+	out := make([]walletActivityRPCItem, 0, len(merged))
+	for _, row := range merged {
+		out = append(out, row)
+	}
+	slices.SortFunc(out, func(left, right walletActivityRPCItem) int {
+		if byHeight := cmp.Compare(right.Height, left.Height); byHeight != 0 {
+			return byHeight
+		}
+		if byTxID := strings.Compare(left.TxID, right.TxID); byTxID != 0 {
+			return byTxID
+		}
+		return strings.Compare(left.BlockHash, right.BlockHash)
+	})
+	return out[:min(limit, len(out))], nil
+}
+
+func rpcWalletActivityByWatchItemBatch(client *cliRPCClient, items []wallet.WatchItem, limit int) ([]walletActivityRPCItem, error) {
 	params := struct {
 		WatchItems []struct {
 			Type      uint64 `json:"type"`
@@ -576,10 +628,10 @@ func rpcMempoolInfo(client *cliRPCClient) (*node.MempoolInfo, error) {
 }
 
 type cliNodeStatus struct {
-	Info    node.ServiceInfo
-	Mempool node.MempoolInfo
-	Mining  node.MiningInfo
-	Peers   []node.PeerInfo
+	Info    node.ServiceInfo `json:"info"`
+	Mempool node.MempoolInfo `json:"mempool"`
+	Mining  node.MiningInfo  `json:"mining"`
+	Peers   []node.PeerInfo  `json:"peers"`
 }
 
 func fetchNodeStatus(client *cliRPCClient) (cliNodeStatus, error) {
@@ -695,13 +747,11 @@ func flagWasPassed(fs *flag.FlagSet, name string) bool {
 }
 
 func decodeHex32(raw string) ([32]byte, error) {
-	var out [32]byte
-	buf, err := hex.DecodeString(strings.TrimSpace(raw))
-	if err != nil || len(buf) != 32 {
-		return out, fmt.Errorf("invalid 32-byte hex: %q", raw)
+	hash, err := crypto.ParseHash32Hex(strings.TrimSpace(raw))
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("invalid 32-byte hex: %q", raw)
 	}
-	copy(out[:], buf)
-	return out, nil
+	return hash.Array(), nil
 }
 
 func fileExists(path string) bool {

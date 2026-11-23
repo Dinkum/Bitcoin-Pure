@@ -113,18 +113,12 @@ func (p ChainProfile) IsRegtestLike() bool {
 }
 
 type CodecLimits struct {
-	MaxInputs      int
-	MaxOutputs     int
-	MaxTxsPerBlock int
-	MaxBlockBytes  int
+	MaxBlockBytes int
 }
 
 func DefaultCodecLimits() CodecLimits {
 	return CodecLimits{
-		MaxInputs:      100_000,
-		MaxOutputs:     100_000,
-		MaxTxsPerBlock: 200_000,
-		MaxBlockBytes:  64_000_000,
+		MaxBlockBytes: 64_000_000,
 	}
 }
 
@@ -498,7 +492,10 @@ func decodeTxAuthEntry(r *reader) (TxAuthEntry, error) {
 	return entry, nil
 }
 
-func (b TxBase) Encode(out *[]byte) {
+func (b TxBase) Encode(out *[]byte) error {
+	if len(b.Inputs) == 0 && (b.CoinbaseHeight == nil || b.CoinbaseExtraNonce == nil) {
+		return InvalidFormatError{Reason: "coinbase tx is missing canonical metadata"}
+	}
 	writeU32LE(out, b.Version)
 	writeVarInt(out, uint64(len(b.Inputs)))
 	if len(b.Inputs) == 0 {
@@ -515,6 +512,7 @@ func (b TxBase) Encode(out *[]byte) {
 	for _, output := range b.Outputs {
 		output.Encode(out)
 	}
+	return nil
 }
 
 func (b TxBase) EncodedLen() int {
@@ -642,9 +640,12 @@ func (t Transaction) IsCoinbase() bool {
 	return len(t.Base.Inputs) == 0 && t.Base.CoinbaseHeight != nil && t.Base.CoinbaseExtraNonce != nil
 }
 
+// EncodeBase returns nil if required coinbase metadata is missing.
 func (t Transaction) EncodeBase() []byte {
 	out := make([]byte, 0, t.Base.EncodedLen())
-	t.Base.Encode(&out)
+	if err := t.Base.Encode(&out); err != nil {
+		return nil
+	}
 	return out
 }
 
@@ -659,8 +660,11 @@ func (t Transaction) Encode() []byte {
 	return t.AppendEncode(out)
 }
 
+// AppendEncode returns nil if required coinbase metadata is missing.
 func (t Transaction) AppendEncode(out []byte) []byte {
-	t.Base.Encode(&out)
+	if err := t.Base.Encode(&out); err != nil {
+		return nil
+	}
 	t.Auth.Encode(&out)
 	return out
 }
@@ -818,11 +822,14 @@ func (b Block) Encode() []byte {
 	return b.AppendEncode(out)
 }
 
+// AppendEncode returns nil if a transaction lacks required coinbase metadata.
 func (b Block) AppendEncode(out []byte) []byte {
 	encodeBlockHeader(&out, b.Header)
 	writeVarInt(&out, uint64(len(b.Txs)))
 	for _, tx := range b.Txs {
-		tx.Base.Encode(&out)
+		if err := tx.Base.Encode(&out); err != nil {
+			return nil
+		}
 		tx.Auth.Encode(&out)
 	}
 	return out

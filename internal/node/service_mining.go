@@ -38,15 +38,15 @@ func (s *Service) mineOneBlock() ([32]byte, error) {
 	return s.minerManager().mineOneBlock()
 }
 
-func (s *Service) mineBlockTemplate(block types.Block, generation uint64) (types.Block, bool, error) {
-	params := consensus.ParamsForProfile(s.cfg.Profile)
-	selectionAcc, fresh, err := s.miningSelectionAccumulator(block)
-	if err != nil {
-		return types.Block{}, false, err
+func (s *Service) mineBlockTemplate(block types.Block, selectionAcc *utreexo.Accumulator, generation uint64) (types.Block, bool, error) {
+	tip, ok := s.chainState.tipSnapshot()
+	if !ok {
+		return types.Block{}, false, ErrNoTip
 	}
-	if !fresh {
+	if block.Header.PrevBlockHash != tip.TipHash {
 		return types.Block{}, false, nil
 	}
+	params := consensus.ParamsForProfile(s.cfg.Profile)
 	return s.mineBlockSearchSpace(block, params, selectionAcc, func(uint64) bool {
 		return s.currentTemplateGeneration() == generation
 	})
@@ -90,7 +90,7 @@ func (s *Service) handleCommittedBranchTransition(transition committedBranchTran
 	}
 	if transitionRequiresMempoolContextRecheck(transition) {
 		_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
-		rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{Params: consensus.ParamsForProfile(s.cfg.Profile), SpendHeight: spendHeight})
+		rejected := s.pool.RemoveContextuallyInvalid(chainLookup, consensus.TxValidationContext{Params: consensus.ParamsForProfile(s.cfg.Profile), SpendHeight: spendHeight}, consensus.DefaultConsensusRules())
 		txs := make([]types.Transaction, 0, len(rejected))
 		errs := make([]error, 0, len(rejected))
 		for _, reject := range rejected {
@@ -304,26 +304,6 @@ func coinbaseTxForHeight(height uint64, outputs []types.TxOutput) types.Transact
 	}
 }
 
-func (s *Service) miningSelectionAccumulator(block types.Block) (*utreexo.Accumulator, bool, error) {
-	s.stateMu.RLock()
-	view, ok := s.chainState.sharedCommittedView()
-	s.stateMu.RUnlock()
-	if !ok {
-		return nil, false, ErrNoTip
-	}
-	if block.Header.PrevBlockHash != view.TipHash {
-		return nil, false, nil
-	}
-	if len(block.Txs) <= 1 {
-		return view.UTXOAcc, true, nil
-	}
-	nextAcc, err := view.UTXOAcc.Apply(blockSpendOutPoints(block.Txs[1:]), blockCreatedLeaves(block.Txs[1:]))
-	if err != nil {
-		return nil, false, err
-	}
-	return nextAcc, true, nil
-}
-
 func (s *Service) mineBlockSearchSpace(block types.Block, params consensus.ChainParams, selectionAcc *utreexo.Accumulator, shouldContinue func(uint64) bool) (types.Block, bool, error) {
 	mineHeader := s.mineHeaderFn
 	if mineHeader == nil {
@@ -488,27 +468,6 @@ func coinbaseLeaves(txid [32]byte, outputs []types.TxOutput) []utreexo.UtxoLeaf 
 		leaves = append(leaves, utxoLeafForOutput(types.OutPoint{TxID: txid, Vout: uint32(vout)}, output))
 	}
 	return leaves
-}
-
-func blockSpendOutPoints(txs []types.Transaction) []types.OutPoint {
-	spent := make([]types.OutPoint, 0)
-	for _, tx := range txs {
-		for _, input := range tx.Base.Inputs {
-			spent = append(spent, input.PrevOut)
-		}
-	}
-	return spent
-}
-
-func blockCreatedLeaves(txs []types.Transaction) []utreexo.UtxoLeaf {
-	created := make([]utreexo.UtxoLeaf, 0)
-	for _, tx := range txs {
-		txid := consensus.TxID(&tx)
-		for vout, output := range tx.Base.Outputs {
-			created = append(created, utxoLeafForOutput(types.OutPoint{TxID: txid, Vout: uint32(vout)}, output))
-		}
-	}
-	return created
 }
 
 func (s *Service) chainUtxoSnapshotWithTip() ([32]byte, uint64, consensus.UtxoLookup) {

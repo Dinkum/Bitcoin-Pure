@@ -551,3 +551,77 @@ func TestAcceptTxProtectsRequiredParentsDuringMempoolEviction(t *testing.T) {
 		t.Fatalf("expected child tx %x to be admitted", childAdmission.TxID)
 	}
 }
+
+func TestRejectedDescendantLeavesFullMempoolUnchanged(t *testing.T) {
+	parentPrev := types.OutPoint{TxID: [32]byte{111}}
+	otherPrev := types.OutPoint{TxID: [32]byte{112}}
+	parent := spendTx(t, 1, parentPrev, 100, 3, 1)
+	other := spendTx(t, 2, otherPrev, 100, 4, 1)
+	child := spendTx(t, 3, types.OutPoint{TxID: consensus.TxID(&parent)}, 99, 5, 80)
+	pool := NewWithConfig(PoolConfig{MaxMempoolBytes: parent.EncodedLen() + other.EncodedLen(), MaxDescendants: 1})
+	utxos := consensus.UtxoSet{
+		parentPrev: consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(100, signerPubKey(1))),
+		otherPrev:  consensus.UtxoEntryFromOutput(types.NewXOnlyOutput(100, signerPubKey(2))),
+	}
+	rules := consensus.DefaultConsensusRules()
+	for _, tx := range []types.Transaction{parent, other} {
+		if _, err := pool.AcceptTx(tx, utxos, rules); err != nil {
+			t.Fatal(err)
+		}
+	}
+	epoch := pool.Epoch()
+	if _, err := pool.AcceptTx(child, utxos, rules); !errors.Is(err, ErrTooManyDescendants) {
+		t.Fatalf("child error = %v, want ErrTooManyDescendants", err)
+	}
+	if pool.Epoch() != epoch || pool.Count() != 2 || !pool.Contains(consensus.TxID(&other)) {
+		t.Fatal("rejected child changed the mempool")
+	}
+}
+
+func TestOrphanByteBudgetAppliesToAdmissionAndRestore(t *testing.T) {
+	first := orphanTx(t, types.OutPoint{TxID: [32]byte{120}}, 1)
+	second := orphanTx(t, types.OutPoint{TxID: [32]byte{121}}, 2)
+	live := NewWithConfig(PoolConfig{MaxOrphanBytes: first.EncodedLen() + second.EncodedLen()})
+	cfg := PoolConfig{MaxOrphanBytes: second.EncodedLen()}
+	tight := NewWithConfig(cfg)
+	for _, tx := range []types.Transaction{first, second} {
+		for _, pool := range []*Pool{live, tight} {
+			if _, err := pool.AcceptTx(tx, consensus.UtxoSet{}, consensus.DefaultConsensusRules()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	restored := NewWithConfig(cfg)
+	if err := restored.RestorePersistedState(nil, live.PersistenceSnapshot().Orphans); err != nil {
+		t.Fatal(err)
+	}
+	for _, pool := range []*Pool{tight, restored} {
+		orphans := pool.PersistenceSnapshot().Orphans
+		if len(orphans) != 1 || orphans[0].TxID != consensus.TxID(&second) || pool.orphanBytes != second.EncodedLen() {
+			t.Fatalf("orphan byte budget retained wrong set: %d records, %d bytes", len(orphans), pool.orphanBytes)
+		}
+	}
+}
+
+func TestEvictionRescoresAncestorAfterRemovingChild(t *testing.T) {
+	pool := New()
+	parentID, childID, otherID := [32]byte{1}, [32]byte{2}, [32]byte{3}
+	pool.entries[parentID] = &Entry{
+		TxID: parentID, Size: 100, Fee: 100,
+		DescendantSize: 200, DescendantFees: 100,
+		Children: map[[32]byte]struct{}{childID: {}},
+	}
+	pool.entries[childID] = &Entry{
+		TxID: childID, Size: 100,
+		DescendantSize: 100,
+		Parents:        map[[32]byte]struct{}{parentID: {}},
+	}
+	pool.entries[otherID] = &Entry{TxID: otherID, Size: 100, Fee: 60, DescendantSize: 100, DescendantFees: 60}
+	evicted, bytes, fees, ok := pool.planEvictionsLocked(200, nil)
+	if !ok || bytes != 200 || fees != 60 || len(evicted) != 2 {
+		t.Fatalf("eviction plan = %v, %d bytes, %d fees, success %t", evicted, bytes, fees, ok)
+	}
+	if _, removed := evicted[parentID]; removed {
+		t.Fatal("parent's fee rate after removing the child should keep it ahead of the independent entry")
+	}
+}

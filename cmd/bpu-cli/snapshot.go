@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"bitcoin-pure/internal/consensus"
 	"bitcoin-pure/internal/node"
 	"bitcoin-pure/internal/storage"
 	"bitcoin-pure/internal/types"
@@ -201,22 +200,7 @@ func loadValidatedChainFixtureBlocks(path string) ([]types.Block, error) {
 	if err != nil {
 		return nil, err
 	}
-	blocks := make([]types.Block, 0, len(fixture.Blocks))
-	for i, blockHex := range fixture.Blocks {
-		block, err := consensus.DecodeBlockHex(blockHex, types.DefaultCodecLimits())
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode fixture block at index %d: %w", i, err)
-		}
-		gotHash := fmt.Sprintf("%x", consensus.HeaderHash(&block.Header))
-		if i >= len(fixture.ExpectedBlockHashesHex) {
-			return nil, fmt.Errorf("missing expected block hash for index %d", i)
-		}
-		if gotHash != fixture.ExpectedBlockHashesHex[i] {
-			return nil, fmt.Errorf("block hash mismatch at index %d: expected %s, got %s", i, fixture.ExpectedBlockHashesHex[i], gotHash)
-		}
-		blocks = append(blocks, block)
-	}
-	return blocks, nil
+	return decodeChainFixtureBlocks(fixture)
 }
 
 func newFlagSet(name string) *flag.FlagSet {

@@ -22,7 +22,11 @@ func (s *Store) beginMutation() (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("open wallet lock: %w", err)
 	}
-	unlock := func() { _ = lock.Close() }
+	s.mu.Lock()
+	unlock := func() {
+		_ = lock.Close()
+		s.mu.Unlock()
+	}
 	info, err := lock.Stat()
 	if err != nil {
 		unlock()

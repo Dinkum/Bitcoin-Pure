@@ -211,8 +211,10 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 		rejectCache:         newTxRejectCache(txRejectCacheCapacity, txRejectCachePermanentTTL, txRejectCacheTemporaryTTL),
 		validAuth:           newValidAuthCache(validAuthCacheCapacity),
 		payloadBudget:       p2p.NewPayloadBudget(int64(cfg.MaxMessageBytes) * defaultInflightPayloadMultiplier),
+		blockTransferBudget: p2p.NewPayloadBudget(int64(maxPendingPeerBlockBytes)),
+		blockDecodeBudget:   p2p.NewPayloadBudget(int64(maxPendingPeerBlockBytes)),
 		thinStateBudget:     p2p.NewPayloadBudget(int64(cfg.MaxMessageBytes) * defaultInflightPayloadMultiplier),
-		blockServeBudget:    p2p.NewPayloadBudget(int64(cfg.MaxMessageBytes) * defaultInflightPayloadMultiplier),
+		blockServeBudget:    p2p.NewPayloadBudget(int64(maxPendingPeerBlockBytes)),
 		mempoolPersistCh:    make(chan struct{}, 1),
 		startedAt:           time.Now(),
 		nodeID:              nodeID,
@@ -249,10 +251,12 @@ func OpenService(cfg ServiceConfig, genesis *types.Block) (*Service, error) {
 
 func (s *Service) Close() error {
 	s.closeOnce.Do(func() {
+		s.workMu.Lock()
 		s.stopOnce.Do(func() {
 			s.logger.Info("shutting down node service")
 			close(s.stopCh)
 		})
+		s.workMu.Unlock()
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
@@ -283,10 +287,14 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !s.beginServiceWork() {
+		return ErrServiceStopping
+	}
 	s.logger.Info("starting node service")
 	started := false
 	defer func() {
 		if !started {
+			s.wg.Done()
 			_ = s.Close()
 		}
 	}()
@@ -298,7 +306,7 @@ func (s *Service) Start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		s.rpcSrv = &http.Server{
+		server := &http.Server{
 			Addr:              rpcListener.Addr().String(),
 			Handler:           mux,
 			ReadTimeout:       s.cfg.RPCReadTimeout,
@@ -307,15 +315,26 @@ func (s *Service) Start(ctx context.Context) error {
 			IdleTimeout:       s.cfg.RPCIdleTimeout,
 			MaxHeaderBytes:    s.cfg.RPCMaxHeaderBytes,
 		}
+		s.workMu.Lock()
+		if s.isStopping() {
+			s.workMu.Unlock()
+			_ = rpcListener.Close()
+			return ErrServiceStopping
+		}
+		s.rpcSrv = server
+		s.workMu.Unlock()
 		s.logger.Info("rpc server enabled", slog.String("addr", s.rpcSrv.Addr))
 		if s.publicPage {
 			s.logger.Info("public ascii dashboard enabled", slog.String("addr", s.rpcSrv.Addr), slog.Duration("cache_ttl", time.Minute))
 		}
-		s.safeGo("rpc-server", func() {
-			if err := s.rpcSrv.Serve(rpcListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if !s.safeGo("rpc-server", func() {
+			if err := server.Serve(rpcListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Error("rpc server failed", slog.String("addr", s.rpcSrv.Addr), slog.Any("error", err))
 			}
-		})
+		}) {
+			_ = rpcListener.Close()
+			return ErrServiceStopping
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -326,7 +345,14 @@ func (s *Service) Start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		s.workMu.Lock()
+		if s.isStopping() {
+			s.workMu.Unlock()
+			_ = ln.Close()
+			return ErrServiceStopping
+		}
 		s.listener = ln
+		s.workMu.Unlock()
 		s.logger.Info("p2p listener enabled", slog.String("addr", s.cfg.P2PAddr))
 		s.safeGo("accept-loop", func() {
 			s.acceptLoop()
@@ -369,7 +395,6 @@ func (s *Service) Start(ctx context.Context) error {
 	s.safeGo("node-status-loop", func() {
 		s.nodeStatusLoop()
 	})
-	started = true
 	if s.cfg.P2PAddr != "" || len(s.cfg.Peers) > 0 {
 		s.safeGo("sync-watchdog-loop", func() {
 			s.syncWatchdogLoop()
@@ -398,6 +423,10 @@ func (s *Service) Start(ctx context.Context) error {
 			})
 		}
 	}
+	// Startup owns storage until it finishes launching workers. Release that
+	// registration before waiting for shutdown so Close can join the workers.
+	started = true
+	s.wg.Done()
 	select {
 	case <-ctx.Done():
 		s.logger.Info("shutdown signal received")

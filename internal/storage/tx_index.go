@@ -16,6 +16,9 @@ const (
 	txIndexVersion      = 1
 	txIndexBatchEntries = 512
 	txIndexBatchTxBytes = 8 << 20
+
+	txLookupScanBlockLimit = 128
+	txLookupScanByteLimit  = 128 << 20
 )
 
 var (
@@ -24,6 +27,7 @@ var (
 	txIndexStateKey  = []byte("meta/tx_index")
 	// Incomplete history cannot establish that a transaction never confirmed.
 	ErrTransactionHistoryUnavailable = errors.New("transaction status requires unavailable historical blocks")
+	ErrTransactionScanLimit          = errors.New("transaction status scan limit reached; a synced transaction index can answer this query")
 )
 
 type txIndexTip struct {
@@ -94,7 +98,7 @@ func readTxIndexCheckpoint(reader valueReader) (*txIndexCheckpoint, error) {
 		return nil, err
 	}
 	if state.Version != txIndexVersion || state.Next.Height > state.Target.Height ||
-		(!state.Building && (state.Offset != 0 || state.Base != nil)) ||
+		(!state.Building && (state.Offset != 0 || state.Base != nil || state.Next != state.Target)) ||
 		(state.Base != nil && state.Base.Height >= state.Next.Height) {
 		return nil, errors.New("invalid transaction index checkpoint")
 	}
@@ -150,8 +154,8 @@ func (s *ChainStore) TxIndexStatus() TxIndexStatus {
 }
 
 // FindActiveTransaction reads index coverage and the canonical tip from the
-// same snapshot. A lagging/reorged/rebuilding index cannot answer negatively or
-// positively; the fallback follows the actual parent chain in that snapshot.
+// same snapshot. A complete prefix is usable only after the canonical tail
+// links to it; partial rows above that prefix cannot answer the query.
 func (s *ChainStore) FindActiveTransaction(txid [32]byte) ([32]byte, bool, error) {
 	var zero [32]byte
 	snap := s.db.NewSnapshot()
@@ -160,24 +164,30 @@ func (s *ChainStore) FindActiveTransaction(txid [32]byte) ([32]byte, bool, error
 	if err != nil || tip == nil {
 		return zero, false, err
 	}
+	var base *txIndexTip
 	if s.txIndexEnabled {
 		state, indexErr := readTxIndexCheckpoint(snap)
-		if indexErr == nil && state != nil && !state.Building && state.Target == *tip {
-			hash, found, indexErr := lookupIndexedTransaction(snap, txid, tip.Height)
-			if indexErr == nil {
-				return hash, found, nil
+		if indexErr == nil && state != nil {
+			if state.Building {
+				base = state.Base
+			} else {
+				base = &state.Target
 			}
-			s.txIndexRebuild.Store(true)
-			s.notifyDerivedReplay()
 		}
 	}
-	return scanActiveTransaction(snap, *tip, txid)
+	return s.scanActiveTransaction(snap, *tip, base, txid)
 }
+
+var errInvalidTxIndexRow = errors.New("invalid active transaction index row")
 
 func lookupIndexedTransaction(snap *pebble.Snapshot, txid [32]byte, tipHeight uint64) ([32]byte, bool, error) {
 	var hash [32]byte
 	prefix := txIndexKey(txid, 0)[:len(txIndexPrefix)+32]
-	iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	upper := prefixUpperBound(prefix)
+	if tipHeight < ^uint64(0) {
+		upper = txIndexKey(txid, tipHeight+1)
+	}
+	iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
 	if err != nil {
 		return hash, false, err
 	}
@@ -186,32 +196,63 @@ func lookupIndexedTransaction(snap *pebble.Snapshot, txid [32]byte, tipHeight ui
 		return hash, false, iter.Error()
 	}
 	if len(iter.Key()) != len(prefix)+8 || len(iter.Value()) != 32 || binary.BigEndian.Uint64(iter.Key()[len(prefix):]) > tipHeight {
-		return hash, false, errors.New("invalid active transaction index row")
+		return hash, false, errInvalidTxIndexRow
 	}
 	copy(hash[:], iter.Value())
 	return hash, true, nil
 }
 
-func scanActiveTransaction(reader valueReader, tip txIndexTip, txid [32]byte) ([32]byte, bool, error) {
+func (s *ChainStore) scanActiveTransaction(snap *pebble.Snapshot, tip txIndexTip, base *txIndexTip, txid [32]byte) ([32]byte, bool, error) {
 	var zero [32]byte
 	hash := tip.Hash
 	missing := false
+	bytesLeft := uint64(txLookupScanByteLimit)
+	blocksLeft := txLookupScanBlockLimit
 	for height := tip.Height; ; height-- {
-		block, err := getBlockFrom(reader, &hash)
+		if base != nil && height == base.Height && hash == base.Hash {
+			blockHash, found, err := lookupIndexedTransaction(snap, txid, base.Height)
+			if !errors.Is(err, errInvalidTxIndexRow) {
+				if err == nil && missing {
+					return zero, false, ErrTransactionHistoryUnavailable
+				}
+				return blockHash, found, err
+			}
+			s.txIndexRebuild.Store(true)
+			s.notifyBackgroundIndexes()
+			// Keep the remaining scan budget and continue through the same
+			// canonical snapshot when the indexed prefix cannot be read.
+		}
+		if blocksLeft == 0 {
+			return zero, false, ErrTransactionScanLimit
+		}
+		blocksLeft--
+		size, err := blockSizeFrom(snap, &hash)
 		if err != nil {
 			return zero, false, err
 		}
+		if size > bytesLeft {
+			return zero, false, ErrTransactionScanLimit
+		}
+		bytesLeft -= size
+
 		var parent [32]byte
-		if block != nil {
+		if size > 0 {
+			block, err := getBlockFrom(snap, &hash)
+			if err != nil {
+				return zero, false, err
+			}
 			for i := range block.Txs {
 				if consensus.TxID(&block.Txs[i]) == txid {
+					if missing {
+						return zero, false, ErrTransactionHistoryUnavailable
+					}
 					return hash, true, nil
 				}
 			}
 			parent = block.Header.PrevBlockHash
 		} else {
 			missing = true
-			index, err := getBlockIndexFrom(reader, &hash)
+			index, err := getBlockIndexFrom(snap, &hash)
 			if err != nil {
 				return zero, false, err
 			}

@@ -281,6 +281,8 @@ type Service struct {
 	rejectCache         *txRejectCache
 	validAuth           *validAuthCache
 	payloadBudget       *p2p.PayloadBudget
+	blockTransferBudget *p2p.PayloadBudget
+	blockDecodeBudget   *p2p.PayloadBudget
 	thinStateBudget     *p2p.PayloadBudget
 	blockServeBudget    *p2p.PayloadBudget
 	mempoolPersistCh    chan struct{}
@@ -311,6 +313,7 @@ type Service struct {
 	closeOnce           sync.Once
 	closeErr            error
 	rpcRequestSeq       atomic.Uint64
+	workMu              sync.Mutex
 	wg                  sync.WaitGroup
 }
 

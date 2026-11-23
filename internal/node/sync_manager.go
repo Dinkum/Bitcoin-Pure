@@ -500,6 +500,9 @@ func (m *syncManager) releaseTxRequestsForTransactions(txs []types.Transaction) 
 	}
 	m.svc.downloadMu.Lock()
 	defer m.svc.downloadMu.Unlock()
+	if len(m.svc.txRequests) == 0 {
+		return
+	}
 	for _, tx := range txs {
 		delete(m.svc.txRequests, consensus.TxID(&tx))
 	}
@@ -745,16 +748,22 @@ func (m *syncManager) syncStallThreshold() time.Duration {
 func (m *syncManager) onNotFoundMessage(peer *peerConn, msg p2p.NotFoundMessage) error {
 	releasedBlocks := 0
 	releasedTxs := 0
+	m.svc.downloadMu.Lock()
 	for _, item := range msg.Items {
 		switch item.Type {
-		case p2p.InvTypeBlock, p2p.InvTypeBlockFull:
-			m.releaseBlockRequest(item.Hash)
-			releasedBlocks++
+		case p2p.InvTypeBlock, p2p.InvTypeBlockFull, p2p.InvTypeBlockExtended:
+			if req, ok := m.svc.blockRequests[item.Hash]; ok && req.peerAddr == peer.addr {
+				delete(m.svc.blockRequests, item.Hash)
+				releasedBlocks++
+			}
 		case p2p.InvTypeTx:
-			m.releaseTxRequest(item.Hash)
-			releasedTxs++
+			if req, ok := m.svc.txRequests[item.Hash]; ok && req.peerAddr == peer.addr {
+				delete(m.svc.txRequests, item.Hash)
+				releasedTxs++
+			}
 		}
 	}
+	m.svc.downloadMu.Unlock()
 	if releasedBlocks > 0 {
 		m.recordPeerStall(peer.addr, syncRequestBlocks, releasedBlocks, m.blockRequestTimeout())
 		m.svc.logger.Warn("peer reported missing blocks during catch-up",
@@ -765,7 +774,11 @@ func (m *syncManager) onNotFoundMessage(peer *peerConn, msg p2p.NotFoundMessage)
 			slog.Uint64("header_height", m.svc.headerHeight()),
 			slog.String("peer_sync", m.svc.peerSyncDebugSummary(4)),
 		)
-		return m.requestBlocks(peer)
+		for _, candidate := range m.preferredDownloadPeers(2) {
+			if candidate != peer && candidate.canServeDownloads(time.Now()) {
+				return m.requestBlocks(candidate)
+			}
+		}
 	}
 	if releasedTxs > 0 {
 		m.recordPeerStall(peer.addr, syncRequestTxs, releasedTxs, m.txRequestTimeout())

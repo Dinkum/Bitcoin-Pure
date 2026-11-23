@@ -135,6 +135,34 @@ func TestOpenServiceRejectsWildcardRPCBindWithoutAuth(t *testing.T) {
 	}
 }
 
+func TestRPCRequestLimitsAndStrictFields(t *testing.T) {
+	svc := &Service{logger: slog.Default(), cfg: ServiceConfig{RPCMaxBodyBytes: 80}}
+	for _, tc := range []struct {
+		name string
+		body string
+		code int
+		want string
+	}{
+		{"body limit", `{"method":"` + strings.Repeat("a", 81) + `"}`, http.StatusRequestEntityTooLarge, "request body too large"},
+		{"unknown request field", `{"method":"getinfo","unexpected":true}`, http.StatusOK, "unknown field"},
+		{"unknown parameter", `{"method":"mine","params":{"count":1,"unexpected":true}}`, http.StatusOK, "unknown field"},
+		{"unexpected parameter", `{"method":"getinfo","params":{"unexpected":true}}`, http.StatusOK, "unknown field"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18443/", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			svc.handleRPC(resp, req)
+			if resp.Code != tc.code || !strings.Contains(resp.Body.String(), tc.want) {
+				t.Fatalf("response = %d %s, want %d with %q", resp.Code, resp.Body.String(), tc.code, tc.want)
+			}
+			if got := resp.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("content type = %q", got)
+			}
+		})
+	}
+}
+
 func TestUnauthenticatedLoopbackRPCRequiresJSONContentType(t *testing.T) {
 	svc := &Service{logger: slog.Default()}
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18443/", strings.NewReader(`{"method":"unknown","params":{}}`))

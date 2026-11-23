@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,6 +39,7 @@ var (
 )
 
 type Store struct {
+	mu      sync.RWMutex
 	profile types.ChainProfile
 	path    string
 	wallets []Wallet
@@ -135,13 +138,13 @@ type CPFPPlan struct {
 }
 
 type BalanceSummary struct {
-	Confirmed    uint64
-	Mature       uint64
-	Immature     uint64
-	Reserved     uint64
-	Available    uint64
-	PendingCount int
-	AddressCount int
+	Confirmed    uint64 `json:"confirmed_atoms"`
+	Mature       uint64 `json:"mature_atoms"`
+	Immature     uint64 `json:"immature_atoms"`
+	Reserved     uint64 `json:"reserved_atoms"`
+	Available    uint64 `json:"available_atoms"`
+	PendingCount int    `json:"pending_count"`
+	AddressCount int    `json:"address_count"`
 }
 
 type ExportFile struct {
@@ -353,6 +356,8 @@ func parseBPUAmount(raw string) (uint64, error) {
 }
 
 func (s *Store) List() []Wallet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]Wallet, len(s.wallets))
 	for i := range s.wallets {
 		out[i] = cloneWallet(s.wallets[i])
@@ -369,10 +374,12 @@ func (s *Store) BackupWithOptions(path string, overwrite bool) error {
 	if path == "" {
 		return errors.New("backup path is required")
 	}
-	if sameCleanPath(path, s.path) {
+	if s.IsStorePath(path) {
 		return errors.New("backup path cannot be the live wallet store")
 	}
 	// Atomic wallet publication lets a backup read one complete current snapshot.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	latest, err := OpenWithProfile(s.path, s.profile)
 	if err != nil {
 		return err
@@ -396,7 +403,9 @@ func (s *Store) RestoreBackup(path string) error {
 }
 
 func (s *Store) RestoreBackupWithOptions(path string, allowProfileMismatch bool) error {
+	s.mu.RLock()
 	expected, err := json.Marshal(s.wallets)
+	s.mu.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -659,6 +668,8 @@ func (s *Store) CreateWalletWithType(name string, outputType uint64) (Wallet, Ad
 }
 
 func (s *Store) Wallet(name string) (Wallet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return Wallet{}, ErrWalletNotFound
@@ -693,48 +704,22 @@ func (s *Store) NewReceiveAddressWithType(name string, outputType uint64) (Addre
 	return addr, nil
 }
 
-func (s *Store) ReconcilePending(name string, mempool map[[32]byte]struct{}) (int, error) {
-	unlock, err := s.beginMutation()
-	if err != nil {
-		return 0, err
-	}
-	defer unlock()
-	wallet, index, ok := s.findWallet(name)
-	if !ok {
-		return 0, ErrWalletNotFound
-	}
-	_ = mempool
-	filtered := wallet.Pending[:0]
-	removed := 0
-	for _, pending := range wallet.Pending {
-		if _, err := decodeHex32(pending.TxID); err != nil {
-			removed++
-			continue
-		}
-		// Mempool absence is not a final wallet state: the tx may be confirmed,
-		// evicted, not relayed to this node, or hidden by a restart. Keep unknown
-		// spends reserved until a later explicit status signal can clear them.
-		filtered = append(filtered, pending)
-	}
-	if removed == 0 {
-		return 0, nil
-	}
-	next := cloneWallets(s.wallets)
-	next[index].Pending = append([]PendingTx{}, filtered...)
-	if err := s.saveWallets(next); err != nil {
-		return 0, err
-	}
-	s.wallets = next
-	return removed, nil
+type PendingStatus struct {
+	CreatedAt time.Time
+	InMempool bool
+	Confirmed bool
 }
 
-func (s *Store) ReconcilePendingWithStatus(name string, mempool map[[32]byte]struct{}, utxos []SpendableUTXO, confirmed map[[32]byte]struct{}) (int, error) {
+func (s *Store) ReconcilePendingWithStatus(name string, observed map[string]PendingStatus, utxos []SpendableUTXO) (int, error) {
+	if len(observed) == 0 {
+		return 0, nil
+	}
 	unlock, err := s.beginMutation()
 	if err != nil {
 		return 0, err
 	}
 	defer unlock()
-	wallet, index, ok := s.findWallet(name)
+	entry, index, ok := s.findWallet(name)
 	if !ok {
 		return 0, ErrWalletNotFound
 	}
@@ -742,42 +727,29 @@ func (s *Store) ReconcilePendingWithStatus(name string, mempool map[[32]byte]str
 	for _, utxo := range utxos {
 		current[utxo.OutPoint] = struct{}{}
 	}
-	filtered := wallet.Pending[:0]
-	removed := 0
-	for _, pending := range wallet.Pending {
-		txid, err := decodeHex32(pending.TxID)
-		if err != nil {
-			removed++
-			continue
-		}
-		if _, ok := mempool[txid]; ok {
-			filtered = append(filtered, pending)
-			continue
-		}
-		if _, ok := confirmed[txid]; ok {
-			removed++
-			continue
-		}
-		if pendingResolvedAgainstUTXOs(txid, pending, current) {
-			removed++
-			continue
+	filtered := make([]PendingTx, 0, len(entry.Pending))
+	for _, pending := range entry.Pending {
+		status, checked := observed[pending.TxID]
+		// Leave reservations created after the RPC pass for the next sync.
+		if checked && status.CreatedAt.Equal(pending.CreatedAt) && !status.InMempool {
+			txid, err := decodeHex32(pending.TxID)
+			if err != nil || status.Confirmed || pendingResolvedAgainstUTXOs(txid, pending, current) {
+				continue
+			}
 		}
 		filtered = append(filtered, pending)
 	}
+	removed := len(entry.Pending) - len(filtered)
 	if removed == 0 {
 		return 0, nil
 	}
 	next := cloneWallets(s.wallets)
-	next[index].Pending = append([]PendingTx{}, filtered...)
+	next[index].Pending = filtered
 	if err := s.saveWallets(next); err != nil {
 		return 0, err
 	}
 	s.wallets = next
 	return removed, nil
-}
-
-func (s *Store) ReconcilePendingWithUTXOs(name string, mempool map[[32]byte]struct{}, utxos []SpendableUTXO) (int, error) {
-	return s.ReconcilePendingWithStatus(name, mempool, utxos, nil)
 }
 
 func pendingResolvedAgainstUTXOs(txid [32]byte, pending PendingTx, current map[types.OutPoint]struct{}) bool {
@@ -803,38 +775,7 @@ func (s *Store) BuildSend(name string, to string, amount, fee uint64, utxos []Sp
 }
 
 func (s *Store) BuildSendWithKnownAddresses(name string, to string, amount, fee uint64, utxos []SpendableUTXO, knownAddresses []Address) (SendPlan, error) {
-	if amount == 0 {
-		return SendPlan{}, errors.New("amount must be positive")
-	}
-	wallet, _, ok := s.findWallet(name)
-	if !ok {
-		return SendPlan{}, ErrWalletNotFound
-	}
-	destItem, err := ParseWatchAddress(to)
-	if err != nil {
-		return SendPlan{}, err
-	}
-	planningWallet := walletWithKnownAddresses(*wallet, knownAddresses)
-	available, err := spendableCoins(planningWallet, utxos)
-	if err != nil {
-		return SendPlan{}, err
-	}
-	required, err := checkedAdd(amount, fee)
-	if err != nil {
-		return SendPlan{}, ErrInsufficientFunds
-	}
-	selected, total, err := selectCoins(available, required)
-	if err != nil {
-		return SendPlan{}, err
-	}
-	change := total - required
-	plan, err := s.buildSignedPlan(&planningWallet, selected, to, destItem, amount, fee, change)
-	if err != nil {
-		return SendPlan{}, err
-	}
-	plan.InputTotal = total
-	plan.EstimatedBytes = plan.Transaction.EncodedLen()
-	return plan, nil
+	return s.buildSend(name, to, amount, fee, 0, utxos, knownAddresses)
 }
 
 func (s *Store) BuildSendAuto(name string, to string, amount, feeRate uint64, utxos []SpendableUTXO) (SendPlan, error) {
@@ -845,37 +786,67 @@ func (s *Store) BuildSendAutoWithKnownAddresses(name string, to string, amount, 
 	if feeRate == 0 {
 		return SendPlan{}, errors.New("fee rate must be positive")
 	}
-	wallet, _, ok := s.findWallet(name)
+	return s.buildSend(name, to, amount, 0, feeRate, utxos, knownAddresses)
+}
+
+func (s *Store) buildSend(name string, to string, amount, fee, feeRate uint64, utxos []SpendableUTXO, knownAddresses []Address) (SendPlan, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, _, ok := s.findWallet(name)
 	if !ok {
 		return SendPlan{}, ErrWalletNotFound
+	}
+	planningWallet := walletWithKnownAddresses(*entry, knownAddresses)
+	available, err := spendableCoins(planningWallet, utxos)
+	if err != nil {
+		return SendPlan{}, err
+	}
+	return s.planSend(entry.Name, nextAddressIndex(planningWallet), slices.Values(available), to, amount, fee, feeRate)
+}
+
+func (s *Store) planSend(name string, changeIndex int, coins iter.Seq[SelectedInput], to string, amount, fee, feeRate uint64) (SendPlan, error) {
+	if amount == 0 {
+		return SendPlan{}, errors.New("amount must be positive")
 	}
 	destItem, err := ParseWatchAddress(to)
 	if err != nil {
 		return SendPlan{}, err
 	}
-	planningWallet := walletWithKnownAddresses(*wallet, knownAddresses)
-	available, err := spendableCoins(planningWallet, utxos)
+	var selected []SelectedInput
+	var change uint64
+	var estimatedBytes int
+	if feeRate == 0 {
+		required, err := checkedAdd(amount, fee)
+		if err != nil {
+			return SendPlan{}, ErrInsufficientFunds
+		}
+		inputs, total, err := selectCoins(coins, required)
+		if err != nil {
+			return SendPlan{}, err
+		}
+		selected = inputs
+		change = total - required
+	} else {
+		selected, _, fee, change, estimatedBytes, err = selectCoinsForAutoFee(coins, destItem, amount, feeRate)
+		if err != nil {
+			return SendPlan{}, err
+		}
+	}
+	plan, err := s.buildSignedPlan(name, changeIndex, selected, to, destItem, amount, fee, change)
 	if err != nil {
 		return SendPlan{}, err
 	}
-	if amount == 0 {
-		return SendPlan{}, errors.New("amount must be positive")
+	if estimatedBytes == 0 {
+		estimatedBytes = plan.Transaction.EncodedLen()
 	}
-	selected, total, fee, change, estimatedBytes, err := selectCoinsForAutoFee(available, destItem, amount, feeRate)
-	if err != nil {
-		return SendPlan{}, err
-	}
-	plan, err := s.buildSignedPlan(&planningWallet, selected, to, destItem, amount, fee, change)
-	if err != nil {
-		return SendPlan{}, err
-	}
-	plan.InputTotal = total
 	plan.FeeRate = feeRate
 	plan.EstimatedBytes = estimatedBytes
 	return plan, nil
 }
 
 func (s *Store) BuildCPFP(name string, parentTxID [32]byte, feeRate uint64) (CPFPPlan, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if feeRate == 0 {
 		return CPFPPlan{}, errors.New("fee rate must be positive")
 	}
@@ -895,6 +866,8 @@ func (s *Store) BuildCPFP(name string, parentTxID [32]byte, feeRate uint64) (CPF
 }
 
 func (s *Store) BuildCPFPWithExactFee(name string, parentTxID [32]byte, fee uint64) (CPFPPlan, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if fee == 0 {
 		return CPFPPlan{}, errors.New("fee must be positive")
 	}
@@ -915,10 +888,7 @@ func (s *Store) selectPendingCPFPInput(name string, parentTxID [32]byte) (Select
 	if !ok {
 		return SelectedInput{}, nil, ErrWalletNotFound
 	}
-	pendingUTXOs, err := s.PendingSpendableUTXOs(name, &parentTxID)
-	if err != nil {
-		return SelectedInput{}, nil, err
-	}
+	pendingUTXOs := pendingSpendableUTXOs(*wallet, &parentTxID)
 	available, err := spendableCoins(*wallet, pendingUTXOs)
 	if err != nil {
 		return SelectedInput{}, nil, err
@@ -939,11 +909,15 @@ func (s *Store) buildCPFPPlan(wallet *Wallet, parentTxID [32]byte, input Selecte
 	if err != nil {
 		return CPFPPlan{}, err
 	}
+	sweepItem, err := addr.WatchItem()
+	if err != nil {
+		return CPFPPlan{}, err
+	}
 	tx := types.Transaction{
 		Base: types.TxBase{
 			Version: 1,
 			Inputs:  []types.TxInput{{PrevOut: input.OutPoint}},
-			Outputs: []types.TxOutput{txOutputForWatchItem(input.Value-fee, mustWatchItem(addr))},
+			Outputs: []types.TxOutput{txOutputForWatchItem(input.Value-fee, sweepItem)},
 		},
 		Auth: types.TxAuth{Entries: make([]types.TxAuthEntry, 1)},
 	}
@@ -1116,10 +1090,16 @@ func walletWithKnownAddresses(wallet Wallet, knownAddresses []Address) Wallet {
 }
 
 func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]SpendableUTXO, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return nil, ErrWalletNotFound
 	}
+	return pendingSpendableUTXOs(*wallet, parentTxID), nil
+}
+
+func pendingSpendableUTXOs(wallet Wallet, parentTxID *[32]byte) []SpendableUTXO {
 	out := make([]SpendableUTXO, 0)
 	for _, pending := range wallet.Pending {
 		txid, err := decodeHex32(pending.TxID)
@@ -1143,25 +1123,12 @@ func (s *Store) PendingSpendableUTXOs(name string, parentTxID *[32]byte) ([]Spen
 			})
 		}
 	}
-	return out, nil
-}
-
-func (s *Store) SpendablePubKeys(name string) ([][32]byte, error) {
-	items, err := s.SpendableWatchItems(name)
-	if err != nil {
-		return nil, err
-	}
-	out := make([][32]byte, 0, len(items))
-	for _, item := range items {
-		if item.Type != types.OutputXOnlyP2PK {
-			continue
-		}
-		out = append(out, item.Payload32)
-	}
-	return out, nil
+	return out
 }
 
 func (s *Store) SpendableWatchItems(name string) ([]WatchItem, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return nil, ErrWalletNotFound
@@ -1183,6 +1150,8 @@ func (s *Store) SpendableWatchItems(name string) ([]WatchItem, error) {
 }
 
 func (s *Store) Balance(name string, utxos []SpendableUTXO) (BalanceSummary, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	wallet, _, ok := s.findWallet(name)
 	if !ok {
 		return BalanceSummary{}, ErrWalletNotFound
@@ -1390,32 +1359,34 @@ func spendableCoins(wallet Wallet, utxos []SpendableUTXO) ([]SelectedInput, erro
 			Address:  addr,
 		})
 	}
-	slices.SortFunc(out, func(a, b SelectedInput) int {
-		if a.Value != b.Value {
-			if a.Value > b.Value {
-				return -1
-			}
-			return 1
-		}
-		if cmp := bytes.Compare(a.OutPoint.TxID[:], b.OutPoint.TxID[:]); cmp != 0 {
-			return cmp
-		}
-		switch {
-		case a.OutPoint.Vout < b.OutPoint.Vout:
-			return -1
-		case a.OutPoint.Vout > b.OutPoint.Vout:
-			return 1
-		default:
-			return 0
-		}
-	})
+	slices.SortFunc(out, compareCoins)
 	return out, nil
 }
 
-func selectCoins(coins []SelectedInput, required uint64) ([]SelectedInput, uint64, error) {
-	selected := make([]SelectedInput, 0, len(coins))
+func compareCoins(a, b SelectedInput) int {
+	if a.Value != b.Value {
+		if a.Value > b.Value {
+			return -1
+		}
+		return 1
+	}
+	if cmp := bytes.Compare(a.OutPoint.TxID[:], b.OutPoint.TxID[:]); cmp != 0 {
+		return cmp
+	}
+	switch {
+	case a.OutPoint.Vout < b.OutPoint.Vout:
+		return -1
+	case a.OutPoint.Vout > b.OutPoint.Vout:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func selectCoins(coins iter.Seq[SelectedInput], required uint64) ([]SelectedInput, uint64, error) {
+	var selected []SelectedInput
 	var total uint64
-	for _, coin := range coins {
+	for coin := range coins {
 		selected = append(selected, coin)
 		next, err := checkedAdd(total, coin.Value)
 		if err != nil {
@@ -1443,12 +1414,12 @@ func checkedMul(left, right uint64) (uint64, error) {
 	return left * right, nil
 }
 
-func selectCoinsForAutoFee(coins []SelectedInput, destItem WatchItem, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
-	selected := make([]SelectedInput, 0, len(coins))
+func selectCoinsForAutoFee(coins iter.Seq[SelectedInput], destItem WatchItem, amount uint64, feeRate uint64) ([]SelectedInput, uint64, uint64, uint64, int, error) {
+	var selected []SelectedInput
 	var total uint64
 	inputBytes := 0
 	authBytes := 0
-	for _, coin := range coins {
+	for coin := range coins {
 		selected = append(selected, coin)
 		inputBytes += 36
 		authBytes += estimatedAuthEntryBytes(coin.Address)
@@ -1527,29 +1498,28 @@ func estimatedOutputBytes(outputType uint64) int {
 func estimatedAuthEntryBytes(addr Address) int {
 	payloadLen := 64
 	if addr.OutputType() == types.OutputPQLock32 {
-		vkLen := bpcrypto.MLDSA65VerificationKeySize
-		if raw, err := hex.DecodeString(strings.TrimSpace(addr.VerificationKeyHex)); err == nil && len(raw) > 0 {
-			vkLen = len(raw)
-		}
-		sigLen := bpcrypto.MLDSA65SignatureSize
-		payloadLen = vkLen + sigLen
+		payloadLen = bpcrypto.MLDSA65VerificationKeySize + bpcrypto.MLDSA65SignatureSize
 	}
 	return types.CanonicalVarIntLen(uint64(payloadLen)) + payloadLen
 }
 
-func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddress string, destItem WatchItem, amount uint64, fee uint64, change uint64) (SendPlan, error) {
+func (s *Store) buildSignedPlan(name string, changeIndex int, inputs []SelectedInput, toAddress string, destItem WatchItem, amount uint64, fee uint64, change uint64) (SendPlan, error) {
 	outputs := []types.TxOutput{txOutputForWatchItem(amount, destItem)}
 	var changeAddr *Address
 	if change > 0 {
 		// Persist change addresses before broadcast so a later-confirmed self output is still recoverable
 		// even if the operator loses the pending-send context locally.
 		changeType := inputs[0].Address.OutputType()
-		addr, err := newAddress(nextAddressIndex(*wallet), true, changeType)
+		addr, err := newAddress(changeIndex, true, changeType)
+		if err != nil {
+			return SendPlan{}, err
+		}
+		changeItem, err := addr.WatchItem()
 		if err != nil {
 			return SendPlan{}, err
 		}
 		changeAddr = &addr
-		outputs = append(outputs, txOutputForWatchItem(change, mustWatchItem(addr)))
+		outputs = append(outputs, txOutputForWatchItem(change, changeItem))
 	}
 	tx := types.Transaction{
 		Base: types.TxBase{
@@ -1584,7 +1554,7 @@ func (s *Store) buildSignedPlan(wallet *Wallet, inputs []SelectedInput, toAddres
 	}
 	txid := consensus.TxID(&tx)
 	return SendPlan{
-		WalletName:     wallet.Name,
+		WalletName:     name,
 		ToAddress:      toAddress,
 		Amount:         amount,
 		Fee:            fee,
@@ -1697,14 +1667,6 @@ func legacyPubKeyForWatchItem(item WatchItem) [32]byte {
 	return [32]byte{}
 }
 
-func mustWatchItem(addr Address) WatchItem {
-	item, err := addr.WatchItem()
-	if err != nil {
-		panic(fmt.Sprintf("invalid stored wallet address %q: %v", addr.Address, err))
-	}
-	return item
-}
-
 func buildPQAuthPayload(verificationKey []byte, signature []byte) []byte {
 	payload := make([]byte, 0, len(verificationKey)+len(signature))
 	payload = append(payload, verificationKey...)
@@ -1712,22 +1674,12 @@ func buildPQAuthPayload(verificationKey []byte, signature []byte) []byte {
 	return payload
 }
 
-func mustParsePubKey(raw string) [32]byte {
-	pubKey, err := decodeHex32(raw)
-	if err != nil {
-		panic(fmt.Sprintf("invalid stored pubkey %q: %v", raw, err))
-	}
-	return pubKey
-}
-
 func decodeHex32(raw string) ([32]byte, error) {
-	var out [32]byte
-	buf, err := hex.DecodeString(strings.TrimSpace(raw))
-	if err != nil || len(buf) != len(out) {
-		return out, ErrInvalidAddress
+	hash, err := bpcrypto.ParseHash32Hex(strings.TrimSpace(raw))
+	if err != nil {
+		return [32]byte{}, ErrInvalidAddress
 	}
-	copy(out[:], buf)
-	return out, nil
+	return hash.Array(), nil
 }
 
 func (s *Store) findWallet(name string) (*Wallet, int, bool) {
@@ -1832,9 +1784,18 @@ func existingFileOwner(path string) (int, int, bool) {
 	return int(stat.Uid), int(stat.Gid), true
 }
 
-func sameCleanPath(left string, right string) bool {
-	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
+// IsStorePath reports whether path points at the live wallet file.
+func (s *Store) IsStorePath(path string) bool {
+	left, right := path, s.path
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" {
 		return false
+	}
+	leftEval, leftEvalErr := filepath.EvalSymlinks(left)
+	rightEval, rightEvalErr := filepath.EvalSymlinks(right)
+	if leftEvalErr == nil && rightEvalErr == nil {
+		return leftEval == rightEval
 	}
 	leftAbs, leftErr := filepath.Abs(filepath.Clean(left))
 	rightAbs, rightErr := filepath.Abs(filepath.Clean(right))

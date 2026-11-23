@@ -440,7 +440,7 @@ func TestBuildBlockTemplateStopsOnServiceShutdown(t *testing.T) {
 	defer svc.Close()
 
 	svc.stopOnce.Do(func() { close(svc.stopCh) })
-	_, _, err = svc.minerManager().buildBlockTemplateWithGeneration()
+	_, _, _, err = svc.minerManager().buildBlockTemplateWithGeneration()
 	if !errors.Is(err, ErrServiceStopping) {
 		t.Fatalf("expected ErrServiceStopping, got %v", err)
 	}
@@ -836,6 +836,9 @@ func TestMineOneBlockRefreshesInterruptedTemplate(t *testing.T) {
 		t.Fatalf("mined block txid = %x, want %x", got, consensus.TxID(&tx))
 	}
 	stats := svc.BlockTemplateStats()
+	if stats.AppendExtends == 0 {
+		t.Fatal("transaction admission discarded the reusable template")
+	}
 	if stats.Interruptions == 0 {
 		t.Fatal("expected interrupted mining telemetry")
 	}

@@ -7,13 +7,29 @@ import (
 
 // safeGo runs a service-owned goroutine behind a panic barrier so a bad peer,
 // accumulator invariant, or RNG failure cannot take down the whole node.
-func (s *Service) safeGo(name string, fn func()) {
-	s.safeGoWithCleanup(name, nil, fn)
+func (s *Service) safeGo(name string, fn func()) bool {
+	return s.safeGoWithCleanup(name, nil, fn)
 }
 
-func (s *Service) safeGoWithCleanup(name string, cleanup func(), fn func()) {
-	s.wg.Add(1)
+func (s *Service) safeGoWithCleanup(name string, cleanup func(), fn func()) bool {
+	if !s.beginServiceWork() {
+		if cleanup != nil {
+			cleanup()
+		}
+		return false
+	}
 	go s.runGuarded(name, true, cleanup, fn)
+	return true
+}
+
+func (s *Service) beginServiceWork() bool {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.isStopping() {
+		return false
+	}
+	s.wg.Add(1)
+	return true
 }
 
 func (s *Service) safeGoDetached(name string, fn func()) {

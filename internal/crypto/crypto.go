@@ -3,6 +3,7 @@ package crypto
 import (
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -37,8 +38,33 @@ type SchnorrBatchResult struct {
 
 var taggedHashCache sync.Map
 
-func Hash32FromArray(raw [32]byte) Hash32 {
-	return Hash32(raw)
+// TaggedHasher holds the reusable SHA-256 state for a tagged hash domain.
+// A hasher can be shared by concurrent callers.
+type TaggedHasher struct {
+	prefix [2 * sha256.Size]byte
+	state  []byte
+}
+
+func NewTaggedHasher(tag string) *TaggedHasher {
+	hasher := new(TaggedHasher)
+	tagHash := Sha256([]byte(tag))
+	copy(hasher.prefix[:sha256.Size], tagHash[:])
+	copy(hasher.prefix[sha256.Size:], tagHash[:])
+	h := sha256.New()
+	h.Write(hasher.prefix[:])
+	hasher.state, _ = h.(encoding.BinaryMarshaler).MarshalBinary()
+	return hasher
+}
+
+func (hasher *TaggedHasher) Sum256(payload []byte) [32]byte {
+	h := sha256.New()
+	if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(hasher.state); err != nil {
+		h.Write(hasher.prefix[:])
+	}
+	h.Write(payload)
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
 }
 
 func ParseHash32Hex(raw string) (Hash32, error) {
@@ -84,37 +110,25 @@ func Sha256d(buf []byte) [32]byte {
 }
 
 func TaggedHash32(tag string, payload []byte) Hash32 {
-	// Tags are low-cardinality protocol constants, so caching their SHA-256
-	// avoids repeating identical work on every tagged hash invocation.
-	tagHash := cachedTagHash(tag)
-	h := sha256.New()
-	h.Write(tagHash[:])
-	h.Write(tagHash[:])
-	h.Write(payload)
-	var out Hash32
-	h.Sum(out[:0])
-	return out
+	hasher, ok := taggedHashCache.Load(tag)
+	if !ok {
+		hasher, _ = taggedHashCache.LoadOrStore(tag, NewTaggedHasher(tag))
+	}
+	return Hash32(hasher.(*TaggedHasher).Sum256(payload))
 }
 
 func TaggedHash(tag string, payload []byte) [32]byte {
 	return TaggedHash32(tag, payload).Array()
 }
 
-func BIP340ChallengeHash(r32 [32]byte, pubKey32 [32]byte, msg32 [32]byte) [32]byte {
-	payload := make([]byte, 0, 96)
-	payload = append(payload, r32[:]...)
-	payload = append(payload, pubKey32[:]...)
-	payload = append(payload, msg32[:]...)
-	return TaggedHash(BIP340ChallengeTag, payload)
-}
+var bip340ChallengeHasher = NewTaggedHasher(BIP340ChallengeTag)
 
-func cachedTagHash(tag string) [32]byte {
-	if cached, ok := taggedHashCache.Load(tag); ok {
-		return cached.([32]byte)
-	}
-	hash := Sha256([]byte(tag))
-	cached, _ := taggedHashCache.LoadOrStore(tag, hash)
-	return cached.([32]byte)
+func BIP340ChallengeHash(r32 [32]byte, pubKey32 [32]byte, msg32 [32]byte) [32]byte {
+	var payload [96]byte
+	copy(payload[:32], r32[:])
+	copy(payload[32:64], pubKey32[:])
+	copy(payload[64:], msg32[:])
+	return bip340ChallengeHasher.Sum256(payload[:])
 }
 
 func IsValidXOnlyPubKey(pubKey *[32]byte) bool {

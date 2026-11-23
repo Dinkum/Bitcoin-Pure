@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -238,16 +239,17 @@ func runWalletList(args []string) error {
 func runWalletBalance(args []string) error {
 	fs := flag.NewFlagSet("wallet balance", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	setWalletFlagUsage(fs, "bpu-cli wallet balance [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] [wallet]")
+	setWalletFlagUsage(fs, "bpu-cli wallet balance [--json] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] [wallet]")
 	configPath := fs.String("config", "", "config file path")
 	walletDir := fs.String("wallet-dir", "", "wallet store directory")
 	rpcAddr := fs.String("rpc", "", "node RPC address")
 	rpcAuthToken := fs.String("rpc-auth-token", "", "node RPC bearer token")
+	jsonOutput := fs.Bool("json", false, "write the balance as JSON")
 	if err := parseWalletFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 1 {
-		return errors.New("usage: bpu-cli wallet balance [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] [wallet]")
+		return errors.New("usage: bpu-cli wallet balance [--json] [--config PATH] [--wallet-dir DIR] [--rpc ADDR] [--rpc-auth-token TOKEN] [wallet]")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
@@ -266,32 +268,22 @@ func runWalletBalance(args []string) error {
 			return err
 		}
 	}
-	if _, err := store.Wallet(walletName); err != nil {
-		return walletCommandError(walletName, err)
-	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken), rpcClientTimeout(cfg))
-	watchItems, err := store.SpendableWatchItems(walletName)
+	utxos, _, err := syncWalletState(store, client, walletName, 0)
 	if err != nil {
-		return err
-	}
-	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	activity, err := rpcWalletActivityByWatchItems(client, watchItems, walletReconcileActivityLimit(store, walletName, 20))
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	confirmed, err := confirmedWalletTxIDs(client, store, walletName, activity)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	if err := reconcileWalletPending(store, client, walletName, utxos, confirmed); err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
+		return walletSyncError(err, walletName, cfg, *rpcAddr)
 	}
 	balance, err := store.Balance(walletName, utxos)
 	if err != nil {
 		return err
+	}
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Wallet  string `json:"wallet"`
+			Profile string `json:"profile"`
+			Store   string `json:"store"`
+			wallet.BalanceSummary
+		}{walletName, cfg.Profile, walletPath, balance})
 	}
 	fmt.Printf("wallet: %s\n", walletName)
 	fmt.Printf("profile: %s\n", cfg.Profile)
@@ -347,29 +339,10 @@ func runWalletHistory(args []string) error {
 			return err
 		}
 	}
-	watchItems, err := store.SpendableWatchItems(walletName)
-	if err != nil {
-		return walletCommandError(walletName, err)
-	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken), rpcClientTimeout(cfg))
-	activityLimit := walletMaxInt(*limit, walletReconcileActivityLimit(store, walletName, 20))
-	if activityLimit > walletActivityRPCLimitMax {
-		activityLimit = walletActivityRPCLimitMax
-	}
-	activity, err := rpcWalletActivityByWatchItems(client, watchItems, activityLimit)
+	_, activity, err := syncWalletState(store, client, walletName, *limit)
 	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	confirmed, err := confirmedWalletTxIDs(client, store, walletName, activity)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	if err := reconcileWalletPending(store, client, walletName, utxos, confirmed); err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
+		return walletSyncError(err, walletName, cfg, *rpcAddr)
 	}
 	entry, err := store.Wallet(walletName)
 	if err != nil {
@@ -518,7 +491,7 @@ func runWalletBackup(args []string) error {
 		stamp := time.Now().UTC().Format("20060102T150405Z")
 		backupPath = filepath.Join(filepath.Dir(walletPath), "wallets-"+stamp+".backup.json")
 	}
-	if samePath(backupPath, walletPath) {
+	if store.IsStorePath(backupPath) {
 		return errors.New("backup output cannot be the live wallet store")
 	}
 	if err := store.BackupWithOptions(backupPath, *overwrite); err != nil {
@@ -639,7 +612,7 @@ func runWalletExport(args []string) error {
 	if outPath == "" {
 		outPath = filepath.Join(filepath.Dir(walletPath), safeWalletFileStem(walletName)+"-wallet-export.json")
 	}
-	if samePath(outPath, walletPath) {
+	if store.IsStorePath(outPath) {
 		return errors.New("export output cannot be the live wallet store")
 	}
 	if err := wallet.SaveExportFileWithOptions(outPath, export, *overwrite); err != nil {
@@ -738,24 +711,9 @@ func runWalletSend(args []string) error {
 		return err
 	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken), rpcClientTimeout(cfg))
-	watchItems, err := store.SpendableWatchItems(*from)
+	utxos, _, err := syncWalletState(store, client, *from, 0)
 	if err != nil {
-		return err
-	}
-	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	activity, err := rpcWalletActivityByWatchItems(client, watchItems, walletReconcileActivityLimit(store, *from, 20))
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	confirmed, err := confirmedWalletTxIDs(client, store, *from, activity)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	if err := reconcileWalletPending(store, client, *from, utxos, confirmed); err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
+		return walletSyncError(err, *from, cfg, *rpcAddr)
 	}
 	plan := wallet.SendPlan{}
 	var feeQuote *walletFeeQuote
@@ -851,24 +809,9 @@ func runWalletFanout(args []string) error {
 		*from = name
 	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken), rpcClientTimeout(cfg))
-	watchItems, err := store.SpendableWatchItems(*from)
+	utxos, _, err := syncWalletState(store, client, *from, 0)
 	if err != nil {
-		return err
-	}
-	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	activity, err := rpcWalletActivityByWatchItems(client, watchItems, walletReconcileActivityLimit(store, *from, 20))
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	confirmed, err := confirmedWalletTxIDs(client, store, *from, activity)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	if err := reconcileWalletPending(store, client, *from, utxos, confirmed); err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
+		return walletSyncError(err, *from, cfg, *rpcAddr)
 	}
 	var feeQuote *walletFeeQuote
 	feeRate := uint64(0)
@@ -892,25 +835,9 @@ func runWalletFanout(args []string) error {
 		feeQuote = &quote
 		feeRate = quote.FeeRate
 	}
-	plans := make([]wallet.SendPlan, 0, *count)
-	workingUTXOs := append([]wallet.SpendableUTXO(nil), utxos...)
-	knownAddresses := make([]wallet.Address, 0, *count)
-	for i := 0; i < *count; i++ {
-		to := destinations[i%len(destinations)]
-		var plan wallet.SendPlan
-		if *fee > 0 {
-			plan, err = store.BuildSendWithKnownAddresses(*from, to, amount, *fee, workingUTXOs, knownAddresses)
-		} else {
-			plan, err = store.BuildSendAutoWithKnownAddresses(*from, to, amount, feeRate, workingUTXOs, knownAddresses)
-		}
-		if err != nil {
-			return walletCommandError(*from, fmt.Errorf("fanout plan %d/%d: %w", i+1, *count, err))
-		}
-		plans = append(plans, plan)
-		if plan.ChangeAddress != nil {
-			knownAddresses = append(knownAddresses, *plan.ChangeAddress)
-		}
-		workingUTXOs = applyFanoutPlanToUTXOs(workingUTXOs, plan)
+	plans, err := store.BuildFanout(*from, destinations, *count, amount, *fee, feeRate, utxos)
+	if err != nil {
+		return walletCommandError(*from, err)
 	}
 	preview := withWalletContext(renderFanoutPlansPreview(*from, destinations, plans, feeQuote), cfg, resolveRPCAddr(cfg, *rpcAddr))
 	if err := maybeConfirmWalletAction(preview, *yes); err != nil {
@@ -975,24 +902,9 @@ func runWalletCPFP(args []string) error {
 		*from = name
 	}
 	client := newRPCClient(resolveRPCAddr(cfg, *rpcAddr), resolveRPCAuthToken(cfg, *rpcAuthToken), rpcClientTimeout(cfg))
-	watchItems, err := store.SpendableWatchItems(*from)
+	_, _, err = syncWalletState(store, client, *from, 0)
 	if err != nil {
-		return walletCommandError(*from, err)
-	}
-	utxos, err := rpcUTXOsByWatchItems(client, watchItems)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	activity, err := rpcWalletActivityByWatchItems(client, watchItems, walletReconcileActivityLimit(store, *from, 20))
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	confirmed, err := confirmedWalletTxIDs(client, store, *from, activity)
-	if err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
-	}
-	if err := reconcileWalletPending(store, client, *from, utxos, confirmed); err != nil {
-		return walletRPCError(err, cfg, *rpcAddr)
+		return walletSyncError(err, *from, cfg, *rpcAddr)
 	}
 	var plan wallet.CPFPPlan
 	var feeQuote *walletFeeQuote
@@ -1037,22 +949,19 @@ func runWalletCPFP(args []string) error {
 	if err := client.Call("submittx", map[string]string{"hex": plan.TransactionHex}, &result); err != nil {
 		var remoteErr cliRPCRemoteError
 		if errors.As(err, &remoteErr) {
-			_ = store.ForgetPending(*from, plan.TransactionID)
+			return forgetFailedWalletSend(store, *from, plan.TransactionID, err)
 		}
 		return err
 	}
 	reportedTxID, err := decodeHex32(result.TxID)
 	if err != nil {
-		_ = store.ForgetPending(*from, plan.TransactionID)
-		return err
+		return forgetFailedWalletSend(store, *from, plan.TransactionID, err)
 	}
 	if reportedTxID != plan.TransactionID {
-		_ = store.ForgetPending(*from, plan.TransactionID)
-		return fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
+		return forgetFailedWalletSend(store, *from, plan.TransactionID, fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID))
 	}
 	if result.Orphaned {
-		_ = store.ForgetPending(*from, plan.TransactionID)
-		return fmt.Errorf("node stored CPFP child %s as an orphan; parent %x is not currently spendable by the node", result.TxID, plan.ParentTxID)
+		return forgetFailedWalletSend(store, *from, plan.TransactionID, fmt.Errorf("node stored CPFP child %s as an orphan; parent %x is not currently spendable by the node", result.TxID, plan.ParentTxID))
 	}
 	printWalletAction(renderCPFPResult(plan, result.TxID, feeQuote))
 	return nil

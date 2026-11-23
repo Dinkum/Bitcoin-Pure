@@ -4,16 +4,17 @@ import (
 	"sync"
 
 	"bitcoin-pure/internal/consensus"
-	bpcrypto "bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/mempool"
+	"bitcoin-pure/internal/types"
 )
 
 const validAuthCacheCapacity = 262_144
 
 type validAuthCacheKey struct {
-	txid     [32]byte
-	authid   [32]byte
-	paramTag [32]byte
+	txid    [32]byte
+	authid  [32]byte
+	profile types.ChainProfile
+	lineage string
 }
 
 type validAuthCache struct {
@@ -33,15 +34,11 @@ func newValidAuthCache(max int) *validAuthCache {
 	}
 }
 
-func validAuthParamTag(params consensus.ChainParams) [32]byte {
-	return bpcrypto.Sha256d([]byte(params.SighashTag()))
-}
-
 func (c *validAuthCache) remember(txid, authid [32]byte, params consensus.ChainParams) {
 	if c == nil || txid == ([32]byte{}) || authid == ([32]byte{}) {
 		return
 	}
-	key := validAuthCacheKey{txid: txid, authid: authid, paramTag: validAuthParamTag(params)}
+	key := validAuthCacheKey{txid: txid, authid: authid, profile: params.Profile, lineage: params.ChainLineage}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.items == nil {
@@ -68,7 +65,7 @@ func (c *validAuthCache) contains(txid, authid [32]byte, params consensus.ChainP
 	if c == nil || txid == ([32]byte{}) || authid == ([32]byte{}) {
 		return false
 	}
-	key := validAuthCacheKey{txid: txid, authid: authid, paramTag: validAuthParamTag(params)}
+	key := validAuthCacheKey{txid: txid, authid: authid, profile: params.Profile, lineage: params.ChainLineage}
 	c.mu.RLock()
 	_, ok := c.items[key]
 	c.mu.RUnlock()

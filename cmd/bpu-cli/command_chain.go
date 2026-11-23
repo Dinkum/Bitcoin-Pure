@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -141,36 +142,13 @@ func runChainValidateFixture(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	fixture, err := loadChainFixture(*file)
+	fixture, profile, loadedGenesis, err := loadReplayFixture(*file)
 	if err != nil {
 		return err
 	}
-	profile, err := types.ParseChainProfile(fixture.Profile)
+	blocks, err := decodeChainFixtureBlocks(fixture)
 	if err != nil {
 		return err
-	}
-	loadedGenesis, err := loadGenesisFixtureFromPath(fixture.GenesisFixture)
-	if err != nil {
-		return err
-	}
-	if loadedGenesis.Fixture.Profile != fixture.Profile {
-		return fmt.Errorf("chain fixture profile mismatch: chain says %s, genesis says %s", fixture.Profile, loadedGenesis.Fixture.Profile)
-	}
-
-	blocks := make([]types.Block, 0, len(fixture.Blocks))
-	for i, blockHex := range fixture.Blocks {
-		block, err := consensus.DecodeBlockHex(blockHex, types.DefaultCodecLimits())
-		if err != nil {
-			return fmt.Errorf("failed to decode fixture block at index %d: %w", i, err)
-		}
-		gotHash := fmt.Sprintf("%x", consensus.HeaderHash(&block.Header))
-		if i >= len(fixture.ExpectedBlockHashesHex) {
-			return fmt.Errorf("missing expected block hash for index %d", i)
-		}
-		if gotHash != fixture.ExpectedBlockHashesHex[i] {
-			return fmt.Errorf("block hash mismatch at index %d: expected %s, got %s", i, fixture.ExpectedBlockHashesHex[i], gotHash)
-		}
-		blocks = append(blocks, block)
 	}
 
 	var summary node.ChainReplaySummary
@@ -260,36 +238,15 @@ func runChainValidateHeadersFixture(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	fixture, err := loadChainFixture(*file)
+	fixture, profile, loadedGenesis, err := loadReplayFixture(*file)
 	if err != nil {
 		return err
 	}
-	profile, err := types.ParseChainProfile(fixture.Profile)
-	if err != nil {
-		return err
-	}
-	loadedGenesis, err := loadGenesisFixtureFromPath(fixture.GenesisFixture)
-	if err != nil {
-		return err
-	}
-	if loadedGenesis.Fixture.Profile != fixture.Profile {
-		return fmt.Errorf("chain fixture profile mismatch: chain says %s, genesis says %s", fixture.Profile, loadedGenesis.Fixture.Profile)
-	}
-
 	headers := make([]types.BlockHeader, 0, len(fixture.Blocks))
-	for i, blockHex := range fixture.Blocks {
-		block, err := consensus.DecodeBlockHex(blockHex, types.DefaultCodecLimits())
-		if err != nil {
-			return fmt.Errorf("failed to decode fixture block at index %d: %w", i, err)
-		}
-		gotHash := fmt.Sprintf("%x", consensus.HeaderHash(&block.Header))
-		if i >= len(fixture.ExpectedBlockHashesHex) {
-			return fmt.Errorf("missing expected block hash for index %d", i)
-		}
-		if gotHash != fixture.ExpectedBlockHashesHex[i] {
-			return fmt.Errorf("block hash mismatch at index %d: expected %s, got %s", i, fixture.ExpectedBlockHashesHex[i], gotHash)
-		}
+	if err := walkChainFixtureBlocks(fixture, func(block types.Block) {
 		headers = append(headers, block.Header)
+	}); err != nil {
+		return err
 	}
 
 	var summary node.HeaderReplaySummary
@@ -366,36 +323,13 @@ func runChainSyncFixture(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	fixture, err := loadChainFixture(*file)
+	fixture, profile, loadedGenesis, err := loadReplayFixture(*file)
 	if err != nil {
 		return err
 	}
-	profile, err := types.ParseChainProfile(fixture.Profile)
+	blocks, err := decodeChainFixtureBlocks(fixture)
 	if err != nil {
 		return err
-	}
-	loadedGenesis, err := loadGenesisFixtureFromPath(fixture.GenesisFixture)
-	if err != nil {
-		return err
-	}
-	if loadedGenesis.Fixture.Profile != fixture.Profile {
-		return fmt.Errorf("chain fixture profile mismatch: chain says %s, genesis says %s", fixture.Profile, loadedGenesis.Fixture.Profile)
-	}
-
-	blocks := make([]types.Block, 0, len(fixture.Blocks))
-	for i, blockHex := range fixture.Blocks {
-		block, err := consensus.DecodeBlockHex(blockHex, types.DefaultCodecLimits())
-		if err != nil {
-			return fmt.Errorf("failed to decode fixture block at index %d: %w", i, err)
-		}
-		gotHash := fmt.Sprintf("%x", consensus.HeaderHash(&block.Header))
-		if i >= len(fixture.ExpectedBlockHashesHex) {
-			return fmt.Errorf("missing expected block hash for index %d", i)
-		}
-		if gotHash != fixture.ExpectedBlockHashesHex[i] {
-			return fmt.Errorf("block hash mismatch at index %d: expected %s, got %s", i, fixture.ExpectedBlockHashesHex[i], gotHash)
-		}
-		blocks = append(blocks, block)
 	}
 
 	var summary node.HeadersFirstIBDSummary
@@ -494,6 +428,54 @@ func loadGenesisFixtureFromPath(path string) (*loadedGenesisFixture, error) {
 	return &loadedGenesisFixture{Fixture: fixture, Block: block}, nil
 }
 
+func loadReplayFixture(path string) (*chainFixture, types.ChainProfile, *loadedGenesisFixture, error) {
+	fixture, err := loadChainFixture(path)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	profile, err := types.ParseChainProfile(fixture.Profile)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	genesis, err := loadGenesisFixtureFromPath(fixture.GenesisFixture)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if genesis.Fixture.Profile != fixture.Profile {
+		return nil, "", nil, fmt.Errorf("chain fixture profile mismatch: chain says %s, genesis says %s", fixture.Profile, genesis.Fixture.Profile)
+	}
+	return fixture, profile, genesis, nil
+}
+
+func decodeChainFixtureBlocks(fixture *chainFixture) ([]types.Block, error) {
+	blocks := make([]types.Block, 0, len(fixture.Blocks))
+	err := walkChainFixtureBlocks(fixture, func(block types.Block) {
+		blocks = append(blocks, block)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return blocks, nil
+}
+
+func walkChainFixtureBlocks(fixture *chainFixture, visit func(types.Block)) error {
+	for i, blockHex := range fixture.Blocks {
+		block, err := consensus.DecodeBlockHex(blockHex, types.DefaultCodecLimits())
+		if err != nil {
+			return fmt.Errorf("failed to decode fixture block at index %d: %w", i, err)
+		}
+		gotHash := fmt.Sprintf("%x", consensus.HeaderHash(&block.Header))
+		if i >= len(fixture.ExpectedBlockHashesHex) {
+			return fmt.Errorf("missing expected block hash for index %d", i)
+		}
+		if gotHash != fixture.ExpectedBlockHashesHex[i] {
+			return fmt.Errorf("block hash mismatch at index %d: expected %s, got %s", i, fixture.ExpectedBlockHashesHex[i], gotHash)
+		}
+		visit(block)
+	}
+	return nil
+}
+
 func loadChainFixture(path string) (*chainFixture, error) {
 	var fixture chainFixture
 	if err := readJSON(path, &fixture); err != nil {
@@ -524,7 +506,7 @@ func readHexInput(rawHex, file string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		raw := string(bytesTrimSpace(buf))
+		raw := string(bytes.TrimSpace(buf))
 		if _, err := hex.DecodeString(raw); err != nil {
 			return "", err
 		}
@@ -532,16 +514,4 @@ func readHexInput(rawHex, file string) (string, error) {
 	default:
 		return "", errors.New("provide --hex or --file")
 	}
-}
-
-func bytesTrimSpace(buf []byte) []byte {
-	start := 0
-	for start < len(buf) && (buf[start] == ' ' || buf[start] == '\n' || buf[start] == '\t' || buf[start] == '\r') {
-		start++
-	}
-	end := len(buf)
-	for end > start && (buf[end-1] == ' ' || buf[end-1] == '\n' || buf[end-1] == '\t' || buf[end-1] == '\r') {
-		end--
-	}
-	return buf[start:end]
 }

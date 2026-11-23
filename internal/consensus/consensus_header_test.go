@@ -3,6 +3,7 @@ package consensus
 import (
 	"bitcoin-pure/internal/types"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -287,6 +288,44 @@ func TestNextWorkRequiredASERTMatchesReferenceCases(t *testing.T) {
 	}
 }
 
+func TestNextWorkRequiredASERTClampsExtremeInputs(t *testing.T) {
+	params := RegtestParams()
+	anchor := GenesisAsertAnchor(params)
+	cases := []struct {
+		name   string
+		height uint64
+		time   uint64
+		bits   uint32
+	}{
+		{name: "large signed timestamp", time: math.MaxInt64, bits: params.PowLimitBits},
+		{name: "large unsigned timestamp", time: math.MaxUint64, bits: params.PowLimitBits},
+		{name: "height arithmetic underflow", height: math.MaxUint64, time: math.MaxUint64, bits: 0x01010000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := PrevBlockContext{Height: tc.height, Header: types.BlockHeader{Timestamp: tc.time}}
+			bits, err := NextWorkRequiredASERT(anchor, prev, params)
+			if err != nil || bits != tc.bits {
+				t.Fatalf("ASERT = (0x%08x, %v), want (0x%08x, nil)", bits, err, tc.bits)
+			}
+		})
+	}
+
+	params.AsertHalfLifeSecs = 0
+	if _, err := NextWorkRequiredASERT(anchor, PrevBlockContext{}, params); err == nil {
+		t.Fatal("ASERT accepted a zero half-life")
+	}
+}
+
+func TestMiningRejectsOversizedCompactTarget(t *testing.T) {
+	params := RegtestParams()
+	params.PowLimitBits = 0x22010000
+	header := types.BlockHeader{NBits: params.PowLimitBits}
+	if _, _, err := MineHeaderInterruptible(header, params, nil); !errors.Is(err, ErrInvalidCompactTarget) {
+		t.Fatalf("oversized mining target error = %v, want %v", err, ErrInvalidCompactTarget)
+	}
+}
+
 func BenchmarkNextWorkRequiredASERT(b *testing.B) {
 	params := MainnetParams()
 	anchor := GenesisAsertAnchor(params)
@@ -327,19 +366,6 @@ func BenchmarkMineHeaderInterruptible4096(b *testing.B) {
 		if ok {
 			b.Fatal("expected benchmark header to stop before finding pow")
 		}
-	}
-}
-
-func TestNextWorkRequiredBitcoinLegacyRetargetHelperClampsToPowLimit(t *testing.T) {
-	params := RegtestParams()
-	first := &types.BlockHeader{Timestamp: params.GenesisTimestamp, NBits: params.GenesisBits}
-	prev := &types.BlockHeader{Timestamp: params.GenesisTimestamp + uint64(params.TargetSpacingSecs*2016*10), NBits: params.GenesisBits}
-	got, err := NextWorkRequiredBitcoinLegacy(first, prev, params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != params.PowLimitBits {
-		t.Fatalf("expected pow limit bits 0x%08x, got 0x%08x", params.PowLimitBits, got)
 	}
 }
 

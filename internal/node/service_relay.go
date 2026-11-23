@@ -91,7 +91,7 @@ func (s *Service) relayAcceptedTxs(peers []*peerConn, accepted []mempool.Accepte
 		sourceAddr = source.addr
 	}
 	txids := acceptedTxIDs(accepted)
-	s.safeGoDetached("dandelion-fluff-delay", func() {
+	s.safeGo("dandelion-fluff-delay", func() {
 		s.runDandelionFluffAfterDelay(txids, sourceAddr)
 	})
 }
@@ -195,7 +195,7 @@ func (s *Service) scheduleLocalRelayFallbacks(peers []*peerConn, accepted []memp
 			continue
 		}
 		fallbackTxIDs := append([][32]byte(nil), txids...)
-		s.safeGoDetached("local-relay-fallback", func() {
+		s.safeGo("local-relay-fallback", func() {
 			s.runLocalRelayFallback(peer, fallbackTxIDs)
 		})
 	}
@@ -516,14 +516,27 @@ func (p *peerConn) releaseQueuedInv(items []p2p.InvVector) {
 	}
 }
 
-func (p *peerConn) filterQueuedTxs(txs []types.Transaction) []types.Transaction {
+type relayTxBatch struct {
+	txs   []types.Transaction
+	txids [][32]byte
+}
+
+func relayTxIDs(txs []types.Transaction) [][32]byte {
+	txids := make([][32]byte, len(txs))
+	for i := range txs {
+		txids[i] = consensus.TxID(&txs[i])
+	}
+	return txids
+}
+
+func (p *peerConn) filterQueuedTxs(txs []types.Transaction) relayTxBatch {
+	txids := relayTxIDs(txs)
 	p.txMu.Lock()
-	defer p.txMu.Unlock()
 	filtered := make([]types.Transaction, 0, len(txs))
 	duplicateQueued := 0
 	suppressedKnown := 0
-	for _, tx := range txs {
-		txid := consensus.TxID(&tx)
+	filteredIDs := txids[:0]
+	for i, txid := range txids {
 		if p.queuedTx[txid] > 0 {
 			duplicateQueued++
 			continue
@@ -533,8 +546,10 @@ func (p *peerConn) filterQueuedTxs(txs []types.Transaction) []types.Transaction 
 			continue
 		}
 		p.queuedTx[txid]++
-		filtered = append(filtered, tx)
+		filtered = append(filtered, txs[i])
+		filteredIDs = append(filteredIDs, txid)
 	}
+	p.txMu.Unlock()
 	if duplicateQueued > 0 {
 		p.telemetry.noteDuplicateTx(duplicateQueued)
 		if p.svc != nil {
@@ -550,7 +565,7 @@ func (p *peerConn) filterQueuedTxs(txs []types.Transaction) []types.Transaction 
 	if duplicateQueued > 0 || suppressedKnown > 0 {
 		p.maybeLogRelaySuppression("tx_batch", duplicateQueued, suppressedKnown, classifyRelayMessage(p2p.TxBatchMessage{Txs: txs}))
 	}
-	return filtered
+	return relayTxBatch{txs: filtered, txids: filteredIDs}
 }
 
 func (p *peerConn) filterQueuedTxIDs(txids [][32]byte, suppressKnown bool) [][32]byte {
@@ -592,19 +607,7 @@ func (p *peerConn) filterQueuedTxIDs(txids [][32]byte, suppressKnown bool) [][32
 }
 
 func (p *peerConn) releaseQueuedTxs(txs []types.Transaction) {
-	if len(txs) == 0 {
-		return
-	}
-	p.txMu.Lock()
-	defer p.txMu.Unlock()
-	for _, tx := range txs {
-		txid := consensus.TxID(&tx)
-		if remaining := p.queuedTx[txid] - 1; remaining > 0 {
-			p.queuedTx[txid] = remaining
-			continue
-		}
-		delete(p.queuedTx, txid)
-	}
+	p.releaseQueuedTxIDs(relayTxIDs(txs))
 }
 
 func (p *peerConn) releaseQueuedTxIDs(txids [][32]byte) {
@@ -622,20 +625,19 @@ func (p *peerConn) releaseQueuedTxIDs(txids [][32]byte) {
 	}
 }
 
-func (p *peerConn) stagePendingTxs(txs []types.Transaction) ([][]types.Transaction, bool) {
+func (p *peerConn) stagePendingTxs(batch relayTxBatch) ([]relayTxBatch, bool) {
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
 	if p.pendingTxByID == nil {
-		p.pendingTxByID = make(map[[32]byte]*types.Transaction, len(txs))
+		p.pendingTxByID = make(map[[32]byte]*types.Transaction, len(batch.txs))
 	}
-	for _, tx := range txs {
-		txCopy := tx
-		txid := consensus.TxID(&tx)
+	for i, txid := range batch.txids {
+		txCopy := batch.txs[i]
 		p.pendingTxOrder = append(p.pendingTxOrder, txid)
 		p.pendingTxByID[txid] = &txCopy
 	}
-	p.telemetry.noteCoalescedTxs(len(txs))
-	ready := make([][]types.Transaction, 0, len(p.pendingTxOrder)/txRelayBatchMaxItems+1)
+	p.telemetry.noteCoalescedTxs(len(batch.txs))
+	ready := make([]relayTxBatch, 0, len(p.pendingTxOrder)/txRelayBatchMaxItems+1)
 	for len(p.pendingTxOrder) >= txRelayBatchMaxItems {
 		ready = append(ready, p.takePendingTxBatchLocked(txRelayBatchMaxItems))
 	}
@@ -704,7 +706,7 @@ func (p *peerConn) flushPendingTxsAfterDelay() {
 	batches := p.takePendingTxs()
 	txCount := 0
 	for _, batch := range batches {
-		txCount += len(batch)
+		txCount += len(batch.txs)
 		p.enqueueRelayTxs(batch)
 	}
 	if p.svc != nil && len(batches) > 0 {
@@ -790,7 +792,7 @@ func (p *peerConn) clearPendingTxRequestFlushArm() {
 	p.reqFlushArmed = false
 }
 
-func (p *peerConn) takePendingTxs() [][]types.Transaction {
+func (p *peerConn) takePendingTxs() []relayTxBatch {
 	p.txMu.Lock()
 	defer p.txMu.Unlock()
 	defer func() {
@@ -799,7 +801,7 @@ func (p *peerConn) takePendingTxs() [][]types.Transaction {
 	if len(p.pendingTxOrder) == 0 {
 		return nil
 	}
-	batches := make([][]types.Transaction, 0, (len(p.pendingTxOrder)+txRelayBatchMaxItems-1)/txRelayBatchMaxItems)
+	batches := make([]relayTxBatch, 0, (len(p.pendingTxOrder)+txRelayBatchMaxItems-1)/txRelayBatchMaxItems)
 	for len(p.pendingTxOrder) != 0 {
 		end := txRelayBatchMaxItems
 		if end > len(p.pendingTxOrder) {
@@ -830,14 +832,15 @@ func (p *peerConn) takePendingTxRequests() [][][32]byte {
 	return batches
 }
 
-func (p *peerConn) takePendingTxBatchLocked(size int) []types.Transaction {
-	batch := make([]types.Transaction, 0, size)
+func (p *peerConn) takePendingTxBatchLocked(size int) relayTxBatch {
+	batch := relayTxBatch{txs: make([]types.Transaction, 0, size), txids: make([][32]byte, 0, size)}
 	for _, txid := range p.pendingTxOrder[:size] {
 		tx, ok := p.pendingTxByID[txid]
 		if !ok {
 			continue
 		}
-		batch = append(batch, *tx)
+		batch.txs = append(batch.txs, *tx)
+		batch.txids = append(batch.txids, txid)
 		delete(p.pendingTxByID, txid)
 	}
 	p.pendingTxOrder = p.pendingTxOrder[size:]
@@ -884,25 +887,27 @@ func (p *peerConn) takePendingRecon() [][][32]byte {
 	return batches
 }
 
-func (p *peerConn) enqueueRelayTxs(txs []types.Transaction) error {
+func (p *peerConn) enqueueRelayTxs(batch relayTxBatch) error {
+	txs := batch.txs
 	if len(txs) == 0 {
 		return nil
 	}
 	envelope := outboundMessage{
 		msg:        p2p.TxBatchMessage{Txs: txs},
+		txids:      batch.txids,
 		enqueuedAt: time.Now(),
 		lane:       relayQueueLaneSend,
 		class:      classifyRelayMessage(p2p.TxBatchMessage{Txs: txs}),
 	}
 	select {
 	case <-p.closed:
-		p.releaseQueuedTxs(txs)
+		p.releaseQueuedTxIDs(batch.txids)
 		return io.EOF
 	case p.sendQ <- envelope:
 		p.telemetry.noteEnqueue(p.queueDepths())
 		return nil
 	default:
-		p.releaseQueuedTxs(txs)
+		p.releaseQueuedTxIDs(batch.txids)
 		p.telemetry.noteDroppedTxs(len(txs), envelope.lane)
 		if len(txs) >= relayDropWarnThreshold || p.queueDepths().send >= relayQueueWarnDepth {
 			p.logRelayQueuePressure(slog.LevelWarn, "dropped tx relay batch due to saturated send queue", envelope.lane, envelope.class, len(txs))
@@ -952,19 +957,13 @@ func (p *peerConn) enqueueRelayRecon(txids [][32]byte) error {
 }
 
 func (p *peerConn) noteKnownTxs(msg p2p.Message) {
-	p.txMu.Lock()
-	defer p.txMu.Unlock()
 	switch m := msg.(type) {
 	case p2p.TxBatchMessage:
-		for _, tx := range m.Txs {
-			p.rememberKnownTxLocked(consensus.TxID(&tx))
-		}
+		p.noteKnownTxIDs(relayTxIDs(m.Txs))
 	case p2p.TxMessage:
-		p.rememberKnownTxLocked(consensus.TxID(&m.Tx))
+		p.noteKnownTxIDs([][32]byte{consensus.TxID(&m.Tx)})
 	case p2p.TxReconMessage:
-		for _, txid := range m.TxIDs {
-			p.rememberKnownTxLocked(txid)
-		}
+		p.noteKnownTxIDs(m.TxIDs)
 	}
 }
 
@@ -1292,13 +1291,6 @@ func (t *peerRelayTelemetry) noteTxRequestReceived(count int) {
 	t.txReqRecvItems += count
 }
 
-func (t *peerRelayTelemetry) noteFallbackBatch(count int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.fallbackTxBatchMsgs++
-	t.fallbackTxBatchItems += count
-}
-
 func (t *peerRelayTelemetry) noteTxNotFoundSent(count int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1373,7 +1365,8 @@ func (t *peerRelayTelemetry) noteSent(envelope outboundMessage, _ int) {
 	}
 	if envelope.class.txInvItems != 0 || envelope.class.blockInvItems != 0 || envelope.class.txBatchItems != 0 || envelope.class.txReconItems != 0 || envelope.class.txReqItems != 0 {
 		delay := time.Since(envelope.enqueuedAt)
-		t.relaySamples = append(t.relaySamples, float64(delay.Microseconds())/1000)
+		t.relaySamples[t.relayEvents%len(t.relaySamples)] = float64(delay.Microseconds()) / 1000
+		t.relayEvents++
 	}
 }
 
@@ -1392,7 +1385,6 @@ func relayLaneBudget(lane relayQueueLane) time.Duration {
 
 func (t *peerRelayTelemetry) snapshot(addr string, outbound bool, queueDepth queueDepthSnapshot, pendingLocalRelay int) PeerRelayStats {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	stats := PeerRelayStats{
 		Addr:                   addr,
 		Outbound:               outbound,
@@ -1439,12 +1431,15 @@ func (t *peerRelayTelemetry) snapshot(addr string, outbound bool, queueDepth que
 		PriorityStarvation:     t.priorityStarvation,
 		SendStarvation:         t.sendStarvation,
 		LastRelayActivityUnix:  t.lastRelayActivityUnix,
-		RelayEvents:            len(t.relaySamples),
+		RelayEvents:            t.relayEvents,
 	}
-	if len(t.relaySamples) == 0 {
+	var window [len(t.relaySamples)]float64
+	samples := window[:min(t.relayEvents, len(window))]
+	copy(samples, t.relaySamples[:])
+	t.mu.Unlock()
+	if len(samples) == 0 {
 		return stats
 	}
-	samples := append([]float64(nil), t.relaySamples...)
 	slices.Sort(samples)
 	var total float64
 	for _, sample := range samples {

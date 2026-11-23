@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -128,5 +129,22 @@ func TestExampleConfigEnablesTransactionIndex(t *testing.T) {
 	}
 	if !cfg.TxIndexEnabled {
 		t.Fatal("example config should enable transaction indexing")
+	}
+}
+
+func TestLoadRejectsUnknownConfigFields(t *testing.T) {
+	for name, data := range map[string]string{
+		"config.json": `{"max_inboud_peers":50}`,
+		"config.yaml": "max_inboud_peers: 50\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "max_inboud_peers") {
+				t.Fatalf("unknown configuration field error = %v", err)
+			}
+		})
 	}
 }

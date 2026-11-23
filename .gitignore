@@ -5,20 +5,16 @@
 
 # Build subdirectories.
 /*build*
-!/build-aux
-!/build_msvc
 
 # macOS Finder
 .DS_Store
 
 *.pyc
+__pycache__/
+.ruff_cache/
 
 # Only ignore unexpected patches
 *.patch
-!contrib/guix/patches/*.patch
-!depends/patches/**/*.patch
-
-/CMakeUserPresets.json
 
 # Previous releases
 /releases
@@ -26,6 +22,7 @@
 /Works
 /REFERENCE_NODES
 /CI/
+/LOCALONLY/
 /UI_Screenshots/
 /architecture/
 /AGENTS.md
@@ -40,22 +37,12 @@
 /bpu-cli
 /.*-tmp/
 /benchmarks/
-/benchmarks/reports/
-/benchmarks/reports/micro/
-/benchmarks.test
-/node.test
 /*.test
 
-# cargo default target dir
-target/
 .gocache/
 .gopath/
 *.log
 *.log.1
-
-/guix-build-*
-
-/ci/scratch/
 
 # Root-level markdown notes are local unless explicitly published.
 /beta-pq-ideas.md

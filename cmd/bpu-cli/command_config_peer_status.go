@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,11 +19,12 @@ func runStatus(args []string) error {
 	configPath := fs.String("config", "", "")
 	rpcAddr := fs.String("rpc", "", "")
 	rpcAuthToken := fs.String("rpc-auth-token", "", "")
+	jsonOutput := fs.Bool("json", false, "write node status as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return errors.New("usage: bpu-cli status [--config PATH] [--rpc ADDR] [--rpc-auth-token TOKEN]")
+		return errors.New("usage: bpu-cli status [--json] [--config PATH] [--rpc ADDR] [--rpc-auth-token TOKEN]")
 	}
 	cfg, _, err := resolveCLIConfig(*configPath)
 	if err != nil {
@@ -32,6 +34,9 @@ func runStatus(args []string) error {
 	status, err := fetchNodeStatus(client)
 	if err != nil {
 		return err
+	}
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(status)
 	}
 	fmt.Print(renderNodeStatus(status, cfg))
 	return nil
@@ -138,21 +143,12 @@ func runConfigMining(args []string) error {
 	if *workers < 0 {
 		return errors.New("--workers must not be negative")
 	}
-	resolvedConfigPath := strings.TrimSpace(*configPath)
-	if resolvedConfigPath == "" {
-		for _, candidate := range config.DefaultPathCandidates() {
-			if fileExists(candidate) {
-				resolvedConfigPath = candidate
-				break
-			}
-		}
+	cfg, resolvedConfigPath, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
 	}
 	if resolvedConfigPath == "" {
 		return errors.New("config mining requires --config when no installed config exists")
-	}
-	cfg, err := config.Load(resolvedConfigPath)
-	if err != nil {
-		return err
 	}
 	cfg.MinerEnabled = mode == "on"
 	if *workers > 0 {

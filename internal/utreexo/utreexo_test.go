@@ -682,6 +682,36 @@ func TestAccumulatorApplyRejectsDuplicateSpentOutPoint(t *testing.T) {
 	}
 }
 
+func TestAccumulatorApplyReplacesLeafAndAddsMaskedBranchPrefix(t *testing.T) {
+	first := testLeaf(1, 0, 10, 11)
+	second := testLeaf(2, 0, 20, 22)
+	acc, err := NewAccumulatorFromLeaves([]UtxoLeaf{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The all-zero key equals the masked branch prefix but is a new leaf.
+	third := testLeaf(0, 0, 30, 33)
+	added, err := acc.Add(third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := UtxoRoot([]UtxoLeaf{first, second, third}); added.Root() != want {
+		t.Fatalf("incremental root = %x, want %x", added.Root(), want)
+	}
+	replacement := first
+	replacement.ValueAtoms++
+	next, err := acc.Apply([]types.OutPoint{first.OutPoint}, []UtxoLeaf{replacement, third})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := UtxoRoot([]UtxoLeaf{replacement, second, third}); next.Root() != want {
+		t.Fatalf("batched root = %x, want %x", next.Root(), want)
+	}
+	if want := UtxoRoot([]UtxoLeaf{first, second}); acc.Root() != want {
+		t.Fatal("batch mutated the input accumulator")
+	}
+}
+
 func TestAccumulatorRejectsMissingDelete(t *testing.T) {
 	acc, err := NewAccumulatorFromLeaves([]UtxoLeaf{testLeaf(1, 0, 10, 11)})
 	if err != nil {

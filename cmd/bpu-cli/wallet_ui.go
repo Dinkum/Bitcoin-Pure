@@ -45,24 +45,28 @@ func submitWalletSendPlan(store *wallet.Store, client *cliRPCClient, walletName 
 	if err := client.Call("submittx", map[string]string{"hex": plan.TransactionHex}, &result); err != nil {
 		var remoteErr cliRPCRemoteError
 		if errors.As(err, &remoteErr) {
-			_ = store.ForgetPending(walletName, plan.TransactionID)
+			return walletSubmitResult{}, forgetFailedWalletSend(store, walletName, plan.TransactionID, err)
 		}
 		return walletSubmitResult{}, err
 	}
 	reportedTxID, err := decodeHex32(result.TxID)
 	if err != nil {
-		_ = store.ForgetPending(walletName, plan.TransactionID)
-		return walletSubmitResult{}, err
+		return walletSubmitResult{}, forgetFailedWalletSend(store, walletName, plan.TransactionID, err)
 	}
 	if reportedTxID != plan.TransactionID {
-		_ = store.ForgetPending(walletName, plan.TransactionID)
-		return walletSubmitResult{}, fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID)
+		return walletSubmitResult{}, forgetFailedWalletSend(store, walletName, plan.TransactionID, fmt.Errorf("submitted txid mismatch: planned %x, node returned %s", plan.TransactionID, result.TxID))
 	}
 	if result.Orphaned {
-		_ = store.ForgetPending(walletName, plan.TransactionID)
-		return walletSubmitResult{}, fmt.Errorf("node stored transaction %s as an orphan; the node is missing at least one input", result.TxID)
+		return walletSubmitResult{}, forgetFailedWalletSend(store, walletName, plan.TransactionID, fmt.Errorf("node stored transaction %s as an orphan; the node is missing at least one input", result.TxID))
 	}
 	return result, nil
+}
+
+func forgetFailedWalletSend(store *wallet.Store, walletName string, txid [32]byte, cause error) error {
+	if err := store.ForgetPending(walletName, txid); err != nil {
+		return errors.Join(cause, fmt.Errorf("clear pending wallet transaction %x: %w", txid, err))
+	}
+	return cause
 }
 
 func completeWalletSendInputs(store *wallet.Store, from *string, to *string, amountRaw *string, amountAtoms *uint64, yes bool) error {
@@ -402,33 +406,6 @@ func printWalletFanoutResultWithTitle(title string, walletName string, results [
 	}
 }
 
-func applyFanoutPlanToUTXOs(utxos []wallet.SpendableUTXO, plan wallet.SendPlan) []wallet.SpendableUTXO {
-	spent := make(map[types.OutPoint]struct{}, len(plan.Inputs))
-	for _, input := range plan.Inputs {
-		spent[input.OutPoint] = struct{}{}
-	}
-	next := make([]wallet.SpendableUTXO, 0, len(utxos)+1)
-	for _, utxo := range utxos {
-		if _, ok := spent[utxo.OutPoint]; ok {
-			continue
-		}
-		next = append(next, utxo)
-	}
-	if plan.Change > 0 && plan.ChangeAddress != nil {
-		item, err := plan.ChangeAddress.WatchItem()
-		if err == nil {
-			next = append(next, wallet.SpendableUTXO{
-				OutPoint:  types.OutPoint{TxID: plan.TransactionID, Vout: 1},
-				Value:     plan.Change,
-				Type:      item.Type,
-				Payload32: item.Payload32,
-				PubKey:    legacyWalletPubKey(item.Type, item.Payload32),
-			})
-		}
-	}
-	return next
-}
-
 func formatWalletDestinationSummary(destinations []string) string {
 	if len(destinations) == 0 {
 		return "-"
@@ -668,27 +645,13 @@ func classifyWalletMempoolPressure(info node.MempoolInfo) string {
 	switch {
 	case info.Count == 0 && info.Orphans == 0 && info.Bytes == 0:
 		return "idle"
-	case info.Bytes >= (maxBytes*8)/10 || info.Count >= 10_000 || info.Orphans >= walletMaxInt(32, 128/2):
+	case info.Bytes >= (maxBytes*8)/10 || info.Count >= 10_000 || info.Orphans >= max(32, 128/2):
 		return "high"
-	case info.Bytes >= walletMaxInt(16<<20, maxBytes/4) || info.Count >= 1_000 || info.Orphans > 0:
+	case info.Bytes >= max(16<<20, maxBytes/4) || info.Count >= 1_000 || info.Orphans > 0:
 		return "active"
 	default:
 		return "normal"
 	}
-}
-
-func walletMaxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func walletMinInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func formatWalletTargetSummary(quote *walletFeeQuote) string {

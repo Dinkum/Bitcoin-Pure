@@ -120,12 +120,12 @@ func (stats *SystemStats) Summary(now time.Time, window time.Duration) SystemSum
 	if len(windowSamples) >= 2 && summary.Window >= systemMinimumWindow {
 		totalDelta := last.cpuTotalTicks - first.cpuTotalTicks
 		busyDelta := last.cpuBusyTicks - first.cpuBusyTicks
-		if totalDelta > 0 {
+		if last.cpuTotalTicks > first.cpuTotalTicks && last.cpuBusyTicks >= first.cpuBusyTicks && busyDelta <= totalDelta {
 			summary.CPUPercent = (float64(busyDelta) / float64(totalDelta)) * 100
 			summary.HasCPU = true
 		}
 		elapsed := last.takenAt.Sub(first.takenAt).Seconds()
-		if elapsed > 0 {
+		if elapsed > 0 && last.rxBytes >= first.rxBytes && last.txBytes >= first.txBytes {
 			summary.RxBytesPerSec = float64(last.rxBytes-first.rxBytes) / elapsed
 			summary.TxBytesPerSec = float64(last.txBytes-first.txBytes) / elapsed
 			summary.HasNetwork = true

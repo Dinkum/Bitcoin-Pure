@@ -213,6 +213,8 @@ func (BlockChunkMessage) Command() Command { return CmdBlockChunk }
 // expands it into one BlockStart frame followed by bounded BlockChunk frames.
 type ChunkedBlockTransferMessage struct {
 	Block types.Block
+	// Checksum may come from a verified block manifest.
+	Checksum *[32]byte
 }
 
 func (ChunkedBlockTransferMessage) Command() Command { return CmdBlockStart }
@@ -499,7 +501,7 @@ func minInt(left int, right int) int {
 
 func (c *Conn) WriteMessage(msg Message) error {
 	if transfer, ok := msg.(ChunkedBlockTransferMessage); ok {
-		return c.writeChunkedBlock(transfer.Block)
+		return c.writeChunkedBlock(transfer)
 	}
 	payload, err := encodeMessage(msg)
 	if err != nil {
@@ -515,39 +517,80 @@ func (c *Conn) WriteMessage(msg Message) error {
 	binary.LittleEndian.PutUint32(header[8:12], uint32(len(payload)))
 	checksum := crypto.Sha256d(payload)
 	copy(header[12:16], checksum[:4])
-	if err := writeFull(c.Conn, header); err != nil {
-		return fmt.Errorf("write command %d header: %w", msg.Command(), err)
+	return c.writeFrameParts(msg.Command(), header, payload)
+}
+
+func (c *Conn) writeFrameParts(command Command, parts ...[]byte) error {
+	expected := 0
+	for _, part := range parts {
+		expected += len(part)
 	}
-	if err := writeFull(c.Conn, payload); err != nil {
-		return fmt.Errorf("write command %d payload: %w", msg.Command(), err)
+	buffers := net.Buffers(parts)
+	var n int64
+	var err error
+	switch writer := c.Conn.(type) {
+	case interface {
+		WriteBuffers(*net.Buffers) (int64, error)
+	}:
+		n, err = writer.WriteBuffers(&buffers)
+	case *net.TCPConn:
+		n, err = buffers.WriteTo(writer)
+	default:
+		for _, part := range parts {
+			if err := writeFull(writer, part); err != nil {
+				return fmt.Errorf("write command %d: %w", command, err)
+			}
+		}
+		return nil
+	}
+	if err == nil && n != int64(expected) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return fmt.Errorf("write command %d: %w", command, err)
 	}
 	return nil
 }
 
-func (c *Conn) writeChunkedBlock(block types.Block) error {
-	checksum, err := streamedBlockChecksum(block)
-	if err != nil {
-		return err
-	}
-	totalSize := block.EncodedLen()
-	if err := c.WriteMessage(BlockStartMessage{
-		Header:    block.Header,
-		TotalSize: uint64(totalSize),
-		Checksum:  checksum,
-	}); err != nil {
-		return err
-	}
+func (c *Conn) writeChunkedBlock(transfer ChunkedBlockTransferMessage) error {
+	block := transfer.Block
 	const preferredChunkBytes = 4 << 20
 	chunkBytes := minInt(preferredChunkBytes, c.maxPayload-(32+8+4))
 	if chunkBytes <= 0 {
 		return ErrPayloadTooLarge
 	}
-	blockHash := crypto.Sha256d(block.Header.Encode())
+	totalSize := block.EncodedLen()
 	stream := blockChunkStream{
 		conn:      c,
-		blockHash: blockHash,
-		buf:       make([]byte, chunkBytes),
+		blockHash: crypto.Sha256d(block.Header.Encode()),
 	}
+	start := BlockStartMessage{Header: block.Header, TotalSize: uint64(totalSize)}
+	if transfer.Checksum != nil {
+		start.Checksum = *transfer.Checksum
+	} else if totalSize <= preferredChunkBytes {
+		raw := block.Encode()
+		start.Checksum = crypto.Sha256d(raw)
+		if err := c.WriteMessage(start); err != nil {
+			return err
+		}
+		for chunk := 0; chunk < len(raw); chunk += chunkBytes {
+			if err := c.writeBlockChunkFrame(stream.blockHash, uint64(chunk), raw[chunk:min(len(raw), chunk+chunkBytes)]); err != nil {
+				return err
+			}
+		}
+		return nil
+	} else {
+		// Without a manifest, a checksum pass keeps scratch space bounded.
+		checksum, err := streamedBlockChecksum(block)
+		if err != nil {
+			return err
+		}
+		start.Checksum = checksum
+	}
+	if err := c.WriteMessage(start); err != nil {
+		return err
+	}
+	stream.buf = make([]byte, min(totalSize, chunkBytes))
 	written, err := block.WriteTo(&stream)
 	if err != nil {
 		return err
@@ -618,36 +661,30 @@ func (w *blockChunkStream) flush() error {
 }
 
 func (c *Conn) writeBlockChunkFrame(blockHash [32]byte, offset uint64, data []byte) error {
-	var offsetBytes [8]byte
-	binary.LittleEndian.PutUint64(offsetBytes[:], offset)
-	var lengthBytes [4]byte
-	binary.LittleEndian.PutUint32(lengthBytes[:], uint32(len(data)))
-	payloadLen := len(blockHash) + len(offsetBytes) + len(lengthBytes) + len(data)
+	const prefixSize = 32 + 8 + 4
+	payloadLen := prefixSize + len(data)
 	maxPayload, ok := maxPayloadForCommand(CmdBlockChunk, c.maxPayload)
 	if !ok || payloadLen > maxPayload {
 		return ErrPayloadTooLarge
 	}
 
+	var frame [headerSize + prefixSize]byte
+	prefix := frame[headerSize:]
+	copy(prefix, blockHash[:])
+	binary.LittleEndian.PutUint64(prefix[32:], offset)
+	binary.LittleEndian.PutUint32(prefix[40:], uint32(len(data)))
 	firstHasher := sha256.New()
-	_, _ = firstHasher.Write(blockHash[:])
-	_, _ = firstHasher.Write(offsetBytes[:])
-	_, _ = firstHasher.Write(lengthBytes[:])
+	_, _ = firstHasher.Write(prefix)
 	_, _ = firstHasher.Write(data)
 	var first [32]byte
 	firstHasher.Sum(first[:0])
 	checksum := sha256.Sum256(first[:])
 
-	var header [headerSize]byte
-	binary.LittleEndian.PutUint32(header[:4], c.magic)
-	header[4] = byte(CmdBlockChunk)
-	binary.LittleEndian.PutUint32(header[8:12], uint32(payloadLen))
-	copy(header[12:16], checksum[:4])
-	for _, part := range [][]byte{header[:], blockHash[:], offsetBytes[:], lengthBytes[:], data} {
-		if err := writeFull(c.Conn, part); err != nil {
-			return fmt.Errorf("write command %d payload: %w", CmdBlockChunk, err)
-		}
-	}
-	return nil
+	binary.LittleEndian.PutUint32(frame[:4], c.magic)
+	frame[4] = byte(CmdBlockChunk)
+	binary.LittleEndian.PutUint32(frame[8:12], uint32(payloadLen))
+	copy(frame[12:16], checksum[:4])
+	return c.writeFrameParts(CmdBlockChunk, frame[:], data)
 }
 
 func writeFull(w io.Writer, buf []byte) error {
@@ -1107,13 +1144,12 @@ func encodeOutPoints(buf []byte, items []types.OutPoint, limit int) ([]byte, err
 	if len(items) > limit {
 		return nil, fmt.Errorf("too many items: %d", len(items))
 	}
-	buf = append(buf, make([]byte, 4)...)
+	buf = growBytes(buf, 4+len(items)*(32+4))
+	buf = append(buf, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(items)))
 	for _, item := range items {
 		buf = append(buf, item.TxID[:]...)
-		raw := make([]byte, 4)
-		binary.LittleEndian.PutUint32(raw, item.Vout)
-		buf = append(buf, raw...)
+		buf = binary.LittleEndian.AppendUint32(buf, item.Vout)
 	}
 	return buf, nil
 }
@@ -1122,7 +1158,8 @@ func encodeAvaVotes(buf []byte, votes []AvaVote, limit int) ([]byte, error) {
 	if len(votes) > limit {
 		return nil, fmt.Errorf("too many items: %d", len(votes))
 	}
-	buf = append(buf, make([]byte, 4)...)
+	buf = growBytes(buf, 4+len(votes)*(1+32))
+	buf = append(buf, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint32(buf[len(buf)-4:], uint32(len(votes)))
 	for _, vote := range votes {
 		if vote.HasOpinion {
@@ -1162,7 +1199,7 @@ func encodeInvs(items []InvVector) ([]byte, error) {
 	if len(items) > maxInvPerMessage {
 		return nil, fmt.Errorf("too many inv items: %d", len(items))
 	}
-	buf := make([]byte, 4)
+	buf := make([]byte, 4, 4+len(items)*(1+32))
 	binary.LittleEndian.PutUint32(buf, uint32(len(items)))
 	for _, item := range items {
 		buf = append(buf, byte(item.Type))
@@ -1254,7 +1291,7 @@ func encodeHashes(hashes [][32]byte, limit int) ([]byte, error) {
 	if len(hashes) > limit {
 		return nil, fmt.Errorf("too many hashes: %d", len(hashes))
 	}
-	buf := make([]byte, 4)
+	buf := make([]byte, 4, 4+len(hashes)*32)
 	binary.LittleEndian.PutUint32(buf, uint32(len(hashes)))
 	for _, hash := range hashes {
 		buf = append(buf, hash[:]...)

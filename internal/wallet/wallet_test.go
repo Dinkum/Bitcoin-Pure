@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,7 +281,7 @@ func TestReconcilePendingKeepsTransactionsMissingFromMempool(t *testing.T) {
 	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
-	removed, err := store.ReconcilePending("alice", map[[32]byte]struct{}{})
+	removed, err := store.ReconcilePendingWithStatus("alice", observePending(t, store, plan.TransactionID, false), nil)
 	if err != nil {
 		t.Fatalf("ReconcilePending: %v", err)
 	}
@@ -296,7 +297,7 @@ func TestReconcilePendingKeepsTransactionsMissingFromMempool(t *testing.T) {
 	}
 }
 
-func TestReconcilePendingWithUTXOsClearsResolvedTransactions(t *testing.T) {
+func TestReconcilePendingWithStatusClearsResolvedUTXOs(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -321,13 +322,13 @@ func TestReconcilePendingWithUTXOsClearsResolvedTransactions(t *testing.T) {
 	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
-	removed, err := store.ReconcilePendingWithUTXOs("alice", map[[32]byte]struct{}{}, []SpendableUTXO{{
+	removed, err := store.ReconcilePendingWithStatus("alice", observePending(t, store, plan.TransactionID, false), []SpendableUTXO{{
 		OutPoint: spent,
 		Value:    50,
 		PubKey:   keyHash,
 	}})
 	if err != nil {
-		t.Fatalf("ReconcilePendingWithUTXOs: %v", err)
+		t.Fatalf("ReconcilePendingWithStatus: %v", err)
 	}
 	if removed != 1 {
 		t.Fatalf("removed = %d, want 1", removed)
@@ -368,7 +369,7 @@ func TestReconcilePendingWithStatusClearsConfirmedNoChangeSend(t *testing.T) {
 	if err := store.MarkSubmitted("alice", plan.TransactionID, plan.Transaction, plan.Inputs, plan.ChangeAddress); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
-	removed, err := store.ReconcilePendingWithStatus("alice", map[[32]byte]struct{}{}, nil, map[[32]byte]struct{}{plan.TransactionID: {}})
+	removed, err := store.ReconcilePendingWithStatus("alice", observePending(t, store, plan.TransactionID, true), nil)
 	if err != nil {
 		t.Fatalf("ReconcilePendingWithStatus: %v", err)
 	}
@@ -984,5 +985,67 @@ func TestBuildCPFPRejectsFeeOverflow(t *testing.T) {
 	_, err = store.BuildCPFP("alice", parentTxID, ^uint64(0))
 	if !errors.Is(err, ErrInsufficientFunds) {
 		t.Fatalf("BuildCPFP err = %v, want ErrInsufficientFunds", err)
+	}
+}
+
+func mustParsePubKey(raw string) [32]byte {
+	pubKey, err := decodeHex32(raw)
+	if err != nil {
+		panic(fmt.Sprintf("invalid stored pubkey %q: %v", raw, err))
+	}
+	return pubKey
+}
+
+func observePending(t *testing.T, store *Store, id [32]byte, confirmed bool) map[string]PendingStatus {
+	t.Helper()
+	w, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	txid := hex.EncodeToString(id[:])
+	for _, pending := range w.Pending {
+		if pending.TxID == txid {
+			return map[string]PendingStatus{txid: {CreatedAt: pending.CreatedAt, Confirmed: confirmed}}
+		}
+	}
+	t.Fatalf("wallet has no pending transaction %s", txid)
+	return nil
+}
+
+func TestBuildFanoutPlansChangeWithoutMutatingWallet(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), StoreFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, addr, err := store.CreateWallet("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := addr.WatchItem()
+	if err != nil {
+		t.Fatal(err)
+	}
+	funding := types.OutPoint{TxID: [32]byte{1}}
+	plans, err := store.BuildFanout("alice", []string{addr.Address}, 3, 10, 1, 0, []SpendableUTXO{{
+		OutPoint:  funding,
+		Value:     100,
+		Type:      item.Type,
+		Payload32: item.Payload32,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, plan := range plans {
+		if len(plan.Inputs) != 1 || plan.Inputs[0].OutPoint != funding || plan.ChangeAddress == nil || plan.ChangeAddress.Index != i+1 {
+			t.Fatalf("plan %d failed to spend expected coin and assign its change index", i)
+		}
+		funding = types.OutPoint{TxID: plan.TransactionID, Vout: 1}
+	}
+	w, err := store.Wallet("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Addresses) != 1 || len(w.Pending) != 0 {
+		t.Fatal("fanout planning mutated the wallet")
 	}
 }

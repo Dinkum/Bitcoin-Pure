@@ -66,22 +66,9 @@ func runServe(args []string) error {
 		return err
 	}
 
-	cfg := config.Default()
-	resolvedConfigPath := strings.TrimSpace(*configPath)
-	if resolvedConfigPath == "" {
-		for _, candidate := range config.DefaultPathCandidates() {
-			if fileExists(candidate) {
-				resolvedConfigPath = candidate
-				break
-			}
-		}
-	}
-	if resolvedConfigPath != "" {
-		loaded, err := config.Load(resolvedConfigPath)
-		if err != nil {
-			return err
-		}
-		cfg = loaded
+	cfg, resolvedConfigPath, err := resolveCLIConfig(*configPath)
+	if err != nil {
+		return err
 	}
 	if *profileRaw != "" {
 		cfg.Profile = *profileRaw
@@ -382,12 +369,14 @@ func maybeStartPprofServer(addr string, logger *slog.Logger) (*pprofServer, erro
 	if err != nil {
 		return nil, err
 	}
-	previousMutexProfileRate := runtime.SetMutexProfileFraction(1)
-	runtime.SetBlockProfileRate(1)
+	previousMutexProfileRate := runtime.SetMutexProfileFraction(10)
+	runtime.SetBlockProfileRate(int(10 * time.Millisecond))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
 	go func() {

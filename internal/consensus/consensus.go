@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"runtime"
 	"slices"
 	"sync"
@@ -28,11 +29,6 @@ var (
 	bigIntOne            = big.NewInt(1)
 	bigIntABLADelta      = new(big.Int).SetUint64(ablaDelta)
 	bigIntABLAGammaTwice = new(big.Int).SetUint64(2 * ablaGammaDen)
-	asertCoeffLinear     = big.NewInt(195766423245049)
-	asertCoeffQuadratic  = big.NewInt(971821376)
-	asertCoeffCubic      = big.NewInt(5127)
-	asertPolyBias        = new(big.Int).Lsh(big.NewInt(1), 47)
-	asertScaleFactor     = big.NewInt(1 << 16)
 )
 
 type ChainParams struct {
@@ -204,11 +200,9 @@ type ValidatedBlockDelta struct {
 
 type UtxoSet map[types.OutPoint]UtxoEntry
 
-const PQLockTag = "BPU/PQLOCK/MLDSA65/v1"
-
 // PQLock derives the 32-byte consensus lock committed by PQ outputs.
 func PQLock(verificationKey []byte) [32]byte {
-	return crypto.TaggedHash(PQLockTag, verificationKey)
+	return crypto.PQLock(verificationKey)
 }
 
 // UtxoEntryFromOutput materializes a transient, non-coinbase output. Committed
@@ -492,11 +486,7 @@ func (o *UtxoOverlay) Spend(out types.OutPoint) {
 }
 
 func (o *UtxoOverlay) Restore(out types.OutPoint, entry UtxoEntry) {
-	if o == nil {
-		return
-	}
-	delete(o.deleted, out)
-	o.created[out] = NormalizeUtxoEntry(entry)
+	o.Set(out, entry)
 }
 
 func (o *UtxoOverlay) Set(out types.OutPoint, entry UtxoEntry) {
@@ -505,15 +495,6 @@ func (o *UtxoOverlay) Set(out types.OutPoint, entry UtxoEntry) {
 	}
 	delete(o.deleted, out)
 	o.created[out] = NormalizeUtxoEntry(entry)
-}
-
-func (o *UtxoOverlay) ApplyTx(tx types.Transaction, txid [32]byte) {
-	for _, input := range tx.Base.Inputs {
-		o.Spend(input.PrevOut)
-	}
-	for vout, output := range tx.Base.Outputs {
-		o.Set(types.OutPoint{TxID: txid, Vout: uint32(vout)}, UtxoEntryFromOutput(output))
-	}
 }
 
 func (o *UtxoOverlay) Materialize() UtxoSet {
@@ -1179,23 +1160,8 @@ func prepareTxValidationWithLookupAndParams(tx *types.Transaction, lookup UtxoLo
 // every signature independently. Consensus paths must not use probabilistic
 // batch verification for acceptance decisions.
 func ValidatePreparedTx(prepared PreparedTxValidation) (TxValidationSummary, error) {
-	return validatePreparedTxWithSchnorrVerifier(prepared, crypto.VerifySchnorrXOnlyItems)
-}
-
-// ValidatePreparedTxBatchOptimized preserves the batch accelerator for policy
-// paths such as mempool admission. Do not use it for block consensus.
-func ValidatePreparedTxBatchOptimized(prepared PreparedTxValidation) (TxValidationSummary, error) {
-	return validatePreparedTxWithSchnorrVerifier(prepared, crypto.VerifySchnorrBatchXOnlyWithFallback)
-}
-
-func validatePreparedTxWithSchnorrVerifier(prepared PreparedTxValidation, verify func([]crypto.SchnorrBatchItem) bool) (TxValidationSummary, error) {
-	if !verify(prepared.SignatureChecks) {
+	if !crypto.VerifySchnorrXOnlyItems(prepared.SignatureChecks) || !verifyPQChecks(prepared.PQChecks) {
 		return TxValidationSummary{}, ErrInvalidSignature
-	}
-	for _, check := range prepared.PQChecks {
-		if !crypto.VerifyMLDSA65(check.VerificationKey, check.Signature, check.Msg[:]) {
-			return TxValidationSummary{}, ErrInvalidSignature
-		}
 	}
 	return prepared.Summary, nil
 }
@@ -1332,7 +1298,7 @@ func compactToTarget(compact uint32) (*big.Int, error) {
 	} else {
 		target.Lsh(target, uint(8*(int(size)-3)))
 	}
-	if target.Sign() == 0 {
+	if target.Sign() == 0 || target.BitLen() > 256 {
 		return nil, ErrInvalidCompactTarget
 	}
 	return target, nil
@@ -1360,20 +1326,6 @@ func targetToCompact(target *big.Int) (uint32, error) {
 	return (size << 24) | mantissa, nil
 }
 
-func clampTarget(target *big.Int, params ChainParams) (*big.Int, error) {
-	powLimit, err := compactToTarget(params.PowLimitBits)
-	if err != nil {
-		return nil, err
-	}
-	if target.Sign() <= 0 {
-		return big.NewInt(1), nil
-	}
-	if target.Cmp(powLimit) > 0 {
-		return powLimit, nil
-	}
-	return target, nil
-}
-
 func GenesisAsertAnchor(params ChainParams) AsertAnchor {
 	return AsertAnchor{
 		Height:     0,
@@ -1386,6 +1338,9 @@ func NextWorkRequiredASERT(anchor AsertAnchor, prev PrevBlockContext, params Cha
 	if prev.Height < anchor.Height {
 		return 0, fmt.Errorf("asert eval height %d before anchor %d", prev.Height, anchor.Height)
 	}
+	if params.AsertHalfLifeSecs <= 0 {
+		return 0, errors.New("asert half-life must be positive")
+	}
 	anchorTarget, err := compactToTarget(anchor.Bits)
 	if err != nil {
 		return 0, err
@@ -1395,40 +1350,40 @@ func NextWorkRequiredASERT(anchor AsertAnchor, prev PrevBlockContext, params Cha
 		return 0, err
 	}
 
-	timeDelta := int64(prev.Header.Timestamp) - anchor.ParentTime
-	heightDelta := int64(prev.Height - anchor.Height)
-	exponent := ((timeDelta - params.TargetSpacingSecs*(heightDelta+1)) << 16) / params.AsertHalfLifeSecs
-	numShifts := exponent >> 16
-	frac := exponent - (numShifts << 16)
+	// The exponent is wider than signed machine arithmetic even when each input
+	// is individually in range. Quo truncates toward zero. The signed shift floors.
+	var exponent, scheduled, term big.Int
+	exponent.SetUint64(prev.Header.Timestamp)
+	exponent.Sub(&exponent, term.SetInt64(anchor.ParentTime))
+	scheduled.SetUint64(prev.Height - anchor.Height)
+	scheduled.Add(&scheduled, bigIntOne)
+	scheduled.Mul(&scheduled, term.SetInt64(params.TargetSpacingSecs))
+	exponent.Sub(&exponent, &scheduled)
+	exponent.Lsh(&exponent, 16)
+	exponent.Quo(&exponent, term.SetInt64(params.AsertHalfLifeSecs))
 
-	fracSquared := frac * frac
-	fracCubed := fracSquared * frac
-
-	// ASERT runs for every block/header validation, so reuse shared constants and
-	// local scratch big.Int values instead of constructing fresh temporaries on
-	// every polynomial term.
-	var fracInt, fracSquaredInt, fracCubedInt big.Int
-	var poly, term, nextTarget big.Int
-	fracInt.SetInt64(frac)
-	fracSquaredInt.SetInt64(fracSquared)
-	fracCubedInt.SetInt64(fracCubed)
-
-	poly.Mul(asertCoeffLinear, &fracInt)
-	term.Mul(asertCoeffQuadratic, &fracSquaredInt)
-	poly.Add(&poly, &term)
-	term.Mul(asertCoeffCubic, &fracCubedInt)
-	poly.Add(&poly, &term)
-	poly.Add(&poly, asertPolyBias)
-	poly.Rsh(&poly, 48)
-	poly.Add(&poly, asertScaleFactor)
-
-	nextTarget.Mul(anchorTarget, &poly)
-	if numShifts < 0 {
-		nextTarget.Rsh(&nextTarget, uint(-numShifts))
-	} else if numShifts > 0 {
-		nextTarget.Lsh(&nextTarget, uint(numShifts))
+	// The polynomial factor is less than 2^17. With a 256-bit anchor,
+	// shifting by -257 already yields zero after the final right shift.
+	// A positive shift of 256 always exceeds the largest 256-bit target.
+	if exponent.Cmp(term.SetInt64(256<<16)) >= 0 {
+		return params.PowLimitBits, nil
 	}
-	nextTarget.Rsh(&nextTarget, 16)
+	if exponent.Cmp(term.SetInt64(-256<<16)) < 0 {
+		return targetToCompact(bigIntOne)
+	}
+	fixedExponent := exponent.Int64()
+	numShifts := fixedExponent >> 16
+	frac := uint64(fixedExponent & 0xffff)
+	// For frac < 2^16, the full polynomial including its rounding bias fits in uint64.
+	factor := ((195766423245049*frac + 971821376*frac*frac + 5127*frac*frac*frac + 1<<47) >> 48) + 1<<16
+	nextTarget := &scheduled
+	nextTarget.Mul(anchorTarget, term.SetUint64(factor))
+	finalShift := numShifts - 16
+	if finalShift < 0 {
+		nextTarget.Rsh(nextTarget, uint(-finalShift))
+	} else {
+		nextTarget.Lsh(nextTarget, uint(finalShift))
+	}
 
 	if nextTarget.Sign() <= 0 {
 		return targetToCompact(bigIntOne)
@@ -1436,34 +1391,7 @@ func NextWorkRequiredASERT(anchor AsertAnchor, prev PrevBlockContext, params Cha
 	if nextTarget.Cmp(powLimit) > 0 {
 		return params.PowLimitBits, nil
 	}
-	return targetToCompact(&nextTarget)
-}
-
-func NextWorkRequiredBitcoinLegacy(firstHeader *types.BlockHeader, prevHeader *types.BlockHeader, params ChainParams) (uint32, error) {
-	if firstHeader == nil || prevHeader == nil {
-		return 0, fmt.Errorf("bitcoin legacy daa requires first and previous headers")
-	}
-	prevTarget, err := compactToTarget(prevHeader.NBits)
-	if err != nil {
-		return 0, err
-	}
-	targetTimespan := params.TargetSpacingSecs * 2016
-	actualTimespan := int64(prevHeader.Timestamp) - int64(firstHeader.Timestamp)
-	minTimespan := targetTimespan / 4
-	maxTimespan := targetTimespan * 4
-	if actualTimespan < minTimespan {
-		actualTimespan = minTimespan
-	}
-	if actualTimespan > maxTimespan {
-		actualTimespan = maxTimespan
-	}
-	nextTarget := new(big.Int).Mul(new(big.Int).Set(prevTarget), big.NewInt(actualTimespan))
-	nextTarget.Quo(nextTarget, big.NewInt(targetTimespan))
-	clamped, err := clampTarget(nextTarget, params)
-	if err != nil {
-		return 0, err
-	}
-	return targetToCompact(clamped)
+	return targetToCompact(nextTarget)
 }
 
 func NextWorkRequired(prev PrevBlockContext, params ChainParams) (uint32, error) {
@@ -1529,44 +1457,20 @@ func BigIntTo32(value *big.Int) [32]byte {
 	return out
 }
 
-func BigIntFrom32(buf [32]byte) *big.Int {
-	return new(big.Int).SetBytes(buf[:])
-}
-
 func AddChainWork(left, right [32]byte) [32]byte {
-	sum := new(big.Int).Add(BigIntFrom32(left), BigIntFrom32(right))
-	return BigIntTo32(sum)
+	var sum [32]byte
+	var carry uint64
+	for end := len(sum); end > 0; end -= 8 {
+		start := end - 8
+		word, nextCarry := bits.Add64(binary.BigEndian.Uint64(left[start:end]), binary.BigEndian.Uint64(right[start:end]), carry)
+		binary.BigEndian.PutUint64(sum[start:end], word)
+		carry = nextCarry
+	}
+	return sum
 }
 
 func CompareChainWork(left, right [32]byte) int {
-	return BigIntFrom32(left).Cmp(BigIntFrom32(right))
-}
-
-func EncodeChainWork(value [32]byte) []byte {
-	return append([]byte(nil), value[:]...)
-}
-
-func DecodeChainWork(buf []byte) ([32]byte, error) {
-	var out [32]byte
-	if len(buf) != len(out) {
-		return out, fmt.Errorf("invalid chainwork length: %d", len(buf))
-	}
-	copy(out[:], buf)
-	return out, nil
-}
-
-func EncodeBool(v bool) []byte {
-	if v {
-		return []byte{1}
-	}
-	return []byte{0}
-}
-
-func DecodeBool(buf []byte) (bool, error) {
-	if len(buf) != 1 {
-		return false, fmt.Errorf("invalid bool length: %d", len(buf))
-	}
-	return buf[0] != 0, nil
+	return bytes.Compare(left[:], right[:])
 }
 
 func EncodeLenPrefixed(data []byte) []byte {
@@ -1580,11 +1484,12 @@ func DecodeLenPrefixed(buf []byte) ([]byte, []byte, error) {
 	if len(buf) < 4 {
 		return nil, nil, errors.New("missing length prefix")
 	}
-	n := int(binary.LittleEndian.Uint32(buf[:4]))
-	if len(buf) < 4+n {
+	n := binary.LittleEndian.Uint32(buf[:4])
+	if uint64(n) > uint64(len(buf)-4) {
 		return nil, nil, errors.New("truncated length-prefixed payload")
 	}
-	return buf[4 : 4+n], buf[4+n:], nil
+	end := 4 + int(n)
+	return buf[4:end], buf[end:], nil
 }
 
 func MedianTimePast(timestamps []uint64) uint64 {
@@ -1623,7 +1528,7 @@ func validateHeaderWithRules(header *types.BlockHeader, prev PrevBlockContext, p
 	if header.Timestamp <= medianTimePast {
 		return ErrTimestampTooEarly
 	}
-	if prev.CurrentTime != 0 && header.Timestamp > prev.CurrentTime+MaxFutureBlockTimeSeconds {
+	if prev.CurrentTime != 0 && header.Timestamp > prev.CurrentTime && header.Timestamp-prev.CurrentTime > MaxFutureBlockTimeSeconds {
 		return ErrTimestampTooFarFuture
 	}
 	expectedNBits, err := NextWorkRequired(prev, params)
@@ -1714,73 +1619,6 @@ func cloneUtxos(utxos UtxoSet) UtxoSet {
 	return out
 }
 
-func blockUtxoDelta(block *types.Block) ([]types.OutPoint, []utreexo.UtxoLeaf) {
-	txids := make([][32]byte, len(block.Txs))
-	for i := range block.Txs {
-		txids[i] = TxID(&block.Txs[i])
-	}
-	return blockUtxoDeltaFromIDs(block, txids)
-}
-
-func blockUtxoDeltaFromIDs(block *types.Block, txids [][32]byte) ([]types.OutPoint, []utreexo.UtxoLeaf) {
-	if block == nil || len(block.Txs) == 0 {
-		return nil, nil
-	}
-	spentCap := max(0, len(block.Txs)-1)
-	outputCap := len(block.Txs)
-	for _, tx := range block.Txs {
-		if len(tx.Base.Inputs) > 1 {
-			spentCap += len(tx.Base.Inputs) - 1
-		}
-		if len(tx.Base.Outputs) > 1 {
-			outputCap += len(tx.Base.Outputs) - 1
-		}
-	}
-	spent := make([]types.OutPoint, 0, spentCap)
-	createdByOutPoint, createdOrder := blockCreatedOutputsFromIDs(block, txids, outputCap)
-	for i := 1; i < len(block.Txs); i++ {
-		tx := &block.Txs[i]
-		for _, input := range tx.Base.Inputs {
-			// Outputs created and spent within the same block never exist in the
-			// pre-block accumulator, so they cancel out of the accumulator delta.
-			if _, ok := createdByOutPoint[input.PrevOut]; ok {
-				delete(createdByOutPoint, input.PrevOut)
-				continue
-			}
-			spent = append(spent, input.PrevOut)
-		}
-	}
-	coinbase := &block.Txs[0]
-	coinbaseTxID := txids[0]
-	for vout, output := range coinbase.Base.Outputs {
-		outPoint := types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}
-		createdByOutPoint[outPoint] = UtxoLeafFromOutput(outPoint, output)
-		createdOrder = append(createdOrder, outPoint)
-	}
-	created := make([]utreexo.UtxoLeaf, 0, len(createdByOutPoint))
-	for _, outPoint := range createdOrder {
-		if leaf, ok := createdByOutPoint[outPoint]; ok {
-			created = append(created, leaf)
-		}
-	}
-	return spent, created
-}
-
-func blockCreatedOutputsFromIDs(block *types.Block, txids [][32]byte, outputCap int) (map[types.OutPoint]utreexo.UtxoLeaf, []types.OutPoint) {
-	createdByOutPoint := make(map[types.OutPoint]utreexo.UtxoLeaf, outputCap)
-	createdOrder := make([]types.OutPoint, 0, outputCap)
-	for i := 1; i < len(block.Txs); i++ {
-		tx := &block.Txs[i]
-		txid := txids[i]
-		for vout, output := range tx.Base.Outputs {
-			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-			createdByOutPoint[outPoint] = UtxoLeafFromOutput(outPoint, output)
-			createdOrder = append(createdOrder, outPoint)
-		}
-	}
-	return createdByOutPoint, createdOrder
-}
-
 // ValidateAndApplyBlockOverlayWithLookup validates against an explicit lookup
 // backend while optionally keeping a materialized base set for callers that
 // need to materialize the full post-block view.
@@ -1807,11 +1645,12 @@ func ValidateAndApplyBlockDeltaWithLookup(block *types.Block, prev PrevBlockCont
 }
 
 func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockContext, blockSizeState BlockSizeState, base UtxoSet, lookup UtxoLookupWithErr, accumulator *utreexo.Accumulator, params ChainParams, rules ConsensusRules, spentPreBlockOut *[]SpentUTXO) (BlockValidationSummary, *UtxoOverlay, *utreexo.Accumulator, error) {
-	if len(block.Txs) == 0 {
+	if block == nil || len(block.Txs) == 0 {
 		return BlockValidationSummary{}, nil, nil, ErrEmptyBlock
 	}
 	blockSize := uint64(block.EncodedLen())
-	if blockSize > uint64(NextBlockSizeLimit(blockSizeState, params)) {
+	nextState := AdvanceBlockSizeState(blockSizeState, blockSize, params)
+	if blockSize > nextState.Limit() {
 		return BlockValidationSummary{}, nil, nil, ErrBlockTooLarge
 	}
 
@@ -1853,7 +1692,6 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 	tempUtxos := NewUtxoOverlayWithBaseLookup(base, lookup)
 	claimedInputs := make(map[types.OutPoint]struct{}, max(0, len(block.Txs)-1))
 	sameBlockCreated := make(map[types.OutPoint]blockCreatedOutput)
-	createdOrder := make([]types.OutPoint, 0)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		if i > 1 && bytes.Compare(txids[i-1][:], txids[i][:]) >= 0 {
@@ -1874,13 +1712,18 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 				TxIndex: i,
 				Entry:   UtxoEntryFromOutputAtHeight(output, prev.Height+1, false),
 			}
-			createdOrder = append(createdOrder, outPoint)
 		}
 	}
 	signatureChecks := make([]crypto.SchnorrBatchItem, 0, max(0, len(block.Txs)-1))
 	pqChecks := make([]PQVerifyCheck, 0)
-	sameBlockSpent := make(map[types.OutPoint]struct{})
-	spentPreBlock := make(map[types.OutPoint]UtxoEntry, len(claimedInputs))
+	var spentPreBlock []SpentUTXO
+	if spentPreBlockOut != nil {
+		spentPreBlock = make([]SpentUTXO, 0, len(claimedInputs))
+	}
+	var accumulatorSpent []types.OutPoint
+	if accumulator != nil {
+		accumulatorSpent = make([]types.OutPoint, 0, len(claimedInputs))
+	}
 	var totalFees uint64
 	for i := 1; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
@@ -1889,14 +1732,20 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		// created by any other non-coinbase transaction in this block.
 		blockLookup := func(out types.OutPoint) (UtxoEntry, bool) {
 			if entry, ok := tempUtxos.Lookup(out); ok {
-				spentPreBlock[out] = entry
+				tempUtxos.Spend(out)
+				if spentPreBlockOut != nil {
+					spentPreBlock = append(spentPreBlock, SpentUTXO{OutPoint: out, Entry: entry})
+				}
+				if accumulator != nil {
+					accumulatorSpent = append(accumulatorSpent, out)
+				}
 				return entry, true
 			}
 			created, ok := sameBlockCreated[out]
 			if !ok || created.TxIndex == i {
 				return UtxoEntry{}, false
 			}
-			sameBlockSpent[out] = struct{}{}
+			delete(sameBlockCreated, out)
 			return created.Entry, true
 		}
 		validatedTx := rules.ValidatedTxCache != nil && rules.ValidatedTxCache(txids[i], authids[i], params)
@@ -1921,47 +1770,33 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 	}
 	verifyStartedAt := time.Now()
 	schnorrResult := verifyBlockSignatureChecks(signatureChecks)
-	verifyDuration := time.Since(verifyStartedAt)
-	if !schnorrResult.Valid {
+	if !schnorrResult.Valid || !verifyBlockPQChecks(pqChecks) {
 		return BlockValidationSummary{}, nil, nil, ErrInvalidSignature
 	}
-	for _, check := range pqChecks {
-		if !crypto.VerifyMLDSA65(check.VerificationKey, check.Signature, check.Msg[:]) {
-			return BlockValidationSummary{}, nil, nil, ErrInvalidSignature
-		}
-	}
+	verifyDuration := time.Since(verifyStartedAt)
 
 	coinbaseValue, err := sumCoinbaseOutputs(coinbase)
 	if err != nil {
 		return BlockValidationSummary{}, nil, nil, err
 	}
 	subsidy := SubsidyAtoms(prev.Height+1, params)
-	if coinbaseValue > subsidy+totalFees {
+	if coinbaseValue > subsidy && coinbaseValue-subsidy > totalFees {
 		return BlockValidationSummary{}, nil, nil, ErrCoinbaseOverpay
 	}
 
-	coinbaseTxID := TxID(coinbase)
-	for outPoint := range claimedInputs {
-		if _, ok := sameBlockSpent[outPoint]; ok {
-			delete(sameBlockCreated, outPoint)
-			continue
-		}
-		tempUtxos.Spend(outPoint)
-	}
-	for _, outPoint := range createdOrder {
-		created, ok := sameBlockCreated[outPoint]
-		if !ok {
-			continue
-		}
+	for outPoint, created := range sameBlockCreated {
 		tempUtxos.Set(outPoint, created.Entry)
 	}
 	for vout, output := range coinbase.Base.Outputs {
-		tempUtxos.Set(types.OutPoint{TxID: coinbaseTxID, Vout: uint32(vout)}, UtxoEntryFromOutputAtHeight(output, prev.Height+1, true))
+		tempUtxos.Set(types.OutPoint{TxID: txids[0], Vout: uint32(vout)}, UtxoEntryFromOutputAtHeight(output, prev.Height+1, true))
 	}
 	var nextAccumulator *utreexo.Accumulator
 	if accumulator != nil {
-		spent, created := blockUtxoDeltaFromIDs(block, txids)
-		nextAccumulator, err = accumulator.Apply(spent, created)
+		created := make([]utreexo.UtxoLeaf, 0, len(tempUtxos.created))
+		for outPoint, entry := range tempUtxos.created {
+			created = append(created, UtxoLeafFromEntry(outPoint, entry))
+		}
+		nextAccumulator, err = accumulator.Apply(accumulatorSpent, created)
 		if err != nil {
 			return BlockValidationSummary{}, nil, nil, err
 		}
@@ -1982,23 +1817,13 @@ func validateAndApplyBlockOverlayWithLookup(block *types.Block, prev PrevBlockCo
 		return BlockValidationSummary{}, nil, nil, fmt.Errorf("utxo lookup failed during block validation: %w", err)
 	}
 	if spentPreBlockOut != nil {
-		spent := make([]SpentUTXO, 0, len(spentPreBlock))
-		for i := 1; i < len(block.Txs); i++ {
-			for _, input := range block.Txs[i].Base.Inputs {
-				if entry, ok := spentPreBlock[input.PrevOut]; ok {
-					spent = append(spent, SpentUTXO{OutPoint: input.PrevOut, Entry: entry})
-				}
-			}
-		}
-		*spentPreBlockOut = spent
+		*spentPreBlockOut = spentPreBlock
 	}
-
-	nextState := AdvanceBlockSizeState(blockSizeState, blockSize, params)
 	return BlockValidationSummary{
 		Height:                 prev.Height + 1,
 		TotalFees:              totalFees,
 		CoinbaseValue:          coinbaseValue,
-		SignatureChecks:        len(signatureChecks),
+		SignatureChecks:        len(signatureChecks) + len(pqChecks),
 		SignatureBatchFallback: schnorrResult.Fallback,
 		SignatureVerifyTime:    verifyDuration,
 		NextBlockSizeState:     nextState,
@@ -2101,6 +1926,36 @@ func verifyBlockSignatureChecks(items []crypto.SchnorrBatchItem) crypto.SchnorrB
 
 func exactSchnorrResult(items []crypto.SchnorrBatchItem) crypto.SchnorrBatchResult {
 	return crypto.SchnorrBatchResult{Valid: crypto.VerifySchnorrXOnlyItems(items)}
+}
+
+func verifyBlockPQChecks(checks []PQVerifyCheck) bool {
+	const minChecksPerWorker = 8
+	workers := parallelWorkers(len(checks) / minChecksPerWorker)
+	if workers < 2 {
+		return verifyPQChecks(checks)
+	}
+	chunkSize := (len(checks) + workers - 1) / workers
+	results := make(chan bool, workers)
+	for start := 0; start < len(checks); start += chunkSize {
+		chunk := checks[start:min(start+chunkSize, len(checks))]
+		go func() {
+			results <- verifyPQChecks(chunk)
+		}()
+	}
+	valid := true
+	for start := 0; start < len(checks); start += chunkSize {
+		valid = <-results && valid
+	}
+	return valid
+}
+
+func verifyPQChecks(checks []PQVerifyCheck) bool {
+	for _, check := range checks {
+		if !crypto.VerifyMLDSA65(check.VerificationKey, check.Signature, check.Msg[:]) {
+			return false
+		}
+	}
+	return true
 }
 
 func DecodeTxHex(raw string, limits types.CodecLimits) (types.Transaction, error) {

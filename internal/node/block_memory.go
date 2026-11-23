@@ -3,6 +3,7 @@ package node
 import (
 	"bitcoin-pure/internal/p2p"
 	"bitcoin-pure/internal/types"
+	"slices"
 	"unsafe"
 )
 
@@ -44,4 +45,23 @@ func (s *Service) reserveBlockReconstruction(count int) (*p2p.PayloadReservation
 		return nil, err
 	}
 	return reservation, nil
+}
+
+// cloneTransaction detaches slices and metadata that may share a block buffer.
+func cloneTransaction(tx types.Transaction) types.Transaction {
+	tx.Base.Inputs = slices.Clone(tx.Base.Inputs)
+	tx.Base.Outputs = slices.Clone(tx.Base.Outputs)
+	tx.Auth.Entries = slices.Clone(tx.Auth.Entries)
+	for i := range tx.Auth.Entries {
+		tx.Auth.Entries[i].AuthPayload = slices.Clone(tx.Auth.Entries[i].AuthPayload)
+	}
+	if tx.Base.CoinbaseHeight != nil {
+		height := *tx.Base.CoinbaseHeight
+		tx.Base.CoinbaseHeight = &height
+	}
+	if tx.Base.CoinbaseExtraNonce != nil {
+		nonce := *tx.Base.CoinbaseExtraNonce
+		tx.Base.CoinbaseExtraNonce = &nonce
+	}
+	return tx
 }

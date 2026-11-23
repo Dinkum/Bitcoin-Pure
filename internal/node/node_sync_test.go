@@ -458,9 +458,6 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	if err := svc.chainState.Store().RewriteActiveHeaderHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
 		t.Fatalf("RewriteActiveHeaderHeights: %v", err)
 	}
-	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes: %v", err)
-	}
 
 	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
 	if err != nil {
@@ -482,9 +479,6 @@ func TestRepairActiveHeightIndexRestoresMissingBlockRequests(t *testing.T) {
 	}
 	if repaired == 0 {
 		t.Fatal("expected repaired entries")
-	}
-	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes after repair: %v", err)
 	}
 
 	hashes, gapDetected, err = svc.missingBlockHashesDetailed(8)
@@ -545,9 +539,6 @@ func TestMissingBlockHashesIncludeForkPointForPromotedBranch(t *testing.T) {
 	// Header promotion updates the derived active-height index asynchronously.
 	// Wait for that replay so this assertion checks fork-point handling rather
 	// than racing the background index repair path.
-	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes branch: %v", err)
-	}
 
 	hashes, gapDetected, err := svc.missingBlockHashesDetailed(8)
 	if err != nil {
@@ -602,9 +593,6 @@ func TestSyncWatchdogRepairsGapAndRequestsBlocks(t *testing.T) {
 	}
 	if err := svc.chainState.Store().RewriteActiveHeaderHeights(0, 1, []storage.BlockIndexEntry{*genesisEntry}); err != nil {
 		t.Fatalf("RewriteActiveHeaderHeights: %v", err)
-	}
-	if err := svc.chainState.Store().WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes: %v", err)
 	}
 
 	peer := newPeerConnForTests("127.0.0.1:18444")

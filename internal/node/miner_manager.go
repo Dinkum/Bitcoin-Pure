@@ -28,7 +28,6 @@ type minerManager struct {
 type blockTemplateCache struct {
 	tipHash         [32]byte
 	mempoolEpoch    uint64
-	generation      uint64
 	builtAt         time.Time
 	block           types.Block
 	selected        []mempool.SnapshotEntry
@@ -39,7 +38,6 @@ type blockTemplateCache struct {
 	usedTxBytes     int
 	baseLookup      consensus.UtxoLookup
 	selectionView   *consensus.UtxoOverlay
-	baseAcc         *utreexo.Accumulator
 	selectionAcc    *utreexo.Accumulator
 }
 
@@ -84,14 +82,23 @@ func (m *minerManager) currentTemplateGeneration() uint64 {
 func (m *minerManager) invalidateBlockTemplate(reason string) {
 	m.templateMu.Lock()
 	m.templateGeneration++
-	m.template = nil
+	if reason != "tx_admission" {
+		m.template = nil
+	}
 	m.templateMu.Unlock()
 	m.templateStats.noteInvalidation(reason)
 }
 
 func (m *minerManager) BuildBlockTemplate() (types.Block, error) {
-	block, _, err := m.buildBlockTemplateWithGeneration()
-	return block, err
+	block, _, _, err := m.buildBlockTemplateWithGeneration()
+	if err != nil {
+		return types.Block{}, err
+	}
+	block = cloneBlock(block)
+	for i := range block.Txs {
+		block.Txs[i] = cloneTransaction(block.Txs[i])
+	}
+	return block, nil
 }
 
 func (m *minerManager) BuildBenchmarkBlockTemplate(maxTxs int) (types.Block, error) {
@@ -103,28 +110,45 @@ func (m *minerManager) BuildBenchmarkBlockTemplate(maxTxs int) (types.Block, err
 	return block, err
 }
 
-func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, error) {
+func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, *utreexo.Accumulator, uint64, error) {
+	for {
+		before, _ := m.svc.chainState.tipSnapshot()
+		block, acc, generation, err := m.buildBlockTemplate()
+		if m.stopping() {
+			return types.Block{}, nil, 0, ErrServiceStopping
+		}
+		current, ok := m.svc.chainState.tipSnapshot()
+		if ok && ((err == nil && block.Header.PrevBlockHash != current.TipHash) ||
+			(err != nil && before.TipHash != current.TipHash)) {
+			continue
+		}
+		return block, acc, generation, err
+	}
+}
+
+func (m *minerManager) buildBlockTemplate() (types.Block, *utreexo.Accumulator, uint64, error) {
 	startedAt := time.Now()
 	if m.stopping() {
-		return types.Block{}, 0, ErrServiceStopping
+		return types.Block{}, nil, 0, ErrServiceStopping
 	}
 	if m.svc.cfg.MinerPubKey == ([32]byte{}) {
-		return types.Block{}, 0, errors.New("miner pubkey is required for block template assembly")
+		return types.Block{}, nil, 0, errors.New("miner pubkey is required for block template assembly")
 	}
 	ctx, err := m.chainTemplateContext()
 	if err != nil {
-		return types.Block{}, 0, err
+		return types.Block{}, nil, 0, err
 	}
 	if m.stopping() {
-		return types.Block{}, 0, ErrServiceStopping
+		return types.Block{}, nil, 0, ErrServiceStopping
 	}
+	generation := m.currentTemplateGeneration()
 	mempoolEpoch := m.svc.pool.Epoch()
-	if cached, generation, ok := m.cachedBlockTemplate(ctx.tipHash, mempoolEpoch); ok {
+	if cached, selectionAcc, ok := m.cachedBlockTemplate(ctx.tipHash, mempoolEpoch); ok {
 		if err := m.svc.refreshMiningTimestamp(&cached.Header, ctx.medianTimePast); err != nil {
-			return types.Block{}, 0, err
+			return types.Block{}, nil, 0, err
 		}
 		if m.stopping() {
-			return types.Block{}, 0, ErrServiceStopping
+			return types.Block{}, nil, 0, ErrServiceStopping
 		}
 		m.templateStats.noteCacheHit(m.svc.pool.SelectionCandidateCount())
 		m.svc.perf.noteTemplateDuration(time.Since(startedAt))
@@ -135,15 +159,14 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 			slog.Int("txs", len(cached.Txs)),
 			slog.Duration("template_duration", time.Since(startedAt)),
 		)
-		return cached, generation, nil
+		return cached, selectionAcc, generation, nil
 	}
-	if block, generation, ok, err := m.extendBlockTemplate(ctx, mempoolEpoch); err != nil {
-		return types.Block{}, 0, err
+	if block, selectionAcc, ok, err := m.extendBlockTemplate(ctx, mempoolEpoch); err != nil {
+		return types.Block{}, nil, 0, err
 	} else if ok {
 		if m.stopping() {
-			return types.Block{}, 0, ErrServiceStopping
+			return types.Block{}, nil, 0, ErrServiceStopping
 		}
-		m.templateStats.noteAppendExtend(m.svc.pool.SelectionCandidateCount())
 		m.svc.noteTemplateRebuild()
 		m.svc.perf.noteTemplateDuration(time.Since(startedAt))
 		m.svc.logger.Debug("template ready",
@@ -153,23 +176,23 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 			slog.Int("txs", len(block.Txs)),
 			slog.Duration("template_duration", time.Since(startedAt)),
 		)
-		return block, generation, nil
+		return block, selectionAcc, generation, nil
 	}
 	snapshot, err := m.chainSelectionSnapshot()
 	if err != nil {
-		return types.Block{}, 0, err
+		return types.Block{}, nil, 0, err
 	}
 	if m.stopping() {
-		return types.Block{}, 0, ErrServiceStopping
+		return types.Block{}, nil, 0, ErrServiceStopping
 	}
 	block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc, err := m.buildBlockCandidate(snapshot, 0)
 	if err != nil {
-		return types.Block{}, 0, err
+		return types.Block{}, nil, 0, err
 	}
 	if m.stopping() {
-		return types.Block{}, 0, ErrServiceStopping
+		return types.Block{}, nil, 0, ErrServiceStopping
 	}
-	generation := m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, snapshot.utxoAcc, selectionAcc)
+	m.storeBlockTemplate(snapshot.tipHash, mempoolEpoch, block, selectedEntries, selectedTxs, selectedTxIDs, selectedAuthIDs, totalFees, usedTxBytes, baseLookup, selectionView, selectionAcc)
 	m.templateStats.noteFullBuild(m.svc.pool.SelectionCandidateCount())
 	m.svc.noteTemplateRebuild()
 	m.svc.perf.noteTemplateDuration(time.Since(startedAt))
@@ -180,7 +203,7 @@ func (m *minerManager) buildBlockTemplateWithGeneration() (types.Block, uint64, 
 		slog.Int("txs", len(block.Txs)),
 		slog.Duration("template_duration", time.Since(startedAt)),
 	)
-	return block, generation, nil
+	return block, selectionAcc, generation, nil
 }
 
 func (m *minerManager) minerLoop(workerID int) {
@@ -220,14 +243,14 @@ func (m *minerManager) mineOneBlock() ([32]byte, error) {
 		if m.stopping() {
 			return [32]byte{}, ErrServiceStopping
 		}
-		block, generation, err := m.buildBlockTemplateWithGeneration()
+		block, selectionAcc, generation, err := m.buildBlockTemplateWithGeneration()
 		if err != nil {
 			return [32]byte{}, err
 		}
 		if m.stopping() {
 			return [32]byte{}, ErrServiceStopping
 		}
-		block, fresh, err := m.svc.mineBlockTemplate(block, generation)
+		block, fresh, err := m.svc.mineBlockTemplate(block, selectionAcc, generation)
 		if err != nil {
 			return [32]byte{}, err
 		}
@@ -397,30 +420,30 @@ func (m *minerManager) chainSelectionSnapshot() (chainSelectionSnapshot, error) 
 	}, nil
 }
 
-func (m *minerManager) cachedBlockTemplate(tipHash [32]byte, mempoolEpoch uint64) (types.Block, uint64, bool) {
+func (m *minerManager) cachedBlockTemplate(tipHash [32]byte, mempoolEpoch uint64) (types.Block, *utreexo.Accumulator, bool) {
 	m.templateMu.Lock()
 	defer m.templateMu.Unlock()
 	if m.template == nil || m.template.tipHash != tipHash || m.template.mempoolEpoch != mempoolEpoch {
-		return types.Block{}, 0, false
+		return types.Block{}, nil, false
 	}
-	return cloneBlock(m.template.block), m.template.generation, true
+	return cloneBlock(m.template.block), m.template.selectionAcc, true
 }
 
-func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoch uint64) (types.Block, uint64, bool, error) {
+func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoch uint64) (types.Block, *utreexo.Accumulator, bool, error) {
 	m.templateMu.Lock()
 	defer m.templateMu.Unlock()
 	if m.template == nil || m.template.tipHash != ctx.tipHash || m.template.mempoolEpoch >= mempoolEpoch {
-		return types.Block{}, 0, false, nil
+		return types.Block{}, nil, false, nil
 	}
 	maxTemplateBytes := int(consensus.NextBlockSizeLimit(ctx.blockSizeState, consensus.ParamsForProfile(m.svc.cfg.Profile)))
 	if maxTemplateBytes > 1024 {
 		maxTemplateBytes -= 1024
 	}
 	if m.template.usedTxBytes >= maxTemplateBytes {
-		return types.Block{}, 0, false, nil
+		return types.Block{}, nil, false, nil
 	}
 	if !m.svc.pool.ContainsAll(m.template.selected) {
-		return types.Block{}, 0, false, nil
+		return types.Block{}, nil, false, nil
 	}
 
 	appendSelectStartedAt := time.Now()
@@ -430,18 +453,18 @@ func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoc
 	}, consensus.DefaultConsensusRules(), maxTemplateBytes, m.template.selected)
 	m.svc.perf.noteTemplateSelectDuration(time.Since(appendSelectStartedAt))
 	if len(added) == 0 {
-		m.template.mempoolEpoch = mempoolEpoch
 		assembleStartedAt := time.Now()
 		block, err := m.assembleBlockTemplate(ctx, m.template.selectedTxs, m.template.selectedTxIDs, m.template.selectedAuthIDs, m.template.totalFees, m.template.selectionAcc)
 		m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
 		if err != nil {
-			return types.Block{}, 0, false, err
+			return types.Block{}, nil, false, err
 		}
+		m.template.mempoolEpoch = mempoolEpoch
 		m.template.block = cloneBlock(block)
 		m.template.builtAt = time.Now()
 		m.templateStats.noteNoChangeRefresh(m.svc.pool.SelectionCandidateCount())
 		m.templateStats.noteBuildTime(m.template.builtAt)
-		return cloneBlock(m.template.block), m.template.generation, true, nil
+		return cloneBlock(m.template.block), m.template.selectionAcc, true, nil
 	}
 
 	m.template.selected = mergeSnapshotEntriesByTxID(m.template.selected, added)
@@ -455,34 +478,36 @@ func (m *minerManager) extendBlockTemplate(ctx chainTemplateContext, mempoolEpoc
 	nextAcc, err := m.template.selectionAcc.Apply(addedSpends, addedLeaves)
 	m.svc.perf.noteTemplateAccumulateDuration(time.Since(accStartedAt))
 	if err != nil {
-		return types.Block{}, 0, false, err
+		// Selection has already updated the overlay; discard this incomplete candidate.
+		m.template = nil
+		return types.Block{}, nil, false, err
 	}
 	m.template.selectionAcc = nextAcc
 	assembleStartedAt := time.Now()
 	block, err := m.assembleBlockTemplate(ctx, m.template.selectedTxs, m.template.selectedTxIDs, m.template.selectedAuthIDs, m.template.totalFees, m.template.selectionAcc)
 	m.svc.perf.noteTemplateAssembleDuration(time.Since(assembleStartedAt))
 	if err != nil {
-		return types.Block{}, 0, false, err
+		// Selection has already updated the overlay; discard this incomplete candidate.
+		m.template = nil
+		return types.Block{}, nil, false, err
 	}
 	m.template.block = cloneBlock(block)
 	m.template.mempoolEpoch = mempoolEpoch
 	m.template.builtAt = time.Now()
 	m.templateStats.noteAppendExtend(m.svc.pool.SelectionCandidateCount())
 	m.templateStats.noteBuildTime(m.template.builtAt)
-	return cloneBlock(m.template.block), m.template.generation, true, nil
+	return cloneBlock(m.template.block), m.template.selectionAcc, true, nil
 }
 
-func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, usedTxBytes int, baseLookup consensus.UtxoLookup, selectionView *consensus.UtxoOverlay, baseAcc *utreexo.Accumulator, selectionAcc *utreexo.Accumulator) uint64 {
+func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64, block types.Block, selected []mempool.SnapshotEntry, selectedTxs []types.Transaction, selectedTxIDs [][32]byte, selectedAuthIDs [][32]byte, totalFees uint64, usedTxBytes int, baseLookup consensus.UtxoLookup, selectionView *consensus.UtxoOverlay, selectionAcc *utreexo.Accumulator) {
 	m.templateMu.Lock()
 	defer m.templateMu.Unlock()
-	if m.templateGeneration == 0 {
-		m.templateGeneration = 1
+	if m.template != nil && m.template.tipHash == tipHash && m.template.mempoolEpoch > mempoolEpoch {
+		return
 	}
-	generation := m.templateGeneration
 	m.template = &blockTemplateCache{
 		tipHash:         tipHash,
 		mempoolEpoch:    mempoolEpoch,
-		generation:      generation,
 		builtAt:         time.Now(),
 		block:           cloneBlock(block),
 		selected:        append([]mempool.SnapshotEntry(nil), selected...),
@@ -493,11 +518,9 @@ func (m *minerManager) storeBlockTemplate(tipHash [32]byte, mempoolEpoch uint64,
 		usedTxBytes:     usedTxBytes,
 		baseLookup:      baseLookup,
 		selectionView:   selectionView,
-		baseAcc:         baseAcc,
 		selectionAcc:    selectionAcc,
 	}
 	m.templateStats.noteBuildTime(m.template.builtAt)
-	return generation
 }
 
 func (m *minerManager) BlockTemplateStats() BlockTemplateStats {

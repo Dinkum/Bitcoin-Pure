@@ -180,7 +180,7 @@ func TestMiningSearchRestartsAfterClockRollback(t *testing.T) {
 		}
 		return types.BlockHeader{}, false, nil
 	}
-	_, complete, err := s.mineBlockTemplate(block, s.currentTemplateGeneration())
+	_, complete, err := s.mineBlockTemplate(block, view.UTXOAcc, s.currentTemplateGeneration())
 	if err != nil || complete || calls != 1 {
 		t.Fatalf("rollback result complete=%v calls=%d err=%v", complete, calls, err)
 	}
@@ -225,7 +225,10 @@ func TestChunkReassemblyReservesRawAndDecodedMemory(t *testing.T) {
 			}
 			raw := block.Encode()
 			hash := consensus.HeaderHash(&block.Header)
-			s.payloadBudget = p2p.NewPayloadBudget(int64(len(raw) + extra))
+			s.blockDecodeBudget = p2p.NewPayloadBudget(int64(len(raw) + extra))
+			if _, err := s.applyPeerHeaders([]types.BlockHeader{block.Header}); err != nil {
+				t.Fatal(err)
+			}
 			peer := newPeerConnForTests("127.0.0.1:18444")
 			peer.blockTransfers = make(map[[32]byte]*incomingBlockTransfer)
 			if err := s.onBlockStartMessage(peer, p2p.BlockStartMessage{Header: block.Header, TotalSize: uint64(len(raw)), Checksum: crypto.Sha256d(raw)}); err != nil {
@@ -234,7 +237,7 @@ func TestChunkReassemblyReservesRawAndDecodedMemory(t *testing.T) {
 			if err := s.onBlockChunkMessage(peer, p2p.BlockChunkMessage{BlockHash: hash, Data: raw}); !errors.Is(err, p2p.ErrPayloadBudget) {
 				t.Fatalf("reassembly bypassed budget: %v", err)
 			}
-			if s.payloadBudget.Stats().Used != 0 {
+			if s.blockDecodeBudget.Stats().Used != 0 || s.blockTransferBudget.Stats().Used != 0 {
 				t.Fatal("failed reassembly leaked reservation")
 			}
 			if s.BlockHeight() != 0 {

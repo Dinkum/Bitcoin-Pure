@@ -88,6 +88,24 @@ func TestBlockWriteToMatchesCanonicalEncoding(t *testing.T) {
 	}
 }
 
+func TestEncodeRejectsCoinbaseMissingMetadata(t *testing.T) {
+	for _, tx := range []Transaction{
+		{Base: TxBase{CoinbaseHeight: testCoinbaseHeight(1)}},
+		{Base: TxBase{CoinbaseExtraNonce: testCoinbaseExtraNonce(1)}},
+	} {
+		if tx.EncodeBase() != nil || tx.Encode() != nil {
+			t.Fatal("malformed coinbase encoded as a transaction")
+		}
+		block := Block{Txs: []Transaction{tx}}
+		if block.Encode() != nil {
+			t.Fatal("block with malformed coinbase encoded successfully")
+		}
+		if _, err := block.WriteTo(io.Discard); err == nil {
+			t.Fatal("block with malformed coinbase streamed successfully")
+		}
+	}
+}
+
 func TestDecodeBlockOwnedBufferBorrowsAuthorizationPayload(t *testing.T) {
 	block := Block{
 		Header: BlockHeader{Version: 1},

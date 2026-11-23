@@ -3,8 +3,6 @@ package storage
 import (
 	"bitcoin-pure/internal/types"
 	"github.com/cockroachdb/pebble"
-	"math/rand/v2"
-	"slices"
 	"testing"
 )
 
@@ -37,26 +35,49 @@ func TestWalletActivityClosesCursorsOnInitializationError(t *testing.T) {
 	}
 }
 
-func TestLocalitySelectionMatchesSortedPrefix(t *testing.T) {
-	rng := rand.New(rand.NewPCG(4, 9))
-	input := make([]LocalityIndexedUTXO, 513)
-	for i := range input {
-		input[i] = LocalityIndexedUTXO{Sequence: uint64(rng.IntN(1024)), OutPoint: types.OutPoint{Vout: uint32(i)}}
+func TestLocalityMigrationPreservesSequenceOrder(t *testing.T) {
+	path := t.TempDir()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	expected := slices.Clone(input)
-	slices.SortFunc(expected, compareLocalityItems)
-	for _, limit := range []int{-1, 0, 1, 2, 255, 256, 260, 513, 1000} {
-		selected := make(localitySelectionHeap, 0)
-		for _, item := range input {
-			keepLocalityItem(&selected, item, limit)
+	block, utxos := sampleBlockAndUTXOs()
+	if err := store.WriteFullState(&StoredChainState{Profile: types.Regtest, TipHeader: block.Header, BlockSizeState: sampleBlockSizeState(), UTXOs: utxos}); err != nil {
+		t.Fatal(err)
+	}
+	batch := store.db.NewBatch()
+	if err := batch.Set(metaChainstateSchemaVersionKey, encodeU64(chainstateSchemaV2), nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, seq := range []uint64{256, 1, 255} {
+		for outPoint, entry := range utxos {
+			key := append(cloneBytes(legacyLocalitySeqPrefix), encodeU64(seq)...)
+			if err := batch.Set(key, encodeLocalitySeqValue(outPoint, entry), nil); err != nil {
+				t.Fatal(err)
+			}
 		}
-		slices.SortFunc(selected, compareLocalityItems)
-		want := expected
-		if limit > 0 && limit < len(want) {
-			want = want[:limit]
-		}
-		if !slices.Equal([]LocalityIndexedUTXO(selected), want) {
-			t.Fatalf("limit %d differs from sorted prefix", limit)
-		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	batch.Close()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	raw, err := store.get(metaChainstateSchemaVersionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, err := decodeU64(raw); err != nil || version != chainstateSchemaVersion {
+		t.Fatalf("schema after locality migration=%d, %v", version, err)
+	}
+	rows, err := store.LoadLocalityOrderedUTXOs(2)
+	if err != nil || len(rows) != 2 || rows[0].Sequence != 1 || rows[1].Sequence != 255 {
+		t.Fatalf("migrated numeric prefix = %+v, %v", rows, err)
 	}
 }

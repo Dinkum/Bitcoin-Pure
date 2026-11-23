@@ -114,3 +114,14 @@ func TestSystemStatsSummaryRequiresMinimumWindowForCPUAndNetwork(t *testing.T) {
 		t.Fatalf("expected network summary to stay warming up for windows under %s", systemMinimumWindow)
 	}
 }
+
+func TestSystemStatsSummarySkipsRatesAcrossCounterReset(t *testing.T) {
+	now := time.Unix(1000, 0)
+	var stats SystemStats
+	stats.Record(SystemSample{takenAt: now.Add(-20 * time.Second), cpuBusyTicks: 100, cpuTotalTicks: 200, rxBytes: 5000, txBytes: 5000})
+	stats.Record(SystemSample{takenAt: now, cpuBusyTicks: 20, cpuTotalTicks: 40, rxBytes: 20, txBytes: 40})
+	summary := stats.Summary(now, time.Minute)
+	if summary.HasCPU || summary.HasNetwork || summary.RxBytesPerSec != 0 || summary.TxBytesPerSec != 0 {
+		t.Fatalf("counter reset produced rates: %+v", summary)
+	}
+}

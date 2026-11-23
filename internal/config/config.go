@@ -1,10 +1,16 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -105,15 +111,26 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	var decode func(any) error
 	switch configFormat(path) {
 	case "yaml":
-		if err := yaml.Unmarshal(buf, &cfg); err != nil {
-			return Config{}, err
-		}
+		decoder := yaml.NewDecoder(bytes.NewReader(buf))
+		decoder.KnownFields(true)
+		decode = decoder.Decode
 	default:
-		if err := json.Unmarshal(buf, &cfg); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(buf))
+		decoder.DisallowUnknownFields()
+		decode = decoder.Decode
+	}
+	if err := decode(&cfg); err != nil {
+		return Config{}, err
+	}
+	var extra any
+	if err := decode(&extra); !errors.Is(err, io.EOF) {
+		if err != nil {
 			return Config{}, err
 		}
+		return Config{}, errors.New("expected one configuration document")
 	}
 	if err := Validate(cfg); err != nil {
 		return Config{}, err
@@ -136,6 +153,32 @@ func Validate(cfg Config) error {
 	case "", "json", "jsonl", "text":
 	default:
 		return fmt.Errorf("invalid log_format %q", cfg.LogFormat)
+	}
+	if cfg.RPCAddr != "" {
+		if err := validateRPCEndpoint(cfg.RPCAddr); err != nil {
+			return fmt.Errorf("rpc_addr: %w", err)
+		}
+	}
+	if cfg.P2PAddr != "" {
+		if err := validateAddress(cfg.P2PAddr, true); err != nil {
+			return fmt.Errorf("p2p_addr: %w", err)
+		}
+	}
+	if pprof := strings.TrimSpace(cfg.PprofAddr); pprof != "" && !strings.EqualFold(pprof, "auto") {
+		if !strings.Contains(pprof, ":") {
+			pprof = ":" + pprof
+		}
+		if err := validateAddress(pprof, true); err != nil {
+			return fmt.Errorf("pprof_addr: %w", err)
+		}
+	}
+	for _, addr := range cfg.Peers {
+		if err := validateAddress(addr, false); err != nil {
+			return fmt.Errorf("peers: %w", err)
+		}
+	}
+	if cfg.MaxInboundPeers < 0 || cfg.MaxOutboundPeers < 0 {
+		return errors.New("peer counts must not be negative")
 	}
 	if strings.TrimSpace(cfg.RPCAddr) != "" {
 		if cfg.RPCReadTimeoutMS <= 0 {
@@ -204,6 +247,35 @@ func Validate(cfg Config) error {
 	return nil
 }
 
+func validateRPCEndpoint(addr string) error {
+	if !strings.Contains(addr, "://") {
+		return validateAddress(addr, true)
+	}
+	// The same config field can be a URL for CLI clients.
+	endpoint, err := url.Parse(addr)
+	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Hostname() == "" {
+		return errors.New("invalid HTTP or HTTPS endpoint")
+	}
+	if port := endpoint.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return errors.New("invalid RPC endpoint port")
+		}
+	}
+	return nil
+}
+
+func validateAddress(addr string, listen bool) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || strings.ContainsAny(host, " /\t\r\n") || (!listen && host == "") {
+		return fmt.Errorf("invalid host:port address %q", addr)
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || (!listen && number == 0) {
+		return fmt.Errorf("invalid port in address %q", addr)
+	}
+	return nil
+}
+
 func DefaultPathCandidates() []string {
 	return []string{DefaultConfigPath, AltConfigPath, LegacyConfigPath}
 }
@@ -250,6 +322,11 @@ func saveSingle(path string, cfg Config) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
@@ -262,7 +339,12 @@ func saveSingle(path string, cfg Config) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	return nil
+	dir, err := os.Open(filepath.Dir(clean))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func compatibilitySidecarPath(path string) string {

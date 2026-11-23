@@ -11,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"bitcoin-pure/internal/node"
+	"bitcoin-pure/internal/wallet"
 )
 
 func TestLogTailSuffixMatchesLines(t *testing.T) {
@@ -140,5 +143,81 @@ func TestLogTailAtBufferBoundaries(t *testing.T) {
 				t.Fatalf("size %d suffix %q: %v, %v", size, suffix, got, err)
 			}
 		}
+	}
+}
+
+func TestSyncWalletStateSkipsPendingRPCsAndMutationWithoutPending(t *testing.T) {
+	store, err := wallet.Open(wallet.StorePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateWallet("main"); err != nil {
+		t.Fatal(err)
+	}
+	// A read-only balance must not attempt to acquire a mutation lock.
+	lockPath := store.Path() + ".lock"
+	if err := os.Rename(lockPath, lockPath+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(lockPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	client := newRPCClient("http://wallet.invalid", "", time.Second)
+	var methods []string
+	client.http.Transport = statusTestTransport(func(r *http.Request) (*http.Response, error) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return nil, err
+		}
+		methods = append(methods, req.Method)
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"result":{"utxos":[]}}`))}, nil
+	})
+	if _, _, err := syncWalletState(store, client, "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(methods, []string{"getutxosbywatchitems"}) {
+		t.Fatalf("RPCs = %v, want only getutxosbywatchitems", methods)
+	}
+}
+
+func TestWalletActivityMergesAcrossWatchItemBatches(t *testing.T) {
+	client := newRPCClient("http://wallet.invalid", "", time.Second)
+	items := make([]wallet.WatchItem, node.MaxRPCWatchItems+1)
+	for i := range items {
+		items[i].Payload32[0] = byte(i)
+		items[i].Payload32[1] = byte(i >> 8)
+	}
+	var requests int
+	client.http.Transport = statusTestTransport(func(r *http.Request) (*http.Response, error) {
+		var req struct {
+			Method string `json:"method"`
+			Params struct {
+				WatchItems []json.RawMessage `json:"watchitems"`
+				Limit      int               `json:"limit"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return nil, err
+		}
+		requests++
+		wantSize := node.MaxRPCWatchItems
+		body := `{"result":{"activity":[{"txid":"01","block_hash":"00","height":2,"received":10,"fee":2},{"txid":"02","height":1}]}}`
+		if requests == 2 {
+			wantSize = 1
+			body = `{"result":{"activity":[{"txid":"01","block_hash":"00","height":2,"sent":6,"fee":2}]}}`
+		}
+		if req.Method != "getwalletactivitybywatchitems" || len(req.Params.WatchItems) != wantSize || req.Params.Limit != 2 {
+			t.Fatalf("bad batch request %d: %s, %d items, limit %d", requests, req.Method, len(req.Params.WatchItems), req.Params.Limit)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	rows, err := rpcWalletActivityByWatchItems(client, items, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(rows) != 2 || rows[0].Net != 4 || rows[0].Fee != 2 || rows[1].TxID != "02" {
+		t.Fatalf("got %d requests and rows %+v", requests, rows)
 	}
 }

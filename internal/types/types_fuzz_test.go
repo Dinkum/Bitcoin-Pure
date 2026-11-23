@@ -7,10 +7,7 @@ import (
 
 func fuzzCodecLimits() CodecLimits {
 	return CodecLimits{
-		MaxInputs:      16,
-		MaxOutputs:     16,
-		MaxTxsPerBlock: 16,
-		MaxBlockBytes:  4096,
+		MaxBlockBytes: 4096,
 	}
 }
 

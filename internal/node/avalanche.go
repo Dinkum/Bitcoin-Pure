@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bitcoin-pure/internal/consensus"
@@ -17,9 +18,12 @@ import (
 )
 
 const (
-	avalancheConflictTTL      = 10 * time.Minute
-	avalanchePruneInterval    = 30 * time.Second
-	avalancheMaxPollOutpoints = 64
+	avalancheConflictTTL        = 10 * time.Minute
+	avalanchePruneInterval      = 30 * time.Second
+	avalancheMaxPollOutpoints   = 64
+	avalancheMaxConflictSets    = 65_536
+	avalancheMaxConflictMembers = 32
+	avalanchePeerPollInterval   = 20 * time.Millisecond
 )
 
 var ErrAvalancheFinalConflict = errors.New("transaction conflicts with avalanche-finalized preference")
@@ -46,7 +50,7 @@ type AvalancheInfo struct {
 type avalancheManager struct {
 	svc *Service
 
-	mu        sync.Mutex
+	mu        sync.RWMutex
 	rng       *rand.Rand
 	conflicts map[types.OutPoint]*avalancheConflictSet
 	polls     map[uint64]*avalanchePollState
@@ -75,7 +79,7 @@ type avalancheStats struct {
 	pollsStarted           uint64
 	pollsFinalized         uint64
 	voteResponses          uint64
-	rejectedFinalConflicts uint64
+	rejectedFinalConflicts atomic.Uint64
 }
 
 func newAvalancheManager(svc *Service) *avalancheManager {
@@ -107,8 +111,8 @@ func (m *avalancheManager) info() AvalancheInfo {
 	if m == nil {
 		return AvalancheInfo{Enabled: false, Mode: "off", Weighting: "disabled"}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	finalized := 0
 	for _, set := range m.conflicts {
 		if set.hasAnyFinal() {
@@ -131,7 +135,7 @@ func (m *avalancheManager) info() AvalancheInfo {
 		PollsStarted:           m.stats.pollsStarted,
 		PollsFinalized:         m.stats.pollsFinalized,
 		VoteResponses:          m.stats.voteResponses,
-		RejectedFinalConflicts: m.stats.rejectedFinalConflicts,
+		RejectedFinalConflicts: m.stats.rejectedFinalConflicts.Load(),
 	}
 }
 
@@ -139,22 +143,28 @@ func (m *avalancheManager) rejectionError(tx types.Transaction) error {
 	if !m.enabled() {
 		return nil
 	}
-	txid := consensus.TxID(&tx)
+	var txid [32]byte
+	hasTxID := false
 	now := time.Now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pruneExpiredIfDueLocked(now)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for _, input := range tx.Base.Inputs {
 		set := m.conflicts[input.PrevOut]
 		if set == nil || now.Sub(set.updatedAt) > avalancheConflictTTL {
 			continue
 		}
 		for winner, final := range set.final {
-			if !final || winner == txid {
+			if !final {
 				continue
 			}
-			m.stats.rejectedFinalConflicts++
-			return ErrAvalancheFinalConflict
+			if !hasTxID {
+				txid = consensus.TxID(&tx)
+				hasTxID = true
+			}
+			if winner != txid {
+				m.stats.rejectedFinalConflicts.Add(1)
+				return ErrAvalancheFinalConflict
+			}
 		}
 	}
 	return nil
@@ -195,11 +205,15 @@ func (m *avalancheManager) onBlockAccepted(block *types.Block) {
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneExpiredIfDueLocked(now)
 	for i := 1; i < len(block.Txs); i++ {
 		tx := block.Txs[i]
 		txid := consensus.TxID(&tx)
 		for _, input := range tx.Base.Inputs {
-			set := m.ensureConflictSetLocked(input.PrevOut, now)
+			set := m.conflicts[input.PrevOut]
+			if set == nil {
+				continue
+			}
 			set.members = map[[32]byte]struct{}{txid: {}}
 			set.pref = txid
 			set.hasPref = true
@@ -209,7 +223,6 @@ func (m *avalancheManager) onBlockAccepted(block *types.Block) {
 			set.updatedAt = now
 		}
 	}
-	m.pruneExpiredIfDueLocked(now)
 }
 
 func (m *avalancheManager) pollLoop() {
@@ -327,18 +340,26 @@ func (m *avalancheManager) onPoll(peer *peerConn, msg p2p.AvaPollMessage) error 
 	if !m.enabled() {
 		return nil
 	}
-	peer.noteAvalanchePollReceived()
+	now := time.Now()
+	peer.avaMu.Lock()
+	if now.Sub(peer.avaState.lastPoll) < avalanchePeerPollInterval {
+		peer.avaMu.Unlock()
+		return nil
+	}
+	peer.avaState.lastPoll = now
+	peer.avaState.pollsReceived++
+	peer.avaMu.Unlock()
 	votes := make([]p2p.AvaVote, 0, len(msg.Items))
-	m.mu.Lock()
+	m.mu.RLock()
 	for _, item := range msg.Items {
 		vote := p2p.AvaVote{}
-		if set := m.conflicts[item]; set != nil && set.hasPref {
+		if set := m.conflicts[item]; set != nil && set.hasPref && now.Sub(set.updatedAt) <= avalancheConflictTTL {
 			vote.HasOpinion = true
 			vote.TxID = set.pref
 		}
 		votes = append(votes, vote)
 	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	peer.noteAvalancheVoteSent()
 	return peer.send(p2p.AvaVoteMessage{PollID: msg.PollID, Votes: votes})
 }
@@ -490,6 +511,24 @@ func (m *avalancheManager) trackTx(tx types.Transaction, preferred bool, now tim
 	m.pruneExpiredIfDueLocked(now)
 	for _, input := range tx.Base.Inputs {
 		set := m.ensureConflictSetLocked(input.PrevOut, now)
+		if set == nil {
+			continue
+		}
+		if _, exists := set.members[txid]; !exists && len(set.members) >= avalancheMaxConflictMembers {
+			if !preferred {
+				continue
+			}
+			for member := range set.members {
+				if member != set.pref && !set.final[member] {
+					delete(set.members, member)
+					delete(set.counter, member)
+					break
+				}
+			}
+			if len(set.members) >= avalancheMaxConflictMembers {
+				continue
+			}
+		}
 		set.members[txid] = struct{}{}
 		if !set.hasPref || preferred {
 			set.pref = txid
@@ -503,6 +542,9 @@ func (m *avalancheManager) ensureConflictSetLocked(outpoint types.OutPoint, now 
 	set := m.conflicts[outpoint]
 	if set != nil {
 		return set
+	}
+	if len(m.conflicts) >= avalancheMaxConflictSets {
+		return nil
 	}
 	set = &avalancheConflictSet{
 		members:   make(map[[32]byte]struct{}),

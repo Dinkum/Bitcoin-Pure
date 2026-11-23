@@ -58,7 +58,7 @@ func TestConcurrentHeaderAndValidatedBlockWritesPreserveValidation(t *testing.T)
 	}
 }
 
-func TestConcurrentJournalWritersAllocateDistinctSequences(t *testing.T) {
+func TestConcurrentHeightWritersPreserveAllMappings(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -85,25 +85,11 @@ func TestConcurrentJournalWritersAllocateDistinctSequences(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	seq, err := s.journalNextSeq()
-	if err != nil || seq != count {
-		t.Fatalf("journal sequence=%d err=%v; want %d distinct entries", seq, err, count)
-	}
-	seen := make(map[uint64]bool, count)
 	for i := uint64(0); i < count; i++ {
-		raw, err := s.get(journalKey(i))
-		if err != nil || raw == nil {
-			t.Fatalf("journal %d missing: %v", i, err)
+		hash, err := s.GetIndexedHeaderHashByHeight(i)
+		if want := ([32]byte{byte(i + 1)}); err != nil || hash == nil || *hash != want {
+			t.Fatalf("header height %d = %x, %v; want %x", i, hash, err, want)
 		}
-		entry, err := decodeChainJournalEntry(raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		height := entry.Pairs[0].Height
-		if seen[height] {
-			t.Fatalf("duplicate height %d", height)
-		}
-		seen[height] = true
 	}
 }
 

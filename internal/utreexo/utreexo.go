@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"runtime"
 	"slices"
+	"sort"
 	"sync"
 
 	"bitcoin-pure/internal/crypto"
@@ -26,6 +28,12 @@ const (
 const (
 	OutPointKeyBytes = outPointBytes
 	KeyBits          = keyBits
+)
+
+var (
+	leafHasher   = crypto.NewTaggedHasher(UTXOLeafTag)
+	branchHasher = crypto.NewTaggedHasher(UTXOBranchTag)
+	rootHasher   = crypto.NewTaggedHasher(UTXORootTag)
 )
 
 type UtxoLeaf struct {
@@ -116,7 +124,7 @@ func LeafHash(leaf UtxoLeaf) [32]byte {
 		payload32 = leaf.PubKey
 	}
 	buf = append(buf, payload32[:]...)
-	return crypto.TaggedHash(UTXOLeafTag, buf)
+	return leafHasher.Sum256(buf)
 }
 
 func BranchHash(left, right [32]byte) [32]byte {
@@ -124,19 +132,19 @@ func BranchHash(left, right [32]byte) [32]byte {
 	buf := scratch[:0]
 	buf = append(buf, left[:]...)
 	buf = append(buf, right[:]...)
-	return crypto.TaggedHash(UTXOBranchTag, buf)
+	return branchHasher.Sum256(buf)
 }
 
 func UtxoRoot(leaves []UtxoLeaf) [32]byte {
 	if len(leaves) == 0 {
-		return crypto.TaggedHash(UTXORootTag, nil)
+		return rootHasher.Sum256(nil)
 	}
 	sorted := sortedKeyedLeaves(leaves)
 	if err := ensureUniqueSortedLeaves(sorted); err != nil {
 		panic(err.Error())
 	}
 	root := buildAccumulatorTree(sorted, 0, parallelBuildBudget())
-	return crypto.TaggedHash(UTXORootTag, root.hash[:])
+	return rootHasher.Sum256(root.hash[:])
 }
 
 func NewAccumulator() *Accumulator {
@@ -205,9 +213,9 @@ func NewAccumulatorFromNodeRecords(records []AccumulatorNodeRecord) (*Accumulato
 
 func (a *Accumulator) Root() [32]byte {
 	if a == nil || a.root == nil {
-		return crypto.TaggedHash(UTXORootTag, nil)
+		return rootHasher.Sum256(nil)
 	}
-	return crypto.TaggedHash(UTXORootTag, a.root.hash[:])
+	return rootHasher.Sum256(a.root.hash[:])
 }
 
 func (a *Accumulator) Count() int {
@@ -278,28 +286,85 @@ func (a *Accumulator) Apply(spent []types.OutPoint, created []UtxoLeaf) (*Accumu
 	if err := ensureUniqueSortedLeaves(sortedCreated); err != nil {
 		return nil, err
 	}
-	root := a.root
-	for _, key := range sortedSpent {
-		var deleted bool
-		root, deleted, err = deleteLeaf(root, key)
-		if err != nil {
-			return nil, err
-		}
-		if !deleted {
-			outPoint := outPointFromKey(key)
-			return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
-		}
-	}
-	for _, leaf := range sortedCreated {
-		root, err = insertLeaf(root, leaf)
-		if err != nil {
-			return nil, err
-		}
+	root, err := applyLeafUpdates(a.root, sortedSpent, sortedCreated, 0)
+	if err != nil {
+		return nil, err
 	}
 	if root == nil {
 		return NewAccumulator(), nil
 	}
 	return &Accumulator{root: root, count: root.count}, nil
+}
+
+func applyLeafUpdates(node *accNode, spent [][outPointBytes]byte, created []keyedLeaf, minDepth int) (*accNode, error) {
+	if len(spent) == 0 && len(created) == 0 {
+		return node, nil
+	}
+	if node == nil {
+		if len(spent) != 0 {
+			outPoint := outPointFromKey(spent[0])
+			return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
+		}
+		return buildAccumulatorTree(created, minDepth, 0), nil
+	}
+
+	// Every spend must already lie under this node. Sorted endpoints cover
+	// the whole range; a spend alone cannot introduce a branch.
+	if len(spent) != 0 {
+		for _, key := range [2][outPointBytes]byte{spent[0], spent[len(spent)-1]} {
+			if maskPathKey(key, node.path.Depth) != node.path.Key {
+				outPoint := outPointFromKey(key)
+				return nil, fmt.Errorf("missing accumulator leaf %x:%d", outPoint.TxID, outPoint.Vout)
+			}
+		}
+	}
+
+	depth := node.path.Depth
+	if len(created) != 0 {
+		for _, key := range [2][outPointBytes]byte{created[0].key, created[len(created)-1].key} {
+			divergence := firstDifferentBitFrom(node.path.Key, key, minDepth)
+			if divergence >= 0 {
+				depth = min(depth, divergence)
+			}
+		}
+	}
+	if depth == keyBits {
+		if len(spent) == 0 {
+			return nil, fmt.Errorf("duplicate outpoint in UTXO commitment")
+		}
+		if len(created) == 0 {
+			return nil, nil
+		}
+		return makeLeaf(created[0]), nil
+	}
+
+	left, right := node.left, node.right
+	if depth < node.path.Depth {
+		// New leaves may diverge in a depth that the old trie skipped.
+		if bitSet(node.path.Key, depth) {
+			left, right = nil, node
+		} else {
+			left, right = node, nil
+		}
+	}
+	spentSplit := sort.Search(len(spent), func(i int) bool { return bitSet(spent[i], depth) })
+	createdSplit := splitAtBit(created, depth)
+	nextLeft, err := applyLeafUpdates(left, spent[:spentSplit], created[:createdSplit], depth+1)
+	if err != nil {
+		return nil, err
+	}
+	nextRight, err := applyLeafUpdates(right, spent[spentSplit:], created[createdSplit:], depth+1)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case nextLeft == nil:
+		return nextRight, nil
+	case nextRight == nil:
+		return nextLeft, nil
+	default:
+		return makeBranch(depth, nextLeft.path.Key, nextLeft, nextRight), nil
+	}
 }
 
 func AccumulatorNodeRecords(acc *Accumulator) []AccumulatorNodeRecord {
@@ -375,10 +440,6 @@ func OutPointKey(outPoint types.OutPoint) [OutPointKeyBytes]byte {
 	return leafKey(outPoint)
 }
 
-func OutPointFromKey(key [OutPointKeyBytes]byte) types.OutPoint {
-	return outPointFromKey(key)
-}
-
 // Prove returns a single-outpoint Merklix proof over the current accumulator
 // root. Membership proofs carry the queried leaf; exclusion proofs carry a
 // committed terminal leaf whose full path proves the query branch is absent.
@@ -422,7 +483,7 @@ func VerifyProof(root [32]byte, proof OutPointProof) bool {
 		return false
 	}
 	if len(proof.Steps) == 0 {
-		return !proof.Exists && proof.Terminal == nil && root == crypto.TaggedHash(UTXORootTag, nil)
+		return !proof.Exists && proof.Terminal == nil && root == rootHasher.Sum256(nil)
 	}
 	if proof.Exists {
 		if proof.Terminal != nil {
@@ -468,7 +529,7 @@ func verifyMembershipProof(root [32]byte, leaf UtxoLeaf, steps []ProofStep) bool
 			current = BranchHash(current, step.SiblingHash)
 		}
 	}
-	return root == crypto.TaggedHash(UTXORootTag, current[:])
+	return root == rootHasher.Sum256(current[:])
 }
 
 func firstDifferentBit(left, right [outPointBytes]byte) int {
@@ -476,9 +537,13 @@ func firstDifferentBit(left, right [outPointBytes]byte) int {
 }
 
 func firstDifferentBitFrom(left, right [outPointBytes]byte, start int) int {
-	for bitIndex := start; bitIndex < keyBits; bitIndex++ {
-		if bitSet(left, bitIndex) != bitSet(right, bitIndex) {
-			return bitIndex
+	for i := start / 8; i < len(left); i++ {
+		delta := left[i] ^ right[i]
+		if i == start/8 {
+			delta &= 0xff >> (start % 8)
+		}
+		if delta != 0 {
+			return i*8 + bits.LeadingZeros8(delta)
 		}
 	}
 	return -1
@@ -808,10 +873,10 @@ func insertLeaf(node *accNode, leaf keyedLeaf) (*accNode, error) {
 		return makeLeaf(leaf), nil
 	}
 	divergence := firstDifferentBitFrom(node.path.Key, leaf.key, 0)
-	if divergence < 0 {
+	if divergence < 0 && node.leaf != nil {
 		return nil, fmt.Errorf("duplicate outpoint in UTXO commitment")
 	}
-	if divergence < node.path.Depth {
+	if divergence >= 0 && divergence < node.path.Depth {
 		newLeaf := makeLeaf(leaf)
 		if bitSet(leaf.key, divergence) {
 			return makeBranch(divergence, leaf.key, node, newLeaf), nil
@@ -881,12 +946,7 @@ func makeBranch(depth int, prefix [outPointBytes]byte, left, right *accNode) *ac
 }
 
 func splitAtBit(leaves []keyedLeaf, bitIndex int) int {
-	for i, leaf := range leaves {
-		if bitSet(leaf.key, bitIndex) {
-			return i
-		}
-	}
-	return len(leaves)
+	return sort.Search(len(leaves), func(i int) bool { return bitSet(leaves[i].key, bitIndex) })
 }
 
 func sortedSpentKeys(spent []types.OutPoint) ([][outPointBytes]byte, error) {

@@ -49,7 +49,7 @@ func (s *Service) scheduleMempoolPersistence() {
 }
 
 func (s *Service) mempoolPersistLoop() {
-	const persistDebounce = 25 * time.Millisecond
+	const persistDebounce = 250 * time.Millisecond
 	var timer *time.Timer
 	var timerCh <-chan time.Time
 	defer func() {
@@ -423,6 +423,10 @@ func (s *Service) reloadPersistedMempool() error {
 		poolSnapshot := s.pool.PersistenceSnapshot()
 		s.mempoolPersistMu.Lock()
 		s.mempoolPersistEpoch = poolSnapshot.Epoch
+		if len(poolSnapshot.Orphans) != len(orphans) {
+			// A tighter orphan budget can trim entries during restore.
+			s.mempoolPersistEpoch = ^uint64(0)
+		}
 		s.mempoolFastFlushes = 0
 		s.mempoolPersistMu.Unlock()
 		s.logger.Info("restored mempool from persisted state",

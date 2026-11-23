@@ -25,5 +25,5 @@ func (s *ChainStore) applyHeaderUpdateBatch(batch *pebble.Batch, update *HeaderC
 	for _, entry := range update.Entries {
 		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: consensus.HeaderHash(&entry.Header)})
 	}
-	return s.appendJournalEntryBatch(batch, chainJournalEntry{Kind: journalRewriteHeaderHeights, ForkHeight: update.ForkHeight, OldTipHeight: update.OldTipHeight, Pairs: pairs})
+	return applyJournalEntryBatch(batch, chainJournalEntry{Kind: journalRewriteHeaderHeights, ForkHeight: update.ForkHeight, OldTipHeight: update.OldTipHeight, Pairs: pairs})
 }

@@ -393,12 +393,13 @@ func TestHandlePeerBlockAcceptanceErrorBansPeerAndCachesRejectedBlock(t *testing
 
 func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	secondAccept := make(chan struct{})
 	listener := &scriptedListener{
 		results: []scriptedAcceptResult{
 			{err: temporaryAcceptTestError{err: errors.New("too many open files")}},
 			{err: net.ErrClosed},
 		},
-		secondAccept: make(chan struct{}),
+		secondAccept: secondAccept,
 	}
 	svc := &Service{
 		logger:   logger,
@@ -414,7 +415,7 @@ func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
 	}()
 
 	select {
-	case <-listener.secondAccept:
+	case <-secondAccept:
 	case <-time.After(time.Second):
 		t.Fatal("accept loop did not retry after temporary accept error")
 	}
@@ -749,7 +750,7 @@ func TestPeerCloseDrainsBufferedRelayState(t *testing.T) {
 		invItems: inv,
 	}
 	tx := coinbaseTxForHeight(1, []types.TxOutput{{ValueAtoms: 1, PubKey: nodeSignerPubKey(9)}})
-	filteredTxs := peer.filterQueuedTxs([]types.Transaction{tx})
+	filteredTxs := peer.filterQueuedTxs([]types.Transaction{tx}).txs
 	peer.sendQ <- outboundMessage{
 		msg: p2p.TxBatchMessage{Txs: filteredTxs},
 	}

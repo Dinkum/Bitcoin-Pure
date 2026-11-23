@@ -239,6 +239,10 @@ func (m *peerManager) ConnectPeer(addr string) error {
 }
 
 func (m *peerManager) connectPeer(addr string, manual bool) error {
+	if !m.svc.beginServiceWork() {
+		return ErrServiceStopping
+	}
+	defer m.svc.wg.Done()
 	addr = normalizePeerAddr(addr)
 	if addr == "" {
 		return nil
@@ -470,6 +474,11 @@ func (m *peerManager) handlePeer(conn net.Conn, outbound bool, targetAddr string
 		releaseInboundHandshake()
 	}
 	m.svc.peerMu.Lock()
+	if m.svc.isStopping() || m.svc.peers[addr] != nil {
+		m.svc.peerMu.Unlock()
+		_ = conn.Close()
+		return false
+	}
 	if !outbound {
 		inbound := 0
 		for _, existing := range m.svc.peers {
@@ -595,7 +604,12 @@ func (m *peerManager) peerPingLoop(peer *peerConn) {
 		select {
 		case <-m.svc.stopCh:
 			return
-		case <-ticker.C:
+		case <-peer.closed:
+			return
+		case now := <-ticker.C:
+			peer.blockTransferMu.Lock()
+			pruneExpiredBlockTransfersLocked(peer, now)
+			peer.blockTransferMu.Unlock()
 			if err := peer.send(p2p.PingMessage{Nonce: randomNonce()}); err != nil {
 				return
 			}
@@ -874,25 +888,6 @@ func (m *peerManager) PeerInfo() []PeerInfo {
 		return strings.Compare(a.Addr, b.Addr)
 	})
 	return out
-}
-
-func (m *peerManager) selectInboundEvictionTargetLocked(now time.Time, localHeaderHeight uint64, preferred map[string]bool) (*peerConn, peerRetentionState) {
-	var victim *peerConn
-	var victimState peerRetentionState
-	for _, peer := range m.svc.peers {
-		if peer.outbound {
-			continue
-		}
-		state := m.peerRetentionStateLocked(peer, now, localHeaderHeight, preferred)
-		if state.Protected || state.UsefulnessClass != peerUsefulnessLowValue {
-			continue
-		}
-		if victim == nil || m.peerStateLessUseful(state, victimState, peer.addr, victim.addr) {
-			victim = peer
-			victimState = state
-		}
-	}
-	return victim, victimState
 }
 
 func (m *peerManager) selectOutboundEvictionTargetLocked(candidateAddr string, candidate peerRetentionState, now time.Time, localHeaderHeight uint64, preferred map[string]bool) (string, *peerConn, peerRetentionState, bool) {
@@ -1236,14 +1231,24 @@ func (m *peerManager) rememberKnownPeers(addrs []string) {
 		m.svc.knownPeers = make(map[string]storage.KnownPeerRecord)
 	}
 	now := time.Now().UTC()
+	interfaceIPs := sync.OnceValue(localInterfaceIPs)
+	changed := false
 	for _, addr := range addrs {
 		addr, ok := normalizeLearnedPeerAddr(addr)
-		if !ok || m.isSelfPeerAddr(addr) {
+		if !ok || m.isSelfPeerAddrUsing(addr, func(ip netip.Addr) bool { return slices.Contains(interfaceIPs(), ip) }) {
 			continue
 		}
 		record := m.svc.knownPeers[addr]
+		if now.Sub(record.LastSeen) < time.Minute {
+			continue
+		}
+		changed = true
 		record.LastSeen = now
 		m.svc.knownPeers[addr] = normalizeKnownPeerRecord(record)
+	}
+	if !changed {
+		m.svc.peerMu.Unlock()
+		return
 	}
 	trimKnownPeerMapLocked(m.svc.knownPeers)
 	snapshot := cloneKnownPeerMap(m.svc.knownPeers)
@@ -1538,6 +1543,10 @@ func (m *peerManager) evictUnhealthyAutoPeer(addr string) bool {
 }
 
 func (m *peerManager) isSelfPeerAddr(addr string) bool {
+	return m.isSelfPeerAddrUsing(addr, func(ip netip.Addr) bool { return slices.Contains(localInterfaceIPs(), ip) })
+}
+
+func (m *peerManager) isSelfPeerAddrUsing(addr string, interfaceContains func(netip.Addr) bool) bool {
 	addr = normalizePeerAddr(addr)
 	if addr == "" {
 		return false
@@ -1571,7 +1580,7 @@ func (m *peerManager) isSelfPeerAddr(addr string) bool {
 	if !ok {
 		return false
 	}
-	return localInterfaceIPsContain(peerIP)
+	return interfaceContains(peerIP)
 }
 
 func logPeerHandshakeFailure(logger *slog.Logger, outbound bool, err error, msg string, attrs ...any) {
@@ -1699,11 +1708,12 @@ func parsePeerAddr(host string) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
-func localInterfaceIPsContain(target netip.Addr) bool {
+func localInterfaceIPs() []netip.Addr {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return false
+		return nil
 	}
+	ips := make([]netip.Addr, 0, len(addrs))
 	for _, addr := range addrs {
 		var ip net.IP
 		switch value := addr.(type) {
@@ -1712,12 +1722,9 @@ func localInterfaceIPsContain(target netip.Addr) bool {
 		case *net.IPAddr:
 			ip = value.IP
 		}
-		if ip == nil {
-			continue
-		}
-		if parsed, ok := netip.AddrFromSlice(ip); ok && parsed.Unmap() == target {
-			return true
+		if parsed, ok := netip.AddrFromSlice(ip); ok {
+			ips = append(ips, parsed.Unmap())
 		}
 	}
-	return false
+	return ips
 }

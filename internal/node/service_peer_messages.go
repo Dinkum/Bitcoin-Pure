@@ -11,7 +11,9 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -29,7 +31,7 @@ func (s *Service) onPeerMessage(peer *peerConn, msg p2p.Message) error {
 		}
 		return peer.send(p2p.AddrMessage{Addrs: s.knownPeerAddrs()})
 	case p2p.AddrMessage:
-		if s.cfg.StaticPeerTopology {
+		if s.cfg.StaticPeerTopology || !peer.allowAddrUpdate(time.Now()) {
 			return nil
 		}
 		s.rememberKnownPeers(m.Addrs)
@@ -153,30 +155,61 @@ func (s *Service) onBlockStartMessage(peer *peerConn, msg p2p.BlockStartMessage)
 	if msg.TotalSize < types.BlockHeaderEncodedLen {
 		return errors.New("chunked block total is shorter than its header")
 	}
+	hash := consensus.HeaderHash(&msg.Header)
+	index, err := s.chainState.Store().GetBlockIndex(&hash)
+	if err != nil {
+		return err
+	}
+	if index == nil || index.Header != msg.Header || s.hasRejectedBlock(hash) {
+		return fmt.Errorf("unexpected chunked block for unknown or rejected header %x", hash)
+	}
+	tip, hasTip := s.chainState.tipSnapshot()
+	if !s.blockRequestOwnedByPeer(hash, peer.addr) && (!hasTip || msg.Header.PrevBlockHash != tip.TipHash) {
+		return fmt.Errorf("unexpected chunked block outside active-tip window %x", hash)
+	}
 	parent, err := s.chainState.Store().GetBlockIndex(&msg.Header.PrevBlockHash)
 	if err != nil {
 		return err
 	}
-	if parent == nil || !parent.Validated {
+	if parent == nil {
 		return ErrUnknownParent
 	}
-	maxBytes := consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(s.cfg.Profile))
-	if msg.TotalSize > maxBytes {
-		return consensus.ErrBlockTooLarge
+	// A requested descendant may arrive before its parent's body. Block
+	// validation enforces the exact ABLA limit as soon as the parent connects.
+	if parent.Validated {
+		maxBytes := consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(s.cfg.Profile))
+		if msg.TotalSize > maxBytes {
+			return consensus.ErrBlockTooLarge
+		}
 	}
-	hash := consensus.HeaderHash(&msg.Header)
 	peer.blockTransferMu.Lock()
 	defer peer.blockTransferMu.Unlock()
 	pruneExpiredBlockTransfersLocked(peer, time.Now())
+	select {
+	case <-peer.closed:
+		return net.ErrClosed
+	default:
+	}
 	if _, duplicate := peer.blockTransfers[hash]; duplicate {
 		return fmt.Errorf("duplicate chunked block transfer %x", hash)
 	}
 	if len(peer.blockTransfers) >= 2 {
 		return errors.New("too many concurrent chunked block transfers")
 	}
+	if msg.TotalSize > uint64(math.MaxInt) {
+		return p2p.ErrPayloadBudget
+	}
+	release, ok := s.blockTransferBudget.TryAcquire(int(msg.TotalSize))
+	if !ok {
+		return p2p.ErrPayloadBudget
+	}
 	file, err := os.CreateTemp("", "bpu-block-transfer-*")
 	if err != nil {
+		release()
 		return err
+	}
+	if peer.blockTransfers == nil {
+		peer.blockTransfers = make(map[[32]byte]*incomingBlockTransfer)
 	}
 	peer.blockTransfers[hash] = &incomingBlockTransfer{
 		header:   msg.Header,
@@ -184,6 +217,7 @@ func (s *Service) onBlockStartMessage(peer *peerConn, msg p2p.BlockStartMessage)
 		checksum: msg.Checksum,
 		file:     file,
 		updated:  time.Now(),
+		release:  release,
 	}
 	return nil
 }
@@ -217,32 +251,19 @@ func (s *Service) onBlockChunkMessage(peer *peerConn, msg p2p.BlockChunkMessage)
 	delete(peer.blockTransfers, msg.BlockHash)
 	peer.blockTransferMu.Unlock()
 
-	name := transfer.file.Name()
-	if err := transfer.file.Close(); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	defer os.Remove(name)
-	reservation := s.payloadBudget.NewReservation()
+	defer transfer.close()
+	reservation := s.blockDecodeBudget.NewReservation()
 	defer reservation.Release()
-	if transfer.total > uint64(math.MaxInt) {
-		return p2p.ErrPayloadBudget
-	}
 	if err := reservation.Reserve(int(transfer.total)); err != nil {
 		return err
 	}
-	file, err := os.Open(name)
-	if err != nil {
+	if _, err := transfer.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	raw := make([]byte, int(transfer.total))
-	_, readErr := io.ReadFull(file, raw)
-	closeErr := file.Close()
+	_, readErr := io.ReadFull(transfer.file, raw)
 	if readErr != nil {
 		return readErr
-	}
-	if closeErr != nil {
-		return closeErr
 	}
 	if uint64(len(raw)) != transfer.total || crypto.Sha256d(raw) != transfer.checksum {
 		return errors.New("chunked block transfer checksum mismatch")
@@ -269,11 +290,7 @@ func pruneExpiredBlockTransfersLocked(peer *peerConn, now time.Time) {
 		if transfer.updated.IsZero() || now.Sub(transfer.updated) <= incomingBlockTransferIdleTimeout {
 			continue
 		}
-		if transfer.file != nil {
-			name := transfer.file.Name()
-			_ = transfer.file.Close()
-			_ = os.Remove(name)
-		}
+		transfer.close()
 		delete(peer.blockTransfers, hash)
 	}
 }
@@ -571,12 +588,6 @@ func (p *peerConn) noteAvalanchePollSent() {
 	p.avaMu.Unlock()
 }
 
-func (p *peerConn) noteAvalanchePollReceived() {
-	p.avaMu.Lock()
-	p.avaState.pollsReceived++
-	p.avaMu.Unlock()
-}
-
 func (p *peerConn) noteAvalancheVoteSent() {
 	p.avaMu.Lock()
 	p.avaState.votesSent++
@@ -851,49 +862,76 @@ func (s *Service) blockRequestOwnedByPeer(hash [32]byte, peerAddr string) bool {
 }
 
 func (s *Service) onGetXBlockTxMessage(peer *peerConn, msg p2p.GetXBlockTxMessage) error {
-	block, ok, err := s.loadBlock(msg.BlockHash)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return peer.send(p2p.NotFoundMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlockFull, Hash: msg.BlockHash}}})
-	}
-	indexes := make([]uint32, 0, len(msg.Indexes))
-	txs := make([]types.Transaction, 0, len(msg.Indexes))
-	for _, index := range msg.Indexes {
-		if int(index) >= len(block.Txs) {
-			continue
-		}
-		indexes = append(indexes, index)
-		txs = append(txs, block.Txs[index])
-	}
-	if len(indexes) == 0 {
-		return peer.send(p2p.NotFoundMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlockFull, Hash: msg.BlockHash}}})
-	}
-	return peer.send(p2p.XBlockTxMessage{BlockHash: msg.BlockHash, Indexes: indexes, Txs: txs})
+	return queueBlockTransactions(peer, msg.BlockHash, msg.Indexes, true)
 }
 
 func (s *Service) onGetBlockTxMessage(peer *peerConn, msg p2p.GetBlockTxMessage) error {
-	block, ok, err := s.loadBlock(msg.BlockHash)
+	return queueBlockTransactions(peer, msg.BlockHash, msg.Indexes, false)
+}
+
+func queueBlockTransactions(peer *peerConn, hash [32]byte, indexes []uint32, extended bool) error {
+	const maxRecoveryIndexes = 4096
+	if len(indexes) == 0 || len(indexes) > maxRecoveryIndexes {
+		// An incomplete response prompts the receiver to request a full block
+		// or try its next recovery step.
+		if extended {
+			return peer.send(p2p.XBlockTxMessage{BlockHash: hash})
+		}
+		return peer.send(p2p.BlockTxMessage{BlockHash: hash})
+	}
+	return peer.enqueueBlockResponse(&outboundBlockReference{
+		item:             p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: hash},
+		recoveryIndexes:  slices.Clone(indexes),
+		extendedRecovery: extended,
+	})
+}
+
+func (s *Service) resolveBlockTransactions(peer *peerConn, ref *outboundBlockReference, size int) (p2p.Message, error) {
+	hash := ref.item.Hash
+	notFound := p2p.NotFoundMessage{Items: []p2p.InvVector{ref.item}}
+	limit := s.blockServingLimit()
+	// Charge source reads even when the requested response is small.
+	if !peer.allowBlockServeBytes(min(size, limit), time.Now(), limit) {
+		return notFound, nil
+	}
+	block, ok, err := s.loadBlock(hash)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !ok {
-		return peer.send(p2p.NotFoundMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlockFull, Hash: msg.BlockHash}}})
+		return notFound, nil
 	}
-	indexes := make([]uint32, 0, len(msg.Indexes))
-	txs := make([]types.Transaction, 0, len(msg.Indexes))
-	for _, index := range msg.Indexes {
-		if int(index) >= len(block.Txs) {
+	var indexes []uint32
+	var txs []types.Transaction
+	seen := make(map[uint32]struct{})
+	remaining := limit - (32 + 4 + 4)
+	for _, index := range ref.recoveryIndexes {
+		if uint64(index) >= uint64(len(block.Txs)) {
 			continue
 		}
+		if _, duplicate := seen[index]; duplicate {
+			continue
+		}
+		cost := 8 + block.Txs[index].EncodedLen()
+		if cost > remaining {
+			break
+		}
+		seen[index] = struct{}{}
 		indexes = append(indexes, index)
 		txs = append(txs, block.Txs[index])
+		remaining -= cost
 	}
-	if len(indexes) == 0 {
-		return peer.send(p2p.NotFoundMessage{Items: []p2p.InvVector{{Type: p2p.InvTypeBlockFull, Hash: msg.BlockHash}}})
+	if ref.extendedRecovery {
+		return p2p.XBlockTxMessage{BlockHash: hash, Indexes: indexes, Txs: txs}, nil
 	}
-	return peer.send(p2p.BlockTxMessage{BlockHash: msg.BlockHash, Indexes: indexes, Txs: txs})
+	return p2p.BlockTxMessage{BlockHash: hash, Indexes: indexes, Txs: txs}, nil
+}
+
+func (s *Service) reserveBlockServing(size uint64) (func(), bool) {
+	if size == 0 || size > maxPendingPeerBlockBytes {
+		return nil, false
+	}
+	return s.blockServeBudget.TryAcquire(int(size))
 }
 
 func (s *Service) onXBlockTxMessage(peer *peerConn, msg p2p.XBlockTxMessage) error {
@@ -989,21 +1027,39 @@ func (s *Service) preferredBlockRelayMessageForBlock(peer *peerConn, block types
 	}
 }
 
-func (s *Service) resolveQueuedBlockReference(peer *peerConn, ref *outboundBlockReference) (p2p.Message, error) {
+func (s *Service) resolveQueuedBlockReference(peer *peerConn, ref *outboundBlockReference, size int, checksum [32]byte) (p2p.Message, error) {
 	if ref == nil {
 		return nil, errors.New("missing queued block reference")
+	}
+	if ref.recoveryIndexes != nil {
+		return s.resolveBlockTransactions(peer, ref, size)
+	}
+	limit := s.blockServingLimit()
+	oversized := size > limit-4 // The full-block payload prefixes its body length.
+	chunked := oversized && peer.supportsChunkedBlockRelay()
+	notFound := p2p.NotFoundMessage{Items: []p2p.InvVector{ref.item}}
+	if size == 0 || (oversized && !chunked) || !ref.batch.tryCharge(size, chunked) ||
+		!peer.allowBlockServeBytes(min(size, limit*2), time.Now(), limit) {
+		return notFound, nil
 	}
 	block, ok, err := s.loadBlock(ref.item.Hash)
 	if err != nil {
 		return nil, err
 	}
-	blockBytes := block.EncodedLen()
-	if !ok || !ref.batch.tryCharge(blockBytes) || !peer.allowBlockServeBytes(blockBytes, time.Now(), s.blockServingLimit()) {
-		return p2p.NotFoundMessage{Items: []p2p.InvVector{ref.item}}, nil
+	if !ok {
+		return notFound, nil
+	}
+	if chunked {
+		return p2p.ChunkedBlockTransferMessage{Block: block, Checksum: &checksum}, nil
 	}
 	switch ref.item.Type {
 	case p2p.InvTypeBlock:
-		return s.preferredBlockRelayMessageForBlock(peer, block), nil
+		message := s.preferredBlockRelayMessageForBlock(peer, block)
+		if transfer, ok := message.(p2p.ChunkedBlockTransferMessage); ok {
+			transfer.Checksum = &checksum
+			message = transfer
+		}
+		return message, nil
 	case p2p.InvTypeBlockExtended:
 		return buildXThinBlockMessage(block), nil
 	case p2p.InvTypeBlockFull:
@@ -1025,20 +1081,6 @@ func (s *Service) loadBlock(hash [32]byte) (types.Block, bool, error) {
 		return types.Block{}, false, nil
 	}
 	return *block, true, nil
-}
-
-func (s *Service) hasKnownBlock(hash [32]byte) (bool, error) {
-	if _, ok := s.recentBlock(hash); ok {
-		return true, nil
-	}
-	if s.chainState == nil {
-		return false, nil
-	}
-	block, err := s.chainState.Store().GetBlock(&hash)
-	if err != nil || block == nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func (s *Service) acceptThinBlock(peer *peerConn, block types.Block) error {

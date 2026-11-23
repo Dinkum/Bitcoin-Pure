@@ -478,18 +478,13 @@ func TestSelectForBlockOverlayKeepsBaseUTXOMapImmutable(t *testing.T) {
 	if _, ok := overlay.Lookup(rootPrev); ok {
 		t.Fatal("overlay still exposes spent root prevout")
 	}
-	if len(selected[0].SignatureChecks) != 0 {
-		t.Fatal("selection snapshots should stay lightweight and skip redundant signature rechecks")
-	}
 	if len(selected[0].SpentOutPoints) != len(parent.Base.Inputs) {
 		t.Fatalf("selection snapshot spent delta len = %d, want %d", len(selected[0].SpentOutPoints), len(parent.Base.Inputs))
 	}
 	if len(selected[0].CreatedLeaves) != len(parent.Base.Outputs) {
 		t.Fatalf("selection snapshot created delta len = %d, want %d", len(selected[0].CreatedLeaves), len(parent.Base.Outputs))
 	}
-	if snapshot := findSnapshot(t, pool.Snapshot(), parentAdmission.TxID); len(snapshot.SignatureChecks) != 0 {
-		t.Fatal("generic mempool snapshots should stay lightweight and exclude selection-only signature checks")
-	} else if len(snapshot.SpentOutPoints) != 0 || len(snapshot.CreatedLeaves) != 0 {
+	if snapshot := findSnapshot(t, pool.Snapshot(), parentAdmission.TxID); len(snapshot.SpentOutPoints) != 0 || len(snapshot.CreatedLeaves) != 0 {
 		t.Fatal("generic mempool snapshots should stay lightweight and exclude selection-only accumulator deltas")
 	}
 }
@@ -654,4 +649,12 @@ func TestCandidateLessUsesExactFeerateOrdering(t *testing.T) {
 	if !candidateLess(tieByRateHigherFee, tieByRateLowerFee) {
 		t.Fatal("equal-feerate candidates should break ties on absolute fee")
 	}
+}
+
+func cloneUtxos(utxos consensus.UtxoSet) consensus.UtxoSet {
+	out := make(consensus.UtxoSet, len(utxos))
+	for outPoint, entry := range utxos {
+		out[outPoint] = entry
+	}
+	return out
 }

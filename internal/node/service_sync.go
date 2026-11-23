@@ -118,11 +118,11 @@ func (s *Service) missingBlockHashesDetailed(limit int) ([][32]byte, bool, error
 		if hash == nil {
 			return out, true, nil
 		}
-		block, err := s.chainState.Store().GetBlock(hash)
+		hasBlock, err := s.chainState.Store().HasBlock(hash)
 		if err != nil {
 			return nil, false, err
 		}
-		if block == nil {
+		if !hasBlock {
 			if s.hasPendingPeerBlock(*hash) {
 				continue
 			}

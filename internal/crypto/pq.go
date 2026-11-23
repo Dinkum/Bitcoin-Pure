@@ -18,11 +18,12 @@ const (
 var (
 	ErrInvalidMLDSA65VerificationKey = errors.New("invalid ML-DSA-65 verification key")
 	ErrInvalidMLDSA65PrivateKey      = errors.New("invalid ML-DSA-65 private key")
+	pqLockHasher                     = NewTaggedHasher(PQLockTag)
 )
 
 // PQLock derives the 32-byte consensus lock committed by PQ outputs.
 func PQLock(verificationKey []byte) [32]byte {
-	return TaggedHash(PQLockTag, verificationKey)
+	return pqLockHasher.Sum256(verificationKey)
 }
 
 func GenerateMLDSA65Key(rand io.Reader) ([]byte, []byte, error) {

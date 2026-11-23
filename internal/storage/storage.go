@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bytes"
-	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -12,7 +11,6 @@ import (
 	"log/slog"
 	"math"
 	"path/filepath"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,7 +58,8 @@ var (
 	legacyUTXOAccumulatorNodePrefix = []byte("utxo_acc_node/")
 	utxoAccumulatorNodePrefix       = []byte("utxo_acc_node_v2/")
 	snapshotUTXOPrefix              = []byte("snapshot_utxo/")
-	localitySeqPrefix               = []byte("locality_seq/")
+	localitySeqPrefix               = []byte("locality_seq_v2/")
+	legacyLocalitySeqPrefix         = []byte("locality_seq/")
 	localityMetaPrefix              = []byte("locality_meta/")
 	walletOriginPrefix              = []byte("wallet_origin/")
 	walletUTXOPrefix                = []byte("wallet_utxo/")
@@ -69,10 +68,10 @@ var (
 )
 
 const (
-	walletIndexChunkSize        = 10_000
 	utxoAccumulatorIndexVersion = uint64(2)
 	utxoAccumulatorIndexV1      = uint64(1)
-	chainstateSchemaVersion     = uint64(2)
+	chainstateSchemaVersion     = uint64(3)
+	chainstateSchemaV2          = uint64(2)
 	storedBlockManifestVersion  = byte(1)
 	storedBlockChunkBytes       = 4 << 20
 )
@@ -88,6 +87,7 @@ var (
 	utxoAccumulatorNodePrefixEnd       = prefixUpperBound(utxoAccumulatorNodePrefix)
 	snapshotUTXOPrefixEnd              = prefixUpperBound(snapshotUTXOPrefix)
 	localitySeqPrefixEnd               = prefixUpperBound(localitySeqPrefix)
+	legacyLocalitySeqPrefixEnd         = prefixUpperBound(legacyLocalitySeqPrefix)
 	localityMetaPrefixEnd              = prefixUpperBound(localityMetaPrefix)
 	walletOriginPrefixEnd              = prefixUpperBound(walletOriginPrefix)
 	walletUTXOPrefixEnd                = prefixUpperBound(walletUTXOPrefix)
@@ -140,12 +140,6 @@ type FastSyncState struct {
 	LastError          string   `json:"last_error,omitempty"`
 }
 
-type LocalityIndexedUTXO struct {
-	Sequence uint64
-	OutPoint types.OutPoint
-	Entry    consensus.UtxoEntry
-}
-
 type KnownPeerRecord struct {
 	LastSeen     time.Time
 	LastSuccess  time.Time
@@ -161,51 +155,6 @@ type StoredHeaderState struct {
 	TipHeader types.BlockHeader
 }
 
-// StoredMempoolState keeps restart-only tx relay state out of consensus tables.
-// The encoded transactions are replayed through normal mempool policy when the
-// persisted tip no longer matches the committed chain tip.
-type StoredMempoolState struct {
-	Version   uint32               `json:"version"`
-	Profile   types.ChainProfile   `json:"profile"`
-	TipHeight uint64               `json:"tip_height"`
-	TipHash   [32]byte             `json:"tip_hash"`
-	Entries   []StoredMempoolEntry `json:"entries,omitempty"`
-	Orphans   []StoredMempoolEntry `json:"orphans,omitempty"`
-}
-
-// StoredMempoolStateMeta is the durable checkpoint header for restart-only
-// mempool persistence. The actual accepted/orphan records live under per-tx
-// keys so flushes can upsert or delete only what changed.
-type StoredMempoolStateMeta struct {
-	Version   uint32             `json:"version"`
-	Profile   types.ChainProfile `json:"profile"`
-	TipHeight uint64             `json:"tip_height"`
-	TipHash   [32]byte           `json:"tip_hash"`
-}
-
-type StoredMempoolEntry struct {
-	Tx      []byte                        `json:"tx"`
-	Summary consensus.TxValidationSummary `json:"summary"`
-	AddedAt uint64                        `json:"added_at"`
-	Missing []types.OutPoint              `json:"missing,omitempty"`
-}
-
-type StoredMempoolDeltaEntry struct {
-	TxID  [32]byte
-	Entry StoredMempoolEntry
-}
-
-// StoredMempoolStateDelta applies one atomically visible checkpoint update: a
-// new tip header plus any accepted/orphan record upserts and deletes needed to
-// bring the stored restart cache in sync with the live mempool.
-type StoredMempoolStateDelta struct {
-	Meta          StoredMempoolStateMeta
-	EntryUpserts  []StoredMempoolDeltaEntry
-	EntryDeletes  [][32]byte
-	OrphanUpserts []StoredMempoolDeltaEntry
-	OrphanDeletes [][32]byte
-}
-
 type BlockIndexEntry struct {
 	Height         uint64
 	ParentHash     [32]byte
@@ -218,35 +167,6 @@ type BlockIndexEntry struct {
 // BlockUndoEntry is the durable representation of consensus's authoritative
 // pre-block spend delta. The alias keeps the existing byte layout unchanged.
 type BlockUndoEntry = consensus.SpentUTXO
-
-type WalletWatchItem struct {
-	Type      uint64
-	Payload32 [32]byte
-}
-
-type WalletIndexedUTXO struct {
-	OutPoint types.OutPoint
-	Entry    consensus.UtxoEntry
-	Height   uint64
-	Coinbase bool
-}
-
-type WalletActivityRecord struct {
-	TxID      [32]byte
-	BlockHash [32]byte
-	Height    uint64
-	Timestamp uint64
-	Coinbase  bool
-	Received  uint64
-	Sent      uint64
-	Fee       uint64
-}
-
-type walletOriginRecord struct {
-	Entry    consensus.UtxoEntry
-	Height   uint64
-	Coinbase bool
-}
 
 type HeaderBatchEntry struct {
 	Height    uint64
@@ -265,33 +185,11 @@ type ChainStore struct {
 	txIndexNotify  chan struct{}
 	// Lock order is node state, then mutationMu. Keep every dependent store
 	// read and its commit together; Pebble batches do not isolate readers.
-	mutationMu   sync.Mutex
-	deriveNotify chan struct{}
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
-	closeOnce    sync.Once
-	closeErr     error
-}
-
-type chainJournalKind uint8
-
-const (
-	journalSetBlockHeight chainJournalKind = 1 + iota
-	journalRewriteBlockHeights
-	journalSetHeaderHeight
-	journalRewriteHeaderHeights
-)
-
-type chainJournalHeightHash struct {
-	Height uint64
-	Hash   [32]byte
-}
-
-type chainJournalEntry struct {
-	Kind         chainJournalKind
-	ForkHeight   uint64
-	OldTipHeight uint64
-	Pairs        []chainJournalHeightHash
+	mutationMu sync.Mutex
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 type pebbleLogger struct {
@@ -341,6 +239,7 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		pebbleOpts.Cache = cache
 	}
 	if opts.BloomFilterBitsPerKey > 0 {
+		// Pebble inherits the final LevelOptions for all deeper levels.
 		pebbleOpts.Levels = []pebble.LevelOptions{{
 			FilterPolicy: bloom.FilterPolicy(opts.BloomFilterBitsPerKey),
 			FilterType:   pebble.TableFilter,
@@ -353,7 +252,6 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 	store := &ChainStore{
 		logger:       logger,
 		db:           db,
-		deriveNotify: make(chan struct{}, 1),
 		filterNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 	}
@@ -361,11 +259,22 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 		_ = db.Close()
 		return nil, err
 	}
-	store.wg.Add(1)
-	go func() {
-		defer store.wg.Done()
-		store.derivedIndexLoop()
-	}()
+	if err := store.markCurrentChainstateSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.recoverLegacyHeightJournal(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover legacy height index: %w", err)
+	}
+	if err := store.removeLegacyWalletOrigins(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateLocalityIndex(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate locality index: %w", err)
+	}
 	if opts.TxIndexEnabled {
 		store.txIndexEnabled = true
 		store.txIndexNotify = make(chan struct{}, 1)
@@ -374,8 +283,30 @@ func OpenWithLoggerAndOptions(path string, logger *slog.Logger, opts OpenOptions
 	}
 	store.wg.Add(1)
 	go func() { defer store.wg.Done(); store.compactFilterIndexLoop() }()
-	store.notifyDerivedReplay()
+	store.notifyBackgroundIndexes()
 	return store, nil
+}
+
+// Advance the schema marker before retiring older derived keyspaces.
+// Older binaries refuse this marker instead of writing indexes they can
+// no longer read. The individual migrations remain restartable.
+func (s *ChainStore) markCurrentChainstateSchema() error {
+	raw, err := s.get(metaChainstateSchemaVersionKey)
+	if err != nil || raw == nil {
+		return err
+	}
+	version, err := decodeU64(raw)
+	if err != nil {
+		return err
+	}
+	switch version {
+	case chainstateSchemaVersion:
+		return nil
+	case chainstateSchemaV2:
+		return s.db.Set(metaChainstateSchemaVersionKey, encodeU64(chainstateSchemaVersion), consensusCriticalWriteOptions)
+	default:
+		return fmt.Errorf("%w: unsupported chainstate schema version %d", ErrChainstateReindexRequired, version)
+	}
 }
 
 func (s *ChainStore) Close() error {
@@ -394,7 +325,9 @@ func (s *ChainStore) Close() error {
 }
 
 func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
-	meta, hasChecksum, err := s.loadChainStateMeta()
+	snap := s.db.NewSnapshot()
+	defer snap.Close()
+	meta, hasChecksum, err := loadChainStateMeta(snap)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +335,7 @@ func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
 		return nil, nil
 	}
 	utxos := make(consensus.UtxoSet)
-	if err := s.ForEachUTXO(func(outpoint types.OutPoint, entry consensus.UtxoEntry) error {
+	if err := forEachUTXO(snap, func(outpoint types.OutPoint, entry consensus.UtxoEntry) error {
 		utxos[outpoint] = entry
 		return nil
 	}); err != nil {
@@ -427,39 +360,41 @@ func (s *ChainStore) LoadChainState() (*StoredChainState, error) {
 // intentionally avoids scanning the UTXO keyspace so callers can opt into a
 // disk-backed view without paying the startup RAM cost up front.
 func (s *ChainStore) LoadChainStateMeta() (*StoredChainStateMeta, error) {
-	meta, _, err := s.loadChainStateMeta()
+	snap := s.db.NewSnapshot()
+	defer snap.Close()
+	meta, _, err := loadChainStateMeta(snap)
 	return meta, err
 }
 
-func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
-	profileBytes, err := s.get(metaProfileKey)
+func loadChainStateMeta(reader valueReader) (*StoredChainStateMeta, bool, error) {
+	profileBytes, err := readValue(reader, metaProfileKey)
 	if err != nil {
 		return nil, false, err
 	}
 	if profileBytes == nil {
 		return nil, false, nil
 	}
-	heightBytes, err := s.get(metaTipHeightKey)
+	heightBytes, err := readValue(reader, metaTipHeightKey)
 	if err != nil {
 		return nil, false, err
 	}
-	headerBytes, err := s.get(metaTipHeaderKey)
+	headerBytes, err := readValue(reader, metaTipHeaderKey)
 	if err != nil {
 		return nil, false, err
 	}
-	blockSizeBytes, err := s.get(metaBlockSizeStateKey)
+	blockSizeBytes, err := readValue(reader, metaBlockSizeStateKey)
 	if err != nil {
 		return nil, false, err
 	}
-	checksumBytes, err := s.get(metaUTXOChecksumKey)
+	checksumBytes, err := readValue(reader, metaUTXOChecksumKey)
 	if err != nil {
 		return nil, false, err
 	}
-	countBytes, err := s.get(metaUTXOCountKey)
+	countBytes, err := readValue(reader, metaUTXOCountKey)
 	if err != nil {
 		return nil, false, err
 	}
-	accRootBytes, err := s.get(metaUTXOAccumulatorRootKey)
+	accRootBytes, err := readValue(reader, metaUTXOAccumulatorRootKey)
 	if err != nil {
 		return nil, false, err
 	}
@@ -469,7 +404,7 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 	if heightBytes == nil || headerBytes == nil || blockSizeBytes == nil {
 		return nil, false, errors.New("invalid data: missing chain metadata")
 	}
-	schemaBytes, err := s.get(metaChainstateSchemaVersionKey)
+	schemaBytes, err := readValue(reader, metaChainstateSchemaVersionKey)
 	if err != nil {
 		return nil, false, err
 	}
@@ -480,7 +415,7 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if schemaVersion != chainstateSchemaVersion {
+	if schemaVersion != chainstateSchemaVersion && schemaVersion != chainstateSchemaV2 {
 		return nil, false, fmt.Errorf("%w: unsupported chainstate schema version %d", ErrChainstateReindexRequired, schemaVersion)
 	}
 
@@ -540,207 +475,6 @@ func (s *ChainStore) loadChainStateMeta() (*StoredChainStateMeta, bool, error) {
 	}, checksumBytes != nil, nil
 }
 
-// migrateUTXOAccumulatorIndex rebuilds the v1 derived index from the canonical
-// UTXO keyspace into a separate, bounded-write staging namespace. Only the
-// final synced metadata batch activates v2, so an interrupted migration leaves
-// the complete v1 index visible rather than a partially written v2 index.
-func (s *ChainStore) migrateUTXOAccumulatorIndex() error {
-	versionBytes, err := s.get(metaUTXOAccumulatorVersionKey)
-	if err != nil || versionBytes == nil {
-		return err
-	}
-	version, err := decodeU64(versionBytes)
-	if err != nil {
-		return err
-	}
-	switch version {
-	case utxoAccumulatorIndexVersion:
-		if _, ok, err := s.LoadUTXOAccumulator(); err != nil {
-			return fmt.Errorf("validate utxo accumulator index: %w", err)
-		} else if !ok {
-			return errors.New("utxo accumulator v2 metadata is present without an index")
-		}
-		s.cleanupLegacyUTXOAccumulatorIndex()
-		return nil
-	case utxoAccumulatorIndexV1:
-	default:
-		return fmt.Errorf("unsupported utxo accumulator index version %d", version)
-	}
-
-	meta, err := s.LoadChainStateMeta()
-	if err != nil {
-		return fmt.Errorf("load chain metadata for utxo accumulator migration: %w", err)
-	}
-	if meta == nil {
-		return errors.New("cannot migrate utxo accumulator index without chain metadata")
-	}
-	acc := utreexo.NewAccumulator()
-	if err := s.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
-		next, err := acc.Add(consensus.UtxoLeafFromEntry(outPoint, entry))
-		if err != nil {
-			return err
-		}
-		acc = next
-		return nil
-	}); err != nil {
-		return fmt.Errorf("scan canonical utxos for accumulator migration: %w", err)
-	}
-	if acc.Count() != meta.UTXOCount {
-		return fmt.Errorf("refusing utxo accumulator migration: rebuilt count=%d meta=%d", acc.Count(), meta.UTXOCount)
-	}
-	root := acc.Root()
-	if root != meta.TipHeader.UTXORoot {
-		return fmt.Errorf("refusing utxo accumulator migration: rebuilt root=%x header=%x", root, meta.TipHeader.UTXORoot)
-	}
-	if meta.UTXOAccumulatorRoot != ([32]byte{}) && root != meta.UTXOAccumulatorRoot {
-		return fmt.Errorf("refusing utxo accumulator migration: rebuilt root=%x meta=%x", root, meta.UTXOAccumulatorRoot)
-	}
-
-	// v2 lives in a separate namespace. Populate it in bounded synced chunks
-	// while v1 remains active, then make the completed generation visible with
-	// one metadata batch. A restart after interrupted staging simply discards
-	// the inactive v2 namespace and starts it again.
-	clearBatch := s.db.NewBatch()
-	if err := clearBatch.DeleteRange(utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd, nil); err != nil {
-		clearBatch.Close()
-		return err
-	}
-	if err := clearBatch.Commit(consensusCriticalWriteOptions); err != nil {
-		clearBatch.Close()
-		return fmt.Errorf("clear incomplete utxo accumulator staging index: %w", err)
-	}
-	clearBatch.Close()
-
-	if err := s.stageAccumulatorIndex(acc); err != nil {
-		return err
-	}
-	if err := s.validateAccumulatorIndexRecords(acc); err != nil {
-		return fmt.Errorf("validate staged utxo accumulator index: %w", err)
-	}
-
-	activation := s.db.NewBatch()
-	if rootPath, ok := utreexo.AccumulatorRootPath(acc); ok {
-		if err := activation.Set(metaUTXOAccumulatorRootPathKey, encodeAccumulatorPath(rootPath), nil); err != nil {
-			activation.Close()
-			return err
-		}
-	} else if err := activation.Delete(metaUTXOAccumulatorRootPathKey, nil); err != nil {
-		activation.Close()
-		return err
-	}
-	if err := activation.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil); err != nil {
-		activation.Close()
-		return err
-	}
-	if err := activation.Commit(consensusCriticalWriteOptions); err != nil {
-		activation.Close()
-		return fmt.Errorf("activate utxo accumulator index migration: %w", err)
-	}
-	activation.Close()
-
-	s.cleanupLegacyUTXOAccumulatorIndex()
-	s.logger.Info("migrated utxo accumulator index", slog.Uint64("from_version", version), slog.Uint64("to_version", utxoAccumulatorIndexVersion), slog.Int("utxo_count", acc.Count()))
-	return nil
-}
-
-func (s *ChainStore) stageAccumulatorIndex(acc *utreexo.Accumulator) error {
-	const migrationRecordBatchSize = 4096
-	batch := s.db.NewBatch()
-	defer func() { batch.Close() }()
-	batchCount := 0
-	flush := func() error {
-		if batchCount == 0 {
-			return nil
-		}
-		if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-			return err
-		}
-		batch.Close()
-		batch = s.db.NewBatch()
-		batchCount = 0
-		return nil
-	}
-	err := utreexo.ForEachAccumulatorNodeRecord(acc, func(record utreexo.AccumulatorNodeRecord) error {
-		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
-			return err
-		}
-		batchCount++
-		if batchCount == migrationRecordBatchSize {
-			return flush()
-		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("stage utxo accumulator index records: %w", err)
-	}
-	if err := flush(); err != nil {
-		return fmt.Errorf("stage utxo accumulator index records: %w", err)
-	}
-	return nil
-}
-
-func (s *ChainStore) validateAccumulatorIndexRecords(acc *utreexo.Accumulator) error {
-	expectedCount := 0
-	if err := utreexo.ForEachAccumulatorNodeRecord(acc, func(record utreexo.AccumulatorNodeRecord) error {
-		expectedCount++
-		value, closer, err := s.db.Get(accumulatorNodeKey(record.Path))
-		if err != nil {
-			return err
-		}
-		matches := bytes.Equal(value, encodeAccumulatorNodeValue(record))
-		closer.Close()
-		if !matches {
-			return fmt.Errorf("staged accumulator record mismatch at depth %d", record.Path.Depth)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	actualCount := 0
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: utxoAccumulatorNodePrefix, UpperBound: utxoAccumulatorNodePrefixEnd})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		actualCount++
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	if actualCount != expectedCount {
-		return fmt.Errorf("staged accumulator record count=%d, want %d", actualCount, expectedCount)
-	}
-	return nil
-}
-
-func (s *ChainStore) cleanupLegacyUTXOAccumulatorIndex() {
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: legacyUTXOAccumulatorNodePrefix, UpperBound: legacyUTXOAccumulatorNodePrefixEnd})
-	if err != nil {
-		s.logger.Warn("failed to inspect legacy utxo accumulator index", slog.String("error", err.Error()))
-		return
-	}
-	hasLegacy := iter.First()
-	iterErr := iter.Error()
-	iter.Close()
-	if iterErr != nil {
-		s.logger.Warn("failed to inspect legacy utxo accumulator index", slog.String("error", iterErr.Error()))
-		return
-	}
-	if !hasLegacy {
-		return
-	}
-	cleanup := s.db.NewBatch()
-	defer cleanup.Close()
-	if err := cleanup.DeleteRange(legacyUTXOAccumulatorNodePrefix, legacyUTXOAccumulatorNodePrefixEnd, nil); err != nil {
-		s.logger.Warn("failed to schedule legacy utxo accumulator cleanup", slog.String("error", err.Error()))
-		return
-	}
-	if err := cleanup.Commit(bestEffortWriteOptions); err != nil {
-		s.logger.Warn("failed to clean legacy utxo accumulator index", slog.String("error", err.Error()))
-	}
-}
-
 // GetUTXO performs a single-key Pebble lookup for a committed UTXO entry.
 // A returned nil error cleanly distinguishes "not found" from I/O failure.
 func (s *ChainStore) GetUTXO(outPoint types.OutPoint) (consensus.UtxoEntry, bool, error) {
@@ -785,7 +519,11 @@ func (s *ChainStore) UTXOLookupFunc() consensus.UtxoLookup {
 
 // ForEachUTXO scans the committed UTXO keyspace in key order.
 func (s *ChainStore) ForEachUTXO(fn func(types.OutPoint, consensus.UtxoEntry) error) error {
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	return forEachUTXO(s.db, fn)
+}
+
+func forEachUTXO(reader storeReader, fn func(types.OutPoint, consensus.UtxoEntry) error) error {
+	iter, err := reader.NewIter(&pebble.IterOptions{
 		LowerBound: utxoPrefix,
 		UpperBound: utxoPrefixEnd,
 	})
@@ -868,323 +606,10 @@ func (s *ChainStore) ForEachFastSyncSnapshotUTXO(fn func(types.OutPoint, consens
 	return iter.Error()
 }
 
-func (s *ChainStore) LoadLocalityOrderedUTXOs(limit int) ([]LocalityIndexedUTXO, error) {
-	items := make(localitySelectionHeap, 0)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: localitySeqPrefix,
-		UpperBound: localitySeqPrefixEnd,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		seq, err := decodeLocalitySeqFromKey(iter.Key())
-		if err != nil {
-			return nil, err
-		}
-		outPoint, entry, ok, err := decodeLocalitySeqValue(iter.Value())
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			outPoint, err = decodeOutPoint(iter.Value())
-			if err != nil {
-				return nil, err
-			}
-			entryBuf, err := s.get(utxoKey(outPoint))
-			if err != nil {
-				return nil, err
-			}
-			if entryBuf == nil {
-				// The locality index is non-consensus metadata. If a stale row slips
-				// through during recovery, skip it instead of poisoning canonical UTXO
-				// reads.
-				continue
-			}
-			entry, err = decodeUTXOEntry(entryBuf)
-			if err != nil {
-				return nil, err
-			}
-		}
-		item := LocalityIndexedUTXO{
-			Sequence: seq,
-			OutPoint: outPoint,
-			Entry:    entry,
-		}
-		keepLocalityItem(&items, item, limit)
-	}
-	if err := iter.Error(); err != nil {
-		return nil, err
-	}
-	slices.SortFunc(items, compareLocalityItems)
-	return items, nil
-}
-
-func (s *ChainStore) WalletUTXOsByWatchItems(items []WalletWatchItem) ([]WalletIndexedUTXO, error) {
-	if len(items) == 0 {
-		return nil, nil
-	}
-	if err := s.requireWalletIndexReady(); err != nil {
-		return nil, err
-	}
-	out := make([]WalletIndexedUTXO, 0)
-	for _, item := range uniqueWalletWatchItems(items) {
-		prefix := walletUTXOItemPrefix(item)
-		iter, err := s.db.NewIter(&pebble.IterOptions{
-			LowerBound: prefix,
-			UpperBound: prefixUpperBound(prefix),
-		})
-		if err != nil {
-			return nil, err
-		}
-		for iter.First(); iter.Valid(); iter.Next() {
-			outPoint, err := decodeOutPoint(iter.Key()[len(prefix):])
-			if err != nil {
-				iter.Close()
-				return nil, err
-			}
-			record, err := decodeWalletIndexedUTXO(iter.Value())
-			if err != nil {
-				iter.Close()
-				return nil, err
-			}
-			record.OutPoint = outPoint
-			out = append(out, record)
-		}
-		if err := iter.Error(); err != nil {
-			iter.Close()
-			return nil, err
-		}
-		iter.Close()
-	}
-	slices.SortFunc(out, compareWalletIndexedUTXOs)
-	return out, nil
-}
-
-func (s *ChainStore) WalletActivityByWatchItems(items []WalletWatchItem, limit int) ([]WalletActivityRecord, error) {
-	if len(items) == 0 {
-		return nil, nil
-	}
-	if err := s.requireWalletIndexReady(); err != nil {
-		return nil, err
-	}
-	uniqueItems := uniqueWalletWatchItems(items)
-	cursors := make([]*walletActivityCursor, 0, len(uniqueItems))
-	defer func() {
-		for _, cursor := range cursors {
-			cursor.iter.Close()
-		}
-	}()
-	for _, item := range uniqueItems {
-		prefix := walletActivityItemWatchPrefix(item)
-		iter, err := s.db.NewIter(&pebble.IterOptions{
-			LowerBound: prefix,
-			UpperBound: prefixUpperBound(prefix),
-		})
-		if err != nil {
-			return nil, err
-		}
-		cursor := &walletActivityCursor{iter: iter}
-		if err := cursor.first(); err != nil {
-			iter.Close()
-			return nil, err
-		}
-		if cursor.valid {
-			cursors = append(cursors, cursor)
-		} else {
-			iter.Close()
-		}
-	}
-
-	activityHeap := walletActivityHeap(cursors)
-	heap.Init(&activityHeap)
-	out := make([]WalletActivityRecord, 0)
-	for activityHeap.Len() > 0 && (limit <= 0 || len(out) < limit) {
-		cursor := heap.Pop(&activityHeap).(*walletActivityCursor)
-		record := cursor.record
-		if err := cursor.next(); err != nil {
-			return nil, err
-		}
-		if cursor.valid {
-			heap.Push(&activityHeap, cursor)
-		}
-		for activityHeap.Len() > 0 {
-			next := activityHeap[0]
-			if next.record.Height != record.Height || next.record.TxID != record.TxID {
-				break
-			}
-			next = heap.Pop(&activityHeap).(*walletActivityCursor)
-			record.Received += next.record.Received
-			record.Sent += next.record.Sent
-			if next.record.Fee > record.Fee {
-				record.Fee = next.record.Fee
-			}
-			if err := next.next(); err != nil {
-				return nil, err
-			}
-			if next.valid {
-				heap.Push(&activityHeap, next)
-			}
-		}
-		out = append(out, record)
-	}
-	return out, nil
-}
-
-func (s *ChainStore) WalletIndexHeight() (*uint64, error) {
-	buf, err := s.get(metaWalletIndexHeightKey)
-	if err != nil {
-		return nil, err
-	}
-	if buf == nil {
-		return nil, nil
-	}
-	height, err := decodeU64(buf)
-	if err != nil {
-		return nil, err
-	}
-	return &height, nil
-}
-
-func (s *ChainStore) requireWalletIndexReady() error {
-	height, err := s.WalletIndexHeight()
-	if err != nil {
-		return err
-	}
-	if height == nil {
-		return errors.New("wallet index is not ready")
-	}
-	chainMeta, err := s.LoadChainStateMeta()
-	if err != nil {
-		return err
-	}
-	if chainMeta == nil {
-		return errors.New("chain state is not ready")
-	}
-	if *height != chainMeta.Height {
-		return fmt.Errorf("wallet index height %d does not match chain height %d", *height, chainMeta.Height)
-	}
-	return nil
-}
-
-func uniqueWalletWatchItems(items []WalletWatchItem) []WalletWatchItem {
-	if len(items) < 2 {
-		return items
-	}
-	seen := make(map[WalletWatchItem]struct{}, len(items))
-	out := make([]WalletWatchItem, 0, len(items))
-	for _, item := range items {
-		if _, ok := seen[item]; ok {
-			continue
-		}
-		seen[item] = struct{}{}
-		out = append(out, item)
-	}
-	return out
-}
-
-type walletActivityCursor struct {
-	iter   *pebble.Iterator
-	record WalletActivityRecord
-	valid  bool
-}
-
-func (c *walletActivityCursor) first() error {
-	c.valid = c.iter.First()
-	if !c.valid {
-		return c.iter.Error()
-	}
-	return c.decode()
-}
-
-func (c *walletActivityCursor) next() error {
-	c.valid = c.iter.Next()
-	if !c.valid {
-		return c.iter.Error()
-	}
-	return c.decode()
-}
-
-func (c *walletActivityCursor) decode() error {
-	record, err := decodeWalletActivityRecord(c.iter.Value())
-	if err != nil {
-		return err
-	}
-	c.record = record
-	return nil
-}
-
-type walletActivityHeap []*walletActivityCursor
-
-func (h walletActivityHeap) Len() int { return len(h) }
-
-func (h walletActivityHeap) Less(i, j int) bool {
-	return compareWalletActivityRecords(h[i].record, h[j].record) < 0
-}
-
-func (h walletActivityHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
-
-func (h *walletActivityHeap) Push(x any) {
-	*h = append(*h, x.(*walletActivityCursor))
-}
-
-func (h *walletActivityHeap) Pop() any {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[:n-1]
-	return item
-}
-
-// Keep a max-heap so selecting the smallest numeric sequences costs O(log limit)
-// per retained row instead of rescanning every selected row for every input.
-func keepLocalityItem(items *localitySelectionHeap, item LocalityIndexedUTXO, limit int) {
-	if limit <= 0 {
-		*items = append(*items, item)
-		return
-	}
-	if len(*items) < limit {
-		heap.Push(items, item)
-	} else if compareLocalityItems(item, (*items)[0]) < 0 {
-		(*items)[0] = item
-		heap.Fix(items, 0)
-	}
-}
-
-type localitySelectionHeap []LocalityIndexedUTXO
-
-func (h localitySelectionHeap) Len() int           { return len(h) }
-func (h localitySelectionHeap) Less(i, j int) bool { return compareLocalityItems(h[i], h[j]) > 0 }
-func (h localitySelectionHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *localitySelectionHeap) Push(x any)        { *h = append(*h, x.(LocalityIndexedUTXO)) }
-func (h *localitySelectionHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
-}
-
-func compareLocalityItems(a, b LocalityIndexedUTXO) int {
-	switch {
-	case a.Sequence < b.Sequence:
-		return -1
-	case a.Sequence > b.Sequence:
-		return 1
-	default:
-		return compareOutPoints(a.OutPoint, b.OutPoint)
-	}
-}
-
-func (s *ChainStore) LocalitySequence(outPoint types.OutPoint) (uint64, bool, error) {
-	return s.localitySeqForOutPoint(outPoint)
-}
-
 func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
-	profileBytes, err := s.get(metaProfileKey)
+	snap := s.db.NewSnapshot()
+	defer snap.Close()
+	profileBytes, err := readValue(snap, metaProfileKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1192,20 +617,20 @@ func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
 		return nil, nil
 	}
 
-	heightBytes, err := s.get(metaHeaderTipHeightKey)
+	heightBytes, err := readValue(snap, metaHeaderTipHeightKey)
 	if err != nil {
 		return nil, err
 	}
-	headerBytes, err := s.get(metaHeaderTipHeaderKey)
+	headerBytes, err := readValue(snap, metaHeaderTipHeaderKey)
 	if err != nil {
 		return nil, err
 	}
 	if heightBytes == nil && headerBytes == nil {
-		heightBytes, err = s.get(metaTipHeightKey)
+		heightBytes, err = readValue(snap, metaTipHeightKey)
 		if err != nil {
 			return nil, err
 		}
-		headerBytes, err = s.get(metaTipHeaderKey)
+		headerBytes, err = readValue(snap, metaTipHeaderKey)
 		if err != nil {
 			return nil, err
 		}
@@ -1231,246 +656,6 @@ func (s *ChainStore) LoadHeaderState() (*StoredHeaderState, error) {
 		Height:    height,
 		TipHeader: header,
 	}, nil
-}
-
-func (s *ChainStore) LoadMempoolState() (*StoredMempoolState, error) {
-	buf, err := s.get(metaMempoolStateKey)
-	if err != nil {
-		return nil, err
-	}
-	if buf == nil {
-		return nil, nil
-	}
-	var meta StoredMempoolStateMeta
-	if err := json.Unmarshal(buf, &meta); err != nil {
-		return nil, err
-	}
-	// Legacy restart checkpoints stored the full mempool in one JSON blob. Keep
-	// decoding that format so reopening an older local data dir does not discard
-	// restart state just because the storage layout changed.
-	if meta.Version < 2 {
-		var legacy StoredMempoolState
-		if err := json.Unmarshal(buf, &legacy); err != nil {
-			return nil, err
-		}
-		return &legacy, nil
-	}
-	entries, err := s.loadMempoolEntries(mempoolEntryPrefix, mempoolEntryPrefixEnd)
-	if err != nil {
-		return nil, err
-	}
-	orphans, err := s.loadMempoolEntries(mempoolOrphanPrefix, mempoolOrphanPrefixEnd)
-	if err != nil {
-		return nil, err
-	}
-	return &StoredMempoolState{
-		Version:   meta.Version,
-		Profile:   meta.Profile,
-		TipHeight: meta.TipHeight,
-		TipHash:   meta.TipHash,
-		Entries:   entries,
-		Orphans:   orphans,
-	}, nil
-}
-
-func (s *ChainStore) WriteMempoolState(state *StoredMempoolState) error {
-	if state == nil {
-		return errors.New("mempool state is required")
-	}
-	version := state.Version
-	if version < 2 {
-		version = 2
-	}
-	delta := StoredMempoolStateDelta{
-		Meta: StoredMempoolStateMeta{
-			// Version 2 switches the on-disk layout to metadata plus per-tx keys.
-			Version:   version,
-			Profile:   state.Profile,
-			TipHeight: state.TipHeight,
-			TipHash:   state.TipHash,
-		},
-		EntryUpserts:  make([]StoredMempoolDeltaEntry, 0, len(state.Entries)),
-		OrphanUpserts: make([]StoredMempoolDeltaEntry, 0, len(state.Orphans)),
-	}
-	for _, entry := range state.Entries {
-		tx, err := types.DecodeTransactionWithLimits(entry.Tx, types.DefaultCodecLimits())
-		if err != nil {
-			return err
-		}
-		delta.EntryUpserts = append(delta.EntryUpserts, StoredMempoolDeltaEntry{
-			TxID:  consensus.TxID(&tx),
-			Entry: entry,
-		})
-	}
-	for _, orphan := range state.Orphans {
-		tx, err := types.DecodeTransactionWithLimits(orphan.Tx, types.DefaultCodecLimits())
-		if err != nil {
-			return err
-		}
-		delta.OrphanUpserts = append(delta.OrphanUpserts, StoredMempoolDeltaEntry{
-			TxID:  consensus.TxID(&tx),
-			Entry: orphan,
-		})
-	}
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := s.clearMempoolStateWithBatch(batch); err != nil {
-		return err
-	}
-	if err := applyMempoolStateDeltaWithBatch(batch, delta); err != nil {
-		return err
-	}
-	if err := batch.Commit(bestEffortWriteOptions); err != nil {
-		return err
-	}
-	s.logger.Debug("wrote full mempool state",
-		slog.Uint64("tip_height", delta.Meta.TipHeight),
-		slog.Int("entries", len(delta.EntryUpserts)),
-		slog.Int("orphans", len(delta.OrphanUpserts)),
-	)
-	return nil
-}
-
-func (s *ChainStore) ApplyMempoolStateDelta(delta StoredMempoolStateDelta) error {
-	if delta.Meta.Profile == "" {
-		return errors.New("mempool state profile is required")
-	}
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := applyMempoolStateDeltaWithBatch(batch, delta); err != nil {
-		return err
-	}
-	if err := batch.Commit(bestEffortWriteOptions); err != nil {
-		return err
-	}
-	s.logger.Debug("applied mempool state delta",
-		slog.Uint64("tip_height", delta.Meta.TipHeight),
-		slog.Int("entry_upserts", len(delta.EntryUpserts)),
-		slog.Int("entry_deletes", len(delta.EntryDeletes)),
-		slog.Int("orphan_upserts", len(delta.OrphanUpserts)),
-		slog.Int("orphan_deletes", len(delta.OrphanDeletes)),
-	)
-	return nil
-}
-
-func (s *ChainStore) ClearMempoolState() error {
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := s.clearMempoolStateWithBatch(batch); err != nil {
-		return err
-	}
-	if err := batch.Commit(bestEffortWriteOptions); err != nil {
-		return err
-	}
-	s.logger.Debug("cleared mempool state")
-	return nil
-}
-
-func (s *ChainStore) clearMempoolStateWithBatch(batch *pebble.Batch) error {
-	if batch == nil {
-		return errors.New("mempool clear batch is required")
-	}
-	if err := batch.Delete(metaMempoolStateKey, bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
-		return err
-	}
-	for _, prefixRange := range []struct {
-		lower []byte
-		upper []byte
-	}{
-		{lower: mempoolEntryPrefix, upper: mempoolEntryPrefixEnd},
-		{lower: mempoolOrphanPrefix, upper: mempoolOrphanPrefixEnd},
-	} {
-		iter, err := s.db.NewIter(&pebble.IterOptions{
-			LowerBound: prefixRange.lower,
-			UpperBound: prefixRange.upper,
-		})
-		if err != nil {
-			return err
-		}
-		for iter.First(); iter.Valid(); iter.Next() {
-			if err := batch.Delete(append([]byte(nil), iter.Key()...), bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
-				_ = iter.Close()
-				return err
-			}
-		}
-		if err := iter.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *ChainStore) loadMempoolEntries(lower, upper []byte) ([]StoredMempoolEntry, error) {
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	entries := make([]StoredMempoolEntry, 0)
-	for iter.First(); iter.Valid(); iter.Next() {
-		var entry StoredMempoolEntry
-		if err := json.Unmarshal(iter.Value(), &entry); err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
-	}
-	if err := iter.Error(); err != nil {
-		return nil, err
-	}
-	return entries, nil
-}
-
-func applyMempoolStateDeltaWithBatch(batch *pebble.Batch, delta StoredMempoolStateDelta) error {
-	if batch == nil {
-		return errors.New("mempool delta batch is required")
-	}
-	encoded, err := json.Marshal(delta.Meta)
-	if err != nil {
-		return err
-	}
-	if err := batch.Set(metaMempoolStateKey, encoded, bestEffortWriteOptions); err != nil {
-		return err
-	}
-	for _, entry := range delta.EntryUpserts {
-		if err := writeMempoolBatchEntry(batch, mempoolEntryPrefix, entry); err != nil {
-			return err
-		}
-	}
-	for _, txid := range delta.EntryDeletes {
-		if err := batch.Delete(mempoolEntryKey(mempoolEntryPrefix, txid), bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
-			return err
-		}
-	}
-	for _, orphan := range delta.OrphanUpserts {
-		if err := writeMempoolBatchEntry(batch, mempoolOrphanPrefix, orphan); err != nil {
-			return err
-		}
-	}
-	for _, txid := range delta.OrphanDeletes {
-		if err := batch.Delete(mempoolEntryKey(mempoolOrphanPrefix, txid), bestEffortWriteOptions); err != nil && !errors.Is(err, pebble.ErrNotFound) {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeMempoolBatchEntry(batch *pebble.Batch, prefix []byte, entry StoredMempoolDeltaEntry) error {
-	encoded, err := json.Marshal(entry.Entry)
-	if err != nil {
-		return err
-	}
-	return batch.Set(mempoolEntryKey(prefix, entry.TxID), encoded, bestEffortWriteOptions)
-}
-
-func mempoolEntryKey(prefix []byte, txid [32]byte) []byte {
-	key := make([]byte, len(prefix)+len(txid))
-	copy(key, prefix)
-	copy(key[len(prefix):], txid[:])
-	return key
 }
 
 func (s *ChainStore) LoadKnownPeers() (map[string]KnownPeerRecord, error) {
@@ -1596,24 +781,11 @@ func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState
 		if err := batch.Set(metaFastSyncStateKey, encoded, nil); err != nil {
 			return err
 		}
-		if err := deletePrefixBatch(s.db, batch, snapshotUTXOPrefix, snapshotUTXOPrefixEnd); err != nil {
+		if err := batch.DeleteRange(snapshotUTXOPrefix, snapshotUTXOPrefixEnd, nil); err != nil {
 			return err
 		}
 	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: utxoPrefix,
-		UpperBound: utxoPrefixEnd,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
+	if err := batch.DeleteRange(utxoPrefix, utxoPrefixEnd, nil); err != nil {
 		return err
 	}
 	for outPoint, entry := range state.UTXOs {
@@ -1624,15 +796,15 @@ func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState
 	if err := invalidateWalletIndexesBatch(batch); err != nil {
 		return err
 	}
-	if err := s.rebuildLocalityIndexBatch(batch, state.UTXOs); err != nil {
+	if err := rebuildLocalityIndexBatch(batch, state.UTXOs); err != nil {
 		return err
 	}
-	if err := replaceAccumulatorIndexBatch(s.db, batch, state.UTXOAccumulator); err != nil {
+	if err := replaceAccumulatorIndexBatch(batch, state.UTXOAccumulator); err != nil {
 		return err
 	}
 	if len(activeEntries) > 0 {
 		pairs := journalPairsFromEntries(activeEntries)
-		if err := s.appendJournalEntriesBatch(batch,
+		if err := writeHeightIndexesBatch(batch,
 			chainJournalEntry{
 				Kind:         journalRewriteBlockHeights,
 				ForkHeight:   0,
@@ -1652,7 +824,7 @@ func (s *ChainStore) writeFullStateLocked(state *StoredChainState, fastSyncState
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Info("wrote full chain state",
 		slog.Uint64("height", state.Height),
 		slog.Int("utxo_count", len(state.UTXOs)),
@@ -1679,20 +851,7 @@ func (s *ChainStore) WriteFastSyncState(state *FastSyncState, snapshot consensus
 	if err := batch.Set(metaFastSyncStateKey, encoded, nil); err != nil {
 		return err
 	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: snapshotUTXOPrefix,
-		UpperBound: snapshotUTXOPrefixEnd,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
+	if err := batch.DeleteRange(snapshotUTXOPrefix, snapshotUTXOPrefixEnd, nil); err != nil {
 		return err
 	}
 	for outPoint, entry := range snapshot {
@@ -1726,20 +885,7 @@ func (s *ChainStore) WriteFastSyncStateMetadata(state *FastSyncState) error {
 	if err := batch.Set(metaFastSyncStateKey, encoded, nil); err != nil {
 		return err
 	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: snapshotUTXOPrefix,
-		UpperBound: snapshotUTXOPrefixEnd,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
+	if err := batch.DeleteRange(snapshotUTXOPrefix, snapshotUTXOPrefixEnd, nil); err != nil {
 		return err
 	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
@@ -1775,20 +921,7 @@ func (s *ChainStore) ClearFastSyncState() error {
 	if err := batch.Delete(metaFastSyncStateKey, nil); err != nil {
 		return err
 	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: snapshotUTXOPrefix,
-		UpperBound: snapshotUTXOPrefixEnd,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
+	if err := batch.DeleteRange(snapshotUTXOPrefix, snapshotUTXOPrefixEnd, nil); err != nil {
 		return err
 	}
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
@@ -1856,7 +989,7 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if err := s.applyLocalityRewriteBatch(batch, previous.UTXOs, next.UTXOs); err != nil {
 		return err
 	}
-	if err := replaceAccumulatorIndexBatch(s.db, batch, next.UTXOAccumulator); err != nil {
+	if err := replaceAccumulatorIndexBatch(batch, next.UTXOAccumulator); err != nil {
 		return err
 	}
 	if err := invalidateWalletIndexesBatch(batch); err != nil {
@@ -1865,7 +998,7 @@ func (s *ChainStore) RewriteFullStateDelta(previous *StoredChainState, next *Sto
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Info("rewrote chain state via utxo delta",
 		slog.Uint64("height", next.Height),
 		slog.Int("deleted_utxos", deleted),
@@ -1893,7 +1026,7 @@ func (s *ChainStore) CommitReorgDeltaWithHeaderUpdate(meta *StoredChainStateMeta
 		return err
 	}
 
-	batch := s.db.NewIndexedBatch()
+	batch := s.db.NewBatch()
 	defer batch.Close()
 	writeMeta := writeBlockMetaFromMeta
 	if headerUpdate == nil {
@@ -1912,7 +1045,7 @@ func (s *ChainStore) CommitReorgDeltaWithHeaderUpdate(meta *StoredChainStateMeta
 			return err
 		}
 	}
-	if err := applyAccumulatorStateBatch(s.db, batch, meta); err != nil {
+	if err := applyAccumulatorStateBatch(batch, meta); err != nil {
 		return err
 	}
 	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
@@ -1931,7 +1064,7 @@ func (s *ChainStore) CommitReorgDeltaWithHeaderUpdate(meta *StoredChainStateMeta
 		return err
 	}
 	pairs := journalPairsFromEntries(activeEntries)
-	if err := s.appendJournalEntriesBatch(batch,
+	if err := writeHeightIndexesBatch(batch,
 		chainJournalEntry{
 			Kind:         journalRewriteBlockHeights,
 			ForkHeight:   forkHeight,
@@ -1942,7 +1075,7 @@ func (s *ChainStore) CommitReorgDeltaWithHeaderUpdate(meta *StoredChainStateMeta
 		return err
 	}
 	if headerUpdate == nil {
-		if err := s.appendJournalEntryBatch(batch, chainJournalEntry{Kind: journalRewriteHeaderHeights, ForkHeight: forkHeight, OldTipHeight: oldTipHeight, Pairs: pairs}); err != nil {
+		if err := applyJournalEntryBatch(batch, chainJournalEntry{Kind: journalRewriteHeaderHeights, ForkHeight: forkHeight, OldTipHeight: oldTipHeight, Pairs: pairs}); err != nil {
 			return err
 		}
 	} else if err := s.applyHeaderUpdateBatch(batch, headerUpdate); err != nil {
@@ -1951,7 +1084,7 @@ func (s *ChainStore) CommitReorgDeltaWithHeaderUpdate(meta *StoredChainStateMeta
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Info("committed reorg delta",
 		slog.Uint64("height", meta.Height),
 		slog.Int("spent_utxos", len(spent)),
@@ -1971,7 +1104,7 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 		return err
 	}
 	hash := consensus.HeaderHash(&state.TipHeader)
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+	if err := applyJournalEntryBatch(batch, chainJournalEntry{
 		Kind:  journalSetHeaderHeight,
 		Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
 	}); err != nil {
@@ -1980,7 +1113,7 @@ func (s *ChainStore) WriteHeaderState(state *StoredHeaderState) error {
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Debug("wrote header state", slog.Uint64("height", state.Height))
 	return nil
 }
@@ -2005,7 +1138,7 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 		if err != nil {
 			return err
 		}
-		if err := putHeaderBatch(batch, preserved, false); err != nil {
+		if err := putHeaderBatch(batch, preserved); err != nil {
 			return err
 		}
 	}
@@ -2014,7 +1147,7 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 		for _, entry := range activeEntries {
 			pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: consensus.HeaderHash(&entry.Header)})
 		}
-		if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		if err := applyJournalEntryBatch(batch, chainJournalEntry{
 			Kind:         journalRewriteHeaderHeights,
 			ForkHeight:   forkHeight,
 			OldTipHeight: oldTipHeight,
@@ -2026,7 +1159,7 @@ func (s *ChainStore) CommitHeaderChain(state *StoredHeaderState, entries []Heade
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Debug("wrote header batch",
 		slog.Uint64("height", state.Height),
 		slog.Int("count", len(entries)),
@@ -2048,10 +1181,10 @@ func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 	if err != nil {
 		return err
 	}
-	if err := putBlockBatch(batch, block, entry, false); err != nil {
+	if err := putBlockBatch(batch, block, entry); err != nil {
 		return err
 	}
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+	if err := applyJournalEntryBatch(batch, chainJournalEntry{
 		Kind:  journalSetBlockHeight,
 		Pairs: []chainJournalHeightHash{{Height: height, Hash: consensus.HeaderHash(&block.Header)}},
 	}); err != nil {
@@ -2060,7 +1193,7 @@ func (s *ChainStore) PutBlock(height uint64, block *types.Block) error {
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	hash := consensus.HeaderHash(&block.Header)
 	s.logger.Debug("stored block",
 		slog.Uint64("height", height),
@@ -2083,11 +1216,11 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 	if err != nil {
 		return err
 	}
-	if err := putHeaderBatch(batch, entry, false); err != nil {
+	if err := putHeaderBatch(batch, entry); err != nil {
 		return err
 	}
 	hash := consensus.HeaderHash(header)
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+	if err := applyJournalEntryBatch(batch, chainJournalEntry{
 		Kind:  journalSetHeaderHeight,
 		Pairs: []chainJournalHeightHash{{Height: height, Hash: hash}},
 	}); err != nil {
@@ -2096,7 +1229,7 @@ func (s *ChainStore) PutHeader(height uint64, header *types.BlockHeader) error {
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Debug("stored header",
 		slog.Uint64("height", height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
@@ -2144,7 +1277,7 @@ func (s *ChainStore) AppendValidatedBlockMetaWithHeaderUpdate(state *StoredChain
 	if err := s.populateAccumulatorDeltaFromUTXODelta(state, spent, created); err != nil {
 		return err
 	}
-	batch := s.db.NewIndexedBatch()
+	batch := s.db.NewBatch()
 	defer batch.Close()
 	writeMeta := writeBlockMetaFromMeta
 	if headerUpdate == nil {
@@ -2153,7 +1286,7 @@ func (s *ChainStore) AppendValidatedBlockMetaWithHeaderUpdate(state *StoredChain
 	if err := writeMeta(batch, state); err != nil {
 		return err
 	}
-	if err := putBlockBatch(batch, block, *entry, false); err != nil {
+	if err := putBlockBatch(batch, block, *entry); err != nil {
 		return err
 	}
 	hash := consensus.HeaderHash(&block.Header)
@@ -2170,7 +1303,7 @@ func (s *ChainStore) AppendValidatedBlockMetaWithHeaderUpdate(state *StoredChain
 			return err
 		}
 	}
-	if err := applyAccumulatorStateBatch(s.db, batch, state); err != nil {
+	if err := applyAccumulatorStateBatch(batch, state); err != nil {
 		return err
 	}
 	if err := s.applyLocalityDeltaBatch(batch, spent, created); err != nil {
@@ -2181,20 +1314,20 @@ func (s *ChainStore) AppendValidatedBlockMetaWithHeaderUpdate(state *StoredChain
 		return err
 	}
 	if walletReady {
-		err = s.applyWalletActiveBlockBatch(batch, state.Height, hash, block, undo, spent, created)
+		err = applyWalletActiveBlockBatch(batch, state.Height, hash, block, undo, created)
 	} else {
 		err = invalidateWalletIndexesBatch(batch)
 	}
 	if err != nil {
 		return err
 	}
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+	if err := applyJournalEntryBatch(batch, chainJournalEntry{
 		Kind: journalSetBlockHeight, Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
 	}); err != nil {
 		return err
 	}
 	if headerUpdate == nil {
-		if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
+		if err := applyJournalEntryBatch(batch, chainJournalEntry{
 			Kind: journalSetHeaderHeight, Pairs: []chainJournalHeightHash{{Height: state.Height, Hash: hash}},
 		}); err != nil {
 			return err
@@ -2205,7 +1338,7 @@ func (s *ChainStore) AppendValidatedBlockMetaWithHeaderUpdate(state *StoredChain
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	s.logger.Debug("appended block delta",
 		slog.Uint64("height", state.Height),
 		slog.String("hash", fmt.Sprintf("%x", hash)),
@@ -2223,16 +1356,13 @@ func (s *ChainStore) PutValidatedBlockWithHeaderUpdate(block *types.Block, entry
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 
-	batch := s.db.NewIndexedBatch()
+	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := putBlockBatch(batch, block, *entry, false); err != nil {
+	if err := putBlockBatch(batch, block, *entry); err != nil {
 		return err
 	}
 	hash := consensus.HeaderHash(&block.Header)
 	if err := batch.Set(blockUndoKey(hash), encodeBlockUndo(undo), nil); err != nil {
-		return err
-	}
-	if err := putWalletOriginsForBlockBatch(batch, entry.Height, hash, block); err != nil {
 		return err
 	}
 	if err := s.applyHeaderUpdateBatch(batch, headerUpdate); err != nil {
@@ -2250,7 +1380,7 @@ func (s *ChainStore) PutValidatedBlockWithoutWalletIndex(block *types.Block, ent
 	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := putBlockBatch(batch, block, *entry, false); err != nil {
+	if err := putBlockBatch(batch, block, *entry); err != nil {
 		return err
 	}
 	hash := consensus.HeaderHash(&block.Header)
@@ -2270,7 +1400,7 @@ func (s *ChainStore) PutValidatedBlocksWithoutWalletIndex(blocks []types.Block, 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	for i := range blocks {
-		if err := putBlockBatch(batch, &blocks[i], entries[i], false); err != nil {
+		if err := putBlockBatch(batch, &blocks[i], entries[i]); err != nil {
 			return err
 		}
 
@@ -2297,7 +1427,7 @@ func (s *ChainStore) PutValidatedBlockUndo(entry *BlockIndexEntry, undo []BlockU
 	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
 		return err
 	}
-	s.notifyDerivedReplay()
+	s.notifyBackgroundIndexes()
 	return nil
 }
 
@@ -2317,97 +1447,88 @@ func (s *ChainStore) preserveValidatedBlockIndex(entry BlockIndexEntry) (BlockIn
 	return entry, nil
 }
 
-func (s *ChainStore) RewriteActiveHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	pairs := make([]chainJournalHeightHash, 0, len(entries))
-	for _, entry := range entries {
-		hash := consensus.HeaderHash(&entry.Header)
-		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: hash})
-	}
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
-		Kind:         journalRewriteBlockHeights,
-		ForkHeight:   forkHeight,
-		OldTipHeight: oldTipHeight,
-		Pairs:        pairs,
-	}); err != nil {
-		return err
-	}
-	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-		return err
-	}
-	s.notifyDerivedReplay()
-	return nil
-}
-
-func (s *ChainStore) RewriteActiveHeaderHeights(forkHeight uint64, oldTipHeight uint64, entries []BlockIndexEntry) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	pairs := make([]chainJournalHeightHash, 0, len(entries))
-	for _, entry := range entries {
-		hash := consensus.HeaderHash(&entry.Header)
-		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: hash})
-	}
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
-		Kind:         journalRewriteHeaderHeights,
-		ForkHeight:   forkHeight,
-		OldTipHeight: oldTipHeight,
-		Pairs:        pairs,
-	}); err != nil {
-		return err
-	}
-	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-		return err
-	}
-	s.notifyDerivedReplay()
-	return nil
-}
-
-func (s *ChainStore) SetHeaderHashByHeight(height uint64, hash [32]byte) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := s.appendJournalEntryBatch(batch, chainJournalEntry{
-		Kind:  journalSetHeaderHeight,
-		Pairs: []chainJournalHeightHash{{Height: height, Hash: hash}},
-	}); err != nil {
-		return err
-	}
-	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-		return err
-	}
-	s.notifyDerivedReplay()
-	return nil
-}
-
 func (s *ChainStore) GetBlock(blockHash *[32]byte) (*types.Block, error) {
-	return getBlockFrom(s.db, blockHash)
+	snap := s.db.NewSnapshot()
+	defer snap.Close()
+	return getBlockFrom(snap, blockHash)
+}
+
+// HasBlock checks the block manifest without materializing the block body.
+func (s *ChainStore) HasBlock(blockHash *[32]byte) (bool, error) {
+	size, err := s.BlockSize(blockHash)
+	return size > 0, err
+}
+
+// BlockSize reads the encoded body size from the manifest. A missing block
+// returns zero without an error.
+func (s *ChainStore) BlockSize(blockHash *[32]byte) (uint64, error) {
+	size, _, err := s.BlockManifest(blockHash)
+	return size, err
+}
+
+// BlockManifest returns the stored size and checksum without loading chunks.
+// A missing block returns zero size and checksum without an error.
+func (s *ChainStore) BlockManifest(blockHash *[32]byte) (uint64, [32]byte, error) {
+	size, _, checksum, err := readBlockManifest(s.db, blockHash)
+	return size, checksum, err
+}
+
+func blockSizeFrom(reader valueReader, blockHash *[32]byte) (uint64, error) {
+	size, _, _, err := readBlockManifest(reader, blockHash)
+	return size, err
+}
+
+func readBlockManifest(reader valueReader, blockHash *[32]byte) (uint64, uint32, [32]byte, error) {
+	manifest, closer, err := reader.Get(blockKey(*blockHash))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, 0, [32]byte{}, nil
+	}
+	if err != nil {
+		return 0, 0, [32]byte{}, err
+	}
+	defer closer.Close()
+	return decodeStoredBlockManifest(manifest)
 }
 
 func getBlockFrom(reader valueReader, blockHash *[32]byte) (*types.Block, error) {
-	manifest, err := readValue(reader, blockKey(*blockHash))
-	if err != nil {
-		return nil, err
-	}
-	if manifest == nil {
-		return nil, nil
-	}
-	totalSize, chunkCount, checksum, err := decodeStoredBlockManifest(manifest)
-	if err != nil {
+	totalSize, chunkCount, checksum, err := readBlockManifest(reader, blockHash)
+	if err != nil || totalSize == 0 {
 		return nil, err
 	}
 	if totalSize > uint64(math.MaxInt) {
 		return nil, fmt.Errorf("stored block is too large to materialize: %d bytes", totalSize)
 	}
-	buf := make([]byte, 0, int(totalSize))
+	maxBytes := totalSize
+	index, err := getBlockIndexFrom(reader, blockHash)
+	if err != nil {
+		return nil, err
+	}
+	if index != nil && index.Height > 0 {
+		parent, err := getBlockIndexFrom(reader, &index.Header.PrevBlockHash)
+		if err != nil {
+			return nil, err
+		}
+		if parent == nil {
+			return nil, fmt.Errorf("missing parent block index for stored block %x", *blockHash)
+		}
+		profileBytes, err := readValue(reader, metaProfileKey)
+		if err != nil {
+			return nil, err
+		}
+		profile, err := types.ParseChainProfile(string(profileBytes))
+		if err != nil {
+			return nil, err
+		}
+		maxBytes = consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(profile))
+		if totalSize > maxBytes {
+			return nil, fmt.Errorf("stored block exceeds parent-derived size limit: size=%d limit=%d", totalSize, maxBytes)
+		}
+	}
+	capacity := int(totalSize)
+	if index == nil || index.Height == 0 {
+		capacity = min(capacity, storedBlockChunkBytes)
+	}
+	buf := make([]byte, 0, capacity)
 	for chunkIndex := uint32(0); chunkIndex < chunkCount; chunkIndex++ {
 		chunk, err := readValue(reader, blockChunkKey(*blockHash, chunkIndex))
 		if err != nil {
@@ -2415,6 +1536,9 @@ func getBlockFrom(reader valueReader, blockHash *[32]byte) (*types.Block, error)
 		}
 		if chunk == nil {
 			return nil, fmt.Errorf("missing stored block chunk %d for %x", chunkIndex, *blockHash)
+		}
+		if uint64(len(chunk)) != min(totalSize-uint64(len(buf)), uint64(storedBlockChunkBytes)) {
+			return nil, fmt.Errorf("invalid stored block chunk size: chunk=%d length=%d", chunkIndex, len(chunk))
 		}
 		buf = append(buf, chunk...)
 	}
@@ -2434,29 +1558,6 @@ func getBlockFrom(reader valueReader, blockHash *[32]byte) (*types.Block, error)
 	if got := consensus.HeaderHash(&header); got != *blockHash {
 		return nil, fmt.Errorf("stored block header hash mismatch: key=%x header=%x", *blockHash, got)
 	}
-	maxBytes := uint64(len(buf))
-	index, err := getBlockIndexFrom(reader, blockHash)
-	if err != nil {
-		return nil, err
-	}
-	if index != nil && index.Height > 0 {
-		parent, err := getBlockIndexFrom(reader, &header.PrevBlockHash)
-		if err != nil {
-			return nil, err
-		}
-		if parent == nil {
-			return nil, fmt.Errorf("missing parent block index for stored block %x", *blockHash)
-		}
-		profileBytes, err := readValue(reader, metaProfileKey)
-		if err != nil {
-			return nil, err
-		}
-		profile, err := types.ParseChainProfile(string(profileBytes))
-		if err != nil {
-			return nil, err
-		}
-		maxBytes = consensus.NextBlockSizeLimit(parent.BlockSizeState, consensus.ParamsForProfile(profile))
-	}
 	block, err := types.DecodeBlockOwnedBuffer(buf, maxBytes)
 	if err != nil {
 		return nil, err
@@ -2473,58 +1574,6 @@ func (s *ChainStore) GetUndo(blockHash *[32]byte) ([]BlockUndoEntry, error) {
 		return nil, nil
 	}
 	return decodeBlockUndo(buf)
-}
-
-func (s *ChainStore) GetBlockHashByHeight(height uint64) (*[32]byte, error) {
-	buf, err := s.get(heightIndexKey(height))
-	if err != nil {
-		return nil, err
-	}
-	if buf == nil {
-		return s.derivedHashByHeight(height, false)
-	}
-	if len(buf) != 32 {
-		return nil, errors.New("invalid height index encoding")
-	}
-	var hash [32]byte
-	copy(hash[:], buf)
-	return &hash, nil
-}
-
-func (s *ChainStore) GetHeaderHashByHeight(height uint64) (*[32]byte, error) {
-	buf, err := s.get(headerHeightIndexKey(height))
-	if err != nil {
-		return nil, err
-	}
-	if buf == nil {
-		return s.derivedHashByHeight(height, true)
-	}
-	if len(buf) != 32 {
-		return nil, errors.New("invalid header height index encoding")
-	}
-	var hash [32]byte
-	copy(hash[:], buf)
-	return &hash, nil
-}
-
-func (s *ChainStore) GetIndexedHeaderHashByHeight(height uint64) (*[32]byte, error) {
-	buf, err := s.get(headerHeightIndexKey(height))
-	if err != nil {
-		return nil, err
-	}
-	if buf == nil {
-		return nil, nil
-	}
-	if len(buf) != 32 {
-		return nil, errors.New("invalid header height index encoding")
-	}
-	var hash [32]byte
-	copy(hash[:], buf)
-	return &hash, nil
-}
-
-func (s *ChainStore) GetCanonicalHeaderHashByHeight(height uint64) (*[32]byte, error) {
-	return s.derivedHashByHeight(height, true)
 }
 
 func (s *ChainStore) GetBlockIndex(blockHash *[32]byte) (*BlockIndexEntry, error) {
@@ -2568,6 +1617,11 @@ type valueReader interface {
 	Get([]byte) ([]byte, io.Closer, error)
 }
 
+type storeReader interface {
+	valueReader
+	NewIter(*pebble.IterOptions) (*pebble.Iterator, error)
+}
+
 func (s *ChainStore) get(key []byte) ([]byte, error) {
 	return readValue(s.db, key)
 }
@@ -2584,865 +1638,18 @@ func readValue(reader valueReader, key []byte) ([]byte, error) {
 	return cloneBytes(value), nil
 }
 
-func (s *ChainStore) derivedHashByHeight(height uint64, header bool) (*[32]byte, error) {
-	tipHeightKey := metaTipHeightKey
-	tipHeaderKey := metaTipHeaderKey
-	if header {
-		tipHeightKey = metaHeaderTipHeightKey
-		tipHeaderKey = metaHeaderTipHeaderKey
-	}
-	heightBytes, err := s.get(tipHeightKey)
-	if err != nil {
-		return nil, err
-	}
-	headerBytes, err := s.get(tipHeaderKey)
-	if err != nil {
-		return nil, err
-	}
-	if (heightBytes == nil || headerBytes == nil) && header {
-		heightBytes, err = s.get(metaTipHeightKey)
-		if err != nil {
-			return nil, err
-		}
-		headerBytes, err = s.get(metaTipHeaderKey)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if heightBytes == nil || headerBytes == nil {
-		return nil, nil
-	}
-	tipHeight, err := decodeU64(heightBytes)
-	if err != nil {
-		return nil, err
-	}
-	if height > tipHeight {
-		return nil, nil
-	}
-	tipHeader, err := types.DecodeBlockHeader(headerBytes)
-	if err != nil {
-		return nil, err
-	}
-	hash := consensus.HeaderHash(&tipHeader)
-	if height == tipHeight {
-		return &hash, nil
-	}
-	cursorHash := hash
-	cursorHeight := tipHeight
-	for cursorHeight > height {
-		entry, err := s.GetBlockIndex(&cursorHash)
-		if err != nil {
-			return nil, err
-		}
-		if entry == nil {
-			return nil, fmt.Errorf("missing block index for derived height lookup %x", cursorHash)
-		}
-		cursorHash = entry.ParentHash
-		cursorHeight--
-	}
-	return &cursorHash, nil
-}
-
-func (s *ChainStore) appendJournalEntriesBatch(batch *pebble.Batch, entries ...chainJournalEntry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	nextSeq, err := s.journalNextSeq()
-	if batch.Indexed() {
-		var raw []byte
-		raw, err = readValue(batch, metaJournalNextSeqKey)
-		if err == nil && raw != nil {
-			nextSeq, err = decodeU64(raw)
-		}
-	}
-	if err != nil {
-		return err
-	}
-	startSeq := nextSeq
-	derivedSeq, err := s.derivedJournalSeq()
-	if batch.Indexed() {
-		var raw []byte
-		raw, err = readValue(batch, metaDerivedJournalSeqKey)
-		if err == nil && raw != nil {
-			derivedSeq, err = decodeU64(raw)
-		}
-	}
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if err := batch.Set(journalKey(nextSeq), encodeChainJournalEntry(entry), nil); err != nil {
-			return err
-		}
-		if err := applyJournalEntryBatch(batch, entry); err != nil {
-			return err
-		}
-		nextSeq++
-	}
-	if derivedSeq >= startSeq {
-		if err := batch.Set(metaDerivedJournalSeqKey, encodeU64(nextSeq), nil); err != nil {
-			return err
-		}
-	}
-	return batch.Set(metaJournalNextSeqKey, encodeU64(nextSeq), nil)
-}
-
-func (s *ChainStore) appendJournalEntryBatch(batch *pebble.Batch, entry chainJournalEntry) error {
-	return s.appendJournalEntriesBatch(batch, entry)
-}
-
-func (s *ChainStore) journalNextSeq() (uint64, error) {
-	buf, err := s.get(metaJournalNextSeqKey)
-	if err != nil {
-		return 0, err
-	}
-	if buf == nil {
-		return 0, nil
-	}
-	return decodeU64(buf)
-}
-
-func (s *ChainStore) derivedJournalSeq() (uint64, error) {
-	buf, err := s.get(metaDerivedJournalSeqKey)
-	if err != nil {
-		return 0, err
-	}
-	if buf == nil {
-		return 0, nil
-	}
-	return decodeU64(buf)
-}
-
-func (s *ChainStore) notifyDerivedReplay() {
-	if s != nil && s.filterNotify != nil {
+func (s *ChainStore) notifyBackgroundIndexes() {
+	if s.filterNotify != nil {
 		select {
 		case s.filterNotify <- struct{}{}:
 		default:
 		}
 	}
-	if s != nil && s.txIndexNotify != nil {
+	if s.txIndexNotify != nil {
 		select {
 		case s.txIndexNotify <- struct{}{}:
 		default:
 		}
-	}
-	if s == nil || s.deriveNotify == nil {
-		return
-	}
-	select {
-	case s.deriveNotify <- struct{}{}:
-	default:
-	}
-}
-
-func (s *ChainStore) derivedIndexLoop() {
-	for {
-		if err := s.replayDerivedIndexes(); err != nil {
-			s.logger.Warn("derived index replay failed", slog.Any("error", err))
-			select {
-			case <-time.After(50 * time.Millisecond):
-			case <-s.stopCh:
-				return
-			}
-			continue
-		}
-		select {
-		case <-s.stopCh:
-			return
-		case <-s.deriveNotify:
-		}
-	}
-}
-
-func (s *ChainStore) replayDerivedIndexes() error {
-	for {
-		applied, err := s.applyNextJournalEntry()
-		if err != nil {
-			return err
-		}
-		if !applied {
-			return nil
-		}
-	}
-}
-
-func (s *ChainStore) applyNextJournalEntry() (bool, error) {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-
-	derivedSeq, err := s.derivedJournalSeq()
-	if err != nil {
-		return false, err
-	}
-	nextSeq, err := s.journalNextSeq()
-	if err != nil {
-		return false, err
-	}
-	if derivedSeq >= nextSeq {
-		return false, nil
-	}
-	buf, err := s.get(journalKey(derivedSeq))
-	if err != nil {
-		return false, err
-	}
-	if buf == nil {
-		batch := s.db.NewBatch()
-		defer batch.Close()
-		if err := batch.Set(metaDerivedJournalSeqKey, encodeU64(derivedSeq+1), nil); err != nil {
-			return false, err
-		}
-		if err := batch.Commit(pebble.NoSync); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	entry, err := decodeChainJournalEntry(buf)
-	if err != nil {
-		return false, err
-	}
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := applyJournalEntryBatch(batch, entry); err != nil {
-		return false, err
-	}
-	if err := batch.Set(metaDerivedJournalSeqKey, encodeU64(derivedSeq+1), nil); err != nil {
-		return false, err
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (s *ChainStore) WaitForDerivedIndexes(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		derivedSeq, err := s.derivedJournalSeq()
-		if err != nil {
-			return err
-		}
-		nextSeq, err := s.journalNextSeq()
-		if err != nil {
-			return err
-		}
-		if derivedSeq >= nextSeq {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return errors.New("timed out waiting for derived indexes")
-		}
-		s.notifyDerivedReplay()
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func (s *ChainStore) rebuildLocalityIndexBatch(batch *pebble.Batch, utxos consensus.UtxoSet) error {
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: localitySeqPrefix,
-		UpperBound: localitySeqPrefixEnd,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	iter, err = s.db.NewIter(&pebble.IterOptions{
-		LowerBound: localityMetaPrefix,
-		UpperBound: localityMetaPrefixEnd,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	ordered := make([]types.OutPoint, 0, len(utxos))
-	for outPoint := range utxos {
-		ordered = append(ordered, outPoint)
-	}
-	sortOutPointsCanonical(ordered)
-	for seq, outPoint := range ordered {
-		if err := batch.Set(localitySeqKey(uint64(seq)), encodeLocalitySeqValue(outPoint, utxos[outPoint]), nil); err != nil {
-			return err
-		}
-		if err := batch.Set(localityMetaKey(outPoint), encodeU64(uint64(seq)), nil); err != nil {
-			return err
-		}
-	}
-	return batch.Set(metaLocalityNextSeqKey, encodeU64(uint64(len(ordered))), nil)
-}
-
-func (s *ChainStore) applyLocalityDeltaBatch(batch *pebble.Batch, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
-	nextSeq, err := s.localityNextSeq()
-	if err != nil {
-		return err
-	}
-	for _, outPoint := range spent {
-		seq, ok, err := s.localitySeqForOutPoint(outPoint)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := batch.Delete(localitySeqKey(seq), nil); err != nil {
-			return err
-		}
-		if err := batch.Delete(localityMetaKey(outPoint), nil); err != nil {
-			return err
-		}
-	}
-	orderedCreated := make([]types.OutPoint, 0, len(created))
-	for outPoint := range created {
-		orderedCreated = append(orderedCreated, outPoint)
-	}
-	sortOutPointsCanonical(orderedCreated)
-	for _, outPoint := range orderedCreated {
-		if oldSeq, ok, err := s.localitySeqForOutPoint(outPoint); err != nil {
-			return err
-		} else if ok {
-			if err := batch.Delete(localitySeqKey(oldSeq), nil); err != nil {
-				return err
-			}
-			if err := batch.Delete(localityMetaKey(outPoint), nil); err != nil {
-				return err
-			}
-		}
-		if err := batch.Set(localitySeqKey(nextSeq), encodeLocalitySeqValue(outPoint, created[outPoint]), nil); err != nil {
-			return err
-		}
-		if err := batch.Set(localityMetaKey(outPoint), encodeU64(nextSeq), nil); err != nil {
-			return err
-		}
-		nextSeq++
-	}
-	return batch.Set(metaLocalityNextSeqKey, encodeU64(nextSeq), nil)
-}
-
-func (s *ChainStore) RebuildWalletIndexes(tipHeight uint64) error {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-	return s.rebuildWalletIndexesLocked(tipHeight)
-}
-
-func (s *ChainStore) RebuildWalletIndexesAtCurrentTip() (uint64, error) {
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-	meta, err := s.LoadChainStateMeta()
-	if err != nil {
-		return 0, err
-	}
-	if meta == nil {
-		return 0, errors.New("chain state is not ready")
-	}
-	return meta.Height, s.rebuildWalletIndexesLocked(meta.Height)
-}
-
-func (s *ChainStore) rebuildWalletIndexesLocked(tipHeight uint64) error {
-	batch := s.db.NewBatch()
-	if err := s.deleteWalletIndexesBatch(batch); err != nil {
-		batch.Close()
-		return err
-	}
-	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-		batch.Close()
-		return err
-	}
-	batch.Close()
-
-	batch = s.db.NewBatch()
-	for height := uint64(0); height <= tipHeight; height++ {
-		hash, err := s.GetBlockHashByHeight(height)
-		if err != nil {
-			batch.Close()
-			return err
-		}
-		if hash == nil {
-			batch.Close()
-			return fmt.Errorf("missing active block hash at height %d during wallet index rebuild", height)
-		}
-		block, err := s.GetBlock(hash)
-		if err != nil {
-			batch.Close()
-			return err
-		}
-		if block == nil {
-			batch.Close()
-			return fmt.Errorf("missing active block %x at height %d during wallet index rebuild", *hash, height)
-		}
-		undo, err := s.GetUndo(hash)
-		if err != nil {
-			batch.Close()
-			return err
-		}
-		if err := putWalletOriginsForBlockBatchWithMap(batch, height, *hash, block, nil); err != nil {
-			batch.Close()
-			return err
-		}
-		if err := putWalletActivityForBlockBatch(batch, height, *hash, block, undo); err != nil {
-			batch.Close()
-			return err
-		}
-		if height%1000 == 999 {
-			if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-				batch.Close()
-				return err
-			}
-			batch.Close()
-			batch = s.db.NewBatch()
-		}
-	}
-	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-		batch.Close()
-		return err
-	}
-	batch.Close()
-
-	batch = s.db.NewBatch()
-	writtenUTXOs := 0
-	if err := s.ForEachUTXO(func(outPoint types.OutPoint, entry consensus.UtxoEntry) error {
-		origin, ok, err := s.walletOrigin(outPoint)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil
-		}
-		if err := batch.Set(walletUTXOKey(walletWatchItemForEntry(entry), outPoint), encodeWalletIndexedUTXO(WalletIndexedUTXO{
-			Entry:    entry,
-			Height:   origin.Height,
-			Coinbase: origin.Coinbase,
-		}), nil); err != nil {
-			return err
-		}
-		writtenUTXOs++
-		if writtenUTXOs%10_000 != 0 {
-			return nil
-		}
-		if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-			return err
-		}
-		batch.Close()
-		batch = s.db.NewBatch()
-		return nil
-	}); err != nil {
-		batch.Close()
-		return err
-	}
-	if err := batch.Set(metaWalletIndexHeightKey, encodeU64(tipHeight), nil); err != nil {
-		batch.Close()
-		return err
-	}
-	if err := batch.Commit(consensusCriticalWriteOptions); err != nil {
-		batch.Close()
-		return err
-	}
-	batch.Close()
-	s.logger.Info("rebuilt wallet indexes", slog.Uint64("height", tipHeight))
-	return nil
-}
-
-func (s *ChainStore) walletIndexReadyForAppend(height uint64) (bool, error) {
-	indexHeight, err := s.WalletIndexHeight()
-	if err != nil {
-		return false, err
-	}
-	if indexHeight == nil {
-		return height == 0, nil
-	}
-	if height == 0 {
-		return *indexHeight == 0, nil
-	}
-	return *indexHeight == height-1, nil
-}
-
-func (s *ChainStore) walletIndexReadyForReorg(oldTipHeight uint64) (bool, error) {
-	indexHeight, err := s.WalletIndexHeight()
-	if err != nil {
-		return false, err
-	}
-	return indexHeight != nil && *indexHeight == oldTipHeight, nil
-}
-
-func (s *ChainStore) applyWalletActiveBlockBatch(batch *pebble.Batch, height uint64, hash [32]byte, block *types.Block, undo []BlockUndoEntry, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
-	origins := make(map[types.OutPoint]walletOriginRecord)
-	if err := putWalletOriginsForBlockBatchWithMap(batch, height, hash, block, origins); err != nil {
-		return err
-	}
-	if err := putWalletActivityForBlockBatch(batch, height, hash, block, undo); err != nil {
-		return err
-	}
-	if err := s.applyWalletUTXODeltaBatch(batch, spent, created, origins); err != nil {
-		return err
-	}
-	return batch.Set(metaWalletIndexHeightKey, encodeU64(height), nil)
-}
-
-func (s *ChainStore) applyWalletReorgBatch(batch *pebble.Batch, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, forkHeight uint64, oldTipHeight uint64, activeEntries []BlockIndexEntry) error {
-	if err := s.deleteWalletActivityHeightRangeBatch(batch, forkHeight+1, oldTipHeight); err != nil {
-		return err
-	}
-	origins := make(map[types.OutPoint]walletOriginRecord)
-	for _, entry := range activeEntries {
-		hash := consensus.HeaderHash(&entry.Header)
-		block, err := s.GetBlock(&hash)
-		if err != nil {
-			return err
-		}
-		if block == nil {
-			return fmt.Errorf("missing active block for wallet reorg index %x", hash)
-		}
-		undo, err := s.GetUndo(&hash)
-		if err != nil {
-			return err
-		}
-		if err := putWalletOriginsForBlockBatchWithMap(batch, entry.Height, hash, block, origins); err != nil {
-			return err
-		}
-		if err := putWalletActivityForBlockBatch(batch, entry.Height, hash, block, undo); err != nil {
-			return err
-		}
-	}
-	if err := s.applyWalletUTXODeltaBatch(batch, spent, created, origins); err != nil {
-		return err
-	}
-	if len(activeEntries) == 0 {
-		return batch.Delete(metaWalletIndexHeightKey, nil)
-	}
-	return batch.Set(metaWalletIndexHeightKey, encodeU64(activeEntries[len(activeEntries)-1].Height), nil)
-}
-
-func (s *ChainStore) applyWalletUTXODeltaBatch(batch *pebble.Batch, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry, origins map[types.OutPoint]walletOriginRecord) error {
-	for _, outPoint := range spent {
-		origin, ok, err := s.walletOrigin(outPoint)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := batch.Delete(walletUTXOKey(walletWatchItemForEntry(origin.Entry), outPoint), nil); err != nil {
-			return err
-		}
-	}
-	for outPoint, entry := range created {
-		origin, ok := origins[outPoint]
-		if !ok {
-			var err error
-			origin, ok, err = s.walletOrigin(outPoint)
-			if err != nil {
-				return err
-			}
-		}
-		if !ok {
-			continue
-		}
-		origin.Entry = entry
-		if err := batch.Set(walletUTXOKey(walletWatchItemForEntry(entry), outPoint), encodeWalletIndexedUTXO(WalletIndexedUTXO{
-			Entry:    entry,
-			Height:   origin.Height,
-			Coinbase: origin.Coinbase,
-		}), nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func putWalletOriginsForBlockBatch(batch *pebble.Batch, height uint64, hash [32]byte, block *types.Block) error {
-	return putWalletOriginsForBlockBatchWithMap(batch, height, hash, block, nil)
-}
-
-func putWalletOriginsForBlockBatchWithMap(batch *pebble.Batch, height uint64, _ [32]byte, block *types.Block, origins map[types.OutPoint]walletOriginRecord) error {
-	if block == nil {
-		return nil
-	}
-	for txIndex := range block.Txs {
-		txid := consensus.TxID(&block.Txs[txIndex])
-		for vout, output := range block.Txs[txIndex].Base.Outputs {
-			outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-			entry := consensus.UtxoEntryFromOutputAtHeight(output, height, txIndex == 0)
-			record := walletOriginRecord{Entry: entry, Height: height, Coinbase: txIndex == 0}
-			if origins != nil {
-				origins[outPoint] = record
-			}
-			if err := batch.Set(walletOriginKey(outPoint), encodeWalletOrigin(record), nil); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func putWalletActivityForBlockBatch(batch *pebble.Batch, height uint64, hash [32]byte, block *types.Block, undo []BlockUndoEntry) error {
-	if block == nil {
-		return nil
-	}
-	resolvedInputs, err := consensus.ResolveBlockInputEntries(block, undo)
-	if err != nil {
-		return fmt.Errorf("resolve wallet activity inputs at height %d: %w", height, err)
-	}
-	timestamp := block.Header.Timestamp
-	for txIndex, tx := range block.Txs {
-		type itemDelta struct {
-			received uint64
-			sent     uint64
-		}
-		deltas := make(map[WalletWatchItem]itemDelta)
-		for _, output := range tx.Base.Outputs {
-			item := walletWatchItemForOutput(output)
-			delta := deltas[item]
-			delta.received += output.ValueAtoms
-			deltas[item] = delta
-		}
-		inputSum := uint64(0)
-		if txIndex > 0 {
-			for _, input := range tx.Base.Inputs {
-				entry, ok := resolvedInputs[input.PrevOut]
-				if !ok {
-					return fmt.Errorf("missing resolved wallet activity input at height %d: %v", height, input.PrevOut)
-				}
-				inputSum += entry.ValueAtoms
-				item := walletWatchItemForEntry(entry)
-				delta := deltas[item]
-				delta.sent += entry.ValueAtoms
-				deltas[item] = delta
-			}
-		}
-		txid := consensus.TxID(&tx)
-		if len(deltas) == 0 {
-			continue
-		}
-		outputSum := uint64(0)
-		for _, output := range tx.Base.Outputs {
-			outputSum += output.ValueAtoms
-		}
-		fee := uint64(0)
-		if txIndex > 0 && inputSum >= outputSum {
-			fee = inputSum - outputSum
-		}
-		for item, delta := range deltas {
-			if delta.received == 0 && delta.sent == 0 {
-				continue
-			}
-			itemFee := uint64(0)
-			if delta.sent > 0 {
-				itemFee = fee
-			}
-			record := WalletActivityRecord{
-				TxID:      txid,
-				BlockHash: hash,
-				Height:    height,
-				Timestamp: timestamp,
-				Coinbase:  txIndex == 0,
-				Received:  delta.received,
-				Sent:      delta.sent,
-				Fee:       itemFee,
-			}
-			encoded := encodeWalletActivityRecord(record)
-			if err := batch.Set(walletActivityItemKey(item, height, txid), encoded, nil); err != nil {
-				return err
-			}
-			if err := batch.Set(walletActivityHeightKey(height, item, txid), nil, nil); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (s *ChainStore) deleteWalletActivityHeightBatch(batch *pebble.Batch, height uint64) error {
-	prefix := walletActivityHeightPrefixForHeight(height)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		item, txid, err := decodeWalletActivityHeightKey(iter.Key(), height)
-		if err != nil {
-			return err
-		}
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-		if err := batch.Delete(walletActivityItemKey(item, height, txid), nil); err != nil {
-			return err
-		}
-	}
-	return iter.Error()
-}
-
-func (s *ChainStore) deleteWalletActivityHeightRangeBatch(batch *pebble.Batch, firstHeight uint64, lastHeight uint64) error {
-	if firstHeight > lastHeight {
-		return nil
-	}
-	lower := walletActivityHeightPrefixForHeight(firstHeight)
-	var upper []byte
-	if lastHeight == ^uint64(0) {
-		upper = walletActHtPrefixEnd
-	} else {
-		upper = walletActivityHeightPrefixForHeight(lastHeight + 1)
-	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if len(iter.Key()) < len(walletActivityHtPrefix)+8 {
-			return errors.New("invalid wallet activity height key")
-		}
-		height, err := decodeU64BE(iter.Key()[len(walletActivityHtPrefix) : len(walletActivityHtPrefix)+8])
-		if err != nil {
-			return err
-		}
-		item, txid, err := decodeWalletActivityHeightKey(iter.Key(), height)
-		if err != nil {
-			return err
-		}
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-		if err := batch.Delete(walletActivityItemKey(item, height, txid), nil); err != nil {
-			return err
-		}
-	}
-	return iter.Error()
-}
-
-func (s *ChainStore) deleteWalletIndexesBatch(batch *pebble.Batch) error {
-	for _, bounds := range []struct {
-		lower []byte
-		upper []byte
-	}{
-		{walletOriginPrefix, walletOriginPrefixEnd},
-		{walletUTXOPrefix, walletUTXOPrefixEnd},
-		{walletActivityItemPrefix, walletActItemPrefixEnd},
-		{walletActivityHtPrefix, walletActHtPrefixEnd},
-	} {
-		iter, err := s.db.NewIter(&pebble.IterOptions{
-			LowerBound: bounds.lower,
-			UpperBound: bounds.upper,
-		})
-		if err != nil {
-			return err
-		}
-		for iter.First(); iter.Valid(); iter.Next() {
-			if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-				iter.Close()
-				return err
-			}
-		}
-		if err := iter.Error(); err != nil {
-			iter.Close()
-			return err
-		}
-		iter.Close()
-	}
-	return batch.Delete(metaWalletIndexHeightKey, nil)
-}
-
-func invalidateWalletIndexesBatch(batch *pebble.Batch) error {
-	return batch.Delete(metaWalletIndexHeightKey, nil)
-}
-
-func deletePrefixBatch(db *pebble.DB, batch *pebble.Batch, lower, upper []byte) error {
-	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := batch.Delete(cloneBytes(iter.Key()), nil); err != nil {
-			return err
-		}
-	}
-	return iter.Error()
-}
-
-func (s *ChainStore) applyLocalityRewriteBatch(batch *pebble.Batch, previous consensus.UtxoSet, next consensus.UtxoSet) error {
-	spent := make([]types.OutPoint, 0)
-	created := make(map[types.OutPoint]consensus.UtxoEntry)
-	for outPoint := range previous {
-		if _, ok := next[outPoint]; !ok {
-			spent = append(spent, outPoint)
-		}
-	}
-	for outPoint, entry := range next {
-		if _, ok := previous[outPoint]; !ok {
-			created[outPoint] = entry
-		}
-	}
-	return s.applyLocalityDeltaBatch(batch, spent, created)
-}
-
-func (s *ChainStore) localityNextSeq() (uint64, error) {
-	buf, err := s.get(metaLocalityNextSeqKey)
-	if err != nil {
-		return 0, err
-	}
-	if buf == nil {
-		return 0, nil
-	}
-	return decodeU64(buf)
-}
-
-func (s *ChainStore) localitySeqForOutPoint(outPoint types.OutPoint) (uint64, bool, error) {
-	buf, err := s.get(localityMetaKey(outPoint))
-	if err != nil {
-		return 0, false, err
-	}
-	if buf == nil {
-		return 0, false, nil
-	}
-	seq, err := decodeU64(buf)
-	if err != nil {
-		return 0, false, err
-	}
-	return seq, true, nil
-}
-
-func sortOutPointsCanonical(outPoints []types.OutPoint) {
-	slices.SortFunc(outPoints, func(a, b types.OutPoint) int {
-		return compareOutPoints(a, b)
-	})
-}
-
-func compareOutPoints(a, b types.OutPoint) int {
-	switch cmp := bytes.Compare(a.TxID[:], b.TxID[:]); {
-	case cmp < 0:
-		return -1
-	case cmp > 0:
-		return 1
-	case a.Vout < b.Vout:
-		return -1
-	case a.Vout > b.Vout:
-		return 1
-	default:
-		return 0
 	}
 }
 
@@ -3521,7 +1728,7 @@ func writeBlockMetaFromMeta(batch *pebble.Batch, state *StoredChainStateMeta) er
 	return nil
 }
 
-func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry, active bool) error {
+func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntry) error {
 	blockHash := consensus.HeaderHash(&block.Header)
 	totalSize := block.EncodedLen()
 	chunkCount64 := (uint64(totalSize) + storedBlockChunkBytes - 1) / storedBlockChunkBytes
@@ -3532,7 +1739,7 @@ func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntr
 	chunkWriter := blockBatchChunkWriter{
 		batch:     batch,
 		blockHash: blockHash,
-		buf:       make([]byte, storedBlockChunkBytes),
+		buf:       make([]byte, min(totalSize, storedBlockChunkBytes)),
 	}
 	firstHasher := sha256.New()
 	written, err := block.WriteTo(io.MultiWriter(firstHasher, &chunkWriter))
@@ -3552,7 +1759,7 @@ func putBlockBatch(batch *pebble.Batch, block *types.Block, entry BlockIndexEntr
 	if err := batch.Set(blockKey(blockHash), manifest, nil); err != nil {
 		return err
 	}
-	return putHeaderBatch(batch, entry, active)
+	return putHeaderBatch(batch, entry)
 }
 
 type blockBatchChunkWriter struct {
@@ -3609,15 +1816,6 @@ func (w *blockBatchChunkWriter) writeChunk(chunk []byte) error {
 	return nil
 }
 
-func journalPairsFromEntries(entries []BlockIndexEntry) []chainJournalHeightHash {
-	pairs := make([]chainJournalHeightHash, 0, len(entries))
-	for _, entry := range entries {
-		hash := consensus.HeaderHash(&entry.Header)
-		pairs = append(pairs, chainJournalHeightHash{Height: entry.Height, Hash: hash})
-	}
-	return pairs
-}
-
 func writeHeaderMeta(batch *pebble.Batch, state *StoredHeaderState) error {
 	if err := batch.Set(metaProfileKey, []byte(state.Profile.String()), nil); err != nil {
 		return err
@@ -3628,7 +1826,7 @@ func writeHeaderMeta(batch *pebble.Batch, state *StoredHeaderState) error {
 	return batch.Set(metaHeaderTipHeaderKey, state.TipHeader.Encode(), nil)
 }
 
-func putHeaderBatch(batch *pebble.Batch, entry BlockIndexEntry, active bool) error {
+func putHeaderBatch(batch *pebble.Batch, entry BlockIndexEntry) error {
 	blockHash := consensus.HeaderHash(&entry.Header)
 	return batch.Set(blockIndexKey(blockHash), encodeBlockIndexEntry(entry), nil)
 }
@@ -3661,12 +1859,6 @@ func encodeU64(v uint64) []byte {
 func encodeU64BE(v uint64) []byte {
 	out := make([]byte, 8)
 	binary.BigEndian.PutUint64(out, v)
-	return out
-}
-
-func encodeI64(v int64) []byte {
-	out := make([]byte, 8)
-	binary.LittleEndian.PutUint64(out, uint64(v))
 	return out
 }
 
@@ -3720,9 +1912,9 @@ func decodeStoredBlockManifest(manifest []byte) (uint64, uint32, [32]byte, error
 	chunkCount := binary.LittleEndian.Uint32(manifest[9:13])
 	expectedChunks := uint64(0)
 	if totalSize > 0 {
-		expectedChunks = (totalSize + storedBlockChunkBytes - 1) / storedBlockChunkBytes
+		expectedChunks = 1 + (totalSize-1)/storedBlockChunkBytes
 	}
-	if expectedChunks > math.MaxUint32 || uint64(chunkCount) != expectedChunks {
+	if totalSize < types.BlockHeaderEncodedLen || expectedChunks > math.MaxUint32 || uint64(chunkCount) != expectedChunks {
 		return 0, 0, checksum, errors.New("invalid stored block manifest chunk count")
 	}
 	copy(checksum[:], manifest[13:])
@@ -3737,30 +1929,8 @@ func blockUndoKey(hash [32]byte) []byte {
 	return append(append([]byte(nil), blockUndoPrefix...), hash[:]...)
 }
 
-func journalKey(seq uint64) []byte {
-	return append(append([]byte(nil), journalPrefix...), encodeU64(seq)...)
-}
-
-func heightIndexKey(height uint64) []byte {
-	return append(append([]byte(nil), heightIndexPrefix...), encodeU64(height)...)
-}
-
-func headerHeightIndexKey(height uint64) []byte {
-	return append(append([]byte(nil), headerHeightIndexPrefix...), encodeU64(height)...)
-}
-
 func knownPeerKey(addr string) []byte {
 	return append(append([]byte(nil), knownPeerPrefix...), []byte(addr)...)
-}
-
-func localitySeqKey(seq uint64) []byte {
-	return append(append([]byte(nil), localitySeqPrefix...), encodeU64(seq)...)
-}
-
-func localityMetaKey(outPoint types.OutPoint) []byte {
-	buf := append([]byte(nil), localityMetaPrefix...)
-	outPoint.Encode(&buf)
-	return buf
 }
 
 func utxoKey(outPoint types.OutPoint) []byte {
@@ -3775,48 +1945,6 @@ func snapshotUTXOKey(outPoint types.OutPoint) []byte {
 	return buf
 }
 
-func walletOriginKey(outPoint types.OutPoint) []byte {
-	buf := append([]byte(nil), walletOriginPrefix...)
-	outPoint.Encode(&buf)
-	return buf
-}
-
-func walletUTXOItemPrefix(item WalletWatchItem) []byte {
-	buf := append([]byte(nil), walletUTXOPrefix...)
-	encodeWalletWatchItem(&buf, item)
-	return buf
-}
-
-func walletUTXOKey(item WalletWatchItem, outPoint types.OutPoint) []byte {
-	buf := walletUTXOItemPrefix(item)
-	outPoint.Encode(&buf)
-	return buf
-}
-
-func walletActivityItemWatchPrefix(item WalletWatchItem) []byte {
-	buf := append([]byte(nil), walletActivityItemPrefix...)
-	encodeWalletWatchItem(&buf, item)
-	return buf
-}
-
-func walletActivityItemKey(item WalletWatchItem, height uint64, txid [32]byte) []byte {
-	buf := walletActivityItemWatchPrefix(item)
-	buf = append(buf, encodeU64BE(^height)...)
-	buf = append(buf, txid[:]...)
-	return buf
-}
-
-func walletActivityHeightPrefixForHeight(height uint64) []byte {
-	return append(append([]byte(nil), walletActivityHtPrefix...), encodeU64BE(height)...)
-}
-
-func walletActivityHeightKey(height uint64, item WalletWatchItem, txid [32]byte) []byte {
-	buf := walletActivityHeightPrefixForHeight(height)
-	encodeWalletWatchItem(&buf, item)
-	buf = append(buf, txid[:]...)
-	return buf
-}
-
 func decodeOutPoint(buf []byte) (types.OutPoint, error) {
 	if len(buf) != 36 {
 		return types.OutPoint{}, errors.New("invalid outpoint encoding")
@@ -3825,118 +1953,6 @@ func decodeOutPoint(buf []byte) (types.OutPoint, error) {
 	copy(outPoint.TxID[:], buf[:32])
 	outPoint.Vout = binary.LittleEndian.Uint32(buf[32:36])
 	return outPoint, nil
-}
-
-func encodeOutPoint(outPoint types.OutPoint) []byte {
-	buf := make([]byte, 0, 36)
-	outPoint.Encode(&buf)
-	return buf
-}
-
-func encodeWalletWatchItem(buf *[]byte, item WalletWatchItem) {
-	*buf = append(*buf, encodeU64(item.Type)...)
-	*buf = append(*buf, item.Payload32[:]...)
-}
-
-func decodeWalletWatchItem(buf []byte) (WalletWatchItem, error) {
-	if len(buf) != 40 {
-		return WalletWatchItem{}, errors.New("invalid wallet watch item encoding")
-	}
-	itemType, err := decodeU64(buf[:8])
-	if err != nil {
-		return WalletWatchItem{}, err
-	}
-	var payload [32]byte
-	copy(payload[:], buf[8:40])
-	return WalletWatchItem{Type: itemType, Payload32: payload}, nil
-}
-
-func encodeWalletOrigin(record walletOriginRecord) []byte {
-	buf := make([]byte, 0, 8+1+49)
-	buf = append(buf, encodeU64(record.Height)...)
-	if record.Coinbase {
-		buf = append(buf, 1)
-	} else {
-		buf = append(buf, 0)
-	}
-	return append(buf, encodeUTXOEntry(record.Entry)...)
-}
-
-func decodeWalletOrigin(buf []byte) (walletOriginRecord, error) {
-	if len(buf) < 10 {
-		return walletOriginRecord{}, errors.New("invalid wallet origin encoding")
-	}
-	height, err := decodeU64(buf[:8])
-	if err != nil {
-		return walletOriginRecord{}, err
-	}
-	coinbase, err := decodeBoolByte(buf[8])
-	if err != nil {
-		return walletOriginRecord{}, err
-	}
-	entry, err := decodeUTXOEntry(buf[9:])
-	if err != nil {
-		return walletOriginRecord{}, err
-	}
-	return walletOriginRecord{Height: height, Coinbase: coinbase, Entry: entry}, nil
-}
-
-func encodeWalletIndexedUTXO(record WalletIndexedUTXO) []byte {
-	return encodeWalletOrigin(walletOriginRecord{Entry: record.Entry, Height: record.Height, Coinbase: record.Coinbase})
-}
-
-func decodeWalletIndexedUTXO(buf []byte) (WalletIndexedUTXO, error) {
-	origin, err := decodeWalletOrigin(buf)
-	if err != nil {
-		return WalletIndexedUTXO{}, err
-	}
-	return WalletIndexedUTXO{Entry: origin.Entry, Height: origin.Height, Coinbase: origin.Coinbase}, nil
-}
-
-func encodeWalletActivityRecord(record WalletActivityRecord) []byte {
-	buf := make([]byte, 0, 105)
-	buf = append(buf, record.TxID[:]...)
-	buf = append(buf, record.BlockHash[:]...)
-	buf = append(buf, encodeU64(record.Height)...)
-	buf = append(buf, encodeU64(record.Timestamp)...)
-	if record.Coinbase {
-		buf = append(buf, 1)
-	} else {
-		buf = append(buf, 0)
-	}
-	buf = append(buf, encodeU64(record.Received)...)
-	buf = append(buf, encodeU64(record.Sent)...)
-	buf = append(buf, encodeU64(record.Fee)...)
-	return buf
-}
-
-func decodeWalletActivityRecord(buf []byte) (WalletActivityRecord, error) {
-	if len(buf) != 105 {
-		return WalletActivityRecord{}, errors.New("invalid wallet activity encoding")
-	}
-	var record WalletActivityRecord
-	copy(record.TxID[:], buf[:32])
-	copy(record.BlockHash[:], buf[32:64])
-	var err error
-	if record.Height, err = decodeU64(buf[64:72]); err != nil {
-		return WalletActivityRecord{}, err
-	}
-	if record.Timestamp, err = decodeU64(buf[72:80]); err != nil {
-		return WalletActivityRecord{}, err
-	}
-	if record.Coinbase, err = decodeBoolByte(buf[80]); err != nil {
-		return WalletActivityRecord{}, err
-	}
-	if record.Received, err = decodeU64(buf[81:89]); err != nil {
-		return WalletActivityRecord{}, err
-	}
-	if record.Sent, err = decodeU64(buf[89:97]); err != nil {
-		return WalletActivityRecord{}, err
-	}
-	if record.Fee, err = decodeU64(buf[97:105]); err != nil {
-		return WalletActivityRecord{}, err
-	}
-	return record, nil
 }
 
 func decodeBoolByte(raw byte) (bool, error) {
@@ -3948,647 +1964,6 @@ func decodeBoolByte(raw byte) (bool, error) {
 	default:
 		return false, errors.New("invalid bool encoding")
 	}
-}
-
-func decodeWalletActivityHeightKey(key []byte, height uint64) (WalletWatchItem, [32]byte, error) {
-	prefixLen := len(walletActivityHtPrefix) + 8
-	if len(key) != prefixLen+40+32 {
-		return WalletWatchItem{}, [32]byte{}, errors.New("invalid wallet activity height key")
-	}
-	gotHeight, err := decodeU64BE(key[len(walletActivityHtPrefix):prefixLen])
-	if err != nil {
-		return WalletWatchItem{}, [32]byte{}, err
-	}
-	if gotHeight != height {
-		return WalletWatchItem{}, [32]byte{}, errors.New("wallet activity height key mismatch")
-	}
-	item, err := decodeWalletWatchItem(key[prefixLen : prefixLen+40])
-	if err != nil {
-		return WalletWatchItem{}, [32]byte{}, err
-	}
-	var txid [32]byte
-	copy(txid[:], key[prefixLen+40:])
-	return item, txid, nil
-}
-
-func walletWatchItemForOutput(output types.TxOutput) WalletWatchItem {
-	return WalletWatchItem{Type: output.Type, Payload32: output.CanonicalPayload32()}
-}
-
-func walletWatchItemForEntry(entry consensus.UtxoEntry) WalletWatchItem {
-	item := WalletWatchItem{Type: entry.Type, Payload32: entry.Payload32}
-	if item.Type == types.OutputXOnlyP2PK && item.Payload32 == ([32]byte{}) {
-		item.Payload32 = entry.PubKey
-	}
-	return item
-}
-
-func (s *ChainStore) walletOrigin(outPoint types.OutPoint) (walletOriginRecord, bool, error) {
-	buf, err := s.get(walletOriginKey(outPoint))
-	if err != nil {
-		return walletOriginRecord{}, false, err
-	}
-	if buf == nil {
-		return walletOriginRecord{}, false, nil
-	}
-	record, err := decodeWalletOrigin(buf)
-	if err != nil {
-		return walletOriginRecord{}, false, err
-	}
-	return record, true, nil
-}
-
-func compareWalletIndexedUTXOs(a, b WalletIndexedUTXO) int {
-	if a.Entry.Type < b.Entry.Type {
-		return -1
-	}
-	if a.Entry.Type > b.Entry.Type {
-		return 1
-	}
-	aItem := walletWatchItemForEntry(a.Entry)
-	bItem := walletWatchItemForEntry(b.Entry)
-	if cmp := bytes.Compare(aItem.Payload32[:], bItem.Payload32[:]); cmp != 0 {
-		return cmp
-	}
-	return compareOutPoints(a.OutPoint, b.OutPoint)
-}
-
-func compareWalletActivityRecords(a, b WalletActivityRecord) int {
-	switch {
-	case a.Height > b.Height:
-		return -1
-	case a.Height < b.Height:
-		return 1
-	}
-	if cmp := bytes.Compare(a.TxID[:], b.TxID[:]); cmp != 0 {
-		return cmp
-	}
-	return bytes.Compare(a.BlockHash[:], b.BlockHash[:])
-}
-
-func encodeLocalitySeqValue(outPoint types.OutPoint, entry consensus.UtxoEntry) []byte {
-	buf := make([]byte, 0, 36+49)
-	outPoint.Encode(&buf)
-	return append(buf, encodeUTXOEntry(entry)...)
-}
-
-func decodeLocalitySeqValue(buf []byte) (types.OutPoint, consensus.UtxoEntry, bool, error) {
-	if len(buf) == 36 {
-		return types.OutPoint{}, consensus.UtxoEntry{}, false, nil
-	}
-	if len(buf) < 37 {
-		return types.OutPoint{}, consensus.UtxoEntry{}, false, errors.New("invalid locality sequence value")
-	}
-	outPoint, err := decodeOutPoint(buf[:36])
-	if err != nil {
-		return types.OutPoint{}, consensus.UtxoEntry{}, false, err
-	}
-	entry, err := decodeUTXOEntry(buf[36:])
-	if err != nil {
-		return types.OutPoint{}, consensus.UtxoEntry{}, false, err
-	}
-	return outPoint, entry, true, nil
-}
-
-func decodeLocalitySeqFromKey(key []byte) (uint64, error) {
-	if len(key) != len(localitySeqPrefix)+8 {
-		return 0, errors.New("invalid locality sequence key")
-	}
-	return decodeU64(key[len(localitySeqPrefix):])
-}
-
-func (s *ChainStore) LoadUTXOAccumulator() (*utreexo.Accumulator, bool, error) {
-	versionBytes, err := s.get(metaUTXOAccumulatorVersionKey)
-	if err != nil {
-		return nil, false, err
-	}
-	if versionBytes == nil {
-		return nil, false, nil
-	}
-	version, err := decodeU64(versionBytes)
-	if err != nil {
-		return nil, false, err
-	}
-	if version != utxoAccumulatorIndexVersion {
-		return nil, false, fmt.Errorf("unsupported utxo accumulator index version %d", version)
-	}
-	rootPathBytes, err := s.get(metaUTXOAccumulatorRootPathKey)
-	if err != nil {
-		return nil, false, err
-	}
-	meta, err := s.LoadChainStateMeta()
-	if err != nil {
-		return nil, false, err
-	}
-	if meta == nil {
-		return nil, false, nil
-	}
-	acc, physicalRecordCount, err := s.loadAccumulatorFromLeafRecords(utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd)
-	if err != nil {
-		return nil, false, err
-	}
-	if physicalRecordCount != utreexo.MaterialNodeCount(acc) {
-		return nil, false, fmt.Errorf("utxo accumulator physical record count=%d, want %d", physicalRecordCount, utreexo.MaterialNodeCount(acc))
-	}
-	if err := s.validateAccumulatorIndexRecords(acc); err != nil {
-		return nil, false, err
-	}
-	if acc.Count() != meta.UTXOCount {
-		return nil, false, fmt.Errorf("utxo accumulator count mismatch: index=%d meta=%d", acc.Count(), meta.UTXOCount)
-	}
-	if acc.Root() != meta.TipHeader.UTXORoot {
-		return nil, false, fmt.Errorf("utxo accumulator root mismatch: index=%x header=%x", acc.Root(), meta.TipHeader.UTXORoot)
-	}
-	if meta.UTXOAccumulatorRoot != ([32]byte{}) && acc.Root() != meta.UTXOAccumulatorRoot {
-		return nil, false, fmt.Errorf("utxo accumulator root mismatch: index=%x meta=%x", acc.Root(), meta.UTXOAccumulatorRoot)
-	}
-	rootPath, hasRoot := utreexo.AccumulatorRootPath(acc)
-	if !hasRoot {
-		if len(rootPathBytes) != 0 {
-			return nil, false, errors.New("utxo accumulator root path present for empty index")
-		}
-	} else {
-		persistedRootPath, err := decodeAccumulatorPath(rootPathBytes)
-		if err != nil {
-			return nil, false, fmt.Errorf("invalid utxo accumulator root path: %w", err)
-		}
-		if persistedRootPath != rootPath {
-			return nil, false, errors.New("utxo accumulator root path mismatch")
-		}
-	}
-	return acc, true, nil
-}
-
-func (s *ChainStore) loadAccumulatorFromLeafRecords(lower, upper []byte) (*utreexo.Accumulator, int, error) {
-	acc := utreexo.NewAccumulator()
-	physicalRecordCount := 0
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
-	if err != nil {
-		return nil, 0, err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		physicalRecordCount++
-		path, err := decodeAccumulatorNodeKey(iter.Key())
-		if err != nil {
-			return nil, 0, err
-		}
-		record, err := decodeAccumulatorNodeValue(path, iter.Value())
-		if err != nil {
-			return nil, 0, err
-		}
-		if record.Leaf != nil {
-			next, err := acc.Add(*record.Leaf)
-			if err != nil {
-				return nil, 0, err
-			}
-			acc = next
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return nil, 0, err
-	}
-	return acc, physicalRecordCount, nil
-}
-
-func (s *ChainStore) UTXOAccumulatorProof(outPoint types.OutPoint) (utreexo.OutPointProof, error) {
-	proof := utreexo.OutPointProof{Version: utreexo.ProofVersion, OutPoint: outPoint}
-	meta, err := s.LoadChainStateMeta()
-	if err != nil {
-		return proof, err
-	}
-	if meta == nil || meta.UTXOCount == 0 {
-		return proof, nil
-	}
-	rootPathBytes, err := s.get(metaUTXOAccumulatorRootPathKey)
-	if err != nil {
-		return proof, err
-	}
-	path, err := decodeAccumulatorPath(rootPathBytes)
-	if err != nil {
-		return proof, fmt.Errorf("invalid utxo accumulator root path: %w", err)
-	}
-	node, ok, err := s.accumulatorNode(path)
-	if err != nil {
-		return proof, err
-	}
-	if !ok {
-		return proof, errors.New("missing utxo accumulator root node")
-	}
-	queryKey := utreexo.OutPointKey(outPoint)
-	if !accumulatorPathMatchesKey(path, queryKey) {
-		terminal, err := s.firstAccumulatorLeaf(path)
-		if err != nil {
-			return proof, err
-		}
-		membership, err := s.UTXOAccumulatorProof(terminal.OutPoint)
-		if err != nil {
-			return proof, err
-		}
-		terminalCopy := *terminal
-		proof.Terminal = &terminalCopy
-		proof.Steps = membership.Steps
-		return proof, nil
-	}
-	steps := make([]utreexo.ProofStep, utreexo.KeyBits)
-	for node.Leaf == nil {
-		if node.LeftPath == nil || node.RightPath == nil || !validAccumulatorChildren(path, *node.LeftPath, *node.RightPath) {
-			return proof, errors.New("invalid accumulator branch record")
-		}
-		queryRight := accumulatorBitSet(queryKey, path.Depth)
-		nextPath := node.LeftPath
-		siblingPath := node.RightPath
-		if queryRight {
-			nextPath, siblingPath = node.RightPath, node.LeftPath
-		}
-		sibling, siblingOK, err := s.accumulatorNode(*siblingPath)
-		if err != nil {
-			return proof, err
-		}
-		if !siblingOK {
-			return proof, errors.New("missing accumulator sibling node")
-		}
-		steps[path.Depth] = utreexo.ProofStep{HasSibling: true, SiblingHash: sibling.Hash}
-		next, nextOK, err := s.accumulatorNode(*nextPath)
-		if err != nil {
-			return proof, err
-		}
-		if !nextOK {
-			return proof, errors.New("missing accumulator child node")
-		}
-		if !accumulatorPathMatchesKey(*nextPath, queryKey) {
-			terminal, err := s.firstAccumulatorLeaf(*nextPath)
-			if err != nil {
-				return proof, err
-			}
-			membership, err := s.UTXOAccumulatorProof(terminal.OutPoint)
-			if err != nil {
-				return proof, err
-			}
-			if !membership.Exists {
-				return proof, errors.New("accumulator exclusion witness is not a member")
-			}
-			terminalCopy := *terminal
-			proof.Terminal = &terminalCopy
-			proof.Steps = membership.Steps
-			return proof, nil
-		}
-		path = *nextPath
-		node = next
-	}
-	if node.Leaf == nil {
-		return proof, errors.New("invalid accumulator proof leaf")
-	}
-	if node.Leaf.OutPoint != outPoint {
-		return proof, fmt.Errorf("accumulator proof leaf mismatch: got %x:%d", node.Leaf.OutPoint.TxID, node.Leaf.OutPoint.Vout)
-	}
-	proof.Exists = true
-	proof.Type = node.Leaf.Type
-	proof.ValueAtoms = node.Leaf.ValueAtoms
-	proof.Payload32 = node.Leaf.Payload32
-	proof.PubKey = node.Leaf.PubKey
-	proof.Steps = steps
-	return proof, nil
-}
-
-func (s *ChainStore) firstAccumulatorLeaf(path utreexo.AccumulatorNodePath) (*utreexo.UtxoLeaf, error) {
-	for {
-		node, ok, err := s.accumulatorNode(path)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, errors.New("missing accumulator exclusion witness node")
-		}
-		if node.Leaf != nil {
-			leaf := *node.Leaf
-			return &leaf, nil
-		}
-		if node.LeftPath == nil || node.RightPath == nil || !validAccumulatorChildren(path, *node.LeftPath, *node.RightPath) {
-			return nil, errors.New("invalid accumulator branch record")
-		}
-		path = *node.LeftPath
-	}
-}
-
-func (s *ChainStore) WriteUTXOAccumulator(acc *utreexo.Accumulator) error {
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := replaceAccumulatorIndexBatch(s.db, batch, acc); err != nil {
-		return err
-	}
-	count := 0
-	if acc != nil {
-		count = acc.Count()
-	}
-	if err := batch.Set(metaUTXOCountKey, encodeU64(uint64(count)), nil); err != nil {
-		return err
-	}
-	return batch.Commit(consensusCriticalWriteOptions)
-}
-
-func (s *ChainStore) accumulatorNode(path utreexo.AccumulatorNodePath) (utreexo.AccumulatorNodeRecord, bool, error) {
-	key := accumulatorNodeKey(path)
-	val, closer, err := s.db.Get(key)
-	if errors.Is(err, pebble.ErrNotFound) {
-		return utreexo.AccumulatorNodeRecord{}, false, nil
-	}
-	if err != nil {
-		return utreexo.AccumulatorNodeRecord{}, false, err
-	}
-	defer closer.Close()
-	record, err := decodeAccumulatorNodeValue(path, val)
-	if err != nil {
-		return utreexo.AccumulatorNodeRecord{}, false, err
-	}
-	return record, true, nil
-}
-
-func applyAccumulatorStateBatch(db *pebble.DB, batch *pebble.Batch, state *StoredChainStateMeta) error {
-	if state == nil {
-		return nil
-	}
-	switch {
-	case state.UTXOAccumulatorDelta != nil:
-		return applyAccumulatorDeltaBatch(batch, *state.UTXOAccumulatorDelta)
-	case state.UTXOAccumulator != nil:
-		return replaceAccumulatorIndexBatch(db, batch, state.UTXOAccumulator)
-	default:
-		return nil
-	}
-}
-
-func (s *ChainStore) populateAccumulatorDeltaFromUTXODelta(state *StoredChainStateMeta, spent []types.OutPoint, created map[types.OutPoint]consensus.UtxoEntry) error {
-	if state == nil || state.UTXOAccumulator != nil || state.UTXOAccumulatorDelta != nil {
-		return nil
-	}
-	current, ok, err := s.LoadUTXOAccumulator()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-	createdLeaves := make([]utreexo.UtxoLeaf, 0, len(created))
-	for outPoint, entry := range created {
-		createdLeaves = append(createdLeaves, consensus.UtxoLeafFromEntry(outPoint, entry))
-	}
-	next, err := current.Apply(spent, createdLeaves)
-	if err != nil {
-		return err
-	}
-	delta := utreexo.AccumulatorNodeDeltaBetween(current, next)
-	state.UTXOAccumulatorDelta = &delta
-	state.UTXOAccumulatorRoot = next.Root()
-	state.UTXOCount = next.Count()
-	return nil
-}
-
-func replaceAccumulatorIndexBatch(db *pebble.DB, batch *pebble.Batch, acc *utreexo.Accumulator) error {
-	if err := deletePrefixBatch(db, batch, utxoAccumulatorNodePrefix, utxoAccumulatorNodePrefixEnd); err != nil {
-		return err
-	}
-	if err := utreexo.ForEachAccumulatorNodeRecord(acc, func(record utreexo.AccumulatorNodeRecord) error {
-		return batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil)
-	}); err != nil {
-		return err
-	}
-	if err := batch.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil); err != nil {
-		return err
-	}
-	if rootPath, ok := utreexo.AccumulatorRootPath(acc); ok {
-		if err := batch.Set(metaUTXOAccumulatorRootPathKey, encodeAccumulatorPath(rootPath), nil); err != nil {
-			return err
-		}
-	} else if err := batch.Delete(metaUTXOAccumulatorRootPathKey, nil); err != nil {
-		return err
-	}
-	if acc == nil {
-		root := utreexo.NewAccumulator().Root()
-		return batch.Set(metaUTXOAccumulatorRootKey, root[:], nil)
-	}
-	root := acc.Root()
-	return batch.Set(metaUTXOAccumulatorRootKey, root[:], nil)
-}
-
-func applyAccumulatorDeltaBatch(batch *pebble.Batch, delta utreexo.AccumulatorNodeDelta) error {
-	for _, path := range delta.Deletes {
-		if err := batch.Delete(accumulatorNodeKey(path), nil); err != nil {
-			return err
-		}
-	}
-	for _, record := range delta.Upserts {
-		if err := batch.Set(accumulatorNodeKey(record.Path), encodeAccumulatorNodeValue(record), nil); err != nil {
-			return err
-		}
-	}
-	if delta.RootPath != nil {
-		if err := batch.Set(metaUTXOAccumulatorRootPathKey, encodeAccumulatorPath(*delta.RootPath), nil); err != nil {
-			return err
-		}
-	} else if err := batch.Delete(metaUTXOAccumulatorRootPathKey, nil); err != nil {
-		return err
-	}
-	return batch.Set(metaUTXOAccumulatorVersionKey, encodeU64(utxoAccumulatorIndexVersion), nil)
-}
-
-func accumulatorNodeKey(path utreexo.AccumulatorNodePath) []byte {
-	if path.Depth < 0 || path.Depth > utreexo.KeyBits {
-		panic("invalid accumulator node path depth")
-	}
-	keyLen := (path.Depth + 7) / 8
-	buf := make([]byte, 0, len(utxoAccumulatorNodePrefix)+2+keyLen)
-	buf = append(buf, utxoAccumulatorNodePrefix...)
-	buf = append(buf, byte(path.Depth>>8), byte(path.Depth))
-	buf = append(buf, path.Key[:keyLen]...)
-	return buf
-}
-
-func accumulatorChildPath(parent utreexo.AccumulatorNodePath, right bool) utreexo.AccumulatorNodePath {
-	child := utreexo.AccumulatorNodePath{
-		Depth: parent.Depth + 1,
-		Key:   parent.Key,
-	}
-	if right {
-		byteIndex := parent.Depth / 8
-		bitOffset := 7 - (parent.Depth % 8)
-		child.Key[byteIndex] |= 1 << bitOffset
-	}
-	return child
-}
-
-func accumulatorBitSet(key [utreexo.OutPointKeyBytes]byte, depth int) bool {
-	byteIndex := depth / 8
-	bitOffset := 7 - (depth % 8)
-	return ((key[byteIndex] >> bitOffset) & 1) == 1
-}
-
-func decodeAccumulatorNodeKey(key []byte) (utreexo.AccumulatorNodePath, error) {
-	if len(key) < len(utxoAccumulatorNodePrefix)+2 || !bytes.HasPrefix(key, utxoAccumulatorNodePrefix) {
-		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node key")
-	}
-	raw := key[len(utxoAccumulatorNodePrefix):]
-	depth := int(raw[0])<<8 | int(raw[1])
-	if depth < 0 || depth > utreexo.KeyBits {
-		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node depth")
-	}
-	keyLen := (depth + 7) / 8
-	if len(raw) != 2+keyLen {
-		return utreexo.AccumulatorNodePath{}, errors.New("invalid accumulator node path length")
-	}
-	if depth%8 != 0 && keyLen > 0 {
-		unusedMask := byte((1 << (8 - depth%8)) - 1)
-		if raw[2+keyLen-1]&unusedMask != 0 {
-			return utreexo.AccumulatorNodePath{}, errors.New("non-canonical accumulator node path key")
-		}
-	}
-	var pathKey [utreexo.OutPointKeyBytes]byte
-	copy(pathKey[:], raw[2:])
-	return utreexo.AccumulatorNodePath{Depth: depth, Key: pathKey}, nil
-}
-
-func encodeAccumulatorNodeValue(record utreexo.AccumulatorNodeRecord) []byte {
-	buf := make([]byte, 0, 1+8+32+2*(2+utreexo.OutPointKeyBytes)+36+49)
-	if record.Leaf != nil {
-		buf = append(buf, 1)
-	} else {
-		buf = append(buf, 0)
-	}
-	buf = append(buf, encodeU64(uint64(record.Count))...)
-	buf = append(buf, record.Hash[:]...)
-	if record.Leaf != nil {
-		record.Leaf.OutPoint.Encode(&buf)
-		entry := consensus.UtxoEntryFromLeaf(*record.Leaf)
-		buf = append(buf, encodeCommittedCoin(entry)...)
-	} else {
-		if record.LeftPath == nil || record.RightPath == nil {
-			panic("internal accumulator record is missing child paths")
-		}
-		buf = append(buf, encodeAccumulatorPath(*record.LeftPath)...)
-		buf = append(buf, encodeAccumulatorPath(*record.RightPath)...)
-	}
-	return buf
-}
-
-func decodeAccumulatorNodeValue(path utreexo.AccumulatorNodePath, buf []byte) (utreexo.AccumulatorNodeRecord, error) {
-	if len(buf) < 41 {
-		return utreexo.AccumulatorNodeRecord{}, errors.New("invalid accumulator node value")
-	}
-	kind := buf[0]
-	count, err := decodeU64(buf[1:9])
-	if err != nil {
-		return utreexo.AccumulatorNodeRecord{}, err
-	}
-	record := utreexo.AccumulatorNodeRecord{
-		Path:  path,
-		Count: int(count),
-	}
-	copy(record.Hash[:], buf[9:41])
-	remaining := buf[41:]
-	switch kind {
-	case 0:
-		left, consumed, err := decodeAccumulatorPathPrefix(remaining)
-		if err != nil {
-			return utreexo.AccumulatorNodeRecord{}, fmt.Errorf("invalid left accumulator child path: %w", err)
-		}
-		right, rightConsumed, err := decodeAccumulatorPathPrefix(remaining[consumed:])
-		if err != nil {
-			return utreexo.AccumulatorNodeRecord{}, fmt.Errorf("invalid right accumulator child path: %w", err)
-		}
-		if consumed+rightConsumed != len(remaining) {
-			return utreexo.AccumulatorNodeRecord{}, errors.New("invalid internal accumulator node payload")
-		}
-		record.LeftPath = &left
-		record.RightPath = &right
-	case 1:
-		if len(remaining) < 36 {
-			return utreexo.AccumulatorNodeRecord{}, errors.New("invalid leaf accumulator node payload")
-		}
-		outPoint, err := decodeOutPoint(remaining[:36])
-		if err != nil {
-			return utreexo.AccumulatorNodeRecord{}, err
-		}
-		entry, err := decodeCommittedCoin(remaining[36:])
-		if err != nil {
-			return utreexo.AccumulatorNodeRecord{}, err
-		}
-		leaf := consensus.UtxoLeafFromEntry(outPoint, entry)
-		record.Leaf = &leaf
-	default:
-		return utreexo.AccumulatorNodeRecord{}, errors.New("invalid accumulator node kind")
-	}
-	return record, nil
-}
-
-func encodeAccumulatorPath(path utreexo.AccumulatorNodePath) []byte {
-	if path.Depth < 0 || path.Depth > utreexo.KeyBits {
-		panic("invalid accumulator path depth")
-	}
-	keyLen := (path.Depth + 7) / 8
-	buf := make([]byte, 2+keyLen)
-	buf[0] = byte(path.Depth >> 8)
-	buf[1] = byte(path.Depth)
-	copy(buf[2:], path.Key[:keyLen])
-	return buf
-}
-
-func decodeAccumulatorPath(buf []byte) (utreexo.AccumulatorNodePath, error) {
-	path, consumed, err := decodeAccumulatorPathPrefix(buf)
-	if err != nil {
-		return utreexo.AccumulatorNodePath{}, err
-	}
-	if consumed != len(buf) {
-		return utreexo.AccumulatorNodePath{}, errors.New("trailing accumulator path bytes")
-	}
-	return path, nil
-}
-
-func decodeAccumulatorPathPrefix(buf []byte) (utreexo.AccumulatorNodePath, int, error) {
-	if len(buf) < 2 {
-		return utreexo.AccumulatorNodePath{}, 0, errors.New("truncated accumulator path")
-	}
-	depth := int(buf[0])<<8 | int(buf[1])
-	if depth < 0 || depth > utreexo.KeyBits {
-		return utreexo.AccumulatorNodePath{}, 0, errors.New("invalid accumulator path depth")
-	}
-	keyLen := (depth + 7) / 8
-	if len(buf) < 2+keyLen {
-		return utreexo.AccumulatorNodePath{}, 0, errors.New("truncated accumulator path key")
-	}
-	var key [utreexo.OutPointKeyBytes]byte
-	copy(key[:], buf[2:2+keyLen])
-	if depth%8 != 0 && keyLen > 0 {
-		unusedMask := byte((1 << (8 - depth%8)) - 1)
-		if key[keyLen-1]&unusedMask != 0 {
-			return utreexo.AccumulatorNodePath{}, 0, errors.New("non-canonical accumulator path key")
-		}
-	}
-	return utreexo.AccumulatorNodePath{Depth: depth, Key: key}, 2 + keyLen, nil
-}
-
-func accumulatorPathMatchesKey(path utreexo.AccumulatorNodePath, key [utreexo.OutPointKeyBytes]byte) bool {
-	fullBytes := path.Depth / 8
-	if !bytes.Equal(path.Key[:fullBytes], key[:fullBytes]) {
-		return false
-	}
-	remaining := path.Depth % 8
-	if remaining == 0 {
-		return true
-	}
-	mask := byte(0xff << (8 - remaining))
-	return path.Key[fullBytes]&mask == key[fullBytes]&mask
-}
-
-func validAccumulatorChildren(parent, left, right utreexo.AccumulatorNodePath) bool {
-	if parent.Depth < 0 || parent.Depth >= utreexo.KeyBits ||
-		left.Depth <= parent.Depth || left.Depth > utreexo.KeyBits ||
-		right.Depth <= parent.Depth || right.Depth > utreexo.KeyBits {
-		return false
-	}
-	if !accumulatorPathMatchesKey(parent, left.Key) || !accumulatorPathMatchesKey(parent, right.Key) {
-		return false
-	}
-	return !accumulatorBitSet(left.Key, parent.Depth) && accumulatorBitSet(right.Key, parent.Depth)
 }
 
 func encodeUTXOEntry(entry consensus.UtxoEntry) []byte {
@@ -4613,93 +1988,6 @@ func encodeCommittedCoin(entry consensus.UtxoEntry) []byte {
 	buf = append(buf, value...)
 	buf = append(buf, entry.Payload32[:]...)
 	return buf
-}
-
-func encodeChainJournalEntry(entry chainJournalEntry) []byte {
-	buf := make([]byte, 1+8+8+4)
-	buf[0] = byte(entry.Kind)
-	binary.LittleEndian.PutUint64(buf[1:9], entry.ForkHeight)
-	binary.LittleEndian.PutUint64(buf[9:17], entry.OldTipHeight)
-	binary.LittleEndian.PutUint32(buf[17:21], uint32(len(entry.Pairs)))
-	for _, pair := range entry.Pairs {
-		rawHeight := make([]byte, 8)
-		binary.LittleEndian.PutUint64(rawHeight, pair.Height)
-		buf = append(buf, rawHeight...)
-		buf = append(buf, pair.Hash[:]...)
-	}
-	return buf
-}
-
-func decodeChainJournalEntry(buf []byte) (chainJournalEntry, error) {
-	if len(buf) < 21 {
-		return chainJournalEntry{}, errors.New("invalid chain journal entry encoding")
-	}
-	entry := chainJournalEntry{
-		Kind:         chainJournalKind(buf[0]),
-		ForkHeight:   binary.LittleEndian.Uint64(buf[1:9]),
-		OldTipHeight: binary.LittleEndian.Uint64(buf[9:17]),
-	}
-	count := binary.LittleEndian.Uint32(buf[17:21])
-	buf = buf[21:]
-	if len(buf) != int(count)*(8+32) {
-		return chainJournalEntry{}, errors.New("invalid chain journal height/hash payload")
-	}
-	entry.Pairs = make([]chainJournalHeightHash, 0, count)
-	for i := uint32(0); i < count; i++ {
-		pair := chainJournalHeightHash{Height: binary.LittleEndian.Uint64(buf[:8])}
-		copy(pair.Hash[:], buf[8:40])
-		entry.Pairs = append(entry.Pairs, pair)
-		buf = buf[40:]
-	}
-	return entry, nil
-}
-
-func applyJournalEntryBatch(batch *pebble.Batch, entry chainJournalEntry) error {
-	switch entry.Kind {
-	case journalSetBlockHeight:
-		for _, pair := range entry.Pairs {
-			if err := batch.Set(heightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
-				return err
-			}
-		}
-	case journalRewriteBlockHeights:
-		for height := entry.ForkHeight + 1; height <= entry.OldTipHeight; height++ {
-			if err := batch.Delete(heightIndexKey(height), nil); err != nil {
-				return err
-			}
-			if height == ^uint64(0) {
-				break
-			}
-		}
-		for _, pair := range entry.Pairs {
-			if err := batch.Set(heightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
-				return err
-			}
-		}
-	case journalSetHeaderHeight:
-		for _, pair := range entry.Pairs {
-			if err := batch.Set(headerHeightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
-				return err
-			}
-		}
-	case journalRewriteHeaderHeights:
-		for height := entry.ForkHeight + 1; height <= entry.OldTipHeight; height++ {
-			if err := batch.Delete(headerHeightIndexKey(height), nil); err != nil {
-				return err
-			}
-			if height == ^uint64(0) {
-				break
-			}
-		}
-		for _, pair := range entry.Pairs {
-			if err := batch.Set(headerHeightIndexKey(pair.Height), pair.Hash[:], nil); err != nil {
-				return err
-			}
-		}
-	default:
-		return fmt.Errorf("unknown chain journal kind %d", entry.Kind)
-	}
-	return nil
 }
 
 func decodeUTXOEntry(buf []byte) (consensus.UtxoEntry, error) {
@@ -4962,17 +2250,19 @@ func looksLikeLegacyBlockSizeState(buf []byte) bool {
 }
 
 func decodeLegacyBlockSizeState(buf []byte) (consensus.BlockSizeState, error) {
+	const headerSize = 24
+	if len(buf) < headerSize {
+		return consensus.BlockSizeState{}, errors.New("truncated legacy block size state")
+	}
 	count := binary.LittleEndian.Uint64(buf[16:24])
-	expected := 24 + int(count)*8
-	if len(buf) != expected {
+	if (len(buf)-headerSize)%8 != 0 || count != uint64((len(buf)-headerSize)/8) {
 		return consensus.BlockSizeState{}, fmt.Errorf("invalid block size state length: %d", len(buf))
 	}
 	limit := binary.LittleEndian.Uint64(buf[:8])
 	ewma := binary.LittleEndian.Uint64(buf[8:16])
 	blockSize := ewma
 	if count > 0 {
-		start := 24 + (int(count)-1)*8
-		blockSize = binary.LittleEndian.Uint64(buf[start : start+8])
+		blockSize = binary.LittleEndian.Uint64(buf[len(buf)-8:])
 	}
 	epsilon := limit / 2
 	beta := limit - epsilon

@@ -90,7 +90,7 @@ func TestLazyBlockBatchEnforcesResponseByteAllowance(t *testing.T) {
 	msg, err := svc.resolveQueuedBlockReference(peer, &outboundBlockReference{
 		item:  p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: firstHash},
 		batch: batch,
-	})
+	}, first.EncodedLen(), [32]byte{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestLazyBlockBatchEnforcesResponseByteAllowance(t *testing.T) {
 	msg, err = svc.resolveQueuedBlockReference(peer, &outboundBlockReference{
 		item:  p2p.InvVector{Type: p2p.InvTypeBlockFull, Hash: secondHash},
 		batch: batch,
-	})
+	}, second.EncodedLen(), [32]byte{})
 	if err != nil {
 		t.Fatal(err)
 	}

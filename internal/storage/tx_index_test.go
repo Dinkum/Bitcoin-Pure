@@ -198,6 +198,35 @@ func TestTxIndexAppendReorgAndFullStateReplacement(t *testing.T) {
 	assertIndexedTransaction(t, s, g.Txs[0], &gh)
 }
 
+func TestLaggingTxIndexUsesCanonicalPrefixWithoutHistoricBlockBodies(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.txIndexEnabled = true
+
+	genesis := txIndexFixtureBlock(0, [32]byte{}, 1, 1)
+	genesisHash := consensus.HeaderHash(&genesis.Header)
+	storeTxIndexTestBlock(t, s, 0, genesis, true)
+	setTxIndexTestTip(t, s, 0, genesis)
+	finishTxIndex(t, s)
+
+	tip := txIndexFixtureBlock(1, genesisHash, 2, 1)
+	tipHash := consensus.HeaderHash(&tip.Header)
+	storeTxIndexTestBlock(t, s, 1, tip, true)
+	setTxIndexTestTip(t, s, 1, tip)
+	if err := s.db.Delete(blockKey(genesisHash), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+
+	assertIndexedTransaction(t, s, tip.Txs[0], &tipHash)
+	assertIndexedTransaction(t, s, genesis.Txs[0], &genesisHash)
+	if _, found, err := s.FindActiveTransaction([32]byte{255}); err != nil || found {
+		t.Fatalf("canonical indexed prefix could not answer a miss: found=%v err=%v", found, err)
+	}
+}
+
 func TestTxIndexIncompleteHistoryAndCorruptionUseSafeFallback(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {

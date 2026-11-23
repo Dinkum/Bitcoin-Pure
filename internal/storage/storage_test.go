@@ -1663,9 +1663,6 @@ func TestAppendValidatedBlockPersistsDeltaUndoAndHeight(t *testing.T) {
 	if hashAtHeight == nil || *hashAtHeight != blockHash {
 		t.Fatal("active height index mismatch after delta append")
 	}
-	if err := store.WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes: %v", err)
-	}
 	rawHeightIndex, err := store.get(heightIndexKey(1))
 	if err != nil {
 		t.Fatalf("raw height index: %v", err)
@@ -1716,8 +1713,8 @@ func TestWalletIndexesFollowActiveChainAndReorg(t *testing.T) {
 	coinbaseAOut := types.OutPoint{TxID: consensus.TxID(&coinbaseA), Vout: 0}
 	spendAOut := types.OutPoint{TxID: consensus.TxID(&spendA), Vout: 0}
 	createdA := consensus.UtxoSet{
-		coinbaseAOut: {ValueAtoms: 25, PubKey: [32]byte{9}},
-		spendAOut:    {ValueAtoms: 40, PubKey: [32]byte{2}},
+		coinbaseAOut: consensus.UtxoEntryFromOutputAtHeight(coinbaseA.Base.Outputs[0], 1, true),
+		spendAOut:    consensus.UtxoEntryFromOutputAtHeight(spendA.Base.Outputs[0], 1, false),
 	}
 	blockA := testBlock(genesisHash, 2, genesis.Header.NBits, createdA, coinbaseA, spendA)
 	entryA := BlockIndexEntry{
@@ -1745,8 +1742,8 @@ func TestWalletIndexesFollowActiveChainAndReorg(t *testing.T) {
 	coinbaseBOut := types.OutPoint{TxID: consensus.TxID(&coinbaseB), Vout: 0}
 	spendBOut := types.OutPoint{TxID: consensus.TxID(&spendB), Vout: 0}
 	createdB := consensus.UtxoSet{
-		coinbaseBOut: {ValueAtoms: 26, PubKey: [32]byte{8}},
-		spendBOut:    {ValueAtoms: 41, PubKey: [32]byte{3}},
+		coinbaseBOut: consensus.UtxoEntryFromOutputAtHeight(coinbaseB.Base.Outputs[0], 1, true),
+		spendBOut:    consensus.UtxoEntryFromOutputAtHeight(spendB.Base.Outputs[0], 1, false),
 	}
 	blockB := testBlock(genesisHash, 3, genesis.Header.NBits, createdB, coinbaseB, midB, spendB)
 	entryB := BlockIndexEntry{
@@ -1889,9 +1886,6 @@ func TestHeaderHeightLookupsSeparateIndexedAndCanonicalViews(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes: %v", err)
-	}
 
 	// Simulate the derived index lagging behind the canonical header tip.
 	if err := store.db.Delete(headerHeightIndexKey(2), pebble.Sync); err != nil {
@@ -1915,7 +1909,7 @@ func TestHeaderHeightLookupsSeparateIndexedAndCanonicalViews(t *testing.T) {
 	}
 }
 
-func TestDerivedIndexesReplayFromJournalOnReopen(t *testing.T) {
+func TestLegacyHeightJournalRecoveryOnReopen(t *testing.T) {
 	path := t.TempDir()
 	store, err := Open(path)
 	if err != nil {
@@ -1957,8 +1951,15 @@ func TestDerivedIndexesReplayFromJournalOnReopen(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate a crash before the async derived-index worker catches up.
-	if err := store.db.Set(metaDerivedJournalSeqKey, encodeU64(0), pebble.NoSync); err != nil {
+	// Reopen a store left by a writer with pending journal entries. The
+	// recovery must apply both in order before retiring the legacy log.
+	for seq, oldHash := range [][32]byte{{1}, hash} {
+		entry := chainJournalEntry{Kind: journalSetBlockHeight, Pairs: []chainJournalHeightHash{{Height: 0, Hash: oldHash}}}
+		if err := store.db.Set(journalKey(uint64(seq)), encodeChainJournalEntry(entry), pebble.NoSync); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.db.Set(metaJournalNextSeqKey, encodeU64(2), pebble.NoSync); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.db.Delete(heightIndexKey(0), pebble.NoSync); err != nil {
@@ -1973,8 +1974,8 @@ func TestDerivedIndexesReplayFromJournalOnReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.WaitForDerivedIndexes(time.Second); err != nil {
-		t.Fatalf("WaitForDerivedIndexes reopen: %v", err)
+	if raw, err := reopened.get(journalKey(0)); err != nil || raw != nil {
+		t.Fatalf("legacy journal remains after recovery: %x, %v", raw, err)
 	}
 	rawHeightIndex, err := reopened.get(heightIndexKey(0))
 	if err != nil {

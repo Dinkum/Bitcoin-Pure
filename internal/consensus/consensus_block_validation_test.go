@@ -1,10 +1,12 @@
 package consensus
 
 import (
+	"bitcoin-pure/internal/crypto"
 	"bitcoin-pure/internal/types"
 	"bitcoin-pure/internal/utreexo"
 	"bytes"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -321,6 +323,59 @@ func TestValidateAndApplyBlockRejectsCoinbaseOverpay(t *testing.T) {
 	_, err = validateAndApplyBlockForTest(t, &block, prev, NewBlockSizeState(params), UtxoSet{}, params, DefaultConsensusRules())
 	if !errors.Is(err, ErrCoinbaseOverpay) {
 		t.Fatalf("expected coinbase overpay, got %v", err)
+	}
+}
+
+func TestValidateAndApplyBlockAllowsRewardWhenFeePlusSubsidyExceedsUint64(t *testing.T) {
+	params := RegtestParams()
+	prev := PrevBlockContext{Header: types.BlockHeader{Timestamp: params.GenesisTimestamp, NBits: params.GenesisBits}}
+	prevOut := types.OutPoint{TxID: [32]byte{1}}
+	utxos := UtxoSet{prevOut: UtxoEntryFromOutput(types.NewXOnlyOutput(math.MaxUint64, consensusTestPubKey(1)))}
+	fee := uint64(math.MaxUint64 - 1)
+	spend := signedSpendTxForConsensusTest(t, 1, prevOut, math.MaxUint64, 2, fee)
+	reward := SubsidyAtoms(1, params)
+	coinbase := coinbaseTxForConsensusTest(1, []types.TxOutput{types.NewXOnlyOutput(reward, consensusTestPubKey(3))})
+	txs := []types.Transaction{coinbase, spend}
+	ids, _, txRoot, authRoot := BuildBlockRoots(txs)
+	nextUTXOs := UtxoSet{
+		{TxID: ids[0]}: UtxoEntryFromOutputAtHeight(coinbase.Base.Outputs[0], 1, true),
+		{TxID: ids[1]}: UtxoEntryFromOutputAtHeight(spend.Base.Outputs[0], 1, false),
+	}
+	block := types.Block{Txs: txs, Header: types.BlockHeader{
+		PrevBlockHash:  HeaderHash(&prev.Header),
+		Timestamp:      prev.Header.Timestamp + 600,
+		NBits:          params.GenesisBits,
+		MerkleTxIDRoot: txRoot,
+		MerkleAuthRoot: authRoot,
+		UTXORoot:       ComputedUTXORoot(nextUTXOs),
+	}}
+	block.Header = mineHeaderForTest(block.Header)
+	summary, err := validateAndApplyBlockForTest(t, &block, prev, NewBlockSizeState(params), utxos, params, DefaultConsensusRules())
+	if err != nil || summary.TotalFees != fee {
+		t.Fatalf("validation = (%+v, %v), want fee %d", summary, err, fee)
+	}
+}
+
+func TestVerifyBlockPQChecksRejectsAnInvalidChunk(t *testing.T) {
+	pubKey, privKey, err := crypto.GenerateMLDSA65Key(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := [32]byte{1}
+	signature, err := crypto.SignMLDSA65(privKey, message[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := make([]PQVerifyCheck, 24)
+	for i := range checks {
+		checks[i] = PQVerifyCheck{VerificationKey: pubKey, Signature: signature, Msg: message}
+	}
+	if !verifyBlockPQChecks(checks) {
+		t.Fatal("valid PQ checks failed")
+	}
+	checks[len(checks)-1].Msg[0] ^= 1
+	if verifyBlockPQChecks(checks) {
+		t.Fatal("invalid PQ check passed")
 	}
 }
 

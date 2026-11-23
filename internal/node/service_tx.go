@@ -66,80 +66,8 @@ func (s *Service) SubmitTxBatch(txs []types.Transaction) ([]mempool.Admission, [
 }
 
 func (s *Service) submitSingleDecodedTxFrom(tx types.Transaction, source *peerConn) (mempool.Admission, error, int, int) {
-	startedAt := time.Now()
-	s.releaseTxRequestsForTransactions([]types.Transaction{tx})
-	admission := mempool.Admission{}
-	var err error
-	orphanCount := 0
-	mempoolSize := 0
-	defer func() {
-		errorCount := 0
-		if err != nil {
-			errorCount = 1
-		}
-		s.perf.noteAdmissionDuration(time.Since(startedAt))
-		attrs := []slog.Attr{
-			slog.Int("tx_count", 1),
-			slog.Int("accepted_txs", len(admission.Accepted)),
-			slog.Int("error_count", errorCount),
-			slog.Int("orphan_count", orphanCount),
-			slog.Int("mempool_size", mempoolSize),
-			slog.Duration("admit_duration", time.Since(startedAt)),
-		}
-		if source != nil {
-			attrs = append(attrs, slog.String("source_addr", source.addr))
-		} else {
-			attrs = append(attrs, slog.String("source_addr", "local"))
-		}
-		s.logger.LogAttrs(context.Background(), slog.LevelDebug, "tx admission batch complete", attrs...)
-	}()
-
-	if err = s.rejectCache.lookup(tx, s.pool.Epoch(), s.chainTipHash()); err != nil {
-		orphanCount = s.pool.OrphanCount()
-		mempoolSize = s.pool.Count()
-		return admission, err, orphanCount, mempoolSize
-	}
-	if err = s.avalancheManager().rejectionError(tx); err != nil {
-		orphanCount = s.pool.OrphanCount()
-		mempoolSize = s.pool.Count()
-		s.rejectCache.remember(tx, err, s.pool.Epoch(), s.chainTipHash())
-		return admission, err, orphanCount, mempoolSize
-	}
-
-	rules := consensus.DefaultConsensusRules()
-	params := consensus.ParamsForProfile(s.cfg.Profile)
-	_, spendHeight, chainLookup := s.chainUtxoSnapshotWithTip()
-	admission, err = s.pool.AcceptTxWithLookupAndParamsAtHeight(tx, chainLookup, params, spendHeight, rules)
-	orphanCount = s.pool.OrphanCount()
-	mempoolSize = s.pool.Count()
-	if err != nil {
-		s.rejectCache.remember(tx, err, s.pool.Epoch(), s.chainTipHash())
-		if errors.Is(err, mempool.ErrInputAlreadySpent) {
-			s.avalancheManager().trackTx(tx, false, time.Now())
-		}
-		return admission, err, orphanCount, mempoolSize
-	}
-
-	s.noteAcceptedAdmissions([]mempool.Admission{admission})
-	if len(admission.Accepted) > 0 {
-		s.invalidateBlockTemplate("tx_admission")
-		now := time.Now()
-		for _, accepted := range admission.Accepted {
-			s.avalancheManager().trackTx(accepted.Tx, true, now)
-		}
-		if source == nil && !admission.Orphaned {
-			s.rebroadcastMu.Lock()
-			s.localRebroadcast[consensus.TxID(&tx)] = now
-			s.rebroadcastMu.Unlock()
-		}
-		s.relayAcceptedTxs(s.peerSnapshotExcluding(source), admission.Accepted, source)
-	}
-	if admission.Orphaned {
-		s.scheduleMempoolPersistence()
-	} else if len(admission.Accepted) > 0 {
-		s.scheduleMempoolPersistence()
-	}
-	return admission, nil, orphanCount, mempoolSize
+	admissions, errs, orphanCount, mempoolSize := s.submitDecodedTxsFrom([]types.Transaction{tx}, source)
+	return admissions[0], errs[0], orphanCount, mempoolSize
 }
 
 // Best-effort view for the diagnostic stress surface; RPC callers use the
@@ -156,13 +84,14 @@ func (s *Service) walletUTXOsByWatchItems(items []compactfilter.WatchItem) ([]Pu
 	if len(items) == 0 {
 		return nil, nil
 	}
-	indexed, err := s.chainState.Store().WalletUTXOsByWatchItems(storageWatchItems(items))
+	watchItems := storageWatchItems(items)
+	s.stateMu.RLock()
+	indexed, err := s.chainState.Store().WalletUTXOsByWatchItems(watchItems)
+	view, ok := s.chainState.tipSnapshot()
+	s.stateMu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	s.stateMu.RLock()
-	view, ok := s.chainState.sharedCommittedView()
-	s.stateMu.RUnlock()
 	if !ok {
 		return nil, ErrNoTip
 	}
@@ -206,63 +135,6 @@ func (s *Service) walletUTXOsByWatchItems(items []compactfilter.WatchItem) ([]Pu
 		}
 	})
 	return out, nil
-}
-
-func (s *Service) annotateWalletUTXOOrigins(utxos []PubKeyUTXO) error {
-	if len(utxos) == 0 {
-		return nil
-	}
-	s.stateMu.RLock()
-	view, ok := s.chainState.sharedCommittedView()
-	s.stateMu.RUnlock()
-	if !ok {
-		return ErrNoTip
-	}
-	remaining := make(map[types.OutPoint]int, len(utxos))
-	for i := range utxos {
-		remaining[utxos[i].OutPoint] = i
-	}
-	params := consensus.ParamsForProfile(s.cfg.Profile)
-	for height := view.Height + 1; height > 0 && len(remaining) > 0; height-- {
-		blockHeight := height - 1
-		hash, err := s.chainState.Store().GetBlockHashByHeight(blockHeight)
-		if err != nil {
-			return err
-		}
-		if hash == nil {
-			continue
-		}
-		block, err := s.chainState.Store().GetBlock(hash)
-		if err != nil {
-			return err
-		}
-		if block == nil {
-			continue
-		}
-		for txIndex := range block.Txs {
-			txid := consensus.TxID(&block.Txs[txIndex])
-			for vout := range block.Txs[txIndex].Base.Outputs {
-				outPoint := types.OutPoint{TxID: txid, Vout: uint32(vout)}
-				utxoIndex, ok := remaining[outPoint]
-				if !ok {
-					continue
-				}
-				confirmations := view.Height - blockHeight + 1
-				utxos[utxoIndex].Height = blockHeight
-				utxos[utxoIndex].Confirmations = confirmations
-				utxos[utxoIndex].Coinbase = txIndex == 0
-				utxos[utxoIndex].Mature = txIndex != 0 || confirmations >= params.CoinbaseMaturity
-				delete(remaining, outPoint)
-			}
-		}
-	}
-	// If an output was found in the UTXO set but its creating block could not be
-	// located, keep it unavailable rather than letting the wallet spend a coin
-	// whose maturity status is unknown.
-	for _, utxoIndex := range remaining {
-		utxos[utxoIndex].Mature = false
-	}
-	return nil
 }
 
 func (s *Service) UTXOsByPubKeys(pubKeys [][32]byte) []PubKeyUTXO {
@@ -364,63 +236,6 @@ func validateWalletActivityLimit(limit int) error {
 	default:
 		return nil
 	}
-}
-
-func walletActivityFromBlock(height uint64, hash [32]byte, block *types.Block, undo []storage.BlockUndoEntry, wanted map[compactfilter.WatchItem]struct{}) ([]WalletActivity, error) {
-	if block == nil {
-		return nil, nil
-	}
-	resolvedInputs, err := consensus.ResolveBlockInputEntries(block, undo)
-	if err != nil {
-		return nil, fmt.Errorf("resolve wallet activity block %x inputs: %w", hash, err)
-	}
-	timestamp := time.Unix(int64(block.Header.Timestamp), 0).UTC()
-	out := make([]WalletActivity, 0, len(block.Txs))
-	for i, tx := range block.Txs {
-		received := uint64(0)
-		for _, output := range tx.Base.Outputs {
-			if _, ok := wanted[compactFilterItemForOutput(output)]; ok {
-				received += output.ValueAtoms
-			}
-		}
-		sent := uint64(0)
-		inputSum := uint64(0)
-		if i > 0 {
-			for _, input := range tx.Base.Inputs {
-				entry, ok := resolvedInputs[input.PrevOut]
-				if !ok {
-					return nil, fmt.Errorf("missing resolved wallet activity input for block %x: %v", hash, input.PrevOut)
-				}
-				inputSum += entry.ValueAtoms
-				if _, ok := wanted[compactFilterItemForUTXO(entry)]; ok {
-					sent += entry.ValueAtoms
-				}
-			}
-		}
-		if received == 0 && sent == 0 {
-			continue
-		}
-		outputSum := uint64(0)
-		for _, output := range tx.Base.Outputs {
-			outputSum += output.ValueAtoms
-		}
-		fee := uint64(0)
-		if i > 0 {
-			fee = inputSum - outputSum
-		}
-		out = append(out, WalletActivity{
-			TxID:      consensus.TxID(&tx),
-			BlockHash: hash,
-			Height:    height,
-			Timestamp: timestamp,
-			Coinbase:  i == 0,
-			Received:  received,
-			Sent:      sent,
-			Fee:       fee,
-			Net:       int64(received) - int64(sent),
-		})
-	}
-	return out, nil
 }
 
 func compactFilterItemForOutput(output types.TxOutput) compactfilter.WatchItem {
@@ -670,7 +485,7 @@ func (s *Service) noteLocalOriginAcceptedTxs(txs []types.Transaction, admissions
 		}
 		// Track only txs explicitly submitted by the local operator path, not
 		// extra txs that happened to get promoted alongside them.
-		s.localRebroadcast[consensus.TxID(&txs[i])] = now
+		s.localRebroadcast[admissions[i].TxID] = now
 	}
 }
 
